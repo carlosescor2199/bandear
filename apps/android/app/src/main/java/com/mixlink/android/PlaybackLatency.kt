@@ -32,11 +32,17 @@ object PlaybackLatency {
     /**
      * The playback buffer to request, in frames, for a packet of [packetFrames] frames.
      *
-     * Three packet intervals of cushion absorbs ordinary network jitter. Because the buffer's
-     * occupancy *is* the playback latency, anything larger is paid on every sample, so this is kept
-     * deliberately close to the packet size. The request is a lower bound: the platform clamps it up
-     * to its own hardware minimum and is free to ignore it.
+     * The buffer's occupancy *is* the playback latency, so the cushion is kept as tight as the
+     * measured network jitter allows. Measured on a Galaxy S23 over the fast path (HAL buffer 4 ms,
+     * arrival jitter ~2 ms), the playback backlog was linear in the cushion: three packets gave
+     * 53.9 ms, two gave 43.9 ms, and one gave 33.9 ms, with a fixed ~24 ms device pipeline under all
+     * of them. One packet left the fast track reporting empty mix cycles, which is the audible-gap
+     * risk, so the default keeps one packet of slack. The request is a lower bound; the platform
+     * clamps it up to its own hardware minimum and is free to ignore it.
      */
     fun targetBufferFrames(packetFrames: Int): Int =
-        (packetFrames.coerceAtLeast(0) * 3).coerceAtLeast(1)
+        (packetFrames.coerceAtLeast(0) * CUSHION_PACKETS).coerceAtLeast(1)
+
+    /** Packet intervals of playback cushion to request. See [targetBufferFrames]. */
+    private const val CUSHION_PACKETS = 2
 }

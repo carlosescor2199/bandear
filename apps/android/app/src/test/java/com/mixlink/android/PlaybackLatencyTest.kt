@@ -31,8 +31,8 @@ class PlaybackLatencyTest {
     }
 
     @Test
-    fun requestsThreePacketIntervalsOfPlaybackCushion() {
-        assertEquals(1_440, PlaybackLatency.targetBufferFrames(480))
+    fun requestsTwoPacketIntervalsOfPlaybackCushion() {
+        assertEquals(960, PlaybackLatency.targetBufferFrames(480))
     }
 
     @Test

@@ -71,9 +71,42 @@ subtraction is just clock skew.
   passed; the failure is in the toolchain, produces no code diagnostic, and is recorded here rather
   than hidden.
 - T5: `:app:testDebugUnitTest` exit 0, BUILD SUCCESSFUL; `PlaybackLatencyTest` tests=7, failures=0,
-  errors=0 (the two new cases are the 3-packet cushion and the never-zero floor).
-- Honest limits: nothing here was measured on a real phone. The backlog metric is the instrument; the
-  buffer target is a reasoned default, not a measured optimum, and must be confirmed on device.
+  errors=0 (the new cases cover the packet cushion and the never-zero floor).
+
+## On-device measurement
+
+Measured on a Galaxy S23 (SM-S916B, Android, 48 kHz stereo) against a Windows server, with the
+server's default input device and `--buffer 240`:
+
+- Server: cpal accepted the request and printed `buffer=Fixed(240)`, but the effective packet
+  interval did not change. The client reported `Inter-arrival: 9.9 ms` and 97.7-99.5 packets per
+  second, which is 480 frames per callback, not 240. On Windows WASAPI **shared** mode the engine
+  period governs the callback size, so `BufferSize::Fixed` cannot go below it; that needs exclusive
+  mode or ASIO. Recorded as a finding, not a fix.
+- Client: the track lands on the **fast path** (`AudioStreamOut` with `AUDIO_OUTPUT_FLAG_FAST`,
+  `FastMixer`, HAL buffer 192 frames = 4 ms), so `PERFORMANCE_MODE_LOW_LATENCY` did its job.
+- Playback backlog was linear in the cushion, and the framework's own track latency agreed:
+
+  | Cushion | Buffer | Playback backlog | Track latency | Sequences lost | Samples discarded |
+  | --- | --- | --- | --- | --- | --- |
+  | 3 packets | 1440 frames | 53.9 ms | 51.00 | 5 | 0 |
+  | 2 packets | 960 frames | 43.9 ms | (not dumped) | 0 | 0 |
+  | 1 packet | 480 frames | 33.9 ms | 31.00 | 0 | 0 |
+
+  The fixed device pipeline is ~24 ms (backlog minus buffer) under every setting; the buffer adds its
+  own duration on top. One packet left the fast track reporting empty mix cycles (`Empty 47`), which
+  is the audible-gap risk, so the committed default is two packets.
+- Remaining budget: ~10 ms capture + ~5 ms network + ~44 ms playback is ~59 ms, still far from the
+  PRD's 25 ms target. The two levers left are the Windows capture backend (exclusive/ASIO, to shrink
+  the packet itself) and the device pipeline (the fast track's own ~24 ms, plus Samsung's always-on
+  effects).
+
+## Honest limits
+
+- Only one device and one server machine were measured. The cushion default is a safe value, not a
+  proven optimum for every phone.
+- The DAC underrun that a too-small buffer would cause is not visible to the app: the only signal was
+  the framework's fast-track `Empty` count, and the audible verdict needs a human listening.
 
 ## Iteration log
 
@@ -85,9 +118,10 @@ subtraction is just clock skew.
   when an explicit size is rejected. `CaptureFormat.buffer_size` now reports what actually took effect.
 - T5: switched the playback write to `WRITE_BLOCKING` so the writer is paced by the render position
   and samples are no longer silently discarded, and added `applyPlaybackBufferTarget`, which asks
-  `setBufferSizeInFrames` for three packet intervals once the first packet reveals the packet size.
+  `setBufferSizeInFrames` for two packet intervals once the first packet reveals the packet size.
   The platform clamps the request up to its hardware minimum; a refused call leaves the buffer as it
-  was.
+  was. The cushion was then tuned on device (see the measurement section): three packets was the first
+  guess, and the measurement showed it was pure added latency.
 
 ## Route
 

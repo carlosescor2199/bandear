@@ -243,12 +243,14 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         jitterMs: Double = 0.0,
         discardedSamples: Long = 0,
         packetsWithDiscardedSamples: Long = 0,
+        playbackBacklogMs: Double = 0.0,
     ) {
         runOnUiThread {
-            statsText.text = "Packets received: $packets\nSequences lost: $lost\nLast sample rate: ${sampleRate?.let { "$it Hz" } ?: "-"}\nPackets per second: %.1f\nInter-arrival: %.1f ms\nJitter: %.1f ms\nAudio samples discarded: $discardedSamples\nAudio packets with discarded samples: $packetsWithDiscardedSamples".format(
+            statsText.text = "Packets received: $packets\nSequences lost: $lost\nLast sample rate: ${sampleRate?.let { "$it Hz" } ?: "-"}\nPackets per second: %.1f\nInter-arrival: %.1f ms\nJitter: %.1f ms\nPlayback backlog: %.1f ms\nAudio samples discarded: $discardedSamples\nAudio packets with discarded samples: $packetsWithDiscardedSamples".format(
                 packetsPerSecond,
                 interArrivalMs,
                 jitterMs,
+                playbackBacklogMs,
             )
             statusText.text = if (running.get()) "Status: Receiving" else "Status: Stopped"
         }
@@ -441,6 +443,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         jitterMs: Double,
         discardedSamples: Long,
         packetsWithDiscardedSamples: Long,
+        playbackBacklogMs: Double,
     ) {
         updateStats(
             packets,
@@ -451,6 +454,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
             jitterMs,
             discardedSamples,
             packetsWithDiscardedSamples,
+            playbackBacklogMs,
         )
     }
 

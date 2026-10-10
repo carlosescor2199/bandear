@@ -2,6 +2,7 @@ package com.mixlink.android
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -35,6 +36,7 @@ internal class PmonPlayer(
             jitterMs: Double,
             discardedSamples: Long,
             packetsWithDiscardedSamples: Long,
+            playbackBacklogMs: Double,
         )
 
         fun onError(message: String)
@@ -73,6 +75,9 @@ internal class PmonPlayer(
         var packetsPerSecond = 0.0
         var discardedSamples = 0L
         var packetsWithDiscardedSamples = 0L
+        var playbackBacklogMs = 0.0
+        var framesWritten = 0L
+        val audioTimestamp = AudioTimestamp()
         val buffer = ByteArray(65_507)
 
         try {
@@ -154,6 +159,24 @@ internal class PmonPlayer(
                             }
                             packetsWithDiscardedSamples++
                         }
+                        // Only samples that actually entered the track count as written. A partial
+                        // write leaves the rest dropped, and counting it anyway would understate how
+                        // far the writer has run ahead of the render position.
+                        if (writtenSamples > 0) {
+                            framesWritten += writtenSamples / PlaybackLatency.CHANNELS
+                        }
+                        if (audioTrack.getTimestamp(audioTimestamp)) {
+                            val instantBacklog = PlaybackLatency.backlogMs(
+                                framesWritten,
+                                audioTimestamp.framePosition,
+                                playbackRate ?: packet.sampleRate,
+                            )
+                            playbackBacklogMs = if (playbackBacklogMs == 0.0) {
+                                instantBacklog
+                            } else {
+                                playbackBacklogMs + 0.1 * (instantBacklog - playbackBacklogMs)
+                            }
+                        }
                         listener.onStats(
                             packetsReceived,
                             sequencesLost,
@@ -163,6 +186,7 @@ internal class PmonPlayer(
                             jitterMs,
                             discardedSamples,
                             packetsWithDiscardedSamples,
+                            playbackBacklogMs,
                         )
                     } catch (error: Exception) {
                         listener.onError(error.message ?: "invalid PMON packet")

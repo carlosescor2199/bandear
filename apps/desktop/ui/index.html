@@ -23,6 +23,14 @@
       <section class="panel panel--input">
         <h2 class="panel-title">Input</h2>
         <div class="readouts">
+          <div class="readout">
+            <label class="readout-label" for="host-select">Driver</label>
+            <select id="host-select" class="select">
+              <option value="auto">auto — prefer ASIO</option>
+              <option value="asio">ASIO</option>
+              <option value="wasapi">WASAPI (shared)</option>
+            </select>
+          </div>
           <div class="readout readout--device">
             <label class="readout-label" for="device-select">Input device</label>
             <select id="device-select" class="select" disabled>
@@ -35,6 +43,15 @@
                 <button id="device-cancel" type="button" class="button">Cancel</button>
               </span>
             </div>
+          </div>
+          <div class="readout">
+            <label class="readout-label" for="buffer-select">Buffer</label>
+            <select id="buffer-select" class="select">
+              <option value="128">128 frames — lowest</option>
+              <option value="256" selected>256 frames — balanced</option>
+              <option value="512">512 frames</option>
+              <option value="1024">1024 frames — safest</option>
+            </select>
           </div>
           <div class="readout">
             <span class="readout-label">Capture format</span>
@@ -58,8 +75,12 @@
           </div>
         </div>
         <p class="hint">
-          Switching device rebuilds only the capture stream: the control channel and the discovery
-          beacon stay up, and packet numbering continues.
+          Driver, buffer and — under ASIO — the device restart the capture engine, the way a DAW does
+          when the driver changes: the phones reconnect on their own. ASIO can only hold one driver at
+          a time, so a device change has to restart; WASAPI switches device without restarting
+          anything. The buffer only takes effect on ASIO, where the driver honours it; WASAPI shared
+          mode pins the period to the device's own (10 ms). The sample rate is 48 kHz by design: it is
+          the format on the wire the phones receive, not a free choice.
         </p>
       </section>
 

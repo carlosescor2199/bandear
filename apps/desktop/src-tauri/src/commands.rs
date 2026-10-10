@@ -6,7 +6,7 @@
 
 use std::sync::Mutex;
 
-use personal_monitoring::{start, EngineConfig, EngineHandle, GroupDefinition};
+use personal_monitoring::{start, AudioHost, EngineConfig, EngineHandle, GroupDefinition};
 
 use crate::dto::{
     CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, StartRequest, StartSummary,
@@ -53,9 +53,17 @@ fn to_engine_config(request: StartRequest) -> EngineConfig {
                 channels: group.channels,
             })
             .collect(),
-        // The window does not expose a buffer control yet, so the desktop keeps the device default.
-        buffer_frames: None,
+        buffer_frames: request.buffer_frames,
+        host: parse_host(request.host.as_deref()),
     }
+}
+
+/// Maps a window value to a backend. An unknown or absent value falls back to `auto`, which is what
+/// the window sends until the engineer picks something.
+fn parse_host(value: Option<&str>) -> AudioHost {
+    value
+        .and_then(|value| AudioHost::parse(value).ok())
+        .unwrap_or(AudioHost::Auto)
 }
 
 /// Starts the engine and returns the device and capture format the window shows.
@@ -192,10 +200,10 @@ pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
     }
 }
 
-/// Lists the input devices the window can switch to, each with the channel count a switch would
-/// capture. Independent of the engine, so the window can populate the selector before starting.
-pub fn list_input_devices() -> Result<Vec<InputDeviceDto>, String> {
-    personal_monitoring::list_input_devices()
+/// Lists the input devices one backend offers, each with the channel count a switch would capture.
+/// Independent of the engine, so the window can populate the selector before starting.
+pub fn list_input_devices(host: Option<String>) -> Result<Vec<InputDeviceDto>, String> {
+    personal_monitoring::list_input_devices_for(parse_host(host.as_deref()))
         .map(|devices| devices.iter().map(InputDeviceDto::from).collect())
         .map_err(|error| error.to_string())
 }

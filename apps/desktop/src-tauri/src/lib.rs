@@ -39,8 +39,8 @@ async fn stop_engine(state: State<'_, DesktopState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn list_input_devices() -> Result<Vec<InputDeviceDto>, String> {
-    commands::list_input_devices()
+async fn list_input_devices(host: Option<String>) -> Result<Vec<InputDeviceDto>, String> {
+    commands::list_input_devices(host)
 }
 
 #[tauri::command]

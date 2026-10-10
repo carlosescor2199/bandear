@@ -11,6 +11,8 @@ const POLL_INTERVAL_MS = 250;
 
 const els = {
   engineState: document.getElementById("engine-state"),
+  hostSelect: document.getElementById("host-select"),
+  bufferSelect: document.getElementById("buffer-select"),
   deviceSelect: document.getElementById("device-select"),
   deviceWarning: document.getElementById("device-warning"),
   deviceWarningText: document.getElementById("device-warning-text"),
@@ -143,10 +145,15 @@ function renderDeviceOptions() {
   for (const device of inputDevices) {
     const option = document.createElement("option");
     option.value = device.name;
-    option.textContent = `${device.name} — ${device.channels} ${
-      device.channels === 1 ? "channel" : "channels"
-    }`;
-    option.disabled = device.channels === 0;
+    // A channel count of 0 means the count could not be read, not that the device is unusable: under
+    // ASIO only one driver can be loaded at a time, so probing a second device fails. Keep it
+    // selectable and say the count is unknown instead of disabling it.
+    option.textContent =
+      device.channels > 0
+        ? `${device.name} — ${device.channels} ${
+            device.channels === 1 ? "channel" : "channels"
+          }`
+        : `${device.name} — channels unknown`;
     els.deviceSelect.append(option);
   }
   syncDeviceSelection();
@@ -165,7 +172,7 @@ function syncDeviceSelection() {
 
 async function loadDevices() {
   try {
-    inputDevices = await invoke("list_input_devices");
+    inputDevices = await invoke("list_input_devices", { host: els.hostSelect.value });
   } catch (error) {
     inputDevices = [];
     console.warn("could not list input devices", error);
@@ -199,7 +206,9 @@ function requestDeviceSwitch(name) {
   if (!device) {
     return;
   }
-  const invalid = invalidGroupsFor(device.channels);
+  // The warning needs a known channel count; an unknown one cannot predict which groups would go
+  // unavailable, and the engine reports it after the switch anyway.
+  const invalid = device.channels > 0 ? invalidGroupsFor(device.channels) : [];
   if (invalid.length > 0) {
     pendingDeviceName = name;
     const noun = invalid.length === 1 ? "group" : "groups";
@@ -216,6 +225,13 @@ function requestDeviceSwitch(name) {
 
 async function performDeviceSwitch(name) {
   hideDeviceWarning();
+  // ASIO can only hold one driver at a time, so a device change has to rebuild the engine with the
+  // new device instead of loading a second driver: the live switch always fails there. WASAPI
+  // switches without restarting anything, so it keeps the cheap path.
+  if (els.hostSelect.value !== "wasapi") {
+    await applyAudioConfig({ device: name });
+    return;
+  }
   els.deviceSelect.disabled = true;
   try {
     const summary = await invoke("switch_device", { device: name });
@@ -487,7 +503,35 @@ function defaultConfig() {
     targets: [],
     controlPort: 50001,
     groups: [],
+    host: els.hostSelect.value,
+    bufferFrames: els.bufferSelect.value ? Number(els.bufferSelect.value) : null,
   };
+}
+
+// Changing the driver or the buffer rebuilds the capture stream with the new setting, the way a DAW
+// restarts its audio engine when the driver changes. A driver change also lets the engine pick the
+// first device of the new backend instead of keeping a name that belongs to the old driver.
+async function applyAudioConfig({ device = null, resetDevice = false }) {
+  const filter = resetDevice ? null : device ?? (lastStatus ? lastStatus.deviceName : null);
+  setEngineState("restarting", "idle");
+  try {
+    const summary = await invoke("start_engine", {
+      config: { ...defaultConfig(), deviceFilter: filter },
+    });
+    els.format.textContent = describeFormat(summary.captureFormat);
+    setEngineState("running", "on");
+    try {
+      await currentWindow.setTitle(`MixLink Server — ${summary.deviceName}`);
+    } catch (error) {
+      console.warn("could not update the window title", error);
+    }
+    startPolling();
+    await loadDevices();
+    await refreshStatus();
+  } catch (error) {
+    setEngineState(`error: ${error}`, "error");
+    els.format.textContent = "—";
+  }
 }
 
 async function startEngine() {
@@ -533,6 +577,8 @@ async function stopEngine() {
 document.getElementById("refresh").addEventListener("click", refreshStatus);
 document.getElementById("stop").addEventListener("click", stopEngine);
 els.deviceSelect.addEventListener("change", () => requestDeviceSwitch(els.deviceSelect.value));
+els.hostSelect.addEventListener("change", () => applyAudioConfig({ resetDevice: true }));
+els.bufferSelect.addEventListener("change", () => applyAudioConfig({ resetDevice: false }));
 els.deviceSwitchAnyway.addEventListener("click", () => {
   if (pendingDeviceName) {
     performDeviceSwitch(pendingDeviceName);

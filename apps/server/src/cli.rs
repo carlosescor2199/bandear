@@ -3,6 +3,7 @@ use std::env;
 use std::error::Error;
 use std::net::{SocketAddr, ToSocketAddrs};
 
+use crate::capture::AudioHost;
 use crate::mix::{Group, GroupLayout, MAX_GROUPS};
 
 const DEFAULT_TARGET: &str = "127.0.0.1:50000";
@@ -28,6 +29,9 @@ pub struct EngineConfig {
     pub control_port: u16,
     pub groups: Vec<GroupDefinition>,
     pub buffer_frames: Option<u32>,
+    /// The capture backend. `Auto` prefers ASIO where it is available; the window lets the engineer
+    /// pick a concrete one.
+    pub host: AudioHost,
 }
 
 /// The crate-internal name the parsing tests use for [EngineConfig].
@@ -55,6 +59,7 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
     let mut control_port = DEFAULT_CONTROL_PORT;
     let mut groups = Vec::new();
     let mut buffer_frames = None;
+    let mut host = AudioHost::Auto;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -93,6 +98,12 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
                 let value = arguments.next().ok_or("--buffer requires a frame count")?;
                 buffer_frames = Some(parse_buffer_frames(&value)?);
             }
+            "--host" => {
+                let value = arguments
+                    .next()
+                    .ok_or("--host requires auto, asio or wasapi")?;
+                host = AudioHost::parse(&value)?;
+            }
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
     }
@@ -107,6 +118,7 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
         control_port,
         groups,
         buffer_frames,
+        host,
     })
 }
 
@@ -304,6 +316,27 @@ mod tests {
         let error = parse_arguments_from(["--buffer", "4"]).unwrap_err();
 
         assert!(error.to_string().contains('4'));
+    }
+
+    #[test]
+    fn defaults_to_the_automatic_host() {
+        let arguments = parse_arguments_from::<0>([]).expect("arguments should parse");
+
+        assert_eq!(arguments.host, AudioHost::Auto);
+    }
+
+    #[test]
+    fn parses_a_concrete_host_case_insensitively() {
+        let arguments = parse_arguments_from(["--host", "ASIO"]).expect("arguments should parse");
+
+        assert_eq!(arguments.host, AudioHost::Asio);
+    }
+
+    #[test]
+    fn rejects_an_unknown_host_naming_the_value() {
+        let error = parse_arguments_from(["--host", "coreaudio"]).unwrap_err();
+
+        assert!(error.to_string().contains("coreaudio"));
     }
 
     #[test]

@@ -21,6 +21,12 @@ pub struct StartRequest {
     pub control_port: Option<u16>,
     #[serde(default)]
     pub groups: Vec<GroupRequest>,
+    /// The capture backend: "auto", "asio" or "wasapi". `None` means "auto", which prefers ASIO.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The capture buffer size in frames. `None` means the engine default.
+    #[serde(default)]
+    pub buffer_frames: Option<u32>,
 }
 
 /// One group as the window describes it. Channel numbers are 1-based, exactly as the CLI takes

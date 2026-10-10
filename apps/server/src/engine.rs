@@ -10,7 +10,7 @@ use cpal::traits::{HostTrait, StreamTrait};
 
 use crate::capture::{
     build_input_stream, describe_buffer, input_host, select_device, select_device_by_name,
-    select_input_config, TARGET_SAMPLE_RATE,
+    select_input_config, AudioHost, TARGET_SAMPLE_RATE,
 };
 use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
@@ -374,6 +374,9 @@ pub struct EngineHandle {
     /// The input buffer size requested for capture, reused by every device switch so a session keeps
     /// the same latency profile across devices. `None` means the device default.
     buffer_frames: Option<u32>,
+    /// The backend the capture stream was opened on, reused by every device switch so a switch never
+    /// silently changes the driver the engineer chose.
+    host: AudioHost,
     source_channels: u8,
     /// The engineer's groups exactly as configured, kept so a device switch can re-validate them
     /// against the new channel count without ever rewriting them.
@@ -494,7 +497,7 @@ impl EngineHandle {
             return Err("the engine is stopping".into());
         }
         let device = {
-            let host = input_host();
+            let host = input_host(self.host);
             let devices = host
                 .input_devices()
                 .map_err(|error| format!("could not enumerate input devices: {error}"))?
@@ -627,7 +630,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     for target in &targets {
         println!("  {target}");
     }
-    let host = input_host();
+    let host = input_host(config.host);
     let devices = host
         .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?
@@ -729,6 +732,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         capture_format,
         control_port: config.control_port,
         buffer_frames,
+        host: config.host,
         source_channels,
         group_definitions: config.groups,
         groups: group_statuses(&group_layout),

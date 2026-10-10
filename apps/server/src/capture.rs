@@ -27,38 +27,92 @@ pub struct InputDevice {
     pub channels: u16,
 }
 
-/// The cpal host the engine captures from.
+/// Which audio host the engine captures from.
 ///
-/// ASIO is preferred when it is compiled in. It bypasses the Windows audio stack entirely and, unlike
-/// WASAPI shared mode, it is a backend where `BufferSize::Fixed` actually shrinks the callback period
-/// - and that period is exactly the capture latency, because the engine sends one packet per callback.
-/// ASIO is not always available (no driver, or the driver is held by another app), so failing to load
-/// it falls back to the default host instead of failing the session.
+/// `Auto` is the default: prefer ASIO where it is compiled in and a driver loads, otherwise the
+/// platform default. The window exposes the concrete choice so an interface with an ASIO driver can
+/// be picked over a built-in one that reports a much larger period.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioHost {
+    #[default]
+    Auto,
+    Asio,
+    Wasapi,
+}
+
+impl AudioHost {
+    /// Parses a `--host` value. Case-insensitive; the error names the accepted values.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "asio" => Ok(Self::Asio),
+            "wasapi" => Ok(Self::Wasapi),
+            other => Err(format!("--host `{other}` is not one of auto, asio, wasapi")),
+        }
+    }
+
+    /// The value the window shows and the CLI accepts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Asio => "asio",
+            Self::Wasapi => "wasapi",
+        }
+    }
+}
+
+/// The ASIO host, created once and shared.
 ///
-/// The ASIO host is created once and shared. ASIO can only have one driver loaded at a time, and
-/// building a second host re-loads a driver, which fails as soon as the device list has already
-/// touched a different one - exactly what a UI that lists devices and then starts the engine does.
-pub(crate) fn input_host() -> &'static cpal::Host {
+/// ASIO can only have one driver loaded at a time, and building a second host re-loads a driver,
+/// which fails as soon as the device list has already touched a different one - exactly what a UI
+/// that lists devices and then starts the engine does.
+#[cfg(all(target_os = "windows", feature = "asio"))]
+fn asio_host() -> &'static cpal::Host {
     use std::sync::OnceLock;
 
     static HOST: OnceLock<cpal::Host> = OnceLock::new();
-    HOST.get_or_init(|| {
-        #[cfg(all(target_os = "windows", feature = "asio"))]
-        {
-            match cpal::host_from_id(cpal::HostId::Asio) {
-                Ok(host) => return host,
-                Err(error) => {
-                    eprintln!("ASIO host unavailable ({error}); falling back to the default host")
-                }
-            }
+    HOST.get_or_init(|| match cpal::host_from_id(cpal::HostId::Asio) {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("ASIO host unavailable ({error}); falling back to the default host");
+            cpal::default_host()
         }
-        cpal::default_host()
     })
 }
 
-/// Enumerates the host's input devices with the channel count a switch would capture.
+/// The platform default host, created once so it can be returned by reference like [asio_host].
+fn default_host() -> &'static cpal::Host {
+    use std::sync::OnceLock;
+
+    static HOST: OnceLock<cpal::Host> = OnceLock::new();
+    HOST.get_or_init(cpal::default_host)
+}
+
+/// The cpal host the engine captures from, for the requested backend.
+///
+/// ASIO bypasses the Windows audio stack entirely and, unlike WASAPI shared mode, it is a backend
+/// where `BufferSize::Fixed` actually shrinks the callback period - and that period is exactly the
+/// capture latency, because the engine sends one packet per callback. It is not always available (no
+/// driver, or the driver is held by another app), so `Auto` and `Asio` fall back to the default host
+/// instead of failing the session.
+pub(crate) fn input_host(host: AudioHost) -> &'static cpal::Host {
+    let want_asio = !matches!(host, AudioHost::Wasapi);
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    if want_asio {
+        return asio_host();
+    }
+    let _ = want_asio;
+    default_host()
+}
+
+/// Enumerates the default host's input devices with the channel count a switch would capture.
 pub fn list_input_devices() -> Result<Vec<InputDevice>, Box<dyn Error>> {
-    let host = input_host();
+    list_input_devices_for(AudioHost::Auto)
+}
+
+/// Enumerates one backend's input devices with the channel count a switch would capture.
+pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<dyn Error>> {
+    let host = input_host(host);
     let devices = host
         .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?;

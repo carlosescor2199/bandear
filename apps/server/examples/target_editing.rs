@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use personal_monitoring::{list_input_devices, start, EngineConfig};
+use personal_monitoring::{list_input_devices, start, AudioHost, EngineConfig};
 use tokio_tungstenite::tungstenite::Message;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -59,6 +59,7 @@ async fn main() {
         control_port: 50001,
         groups: vec![],
         buffer_frames: None,
+        host: AudioHost::Auto,
     };
     let Some(mut handle) = start(config).expect("engine should start") else {
         println!("No input device is available.");

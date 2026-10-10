@@ -153,7 +153,10 @@ server's default input device and `--buffer 240`:
   `--buffer` flag finally does what it says. ASIO reports 32-bit integers, so the capture path gained
   an `I32` conversion. The build needs LLVM/Clang (cpal's build script runs bindgen over the ASIO SDK
   and downloads the SDK itself), so `asio` is a default feature that can be dropped with
-  `--no-default-features`.
+  `--no-default-features`. ASIO can only hold one driver at a time, so the host is created once and
+  shared, and a requested buffer is clamped into the range the device reports. A Realtek ASIO driver
+  reports `1024..=1024` and then rejects even that, so it falls back to its default; the Volt honours
+  `256`.
 
 ## Route
 

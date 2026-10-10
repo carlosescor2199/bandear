@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{
-    BufferSize, Device, InputCallbackInfo, SampleFormat, Stream, StreamConfig,
+    BufferSize, Device, InputCallbackInfo, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
     SupportedStreamConfig, SupportedStreamConfigRange,
 };
 
@@ -34,17 +34,26 @@ pub struct InputDevice {
 /// - and that period is exactly the capture latency, because the engine sends one packet per callback.
 /// ASIO is not always available (no driver, or the driver is held by another app), so failing to load
 /// it falls back to the default host instead of failing the session.
-pub(crate) fn input_host() -> cpal::Host {
-    #[cfg(all(target_os = "windows", feature = "asio"))]
-    {
-        match cpal::host_from_id(cpal::HostId::Asio) {
-            Ok(host) => return host,
-            Err(error) => {
-                eprintln!("ASIO host unavailable ({error}); falling back to the default host")
+///
+/// The ASIO host is created once and shared. ASIO can only have one driver loaded at a time, and
+/// building a second host re-loads a driver, which fails as soon as the device list has already
+/// touched a different one - exactly what a UI that lists devices and then starts the engine does.
+pub(crate) fn input_host() -> &'static cpal::Host {
+    use std::sync::OnceLock;
+
+    static HOST: OnceLock<cpal::Host> = OnceLock::new();
+    HOST.get_or_init(|| {
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        {
+            match cpal::host_from_id(cpal::HostId::Asio) {
+                Ok(host) => return host,
+                Err(error) => {
+                    eprintln!("ASIO host unavailable ({error}); falling back to the default host")
+                }
             }
         }
-    }
-    cpal::default_host()
+        cpal::default_host()
+    })
 }
 
 /// Enumerates the host's input devices with the channel count a switch would capture.
@@ -199,6 +208,18 @@ fn with_buffer_size(mut config: StreamConfig, buffer_frames: Option<u32>) -> Str
     config
 }
 
+/// Narrows a requested buffer to the range the device reports.
+///
+/// Some drivers only accept one buffer size (a Realtek ASIO driver reports `1024..=1024`, the Volt's
+/// accepts a range). Requesting outside that range fails the stream open, so clamping here turns a
+/// failed session into the size the driver actually allows.
+fn clamp_buffer_frames(requested: u32, supported: &SupportedBufferSize) -> u32 {
+    match supported {
+        SupportedBufferSize::Range { min, max } => requested.clamp(*min, *max),
+        SupportedBufferSize::Unknown => requested,
+    }
+}
+
 /// Human-readable form of an applied buffer size, for `CaptureFormat::buffer_size`.
 pub(crate) fn describe_buffer(buffer_frames: Option<u32>) -> String {
     match buffer_frames {
@@ -224,7 +245,10 @@ pub(crate) fn build_input_stream(
 ) -> Result<(Stream, Option<u32>), Box<dyn Error>> {
     let sample_format = supported_config.sample_format();
     let base = supported_config.config();
-    let requested = with_buffer_size(base.clone(), buffer_frames);
+    let supported_buffer = supported_config.buffer_size();
+    let requested_frames =
+        buffer_frames.map(|frames| clamp_buffer_frames(frames, &supported_buffer));
+    let requested = with_buffer_size(base.clone(), requested_frames);
 
     let attempt = open_stream(
         device,
@@ -238,8 +262,8 @@ pub(crate) fn build_input_stream(
     );
 
     match attempt {
-        Ok(stream) => Ok((stream, buffer_frames)),
-        Err(error) => match buffer_frames {
+        Ok(stream) => Ok((stream, requested_frames)),
+        Err(error) => match requested_frames {
             Some(frames) => {
                 eprintln!(
                     "Requested input buffer of {frames} frames was rejected ({error}); falling back to the device default buffer."
@@ -626,5 +650,20 @@ mod tests {
     fn describe_buffer_names_the_applied_size() {
         assert_eq!(describe_buffer(Some(480)), "Fixed(480)");
         assert_eq!(describe_buffer(None), "device default");
+    }
+
+    #[test]
+    fn clamps_a_requested_buffer_into_the_supported_range() {
+        let single = SupportedBufferSize::Range {
+            min: 1024,
+            max: 1024,
+        };
+        assert_eq!(clamp_buffer_frames(256, &single), 1024);
+
+        let range = SupportedBufferSize::Range { min: 128, max: 512 };
+        assert_eq!(clamp_buffer_frames(256, &range), 256);
+        assert_eq!(clamp_buffer_frames(64, &range), 128);
+        assert_eq!(clamp_buffer_frames(4096, &range), 512);
+        assert_eq!(clamp_buffer_frames(256, &SupportedBufferSize::Unknown), 256);
     }
 }

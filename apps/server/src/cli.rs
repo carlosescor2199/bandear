@@ -7,17 +7,27 @@ use crate::mix::{Group, GroupLayout, MAX_GROUPS};
 
 const DEFAULT_TARGET: &str = "127.0.0.1:50000";
 const DEFAULT_CONTROL_PORT: u16 = 50001;
+/// Bounds for `--buffer`: below a plausible driver period, up to one second at 48 kHz. A value
+/// outside them is a typo rather than a tuning choice.
+const MIN_BUFFER_FRAMES: u32 = 16;
+const MAX_BUFFER_FRAMES: u32 = 48_000;
 
 /// The engine's startup configuration, independent of how it was gathered.
 ///
 /// The command line fills this in [parse_arguments], but a UI can build one directly and hand it to
 /// [crate::start] without parsing anything.
+///
+/// `buffer_frames` is the input buffer size in frames; `None` leaves the device default, which is
+/// what every caller used before the option existed. It is the biggest single lever on capture
+/// latency, because the engine packages exactly one packet per input callback, so the callback size
+/// is also the packet interval.
 #[derive(Debug)]
 pub struct EngineConfig {
     pub device_filter: Option<String>,
     pub targets: Vec<String>,
     pub control_port: u16,
     pub groups: Vec<GroupDefinition>,
+    pub buffer_frames: Option<u32>,
 }
 
 /// The crate-internal name the parsing tests use for [EngineConfig].
@@ -44,6 +54,7 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
     let mut targets = Vec::new();
     let mut control_port = DEFAULT_CONTROL_PORT;
     let mut groups = Vec::new();
+    let mut buffer_frames = None;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -78,6 +89,10 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
                 }
                 control_port = port;
             }
+            "--buffer" => {
+                let value = arguments.next().ok_or("--buffer requires a frame count")?;
+                buffer_frames = Some(parse_buffer_frames(&value)?);
+            }
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
     }
@@ -91,6 +106,7 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
         targets,
         control_port,
         groups,
+        buffer_frames,
     })
 }
 
@@ -121,6 +137,23 @@ fn parse_group(value: &str) -> Result<GroupDefinition, Box<dyn Error>> {
         name: name.to_owned(),
         channels: parsed,
     })
+}
+
+/// Parses one `--buffer` frame count.
+///
+/// The range is validated here rather than at the audio device, so a typo fails at startup with the
+/// offending value named instead of silently falling back to the device default later.
+fn parse_buffer_frames(value: &str) -> Result<u32, Box<dyn Error>> {
+    let frames: u32 = value
+        .parse()
+        .map_err(|_| format!("--buffer `{value}` must be a whole number of frames"))?;
+    if !(MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&frames) {
+        return Err(format!(
+            "--buffer `{value}` is outside the supported range {MIN_BUFFER_FRAMES}..={MAX_BUFFER_FRAMES} frames"
+        )
+        .into());
+    }
+    Ok(frames)
 }
 
 /// Validates the engineer's groups against the captured channel count and converts the 1-based
@@ -236,6 +269,41 @@ mod tests {
         let arguments = parse_arguments_from::<0>([]).expect("arguments should parse");
 
         assert_eq!(arguments.targets, vec![DEFAULT_TARGET]);
+    }
+
+    #[test]
+    fn parses_an_explicit_buffer_size() {
+        let arguments = parse_arguments_from(["--buffer", "144"]).expect("arguments should parse");
+
+        assert_eq!(arguments.buffer_frames, Some(144));
+    }
+
+    #[test]
+    fn defaults_to_the_device_buffer_when_not_given() {
+        let arguments = parse_arguments_from::<0>([]).expect("arguments should parse");
+
+        assert_eq!(arguments.buffer_frames, None);
+    }
+
+    #[test]
+    fn rejects_a_buffer_without_a_value_naming_the_flag() {
+        let error = parse_arguments_from(["--buffer"]).unwrap_err();
+
+        assert!(error.to_string().contains("--buffer"));
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_buffer_naming_the_value() {
+        let error = parse_arguments_from(["--buffer", "small"]).unwrap_err();
+
+        assert!(error.to_string().contains("small"));
+    }
+
+    #[test]
+    fn rejects_a_buffer_outside_the_supported_range_naming_the_value() {
+        let error = parse_arguments_from(["--buffer", "4"]).unwrap_err();
+
+        assert!(error.to_string().contains('4'));
     }
 
     #[test]

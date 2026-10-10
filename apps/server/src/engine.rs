@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use cpal::traits::{HostTrait, StreamTrait};
 
 use crate::capture::{
-    build_input_stream, select_device, select_device_by_name, select_input_config,
+    build_input_stream, describe_buffer, select_device, select_device_by_name, select_input_config,
     TARGET_SAMPLE_RATE,
 };
 use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
@@ -362,6 +362,9 @@ pub struct EngineHandle {
     device_name: String,
     capture_format: CaptureFormat,
     control_port: u16,
+    /// The input buffer size requested for capture, reused by every device switch so a session keeps
+    /// the same latency profile across devices. `None` means the device default.
+    buffer_frames: Option<u32>,
     source_channels: u8,
     /// The engineer's groups exactly as configured, kept so a device switch can re-validate them
     /// against the new channel count without ever rewriting them.
@@ -497,9 +500,10 @@ impl EngineHandle {
 
         // Build and start the replacement before touching the current capture, so any failure below
         // is a no-op for the running session.
-        let new_stream = build_input_stream(
+        let (new_stream, effective_buffer) = build_input_stream(
             &device,
             &supported_config,
+            self.buffer_frames,
             packet_sender,
             Arc::clone(&self.samples_seen),
             Arc::clone(&self.packet_stats),
@@ -523,7 +527,7 @@ impl EngineHandle {
             channels: supported_config.channels(),
             sample_rate: supported_config.sample_rate(),
             sample_format: format!("{:?}", supported_config.sample_format()),
-            buffer_size: format!("{:?}", supported_config.buffer_size()),
+            buffer_size: describe_buffer(effective_buffer),
         };
         self.source_channels = plan.source_channels;
         self.groups = plan.groups;
@@ -637,10 +641,10 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
 
     println!("Selected input: {device_name}");
     println!(
-        "Capture format: channels={}, sample rate={} Hz, buffer={:?}, sample format={:?}",
+        "Capture format: channels={}, sample rate={} Hz, buffer={}, sample format={:?}",
         supported_config.channels(),
         supported_config.sample_rate(),
-        supported_config.buffer_size(),
+        describe_buffer(config.buffer_frames),
         supported_config.sample_format()
     );
     if supported_config.sample_rate() != TARGET_SAMPLE_RATE {
@@ -689,9 +693,10 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let samples_seen = Arc::new(AtomicU64::new(0));
     let levels = Arc::new(LevelMeter::new());
     let sequence = Arc::new(AtomicU64::new(0));
-    let stream = build_input_stream(
+    let (stream, effective_buffer) = build_input_stream(
         &device,
         &supported_config,
+        config.buffer_frames,
         packet_sender.clone(),
         Arc::clone(&samples_seen),
         Arc::clone(&packet_stats),
@@ -706,13 +711,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         channels: supported_config.channels(),
         sample_rate: supported_config.sample_rate(),
         sample_format: format!("{:?}", supported_config.sample_format()),
-        buffer_size: format!("{:?}", supported_config.buffer_size()),
+        buffer_size: describe_buffer(effective_buffer),
     };
 
     Ok(Some(EngineHandle {
         device_name,
         capture_format,
         control_port: config.control_port,
+        buffer_frames: config.buffer_frames,
         source_channels,
         group_definitions: config.groups,
         groups: group_statuses(&group_layout),

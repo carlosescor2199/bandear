@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{
-    Device, InputCallbackInfo, SampleFormat, Stream, SupportedStreamConfig,
-    SupportedStreamConfigRange,
+    BufferSize, Device, InputCallbackInfo, SampleFormat, Stream, StreamConfig,
+    SupportedStreamConfig, SupportedStreamConfigRange,
 };
 
 use crate::engine::LevelMeter;
@@ -166,24 +166,99 @@ fn is_supported_sample_format(sample_format: SampleFormat) -> bool {
     )
 }
 
+/// Applies an explicit buffer size to a stream configuration.
+///
+/// This is the single biggest lever on capture latency here: the engine packages exactly one packet
+/// per input callback, so the callback size is also the packet interval. Kept pure and separate from
+/// stream construction so the mapping is testable without an audio host.
+fn with_buffer_size(mut config: StreamConfig, buffer_frames: Option<u32>) -> StreamConfig {
+    if let Some(frames) = buffer_frames {
+        config.buffer_size = BufferSize::Fixed(frames);
+    }
+    config
+}
+
+/// Human-readable form of an applied buffer size, for `CaptureFormat::buffer_size`.
+pub(crate) fn describe_buffer(buffer_frames: Option<u32>) -> String {
+    match buffer_frames {
+        Some(frames) => format!("Fixed({frames})"),
+        None => "device default".to_owned(),
+    }
+}
+
+/// Builds and opens the input stream, returning it with the buffer size that actually took effect.
+///
+/// An explicitly requested buffer that the driver rejects is not fatal: the session falls back to the
+/// device default, which is exactly what the engine used before this option existed, and reports
+/// `None` so the caller can see the request was not honoured instead of assuming it was.
 pub(crate) fn build_input_stream(
     device: &Device,
     supported_config: &SupportedStreamConfig,
+    buffer_frames: Option<u32>,
+    packet_sender: SyncSender<AudioPacket>,
+    samples_seen: Arc<AtomicU64>,
+    packet_stats: Arc<PacketStats>,
+    levels: Arc<LevelMeter>,
+    sequence: Arc<AtomicU64>,
+) -> Result<(Stream, Option<u32>), Box<dyn Error>> {
+    let sample_format = supported_config.sample_format();
+    let base = supported_config.config();
+    let requested = with_buffer_size(base.clone(), buffer_frames);
+
+    let attempt = open_stream(
+        device,
+        &requested,
+        sample_format,
+        packet_sender.clone(),
+        Arc::clone(&samples_seen),
+        Arc::clone(&packet_stats),
+        Arc::clone(&levels),
+        Arc::clone(&sequence),
+    );
+
+    match attempt {
+        Ok(stream) => Ok((stream, buffer_frames)),
+        Err(error) => match buffer_frames {
+            Some(frames) => {
+                eprintln!(
+                    "Requested input buffer of {frames} frames was rejected ({error}); falling back to the device default buffer."
+                );
+                let fallback = with_buffer_size(base, None);
+                let stream = open_stream(
+                    device,
+                    &fallback,
+                    sample_format,
+                    packet_sender,
+                    samples_seen,
+                    packet_stats,
+                    levels,
+                    sequence,
+                )?;
+                Ok((stream, None))
+            }
+            None => Err(error),
+        },
+    }
+}
+
+fn open_stream(
+    device: &Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
     packet_sender: SyncSender<AudioPacket>,
     samples_seen: Arc<AtomicU64>,
     packet_stats: Arc<PacketStats>,
     levels: Arc<LevelMeter>,
     sequence: Arc<AtomicU64>,
 ) -> Result<Stream, Box<dyn Error>> {
-    let config = supported_config.config();
     let channels = config.channels as u8;
     let sample_rate = config.sample_rate;
     let decimator = Decimator::new(sample_rate, channels)?;
     let error_callback = |error| eprintln!("Audio input error: {error}");
 
-    let stream = match supported_config.sample_format() {
+    let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
-            config,
+            config.clone(),
             {
                 let mut decimator = decimator;
                 move |data: &[f32], _info: &InputCallbackInfo| {
@@ -203,7 +278,7 @@ pub(crate) fn build_input_stream(
             None,
         ),
         SampleFormat::I16 => device.build_input_stream(
-            config,
+            config.clone(),
             {
                 let mut decimator = decimator;
                 move |data: &[i16], _info: &InputCallbackInfo| {
@@ -222,7 +297,7 @@ pub(crate) fn build_input_stream(
             None,
         ),
         SampleFormat::U16 => device.build_input_stream(
-            config,
+            config.clone(),
             {
                 let mut decimator = decimator;
                 move |data: &[u16], _info: &InputCallbackInfo| {
@@ -474,5 +549,29 @@ mod tests {
 
         assert_eq!(receiver.recv().unwrap().sequence, 0);
         assert_eq!(receiver.recv().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn with_buffer_size_applies_a_fixed_size_only_when_requested() {
+        let base = StreamConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            buffer_size: BufferSize::Default,
+        };
+
+        assert_eq!(
+            with_buffer_size(base.clone(), Some(480)).buffer_size,
+            BufferSize::Fixed(480)
+        );
+        assert_eq!(
+            with_buffer_size(base, None).buffer_size,
+            BufferSize::Default
+        );
+    }
+
+    #[test]
+    fn describe_buffer_names_the_applied_size() {
+        assert_eq!(describe_buffer(Some(480)), "Fixed(480)");
+        assert_eq!(describe_buffer(None), "device default");
     }
 }

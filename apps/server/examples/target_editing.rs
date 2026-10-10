@@ -58,6 +58,7 @@ async fn main() {
         targets: initial,
         control_port: 50001,
         groups: vec![],
+        buffer_frames: None,
     };
     let Some(mut handle) = start(config).expect("engine should start") else {
         println!("No input device is available.");

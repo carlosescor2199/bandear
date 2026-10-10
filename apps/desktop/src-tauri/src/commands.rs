@@ -53,6 +53,8 @@ fn to_engine_config(request: StartRequest) -> EngineConfig {
                 channels: group.channels,
             })
             .collect(),
+        // The window does not expose a buffer control yet, so the desktop keeps the device default.
+        buffer_frames: None,
     }
 }
 

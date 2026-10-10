@@ -101,7 +101,12 @@ server's default input device and `--buffer 240`:
   The fixed device pipeline is ~24 ms (backlog minus buffer) under every setting; the buffer adds its
   own duration on top. One packet left the fast track reporting empty mix cycles (`Empty 47`), which
   is the audible-gap risk, so the committed default is two packets.
-- Remaining budget: ~10 ms capture + ~5 ms network + ~44 ms playback is ~59 ms, still far from the
+- Adaptive cushion (T6), verified live on the same S23: the controller walked the cushion from its
+  2-packet start down to **1 packet** and held it for over a minute (8618 packets, 0 lost, 0
+  discarded). The track buffer stayed at 480 frames, the framework's own track latency read 31.00,
+  and the playback backlog settled at 33.9-34.1 ms instead of the fixed 2-packet 43.9 ms. Android's
+  underrun count, which the controller watches, stayed at zero.
+- Remaining budget: ~10 ms capture + ~5 ms network + ~34 ms playback is ~49 ms, still above the
   PRD's 25 ms target. The two levers left are the Windows capture backend (exclusive/ASIO, to shrink
   the packet itself) and the device pipeline (the fast track's own ~24 ms, plus Samsung's always-on
   effects).

@@ -65,10 +65,17 @@ interface that actually honours a 256-frame period.
 
 ## ASIO and device changes
 
-ASIO can only hold one driver at a time. The live `switch_device` builds the replacement stream before
-dropping the current one, so under ASIO the second driver can never load and the switch fails with
-`input device "..." is no longer available`. The window therefore restarts the engine with the chosen
-device when the backend is ASIO, and keeps the cheap live switch only for WASAPI.
+ASIO can only hold one driver at a time. Two consequences, both fixed:
+
+- **Listing.** cpal describes a device by loading its driver, so a running session hid every driver
+  but its own: the window showed only `Realtek ASIO` and the Volt never appeared. ASIO devices are now
+  listed from `HKLM\SOFTWARE\ASIO`, the same source a DAW uses, without loading anything. The list is
+  complete and its names are the ones cpal uses, so the engine still opens the chosen one. The channel
+  count is unknown there (`0`, shown as "channels unknown"), because reading it would load a driver.
+- **Switching.** The live `switch_device` builds the replacement stream before dropping the current
+  one, so under ASIO the second driver can never load and the switch fails with
+  `input device "..." is no longer available`. The window therefore restarts the engine with the
+  chosen device when the backend is ASIO, and keeps the cheap live switch only for WASAPI.
 
 ## Route
 

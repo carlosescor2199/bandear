@@ -112,6 +112,20 @@ pub fn list_input_devices() -> Result<Vec<InputDevice>, Box<dyn Error>> {
 
 /// Enumerates one backend's input devices with the channel count a switch would capture.
 pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<dyn Error>> {
+    // ASIO is listed from the registry instead of from cpal. cpal describes a device by loading its
+    // driver, and ASIO only holds one driver at a time, so a running session hides every driver but
+    // its own. The installed names are exactly what a DAW lists, and they are the names cpal uses.
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    if !matches!(host, AudioHost::Wasapi) {
+        let names = installed_asio_driver_names();
+        if !names.is_empty() {
+            return Ok(names
+                .into_iter()
+                .map(|name| InputDevice { name, channels: 0 })
+                .collect());
+        }
+    }
+
     let host = input_host(host);
     let devices = host
         .input_devices()
@@ -124,6 +138,41 @@ pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<d
             )
         })
         .collect())
+}
+
+/// Parses the subkey lines of `reg query HKLM\SOFTWARE\ASIO` into the installed driver names.
+///
+/// Pure so it can be tested without the registry. `reg` prints the full hive name, so both the
+/// `HKEY_LOCAL_MACHINE` and `HKLM` spellings are accepted.
+fn parse_asio_driver_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix(r"HKEY_LOCAL_MACHINE\SOFTWARE\ASIO\")
+                .or_else(|| line.strip_prefix(r"HKLM\SOFTWARE\ASIO\"))?;
+            let name = rest.trim();
+            (!name.is_empty()).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Reads the installed ASIO driver names from the Windows registry.
+///
+/// Shelling out to `reg` keeps this to one call and no new dependency, and the registry is the only
+/// complete source: asking cpal would load a driver, which is the thing that hides the others.
+#[cfg(all(target_os = "windows", feature = "asio"))]
+fn installed_asio_driver_names() -> Vec<String> {
+    let Ok(output) = std::process::Command::new("reg")
+        .args(["query", r"HKLM\SOFTWARE\ASIO"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_asio_driver_names(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Joins a device name with its configuration selection into a reportable [InputDevice].
@@ -704,6 +753,30 @@ mod tests {
     fn describe_buffer_names_the_applied_size() {
         assert_eq!(describe_buffer(Some(480)), "Fixed(480)");
         assert_eq!(describe_buffer(None), "device default");
+    }
+
+    #[test]
+    fn parses_installed_asio_driver_names_from_a_reg_query() {
+        let text = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\ASIO\\Realtek ASIO\r\n\
+                    HKEY_LOCAL_MACHINE\\SOFTWARE\\ASIO\\Universal Audio Volt\r\n\
+                    HKEY_LOCAL_MACHINE\\SOFTWARE\\ASIO\\X-USB ASIO Driver\r\n";
+
+        assert_eq!(
+            parse_asio_driver_names(text),
+            vec![
+                "Realtek ASIO".to_owned(),
+                "Universal Audio Volt".to_owned(),
+                "X-USB ASIO Driver".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_lines_and_a_missing_key() {
+        assert!(parse_asio_driver_names("").is_empty());
+        assert!(
+            parse_asio_driver_names("ERROR: The system was unable to find the key\r\n").is_empty()
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ use std::thread::JoinHandle;
 use cpal::traits::{HostTrait, StreamTrait};
 
 use crate::capture::{
-    build_input_stream, describe_buffer, select_device, select_device_by_name, select_input_config,
-    TARGET_SAMPLE_RATE,
+    build_input_stream, describe_buffer, input_host, select_device, select_device_by_name,
+    select_input_config, TARGET_SAMPLE_RATE,
 };
 use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
@@ -21,6 +21,15 @@ use crate::protocol::AudioPacket;
 use crate::targets::TargetRegistry;
 
 const CHANNEL_CAPACITY: usize = 8;
+
+/// The capture buffer the engine requests when the caller did not choose one.
+///
+/// It is a size a driver can honour (ASIO requires a power of two) and it keeps the packet rate near
+/// 190 per second at 48 kHz. That is the measured balance: small enough to cut both the capture
+/// period and the client's playback cushion, and slow enough that a phone's single receive loop keeps
+/// up. The ASIO driver default of 128 frames is faster still but made the Android client drop about
+/// 7% of packets in testing, and WASAPI shared mode ignores the request entirely.
+const DEFAULT_BUFFER_FRAMES: u32 = 256;
 
 /// Something that changed while the engine was running.
 ///
@@ -485,7 +494,7 @@ impl EngineHandle {
             return Err("the engine is stopping".into());
         }
         let device = {
-            let host = cpal::default_host();
+            let host = input_host();
             let devices = host
                 .input_devices()
                 .map_err(|error| format!("could not enumerate input devices: {error}"))?
@@ -618,7 +627,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     for target in &targets {
         println!("  {target}");
     }
-    let host = cpal::default_host();
+    let host = input_host();
     let devices = host
         .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?
@@ -638,13 +647,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let device = select_device(devices, config.device_filter.as_deref())?;
     let device_name = device.to_string();
     let supported_config = select_input_config(&device)?;
+    let buffer_frames = config.buffer_frames.or(Some(DEFAULT_BUFFER_FRAMES));
 
     println!("Selected input: {device_name}");
     println!(
         "Capture format: channels={}, sample rate={} Hz, buffer={}, sample format={:?}",
         supported_config.channels(),
         supported_config.sample_rate(),
-        describe_buffer(config.buffer_frames),
+        describe_buffer(buffer_frames),
         supported_config.sample_format()
     );
     if supported_config.sample_rate() != TARGET_SAMPLE_RATE {
@@ -696,7 +706,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let (stream, effective_buffer) = build_input_stream(
         &device,
         &supported_config,
-        config.buffer_frames,
+        buffer_frames,
         packet_sender.clone(),
         Arc::clone(&samples_seen),
         Arc::clone(&packet_stats),
@@ -718,7 +728,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         device_name,
         capture_format,
         control_port: config.control_port,
-        buffer_frames: config.buffer_frames,
+        buffer_frames,
         source_channels,
         group_definitions: config.groups,
         groups: group_statuses(&group_layout),

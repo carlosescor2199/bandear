@@ -11,6 +11,14 @@ path = "src/lib.rs"
 name = "personal-monitoring"
 path = "src/main.rs"
 
+[features]
+default = ["asio"]
+# ASIO bypasses the Windows audio stack entirely and is the only Windows backend where
+# BufferSize::Fixed actually shrinks the callback period, which is what capture latency is.
+# It needs LLVM/Clang at build time (cpal's build script runs bindgen over the ASIO SDK and
+# downloads the SDK itself). Build with `--no-default-features` on a machine without Clang.
+asio = ["cpal/asio"]
+
 [dependencies]
 cpal = "0.18"
 ctrlc = "3.4"

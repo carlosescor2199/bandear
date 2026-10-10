@@ -31,6 +31,8 @@ Three concrete causes were confirmed in the code, not assumed:
   device default when a driver rejects an explicit size.
 - T5 (done): harden the client playback path so the buffer cannot saturate silently.
 - T6 (done): make the playback cushion adaptive, driven by the track's own underrun count.
+- T7 (done): capture through ASIO on Windows, the only backend where the capture period can shrink,
+  with a WASAPI fallback.
 - T3 (pending): server capture-to-send queue latency, measured on the server clock.
 - T4 (pending): server capture timestamp on the wire plus a clock-offset estimate over the control
   channel, giving true one-way network latency and a real end-to-end total.
@@ -52,6 +54,7 @@ subtraction is just clock skew.
 - [x] T2: Add `--buffer` and a configurable capture buffer with a device-default fallback.
 - [x] T5: Bound the client playback path (no permanent saturation, no silent discard).
 - [x] T6: Make the playback cushion adaptive from the track's underrun count.
+- [x] T7: Capture through ASIO on Windows (the only backend where the period can shrink).
 - [ ] T3: Measure the server capture-to-send queue latency.
 - [ ] T4: Add the capture timestamp and the control-channel clock offset for true one-way latency.
 
@@ -106,10 +109,19 @@ server's default input device and `--buffer 240`:
   discarded). The track buffer stayed at 480 frames, the framework's own track latency read 31.00,
   and the playback backlog settled at 33.9-34.1 ms instead of the fixed 2-packet 43.9 ms. Android's
   underrun count, which the controller watches, stayed at zero.
-- Remaining budget: ~10 ms capture + ~5 ms network + ~34 ms playback is ~49 ms, still above the
-  PRD's 25 ms target. The two levers left are the Windows capture backend (exclusive/ASIO, to shrink
-  the packet itself) and the device pipeline (the fast track's own ~24 ms, plus Samsung's always-on
-  effects).
+- ASIO (T7), measured on the same machine with the Volt 4:
+  - `--buffer 240` is rejected by the ASIO driver (it wants a power of two); the fallback lands on the
+    driver default of 128 frames, which is **2.67 ms packets at ~347 per second**. That cut the
+    playback backlog to 29.0 ms but made the phone drop **1031 of 14927 packets (~7%)**: the client's
+    single receive loop cannot keep up at that rate.
+  - `--buffer 256` is accepted: **5.33 ms packets at ~187 per second**, playback backlog 29.0 ms,
+    **0 sequences lost**, 0 samples discarded. The backlog matches the 128 case because the adaptive
+    cushion grew to two small packets there, so 256 is strictly better: same latency, no loss.
+  - The default capture buffer is therefore 256 frames: the ASIO driver default (128) loses packets,
+    and WASAPI shared mode ignores the request anyway.
+- Remaining budget: ~5 ms capture + ~3 ms network + ~29 ms playback is ~37 ms, down from ~59 ms when
+  the work started. The two levers left are the client's own receive loop (it caps the packet rate, so
+  it caps how small the packet can be) and the ~24 ms device pipeline, which is not ours to change.
 
 ## Honest limits
 
@@ -136,6 +148,12 @@ server's default input device and `--buffer 240`:
   cushion down after three clean one-second intervals and jumps it back up on any new underrun, and
   `PmonPlayer` drives it from `AudioTrack.underrunCount`, so the client settles on the smallest buffer
   this device and network actually sustain instead of a fixed guess.
+- T7: the engine now captures through the ASIO host when it is available, falling back to the default
+  host. ASIO is the only Windows backend where `BufferSize::Fixed` shrinks the callback period, so the
+  `--buffer` flag finally does what it says. ASIO reports 32-bit integers, so the capture path gained
+  an `I32` conversion. The build needs LLVM/Clang (cpal's build script runs bindgen over the ASIO SDK
+  and downloads the SDK itself), so `asio` is a default feature that can be dropped with
+  `--no-default-features`.
 
 ## Route
 

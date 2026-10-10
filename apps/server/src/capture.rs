@@ -27,9 +27,29 @@ pub struct InputDevice {
     pub channels: u16,
 }
 
+/// The cpal host the engine captures from.
+///
+/// ASIO is preferred when it is compiled in. It bypasses the Windows audio stack entirely and, unlike
+/// WASAPI shared mode, it is a backend where `BufferSize::Fixed` actually shrinks the callback period
+/// - and that period is exactly the capture latency, because the engine sends one packet per callback.
+/// ASIO is not always available (no driver, or the driver is held by another app), so failing to load
+/// it falls back to the default host instead of failing the session.
+pub(crate) fn input_host() -> cpal::Host {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        match cpal::host_from_id(cpal::HostId::Asio) {
+            Ok(host) => return host,
+            Err(error) => {
+                eprintln!("ASIO host unavailable ({error}); falling back to the default host")
+            }
+        }
+    }
+    cpal::default_host()
+}
+
 /// Enumerates the host's input devices with the channel count a switch would capture.
 pub fn list_input_devices() -> Result<Vec<InputDevice>, Box<dyn Error>> {
-    let host = cpal::default_host();
+    let host = input_host();
     let devices = host
         .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?;
@@ -150,7 +170,8 @@ fn sample_format_rank(sample_format: SampleFormat) -> u8 {
     match sample_format {
         SampleFormat::I16 => 0,
         SampleFormat::F32 => 1,
-        SampleFormat::U16 => 2,
+        SampleFormat::I32 => 2,
+        SampleFormat::U16 => 3,
         _ => u8::MAX,
     }
 }
@@ -162,7 +183,7 @@ fn supports_sample_rate(min_sample_rate: u32, max_sample_rate: u32, sample_rate:
 fn is_supported_sample_format(sample_format: SampleFormat) -> bool {
     matches!(
         sample_format,
-        SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+        SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I32 | SampleFormat::U16
     )
 }
 
@@ -316,6 +337,27 @@ fn open_stream(
             error_callback,
             None,
         ),
+        // ASIO drivers hand over 32-bit integers; the top 16 bits are the audio.
+        SampleFormat::I32 => device.build_input_stream(
+            config.clone(),
+            {
+                let mut decimator = decimator;
+                move |data: &[i32], _info: &InputCallbackInfo| {
+                    enqueue_packet(
+                        &packet_sender,
+                        &packet_stats,
+                        &sequence,
+                        decimator
+                            .process(&data.iter().copied().map(i32_to_i16).collect::<Vec<_>>()),
+                        channels,
+                        &samples_seen,
+                        &levels,
+                    );
+                }
+            },
+            error_callback,
+            None,
+        ),
         format => {
             return Err(
                 format!("the selected input uses unsupported sample format {format:?}").into(),
@@ -426,6 +468,14 @@ fn u16_to_i16(sample: u16) -> i16 {
     (i32::from(sample) - 32768) as i16
 }
 
+/// Converts a 32-bit sample to 16-bit by keeping the top half.
+///
+/// ASIO's `ASIOSTInt32LSB` is a full-scale 32-bit integer (and a left-justified 24-bit value in the
+/// same word), so the top 16 bits are the audio and the rest is the fraction the PCM16 wire drops.
+fn i32_to_i16(sample: i32) -> i16 {
+    (sample >> 16) as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +489,9 @@ mod tests {
         assert_eq!(u16_to_i16(0), -32768);
         assert_eq!(u16_to_i16(32768), 0);
         assert_eq!(u16_to_i16(u16::MAX), 32767);
+        assert_eq!(i32_to_i16(0), 0);
+        assert_eq!(i32_to_i16(i32::MAX), 32767);
+        assert_eq!(i32_to_i16(i32::MIN), -32768);
     }
 
     #[test]

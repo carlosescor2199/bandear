@@ -29,7 +29,7 @@ Three concrete causes were confirmed in the code, not assumed:
   the frames written. Single clock, no protocol change, no clock synchronization.
 - T2 (done): make the server capture buffer configurable and small, with a safe fallback to the
   device default when a driver rejects an explicit size.
-- T5 (next): harden the client playback path so the buffer cannot saturate silently.
+- T5 (done): harden the client playback path so the buffer cannot saturate silently.
 - T3 (pending): server capture-to-send queue latency, measured on the server clock.
 - T4 (pending): server capture timestamp on the wire plus a clock-offset estimate over the control
   channel, giving true one-way network latency and a real end-to-end total.
@@ -49,7 +49,7 @@ subtraction is just clock skew.
 
 - [x] T1: Add the playback backlog estimate and show it in the client stats.
 - [x] T2: Add `--buffer` and a configurable capture buffer with a device-default fallback.
-- [ ] T5: Bound the client playback path (no permanent saturation, no silent discard).
+- [x] T5: Bound the client playback path (no permanent saturation, no silent discard).
 - [ ] T3: Measure the server capture-to-send queue latency.
 - [ ] T4: Add the capture timestamp and the control-channel clock offset for true one-way latency.
 
@@ -70,7 +70,8 @@ subtraction is just clock skew.
   CImplib::EmitImportThunk`, access violation inside `link.exe`). The immediate retry linked and
   passed; the failure is in the toolchain, produces no code diagnostic, and is recorded here rather
   than hidden.
-- T5: pending.
+- T5: `:app:testDebugUnitTest` exit 0, BUILD SUCCESSFUL; `PlaybackLatencyTest` tests=7, failures=0,
+  errors=0 (the two new cases are the 3-packet cushion and the never-zero floor).
 - Honest limits: nothing here was measured on a real phone. The backlog metric is the instrument; the
   buffer target is a reasoned default, not a measured optimum, and must be confirmed on device.
 
@@ -82,7 +83,11 @@ subtraction is just clock skew.
 - T2: added `EngineConfig.buffer_frames`, the `--buffer` flag with a validated range, the pure
   `with_buffer_size` mapping and the `describe_buffer` formatter, and a fallback to the device default
   when an explicit size is rejected. `CaptureFormat.buffer_size` now reports what actually took effect.
-- T5: pending, recorded when implemented.
+- T5: switched the playback write to `WRITE_BLOCKING` so the writer is paced by the render position
+  and samples are no longer silently discarded, and added `applyPlaybackBufferTarget`, which asks
+  `setBufferSizeInFrames` for three packet intervals once the first packet reveals the packet size.
+  The platform clamps the request up to its hardware minimum; a refused call leaves the buffer as it
+  was.
 
 ## Route
 

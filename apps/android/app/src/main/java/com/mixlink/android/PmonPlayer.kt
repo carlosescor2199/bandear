@@ -130,8 +130,10 @@ internal class PmonPlayer(
                         if (audioTrack == null) {
                             sourceSampleRate = packet.sampleRate
                             playbackRate = selectPlaybackRate(packet.sampleRate)
-                            audioTrack = createAudioTrack(playbackRate)
-                            audioTrack.play()
+                            val track = createAudioTrack(playbackRate)
+                            track.play()
+                            applyPlaybackBufferTarget(track, packet)
+                            audioTrack = track
                         } else if (packet.sampleRate != sourceSampleRate) {
                             throw PmonPacketParseException(
                                 "sample rate changed from $sourceSampleRate to ${packet.sampleRate}",
@@ -149,8 +151,11 @@ internal class PmonPlayer(
                             processedSamples,
                             0,
                             processedSamples.size,
-                            AudioTrack.WRITE_NON_BLOCKING,
+                            AudioTrack.WRITE_BLOCKING,
                         )
+                        // A blocking write returns only once every sample is queued, so a short count
+                        // now means a write error. The guard stays as the honest signal that audio
+                        // was lost instead of being played.
                         if (writtenSamples < processedSamples.size) {
                             discardedSamples += if (writtenSamples >= 0) {
                                 (processedSamples.size - writtenSamples).toLong()
@@ -250,5 +255,22 @@ internal class PmonPlayer(
                     throw IllegalStateException("could not initialize AudioTrack")
                 }
             }
+    }
+
+    /**
+     * Shrinks the playback buffer to a small multiple of one packet.
+     *
+     * The track's buffer occupancy is the playback latency, so a buffer that is merely the device's
+     * default can sit tens of milliseconds behind the render position and pay that on every sample.
+     * The platform clamps the request up to its own hardware minimum, so a target below the floor
+     * degrades to the floor rather than failing; a refused call leaves the buffer as it was.
+     */
+    private fun applyPlaybackBufferTarget(track: AudioTrack, packet: PmonPacket) {
+        val packetFrames = packet.samples.size / PlaybackLatency.CHANNELS
+        try {
+            track.setBufferSizeInFrames(PlaybackLatency.targetBufferFrames(packetFrames))
+        } catch (_: IllegalStateException) {
+            // Keep the buffer the track was created with.
+        }
     }
 }

@@ -29,4 +29,14 @@ class PlaybackLatencyTest {
     fun reportsZeroForAnUnusableSampleRate() {
         assertEquals(0.0, PlaybackLatency.backlogMs(1_000L, 520L, 0), 1e-9)
     }
+
+    @Test
+    fun requestsThreePacketIntervalsOfPlaybackCushion() {
+        assertEquals(1_440, PlaybackLatency.targetBufferFrames(480))
+    }
+
+    @Test
+    fun neverRequestsAZeroFrameBuffer() {
+        assertEquals(1, PlaybackLatency.targetBufferFrames(0))
+    }
 }

@@ -28,4 +28,15 @@ object PlaybackLatency {
         } else {
             pendingFrames(framesWritten, framePosition) * 1000.0 / sampleRate
         }
+
+    /**
+     * The playback buffer to request, in frames, for a packet of [packetFrames] frames.
+     *
+     * Three packet intervals of cushion absorbs ordinary network jitter. Because the buffer's
+     * occupancy *is* the playback latency, anything larger is paid on every sample, so this is kept
+     * deliberately close to the packet size. The request is a lower bound: the platform clamps it up
+     * to its own hardware minimum and is free to ignore it.
+     */
+    fun targetBufferFrames(packetFrames: Int): Int =
+        (packetFrames.coerceAtLeast(0) * 3).coerceAtLeast(1)
 }

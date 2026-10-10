@@ -30,6 +30,7 @@ Three concrete causes were confirmed in the code, not assumed:
 - T2 (done): make the server capture buffer configurable and small, with a safe fallback to the
   device default when a driver rejects an explicit size.
 - T5 (done): harden the client playback path so the buffer cannot saturate silently.
+- T6 (done): make the playback cushion adaptive, driven by the track's own underrun count.
 - T3 (pending): server capture-to-send queue latency, measured on the server clock.
 - T4 (pending): server capture timestamp on the wire plus a clock-offset estimate over the control
   channel, giving true one-way network latency and a real end-to-end total.
@@ -50,6 +51,7 @@ subtraction is just clock skew.
 - [x] T1: Add the playback backlog estimate and show it in the client stats.
 - [x] T2: Add `--buffer` and a configurable capture buffer with a device-default fallback.
 - [x] T5: Bound the client playback path (no permanent saturation, no silent discard).
+- [x] T6: Make the playback cushion adaptive from the track's underrun count.
 - [ ] T3: Measure the server capture-to-send queue latency.
 - [ ] T4: Add the capture timestamp and the control-channel clock offset for true one-way latency.
 
@@ -70,8 +72,8 @@ subtraction is just clock skew.
   CImplib::EmitImportThunk`, access violation inside `link.exe`). The immediate retry linked and
   passed; the failure is in the toolchain, produces no code diagnostic, and is recorded here rather
   than hidden.
-- T5: `:app:testDebugUnitTest` exit 0, BUILD SUCCESSFUL; `PlaybackLatencyTest` tests=7, failures=0,
-  errors=0 (the new cases cover the packet cushion and the never-zero floor).
+- T5/T6: `:app:testDebugUnitTest` exit 0, BUILD SUCCESSFUL; `PlaybackLatencyTest` tests=12,
+  failures=0, errors=0 (the backlog math, the buffer target and the adaptive cushion controller).
 
 ## On-device measurement
 
@@ -82,7 +84,10 @@ server's default input device and `--buffer 240`:
   interval did not change. The client reported `Inter-arrival: 9.9 ms` and 97.7-99.5 packets per
   second, which is 480 frames per callback, not 240. On Windows WASAPI **shared** mode the engine
   period governs the callback size, so `BufferSize::Fixed` cannot go below it; that needs exclusive
-  mode or ASIO. Recorded as a finding, not a fix.
+  mode or ASIO. Confirmed on a second device (the Volt 4, capturing at 192 kHz: `buffer=Fixed(240)`
+  still produced 1920-frame callbacks) and in cpal's own source, which states it plainly: "The
+  callback period is always GetDevicePeriod() regardless of what is requested here; the value only
+  affects ring-buffer latency." Recorded as a finding, not a fix.
 - Client: the track lands on the **fast path** (`AudioStreamOut` with `AUDIO_OUTPUT_FLAG_FAST`,
   `FastMixer`, HAL buffer 192 frames = 4 ms), so `PERFORMANCE_MODE_LOW_LATENCY` did its job.
 - Playback backlog was linear in the cushion, and the framework's own track latency agreed:
@@ -122,6 +127,10 @@ server's default input device and `--buffer 240`:
   The platform clamps the request up to its hardware minimum; a refused call leaves the buffer as it
   was. The cushion was then tuned on device (see the measurement section): three packets was the first
   guess, and the measurement showed it was pure added latency.
+- T6: replaced the fixed cushion with an adaptive controller. `PlaybackLatency.nextCushion` walks the
+  cushion down after three clean one-second intervals and jumps it back up on any new underrun, and
+  `PmonPlayer` drives it from `AudioTrack.underrunCount`, so the client settles on the smallest buffer
+  this device and network actually sustain instead of a fixed guess.
 
 ## Route
 

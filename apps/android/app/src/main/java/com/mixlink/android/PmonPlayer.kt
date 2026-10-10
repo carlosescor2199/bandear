@@ -10,6 +10,9 @@ import java.net.InetAddress
 import java.net.SocketException
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** Packets between adaptive playback-buffer adjustments: about one second at 100 packets/s. */
+private const val ADJUST_INTERVAL_PACKETS = 100
+
 /**
  * The UDP receive loop, AudioTrack playback and the receiver metrics.
  *
@@ -77,6 +80,11 @@ internal class PmonPlayer(
         var packetsWithDiscardedSamples = 0L
         var playbackBacklogMs = 0.0
         var framesWritten = 0L
+        var packetFrames = 0
+        var cushionPackets = PlaybackLatency.START_CUSHION_PACKETS
+        var cleanIntervals = 0
+        var lastUnderruns = 0
+        var packetsSinceAdjust = 0
         val audioTimestamp = AudioTimestamp()
         val buffer = ByteArray(65_507)
 
@@ -130,9 +138,10 @@ internal class PmonPlayer(
                         if (audioTrack == null) {
                             sourceSampleRate = packet.sampleRate
                             playbackRate = selectPlaybackRate(packet.sampleRate)
+                            packetFrames = packet.samples.size / PlaybackLatency.CHANNELS
                             val track = createAudioTrack(playbackRate)
                             track.play()
-                            applyPlaybackBufferTarget(track, packet)
+                            applyPlaybackBufferTarget(track, packetFrames, cushionPackets)
                             audioTrack = track
                         } else if (packet.sampleRate != sourceSampleRate) {
                             throw PmonPacketParseException(
@@ -193,6 +202,22 @@ internal class PmonPlayer(
                             packetsWithDiscardedSamples,
                             playbackBacklogMs,
                         )
+                        packetsSinceAdjust++
+                        if (packetsSinceAdjust >= ADJUST_INTERVAL_PACKETS) {
+                            packetsSinceAdjust = 0
+                            val underruns = audioTrack.underrunCount
+                            val decision = PlaybackLatency.nextCushion(
+                                cushionPackets,
+                                cleanIntervals,
+                                underruns - lastUnderruns,
+                            )
+                            lastUnderruns = underruns
+                            cleanIntervals = decision.cleanIntervals
+                            if (decision.cushion != cushionPackets) {
+                                cushionPackets = decision.cushion
+                                applyPlaybackBufferTarget(audioTrack, packetFrames, cushionPackets)
+                            }
+                        }
                     } catch (error: Exception) {
                         listener.onError(error.message ?: "invalid PMON packet")
                     }
@@ -258,17 +283,18 @@ internal class PmonPlayer(
     }
 
     /**
-     * Shrinks the playback buffer to a small multiple of one packet.
+     * Asks the track for a playback buffer of [cushionPackets] packet intervals.
      *
      * The track's buffer occupancy is the playback latency, so a buffer that is merely the device's
      * default can sit tens of milliseconds behind the render position and pay that on every sample.
      * The platform clamps the request up to its own hardware minimum, so a target below the floor
      * degrades to the floor rather than failing; a refused call leaves the buffer as it was.
      */
-    private fun applyPlaybackBufferTarget(track: AudioTrack, packet: PmonPacket) {
-        val packetFrames = packet.samples.size / PlaybackLatency.CHANNELS
+    private fun applyPlaybackBufferTarget(track: AudioTrack, packetFrames: Int, cushionPackets: Int) {
         try {
-            track.setBufferSizeInFrames(PlaybackLatency.targetBufferFrames(packetFrames))
+            track.setBufferSizeInFrames(
+                PlaybackLatency.targetBufferFrames(packetFrames, cushionPackets),
+            )
         } catch (_: IllegalStateException) {
             // Keep the buffer the track was created with.
         }

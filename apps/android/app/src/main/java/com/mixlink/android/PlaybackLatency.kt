@@ -1,7 +1,7 @@
 package com.mixlink.android
 
 /**
- * Pure math for the client-side playback latency estimate.
+ * Pure math for the client-side playback latency estimate and its adaptive buffer.
  *
  * The estimate uses a single clock: this device's own audio render position. `AudioTrack.getTimestamp`
  * reports the frame currently being presented, so the frames that were written but are not presented
@@ -11,6 +11,14 @@ package com.mixlink.android
 object PlaybackLatency {
     /** The playback track is always opened as interleaved stereo. */
     const val CHANNELS = 2
+
+    /** Cushion bounds, in packet intervals. The adaptive controller stays inside them. */
+    const val MIN_CUSHION_PACKETS = 1
+    const val MAX_CUSHION_PACKETS = 4
+    const val START_CUSHION_PACKETS = 2
+
+    /** Clean adjustment intervals required before the cushion may shrink by one packet. */
+    private const val CLEAN_INTERVALS_BEFORE_SHRINK = 3
 
     /**
      * Frames written to the track but not presented yet.
@@ -34,15 +42,37 @@ object PlaybackLatency {
      *
      * The buffer's occupancy *is* the playback latency, so the cushion is kept as tight as the
      * measured network jitter allows. Measured on a Galaxy S23 over the fast path (HAL buffer 4 ms,
-     * arrival jitter ~2 ms), the playback backlog was linear in the cushion: three packets gave
-     * 53.9 ms, two gave 43.9 ms, and one gave 33.9 ms, with a fixed ~24 ms device pipeline under all
-     * of them. One packet left the fast track reporting empty mix cycles, which is the audible-gap
-     * risk, so the default keeps one packet of slack. The request is a lower bound; the platform
-     * clamps it up to its own hardware minimum and is free to ignore it.
+     * arrival jitter ~2 ms), the backlog was linear in the cushion: three packets gave 53.9 ms, two
+     * gave 43.9 ms, one gave 33.9 ms, over a fixed ~24 ms device pipeline. The request is a lower
+     * bound; the platform clamps it up to its own hardware minimum and is free to ignore it.
      */
-    fun targetBufferFrames(packetFrames: Int): Int =
-        (packetFrames.coerceAtLeast(0) * CUSHION_PACKETS).coerceAtLeast(1)
+    fun targetBufferFrames(packetFrames: Int, cushionPackets: Int): Int =
+        (packetFrames.coerceAtLeast(0) * cushionPackets.coerceAtLeast(1)).coerceAtLeast(1)
 
-    /** Packet intervals of playback cushion to request. See [targetBufferFrames]. */
-    private const val CUSHION_PACKETS = 2
+    /** One adjustment outcome: the cushion to use next, and the clean-interval count to carry. */
+    data class CushionDecision(val cushion: Int, val cleanIntervals: Int)
+
+    /**
+     * The next cushion after one adjustment interval.
+     *
+     * Because the buffer's occupancy is the playback latency, the controller walks the cushion down
+     * while the track reports no new underruns and jumps back up the moment it does, so the client
+     * settles on the smallest buffer this device and this network can actually sustain instead of a
+     * fixed guess. A few clean intervals are required before shrinking, so one quiet second cannot
+     * ratchet the buffer to the floor and a burst right after does not immediately undo it.
+     */
+    fun nextCushion(
+        currentCushion: Int,
+        cleanIntervals: Int,
+        underrunsInInterval: Int,
+    ): CushionDecision = if (underrunsInInterval > 0) {
+        CushionDecision((currentCushion + 1).coerceAtMost(MAX_CUSHION_PACKETS), 0)
+    } else {
+        val clean = cleanIntervals + 1
+        if (clean >= CLEAN_INTERVALS_BEFORE_SHRINK && currentCushion > MIN_CUSHION_PACKETS) {
+            CushionDecision(currentCushion - 1, 0)
+        } else {
+            CushionDecision(currentCushion, clean)
+        }
+    }
 }

@@ -31,12 +31,57 @@ class PlaybackLatencyTest {
     }
 
     @Test
-    fun requestsTwoPacketIntervalsOfPlaybackCushion() {
-        assertEquals(960, PlaybackLatency.targetBufferFrames(480))
+    fun bufferIsTheCushionTimesThePacket() {
+        assertEquals(960, PlaybackLatency.targetBufferFrames(480, 2))
+        assertEquals(480, PlaybackLatency.targetBufferFrames(480, 1))
     }
 
     @Test
-    fun neverRequestsAZeroFrameBuffer() {
-        assertEquals(1, PlaybackLatency.targetBufferFrames(0))
+    fun bufferIsNeverZeroFrames() {
+        assertEquals(1, PlaybackLatency.targetBufferFrames(0, 2))
+    }
+
+    @Test
+    fun growsTheCushionWhenAnUnderrunHappened() {
+        assertEquals(
+            PlaybackLatency.CushionDecision(3, 0),
+            PlaybackLatency.nextCushion(2, 0, 1),
+        )
+    }
+
+    @Test
+    fun capsTheCushionAtTheMaximum() {
+        assertEquals(
+            PlaybackLatency.CushionDecision(PlaybackLatency.MAX_CUSHION_PACKETS, 0),
+            PlaybackLatency.nextCushion(PlaybackLatency.MAX_CUSHION_PACKETS, 0, 7),
+        )
+    }
+
+    @Test
+    fun waitsForCleanIntervalsBeforeShrinking() {
+        assertEquals(
+            PlaybackLatency.CushionDecision(2, 1),
+            PlaybackLatency.nextCushion(2, 0, 0),
+        )
+        assertEquals(
+            PlaybackLatency.CushionDecision(2, 2),
+            PlaybackLatency.nextCushion(2, 1, 0),
+        )
+    }
+
+    @Test
+    fun shrinksAfterEnoughCleanIntervals() {
+        assertEquals(
+            PlaybackLatency.CushionDecision(1, 0),
+            PlaybackLatency.nextCushion(2, 2, 0),
+        )
+    }
+
+    @Test
+    fun neverShrinksBelowTheFloor() {
+        assertEquals(
+            PlaybackLatency.CushionDecision(PlaybackLatency.MIN_CUSHION_PACKETS, 3),
+            PlaybackLatency.nextCushion(PlaybackLatency.MIN_CUSHION_PACKETS, 2, 0),
+        )
     }
 }

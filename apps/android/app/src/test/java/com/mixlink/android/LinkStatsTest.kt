@@ -41,6 +41,42 @@ class LinkStatsTest {
     }
 
     @Test
+    fun aTimeoutBeforeTheFirstPacketIsNotCounted() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+
+        // The receiver starts before the server knows where to send audio.
+        stats.onReceiveTimeout()
+        stats.onReceiveTimeout()
+
+        assertEquals(0L, stats.poll(1_000, cumulativeUnderruns = 0)?.receiveTimeouts)
+    }
+
+    @Test
+    fun aTimeoutAfterTheFirstPacketIsCounted() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+        stats.onReceiveTimeout()
+        stats.onPacket(lostBefore = 0)
+
+        stats.onReceiveTimeout()
+
+        val report = stats.poll(1_000, cumulativeUnderruns = 0)
+        assertEquals(1L, report?.receiveTimeouts)
+        assertEquals(1L, report?.packetsReceived)
+    }
+
+    @Test
+    fun theStreamStaysStartedAcrossReports() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+        stats.onPacket(lostBefore = 0)
+        stats.poll(1_000, cumulativeUnderruns = 0)
+
+        // Audio stopped after the stream started: every wait now says something about the link.
+        stats.onReceiveTimeout()
+
+        assertEquals(1L, stats.poll(2_000, cumulativeUnderruns = 0)?.receiveTimeouts)
+    }
+
+    @Test
     fun aLatePollReportsTheRealElapsedInterval() {
         val stats = LinkStatsAccumulator(startedAtMs = 0)
 

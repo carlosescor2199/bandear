@@ -71,8 +71,8 @@ never counted. Reporting those numbers as they are would make the traffic light 
   the musicians table.
 - [x] T3 (android): pure `SequenceTracker` (drop late/duplicate, count gaps once), counted receive
   timeouts, a pure stats accumulator and message builder, and the 1 s report sent through
-  `ControlChannel`. JVM tests for each pure helper. Evidence: slice 4 commit (see Progress and
-  Verification).
+  `ControlChannel`. JVM tests for each pure helper. Evidence: `6c93b9f`, refined by the slice 4
+  commit that stops counting timeouts before the first packet (see Progress and Verification).
 
 ## Acceptance criteria
 
@@ -114,15 +114,16 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, this commit |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, this commit (timeouts before the first packet) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
 
 Slice 4 also lands above the budget: the new-session fix is about 170 authored lines (about 140 of
-them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), so about
-650 in all, not counting this document. Its two commits are separate work units, so it can be
-split into two pull requests at those commit boundaries if a smaller review is wanted.
+them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), plus about
+50 for the timeouts-before-the-first-packet fix, so about 700 in all, not counting this document.
+Its commits are separate work units, so it can be split into pull requests at those commit
+boundaries if a smaller review is wanted.
 
 ## Progress
 
@@ -192,7 +193,7 @@ split into two pull requests at those commit boundaries if a smaller review is w
   - `control.rs`: the first successful `register` of a connection clears the report. A later
     `register` on the same socket is a rename (the phone re-announces its name while streaming) and
     keeps the current report, so typing a name does not blank the light.
-- T3 done (this commit, slice 4; route: delegated direct, one writer). Android side of link health:
+- T3 done (`6c93b9f`, slice 4; route: delegated direct, one writer). Android side of link health:
   - `SequenceTracker.kt` (new, pure): the first packet starts the stream; a newer packet is played
     and its gap counted once as lost; a duplicate or late packet is dropped (not written to the
     track) and rewinds nothing; a packet `STREAM_RESTART_PACKETS` (256, about 2.5 s) or more behind
@@ -213,9 +214,18 @@ split into two pull requests at those commit boundaries if a smaller review is w
     delta, unchanged. The local stats screen now shows played packets and the tracker's loss count.
     The `AudioAttributes` block is untouched.
   - `MainActivity.kt`: `onLinkStats` forwards the report to `ControlChannel.sendLinkStats`.
-  - Receive timeouts count from the moment the receiver starts, so the first report of a session can
-    carry one from before the first packet and show red for that one second; a phone that never
-    gets audio keeps reporting timeouts and stays red, which is the point.
+- Timeouts before the first packet (this commit, slice 4; route: delegated direct, one writer): the
+  receiver starts before the server knows where to send audio, so T3's first report of a session
+  could carry a receive timeout from before the first packet and show a phone that connected
+  cleanly as red for its first second. `LinkStatsAccumulator` now counts a receive timeout only
+  once the stream has started (a packet was played); once started it stays started, so a wait
+  while a restarted server comes back is still counted.
+  - Open decision: a phone whose control channel works but which never receives audio (UDP
+    blocked, wrong port) now reports zero packets, zero loss and zero timeouts every second, and
+    the server judges such a report `good` (`judge` in `health.rs`; `loss_percent` is 0 when
+    nothing was expected). Before this commit it showed red. Candidates: send no report until the
+    stream starts (the light stays grey), or count timeouts before the first packet only after a
+    startup grace of a second or two (it turns red).
 
 ## Verification
 
@@ -290,3 +300,12 @@ split into two pull requests at those commit boundaries if a smaller review is w
     `cargo test -p mixlink-desktop`: 21 passed. `cargo check --workspace --all-targets`: clean.
 - T3 runtime check on a phone: not run here (no device in this session). The JVM tests cover the
   pure helpers; the wiring in `PmonPlayer` and `MainActivity` is covered only by the debug build.
+- Timeouts-before-the-first-packet RED (three new `LinkStatsTest` tests, accumulator unchanged):
+  `gradle -p apps/android :app:testDebugUnitTest` gave 77 tests, 2 failed:
+  `aTimeoutBeforeTheFirstPacketIsNotCounted` and `aTimeoutAfterTheFirstPacketIsCounted` (the
+  timeout from before the first packet was counted too). `theStreamStaysStartedAcrossReports`
+  already passed and is kept as a guard.
+- Timeouts-before-the-first-packet GREEN:
+  - `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 77 tests, 0
+    failures; the debug APK assembled with no Kotlin warnings.
+  - `cargo fmt --all -- --check`: exit 0 (no Rust changes).

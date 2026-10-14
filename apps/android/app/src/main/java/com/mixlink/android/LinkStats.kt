@@ -37,16 +37,26 @@ internal class LinkStatsAccumulator(startedAtMs: Long) {
     private var packetsLost = 0L
     private var receiveTimeouts = 0L
     private var lastUnderruns = 0
+    private var streamStarted = false
 
     /** One played packet, with the [lostBefore] packets the stream skipped right before it. */
     fun onPacket(lostBefore: Long) {
+        streamStarted = true
         packetsReceived++
         packetsLost += lostBefore
     }
 
-    /** One receive timeout: a wait for the next packet that ended with nothing. */
+    /**
+     * One receive timeout: a wait for the next packet that ended with nothing.
+     *
+     * Counted only once the stream has started (a packet was played). The receiver starts before
+     * the server knows where to send audio, so a wait before the first packet says nothing about
+     * the link, and counting it would show a phone that connects cleanly as red for its first
+     * second. Once started, the stream stays started: a wait while a restarted server comes back is
+     * a real gap in the audio and is counted.
+     */
     fun onReceiveTimeout() {
-        receiveTimeouts++
+        if (streamStarted) receiveTimeouts++
     }
 
     /** True once a report is due at [nowMs], so the caller reads the underrun count only then. */

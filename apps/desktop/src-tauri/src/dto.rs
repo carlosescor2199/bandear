@@ -308,6 +308,7 @@ mod tests {
             control_connected: false,
             mix: Default::default(),
             counters: Default::default(),
+            link: Default::default(),
         };
 
         let dto = MusicianDto::from(&musician);
@@ -325,6 +326,7 @@ mod tests {
             control_connected: false,
             mix: Default::default(),
             counters: Default::default(),
+            link: Default::default(),
         };
 
         let dto = MusicianDto::from(&musician);

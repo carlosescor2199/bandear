@@ -59,7 +59,7 @@ never counted. Reporting those numbers as they are would make the traffic light 
 
 ## Tasks
 
-- [ ] T1 (server): `stats` message parse and its own routing branch in `control.rs`; latest report
+- [x] T1 (server): `stats` message parse and its own routing branch in `control.rs`; latest report
   stored per target (surviving re-registration); pure `classify` function; health and rates in
   `MusicianStatus`. RED-first unit tests for parse, classify and routing.
 - [ ] T2 (desktop): health and rates in `MusicianDto`; a health column with a dot and a tooltip in
@@ -104,7 +104,7 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | Slice | Content | Commit |
 |---|---|---|
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
-| 2 | Server wiring: routing, per-target storage, engine status (~310 lines) | pending |
+| 2 | Server wiring: routing, per-target storage, engine status (~310 lines) | this commit |
 | 3 | Desktop health column (T2) | pending |
 | 4 | Android sequence tracker and stats report (T3) | pending |
 
@@ -135,7 +135,9 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   `cargo fmt --all -- --check` exit 0, `cargo test -p personal-monitoring` 142 passed,
   `cargo check --workspace --all-targets` clean. It carries two temporary `#[allow(dead_code)]`
   attributes that slice 2 removes once the callers exist.
-- Slice 2 (wiring) is implemented and verified in the working tree; its commit closes T1.
+- Slice 2 (this commit) closes T1: `stats` routing in `control.rs`, per-target report storage in
+  `targets.rs` and health in the engine status, plus the removal of the two temporary
+  `#[allow(dead_code)]` attributes from slice 1 now that the callers exist.
 - Native review: `.atl/` was excluded locally (`.git/info/exclude`, with the user's approval) so the
   review preflight has no untracked files to declare.
 

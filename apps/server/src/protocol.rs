@@ -130,8 +130,6 @@ pub(crate) struct StatsCommand {
 }
 
 /// Parses a `stats` control message, rejecting an interval the rates cannot be normalised by.
-// The control channel starts routing `stats` here in the next commit.
-#[allow(dead_code)]
 pub(crate) fn parse_stats_command(json: &str) -> Result<StatsCommand, String> {
     let command: StatsCommand = serde_json::from_str(json).map_err(|error| error.to_string())?;
     if command.message_type != "stats" {

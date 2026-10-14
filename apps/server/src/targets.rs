@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
+use crate::health::LatestLinkReport;
 use crate::mix::{GroupLayout, MixState};
 use crate::network::TargetCounters;
 
@@ -47,6 +48,9 @@ pub(crate) struct TargetEntry {
     pub(crate) address: SocketAddr,
     pub(crate) mix_state: Arc<MixState>,
     pub(crate) counters: Arc<TargetCounters>,
+    /// The latest link report the musician's phone sent. Only the control connection writes it and
+    /// only the status snapshot reads it; the network thread never touches it.
+    pub(crate) link_report: LatestLinkReport,
     pub(crate) origin: TargetOrigin,
 }
 
@@ -81,6 +85,7 @@ impl TargetRegistry {
                 address: *target,
                 mix_state: Arc::new(MixState::new(layout)),
                 counters: Arc::new(TargetCounters::default()),
+                link_report: LatestLinkReport::default(),
                 origin: TargetOrigin::Configured,
             });
         }
@@ -118,6 +123,7 @@ impl TargetRegistry {
             address,
             mix_state: Arc::new(MixState::new(layout)),
             counters: Arc::new(TargetCounters::default()),
+            link_report: LatestLinkReport::default(),
             origin: TargetOrigin::Registered {
                 name,
                 disconnected_at: None,
@@ -196,6 +202,7 @@ impl TargetRegistry {
             address,
             mix_state: Arc::new(MixState::new(layout)),
             counters: Arc::new(TargetCounters::default()),
+            link_report: LatestLinkReport::default(),
             origin: TargetOrigin::Configured,
         });
         Ok(address)
@@ -229,6 +236,17 @@ impl TargetRegistry {
             .iter()
             .find(|entry| entry.address.ip() == ip)
             .map(|entry| Arc::clone(&entry.mix_state))
+    }
+
+    /// The latest-link-report slot for a control peer's IP, or `None` when that IP is not a target.
+    ///
+    /// The same join as [Self::mix_state], so a `stats` report and a `mix` from the same peer always
+    /// land on the same musician, and an IP with no target is refused the same way.
+    pub(crate) fn link_report(&self, ip: IpAddr) -> Option<LatestLinkReport> {
+        self.read()
+            .iter()
+            .find(|entry| entry.address.ip() == ip)
+            .map(|entry| Arc::clone(&entry.link_report))
     }
 }
 
@@ -586,6 +604,61 @@ mod tests {
             &registry.mix_state(ip("192.168.1.50")).expect("kept target")
         ));
         assert_eq!(mix.snapshot().volume_percent, 42);
+    }
+
+    fn stored_report(received_at: Instant) -> crate::health::LinkReport {
+        crate::health::LinkReport {
+            interval_ms: 1_000,
+            packets_received: 200,
+            packets_lost: 1,
+            underruns: 0,
+            receive_timeouts: 0,
+            received_at,
+        }
+    }
+
+    #[test]
+    fn a_link_report_is_looked_up_by_the_target_ip_and_unknown_ips_have_none() {
+        let registry =
+            TargetRegistry::new(&[address("192.168.1.3:50000")], &GroupLayout::default())
+                .expect("registry should build");
+
+        let slot = registry
+            .link_report(ip("192.168.1.3"))
+            .expect("a configured target has a report slot");
+
+        assert!(slot.lock().expect("report lock").is_none(), "no report yet");
+        assert!(registry.link_report(ip("192.168.1.9")).is_none());
+    }
+
+    #[test]
+    fn a_link_report_survives_re_registration_like_the_counters() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+        let slot = registry
+            .link_report(ip("192.168.1.50"))
+            .expect("registered target");
+        let report = stored_report(Instant::now());
+        *slot.lock().expect("report lock") = Some(report);
+
+        // The phone reconnects and re-registers on a new port with a new name.
+        registry.register(
+            ip("192.168.1.50"),
+            50123,
+            Some("Bea".to_owned()),
+            &GroupLayout::default(),
+        );
+
+        let kept = registry
+            .link_report(ip("192.168.1.50"))
+            .expect("re-registered target");
+        assert!(Arc::ptr_eq(&slot, &kept), "the slot is the same allocation");
+        assert_eq!(*kept.lock().expect("report lock"), Some(report));
     }
 
     #[test]

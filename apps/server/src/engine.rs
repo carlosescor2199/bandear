@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use cpal::traits::{HostTrait, StreamTrait};
 
@@ -15,6 +16,7 @@ use crate::capture::{
 use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
+use crate::health::{link_status, LinkStatus};
 use crate::mix::{Group, GroupLayout, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
@@ -68,7 +70,9 @@ pub struct MusicianCounters {
 /// This is the row the UI shows. The engine performs the join, because the target list and the
 /// control peers are two views of the same person and letting the UI infer the relationship from
 /// two lists lets them disagree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// It is `PartialEq` but not `Eq`, because the link rates are fractional.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MusicianStatus {
     pub address: SocketAddr,
     /// The name the musician typed on their own app and announced when registering, if any.
@@ -79,6 +83,11 @@ pub struct MusicianStatus {
     pub control_connected: bool,
     pub mix: MixValues,
     pub counters: MusicianCounters,
+    /// What the musician's phone reports about the audio it receives, classified into a level.
+    ///
+    /// [LinkHealth::Unknown] with no rates when the phone has not reported recently, including a
+    /// phone that predates stats reports.
+    pub link: LinkStatus,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -97,7 +106,7 @@ pub struct GroupStatus {
 }
 
 /// A snapshot of everything the engine can report without blocking the audio path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EngineStatus {
     pub device_name: String,
     pub capture_format: CaptureFormat,
@@ -160,6 +169,7 @@ pub(crate) fn join_musicians(
     counters: &HashMap<IpAddr, MusicianCounters>,
     mixes: &HashMap<IpAddr, MixValues>,
     names: &HashMap<IpAddr, String>,
+    links: &HashMap<IpAddr, LinkStatus>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -171,6 +181,7 @@ pub(crate) fn join_musicians(
                 control_connected: connected.contains(&ip),
                 mix: mixes.get(&ip).copied().unwrap_or_default(),
                 counters: counters.get(&ip).copied().unwrap_or_default(),
+                link: links.get(&ip).copied().unwrap_or_default(),
             }
         })
         .collect()
@@ -468,6 +479,16 @@ impl EngineHandle {
                     .map(|name| (entry.address.ip(), name.to_owned()))
             })
             .collect();
+        // Each report is copied out under its own short lock and classified against one clock read,
+        // so every musician in the snapshot is judged at the same instant.
+        let now = Instant::now();
+        let links: HashMap<IpAddr, LinkStatus> = entries
+            .iter()
+            .map(|entry| {
+                let report = *entry.link_report.lock().expect("link report lock poisoned");
+                (entry.address.ip(), link_status(report.as_ref(), now))
+            })
+            .collect();
         EngineStatus {
             device_name: self.device_name.clone(),
             capture_format: self.capture_format.clone(),
@@ -480,7 +501,7 @@ impl EngineHandle {
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
-            musicians: join_musicians(&targets, &connected, &counters, &mixes, &names),
+            musicians: join_musicians(&targets, &connected, &counters, &mixes, &names, &links),
         }
     }
 
@@ -801,7 +822,16 @@ mod tests {
         let mut names = HashMap::new();
         names.insert(ip("192.168.1.4"), "Ana".to_owned());
 
-        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &names);
+        let reporting = LinkStatus {
+            health: crate::health::LinkHealth::Warning,
+            underruns_per_second: Some(1.0),
+            loss_percent: Some(0.0),
+            receive_timeouts_per_second: Some(0.0),
+        };
+        let mut links = HashMap::new();
+        links.insert(ip("192.168.1.3"), reporting);
+
+        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &names, &links);
 
         assert_eq!(musicians.len(), 3);
 
@@ -817,6 +847,7 @@ mod tests {
                 packets_discarded: 1,
             }
         );
+        assert_eq!(connected_with_mix.link, reporting);
 
         let disconnected = &musicians[1];
         assert_eq!(disconnected.address, targets[1]);
@@ -837,6 +868,12 @@ mod tests {
         assert!(connected_without_data.control_connected);
         assert_eq!(connected_without_data.counters, MusicianCounters::default());
         assert_eq!(connected_without_data.mix, MixValues::default());
+        // A phone that never reported (or predates reports) is unknown, with no rates to show.
+        assert_eq!(connected_without_data.link, LinkStatus::default());
+        assert_eq!(
+            connected_without_data.link.health,
+            crate::health::LinkHealth::Unknown
+        );
     }
 
     #[test]

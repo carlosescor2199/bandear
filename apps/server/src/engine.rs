@@ -20,7 +20,7 @@ use crate::health::{link_status, LinkStatus};
 use crate::mix::{Group, GroupLayout, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
-use crate::targets::TargetRegistry;
+use crate::targets::{TargetEntry, TargetRegistry};
 
 const CHANNEL_CAPACITY: usize = 8;
 
@@ -85,8 +85,10 @@ pub struct MusicianStatus {
     pub counters: MusicianCounters,
     /// What the musician's phone reports about the audio it receives, classified into a level.
     ///
-    /// [LinkHealth::Unknown] with no rates when the phone has not reported recently, including a
-    /// phone that predates stats reports.
+    /// [LinkHealth::Unknown] with no rates when the phone never reported (including a phone that
+    /// predates stats reports) or when its reports stopped after its control channel closed.
+    /// [LinkHealth::Bad] with no rates when its reports stopped while the control channel is still
+    /// connected: the phone is there but its link is lost.
     pub link: LinkStatus,
 }
 
@@ -183,6 +185,30 @@ pub(crate) fn join_musicians(
                 counters: counters.get(&ip).copied().unwrap_or_default(),
                 link: links.get(&ip).copied().unwrap_or_default(),
             }
+        })
+        .collect()
+}
+
+/// Classifies every target's latest link report at `now`.
+///
+/// A stale report is judged by whether the musician's control channel is still connected: the
+/// reports travel over the same Wi-Fi as the audio, so a phone that lost its link is still connected
+/// but can no longer report it. Each report is copied out under its own short lock and every
+/// musician is judged against the same clock read.
+pub(crate) fn link_statuses(
+    entries: &[TargetEntry],
+    connected: &HashSet<IpAddr>,
+    now: Instant,
+) -> HashMap<IpAddr, LinkStatus> {
+    entries
+        .iter()
+        .map(|entry| {
+            let ip = entry.address.ip();
+            let report = *entry.link_report.lock().expect("link report lock poisoned");
+            (
+                ip,
+                link_status(report.as_ref(), connected.contains(&ip), now),
+            )
         })
         .collect()
 }
@@ -479,16 +505,7 @@ impl EngineHandle {
                     .map(|name| (entry.address.ip(), name.to_owned()))
             })
             .collect();
-        // Each report is copied out under its own short lock and classified against one clock read,
-        // so every musician in the snapshot is judged at the same instant.
-        let now = Instant::now();
-        let links: HashMap<IpAddr, LinkStatus> = entries
-            .iter()
-            .map(|entry| {
-                let report = *entry.link_report.lock().expect("link report lock poisoned");
-                (entry.address.ip(), link_status(report.as_ref(), now))
-            })
-            .collect();
+        let links = link_statuses(&entries, &connected, Instant::now());
         EngineStatus {
             device_name: self.device_name.clone(),
             capture_format: self.capture_format.clone(),
@@ -873,6 +890,55 @@ mod tests {
         assert_eq!(
             connected_without_data.link.health,
             crate::health::LinkHealth::Unknown
+        );
+    }
+
+    #[test]
+    fn a_stale_report_is_judged_by_whether_the_musicians_control_channel_is_still_connected() {
+        use crate::health::{LinkHealth, LinkReport, REPORT_STALE_AFTER};
+        use std::time::Duration;
+
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+                "192.168.1.5:50000".parse().unwrap(),
+            ],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let received_at = Instant::now();
+        for reporting in ["192.168.1.3", "192.168.1.4"] {
+            let slot = registry.link_report(ip(reporting)).expect("configured");
+            *slot.lock().expect("report lock") = Some(LinkReport {
+                interval_ms: 1_000,
+                packets_received: 200,
+                packets_lost: 0,
+                underruns: 0,
+                receive_timeouts: 0,
+                received_at,
+            });
+        }
+        let connected: HashSet<IpAddr> =
+            [ip("192.168.1.3"), ip("192.168.1.5")].into_iter().collect();
+        let later = received_at + REPORT_STALE_AFTER + Duration::from_secs(1);
+
+        let links = link_statuses(&registry.read(), &connected, later);
+
+        assert_eq!(
+            links[&ip("192.168.1.3")].health,
+            LinkHealth::Bad,
+            "still connected but its reports stopped: the link is lost"
+        );
+        assert_eq!(
+            links[&ip("192.168.1.4")].health,
+            LinkHealth::Unknown,
+            "its control channel closed: the musician stopped or left"
+        );
+        assert_eq!(
+            links[&ip("192.168.1.5")].health,
+            LinkHealth::Unknown,
+            "connected but never reported: a phone without stats reports"
         );
     }
 

@@ -117,7 +117,7 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), this commit (reports held until the audio starts or a startup grace passes; review 3 R3-001) |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
@@ -252,7 +252,7 @@ boundaries if a smaller review is wanted.
   seam reaches them; covering them needs that loop split from its Android I/O. The decisions
   themselves are covered by the pure tests: `SequenceTrackerTest` for `DROPPED`, and
   `LinkStatsTest` for reports with no packets after the startup grace.
-- Startup-grace fix (this commit, slice 4; route: delegated direct, one writer; review 3 R3-001):
+- Startup-grace fix (`9fbbd13`, slice 4; route: delegated direct, one writer; review 3 R3-001):
   `LinkStatsAccumulator` holds reports back until the stream starts (the first packet is played) or
   `LINK_STATS_STARTUP_GRACE_MS` (3000 ms, the same span the server keeps a report fresh) has passed
   since the receiver started, whichever comes first; after that a report is due every 1000 ms as
@@ -268,6 +268,27 @@ boundaries if a smaller review is wanted.
   - `PmonPlayer.kt` passes the packet's arrival time to `onPacket`; the `Listener.onLinkStats`
     comment describes the hold-back. Until the first report the server has none for the new
     control session, so the musician shows grey, not red.
+- Review 4 (lineage `review-55d96b6638201158`, range `7b7e194..9fbbd13`): approved and
+  acknowledged. Its only advisory, R3-001 (a suggestion), asks for a boundary test where the first
+  packet arrives exactly at `LINK_STATS_STARTUP_GRACE_MS` before any poll; the behaviour is the
+  documented one, so it is recorded as a follow-up test, not a defect.
+- A separate review of the whole unpushed range (`origin/main` `f231dad`..`90f7a33`, lineage
+  `review-67dd43fed2154ac3`) was approved; its findings are all in earlier, unrelated commits (the
+  audio panel, ASIO buffer defaults, the playback cushion) and are tracked outside this feature.
+
+## Status and next steps
+
+- Code complete: T1, T2 and T3 are done and every slice range has an approved native review.
+- Final checks: `cargo test -p personal-monitoring` 156 passed, `cargo test -p mixlink-desktop` 21
+  passed, Android JVM tests 81 passed with the debug APK assembled.
+- Pending: the acceptance criteria have not been verified on a device. Live check with the S23 and
+  the desktop: green within ~2 s on clean Wi-Fi; red ("silent") ~3 s after connecting with UDP
+  blocked; red once reports stop while connected (Wi-Fi off); grey once the app closes its control
+  channel; grey for an older build that never reports.
+- Pending (user decision): push and the stacked-to-main pull requests, one per slice.
+- Known gaps: no JS test runner for `describeLink` (review 2 R3-002); the `PmonPlayer` receive loop
+  is only covered through its pure helpers (review 3 R3-002); the startup-grace boundary test
+  (review 4 R3-001).
 
 ## Verification
 

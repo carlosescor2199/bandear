@@ -117,15 +117,16 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), this commit (no audio received is bad) |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), this commit (reports held until the audio starts or a startup grace passes; review 3 R3-001) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
 
 Slice 4 also lands above the budget: the new-session fix is about 170 authored lines (about 140 of
 them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), plus about
-50 for the timeouts-before-the-first-packet fix and about 100 for the no-audio fix (about 70 of
-them tests), so about 800 in all, not counting this document.
+50 for the timeouts-before-the-first-packet fix, about 100 for the no-audio fix (about 70 of
+them tests) and about 145 for the startup-grace fix (about 90 of them tests), so about 950 in all,
+not counting this document.
 Its commits are separate work units, so it can be split into pull requests at those commit
 boundaries if a smaller review is wanted.
 
@@ -230,7 +231,7 @@ boundaries if a smaller review is wanted.
     `loss_percent` is 0 when nothing was expected). Before `d46402c` it showed red. Candidates
     were: send no report until the stream starts (the light stays grey), or count timeouts before
     the first packet only after a startup grace of a second or two (it turns red).
-- No-audio fix (this commit, slice 4; route: delegated direct, one writer; resolves the decision
+- No-audio fix (`7b7e194`, slice 4; route: delegated direct, one writer; resolves the decision
   above). Rule: a fresh report whose `packets_received` is 0 over its interval is `bad`, whatever
   the other counts. Reason: the objective is whether the phone hears clean audio, and a phone
   hearing nothing must never be green; the server rule covers every cause (UDP blocked, a wrong
@@ -242,6 +243,31 @@ boundaries if a smaller review is wanted.
     `engine.rs` and `commands.rs` only gain the field in test fixtures.
   - `main.js`: `describeLink` shows the word "silent" and the tooltip `No audio received` for
     `bad` with `packetsPerSecond === 0`; every other case is unchanged.
+- Review 3 (lineage `review-17d283b442597b70`, range `90f7a33..7b7e194`): approved and
+  acknowledged. Advisory R3-001 (the phone reports from the start, so a first interval that ends
+  before any audio arrives sends a 0-packet report and shows a healthy phone as bad) is fixed by
+  the startup-grace commit below. Advisory R3-002 (no test that a `DROPPED` packet is not written
+  to the track, or that reports are sent while no packets arrive) stays a known gap: both live in
+  `PmonPlayer`'s receive loop, which owns the `DatagramSocket` and the `AudioTrack`, and no tiny
+  seam reaches them; covering them needs that loop split from its Android I/O. The decisions
+  themselves are covered by the pure tests: `SequenceTrackerTest` for `DROPPED`, and
+  `LinkStatsTest` for reports with no packets after the startup grace.
+- Startup-grace fix (this commit, slice 4; route: delegated direct, one writer; review 3 R3-001):
+  `LinkStatsAccumulator` holds reports back until the stream starts (the first packet is played) or
+  `LINK_STATS_STARTUP_GRACE_MS` (3000 ms, the same span the server keeps a report fresh) has passed
+  since the receiver started, whichever comes first; after that a report is due every 1000 ms as
+  before. The timeouts-before-the-first-packet rule is unchanged.
+  - Stream starts within the grace: the first interval starts at the first packet (`onPacket` now
+    takes the packet's arrival time), so the first report comes one interval later, carries packets
+    and describes the stream alone; the startup silence before it is not reported.
+  - Grace passes with no packet: the first report covers everything since the receiver started
+    (`interval_ms` is the real elapsed time, about 3000 ms or up to one 250 ms receive timeout more,
+    clamped to 60000) with 0 packets, 0 timeouts and 0 underruns, so the server shows the phone as
+    bad ("No audio received") about 3 s after it connects; reports then follow every second.
+  - A stream that starts after the grace joins the interval already running, so the cadence stays.
+  - `PmonPlayer.kt` passes the packet's arrival time to `onPacket`; the `Listener.onLinkStats`
+    comment describes the hold-back. Until the first report the server has none for the new
+    control session, so the musician shows grey, not red.
 
 ## Verification
 
@@ -344,3 +370,17 @@ boundaries if a smaller review is wanted.
   - `main.js` has no test runner (known gap R3-002). The T2 scratch harness, rerun in headless Chrome
     with a sixth musician (`bad`, all rates 0), showed "silent" / `No audio received` for it and
     the five earlier cases unchanged, with no script errors.
+- Startup-grace fix RED (`LINK_STATS_STARTUP_GRACE_MS` and the `onPacket` time argument added but
+  unused; existing `LinkStatsTest` tests given packet times, and the ones that relied on reports
+  with no packet before the grace now feed a packet or poll after the grace):
+  `gradle -p apps/android :app:testDebugUnitTest` gave 81 tests, 3 failed:
+  `noReportBeforeTheStreamStartsWithinTheStartupGrace`,
+  `theFirstReportComesOneIntervalAfterTheStreamStartsAndCoversOnlyTheStream` and
+  `withNoAudioTheFirstReportComesAfterTheGraceAndCoversAllOfIt` (each got a report where none was
+  due yet). `afterTheGraceReportsFlowEveryIntervalAndAStreamThatStartsLateKeepsTheCadence` already
+  passed and is kept as a guard for the cadence after the grace.
+- Startup-grace fix GREEN:
+  - `gradle -p apps/android :app:testDebugUnitTest assembleDebug` (Gradle 9.6.0 with Android
+    Studio's JBR and the local SDK, as for T3): BUILD SUCCESSFUL, 81 tests, 0 failures; the debug
+    APK assembled with no Kotlin warnings.
+  - `cargo fmt --all -- --check`: exit 0 (no Rust changes).

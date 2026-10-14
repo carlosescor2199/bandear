@@ -274,6 +274,31 @@ const CLIENT_NAME_TITLE =
 const LOCAL_LABEL_TITLE =
   "Local label for this desk, shown only while the musician has not announced a name. Enter saves, Escape reverts";
 
+const LINK_LEVELS = ["unknown", "good", "warning", "bad"];
+
+// What the musician's phone reports about the audio it receives, as the server classified it. The
+// rates come only with a fresh report, so a bad link with no numbers is a phone that is still
+// connected but whose reports stopped arriving: its link is lost.
+function describeLink(musician) {
+  const level = LINK_LEVELS.includes(musician.linkHealth) ? musician.linkHealth : "unknown";
+  const rates = [
+    musician.underrunsPerSecond,
+    musician.lossPercent,
+    musician.receiveTimeoutsPerSecond,
+  ];
+  if (!rates.every((rate) => typeof rate === "number")) {
+    return level === "bad"
+      ? { level, label: "lost", detail: "Reports stopped: link lost" }
+      : { level: "unknown", label: "unknown", detail: "No reports from this phone" };
+  }
+  const [underruns, loss, timeouts] = rates;
+  return {
+    level,
+    label: level,
+    detail: `Underruns ${underruns.toFixed(1)}/s · Loss ${loss.toFixed(2)} % · Timeouts ${timeouts.toFixed(1)}/s`,
+  };
+}
+
 // Builds one musician row. The name input commits on blur (Enter blurs it, Escape reverts first),
 // and the poll never overwrites the input while it has focus. For a client that announced its own
 // name the input is disabled: the phone owns the name, and a local label would be shadowed anyway.
@@ -330,6 +355,15 @@ function buildMusicianRow(musician) {
   const controlLabel = document.createElement("span");
   controlCell.append(controlDot, controlLabel);
 
+  // The dot carries the accessible label (level and numbers); the short word beside it repeats the
+  // level for sighted users, so it is hidden from assistive technology to avoid reading it twice.
+  const linkCell = document.createElement("td");
+  const linkDot = document.createElement("span");
+  linkDot.setAttribute("role", "img");
+  const linkLabel = document.createElement("span");
+  linkLabel.setAttribute("aria-hidden", "true");
+  linkCell.append(linkDot, linkLabel);
+
   const mixCell = document.createElement("td");
   const mixVolume = document.createElement("span");
   mixVolume.className = "mono";
@@ -353,6 +387,7 @@ function buildMusicianRow(musician) {
     nameCell,
     textCell(musician.address, "mono"),
     controlCell,
+    linkCell,
     mixCell,
     sent,
     discarded,
@@ -365,6 +400,9 @@ function buildMusicianRow(musician) {
     localBadge,
     controlDot,
     controlLabel,
+    linkCell,
+    linkDot,
+    linkLabel,
     mixVolume,
     mixState,
     sent,
@@ -393,6 +431,11 @@ function updateMusicianRow(view, musician) {
   view.controlDot.className = musician.controlConnected ? "dot dot--on" : "dot";
   view.controlLabel.textContent = musician.controlConnected ? "connected" : "offline";
   view.controlLabel.className = musician.controlConnected ? "" : "tag";
+  const link = describeLink(musician);
+  view.linkDot.className = `dot dot--${link.level}`;
+  view.linkDot.setAttribute("aria-label", `Link ${link.label}: ${link.detail}`);
+  view.linkLabel.textContent = link.label;
+  view.linkCell.title = link.detail;
   view.mixVolume.textContent = `${musician.volumePercent}%`;
   view.mixState.textContent = musician.muted ? " · muted" : " · live";
   view.mixState.className = musician.muted ? "tag--muted" : "tag--live";

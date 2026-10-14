@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use personal_monitoring::{CaptureFormat, EngineStatus, InputDevice, MusicianStatus};
+use personal_monitoring::{CaptureFormat, EngineStatus, InputDevice, LinkHealth, MusicianStatus};
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
@@ -98,6 +98,14 @@ pub struct MusicianDto {
     pub muted: bool,
     pub packets_sent: u64,
     pub packets_discarded: u64,
+    /// The phone's link health as the server classified it: "unknown", "good", "warning" or "bad".
+    pub link_health: &'static str,
+    /// The rates the health was judged on. All three are absent when there is no fresh report: a
+    /// phone that never reported, one that left, or a lost link ("bad" with no numbers to show).
+    pub underruns_per_second: Option<f64>,
+    /// Lost packets as a percentage of the packets the phone expected.
+    pub loss_percent: Option<f64>,
+    pub receive_timeouts_per_second: Option<f64>,
 }
 
 /// One configured group, with the same 0-based source indices the engine uses.
@@ -157,7 +165,21 @@ impl From<&MusicianStatus> for MusicianDto {
             muted: musician.mix.muted,
             packets_sent: musician.counters.packets_sent,
             packets_discarded: musician.counters.packets_discarded,
+            link_health: link_health_name(musician.link.health),
+            underruns_per_second: musician.link.underruns_per_second,
+            loss_percent: musician.link.loss_percent,
+            receive_timeouts_per_second: musician.link.receive_timeouts_per_second,
         }
+    }
+}
+
+/// The name of a link health level, in the lowercase the window matches on.
+fn link_health_name(health: LinkHealth) -> &'static str {
+    match health {
+        LinkHealth::Unknown => "unknown",
+        LinkHealth::Good => "good",
+        LinkHealth::Warning => "warning",
+        LinkHealth::Bad => "bad",
     }
 }
 
@@ -225,7 +247,9 @@ impl From<&EngineStatus> for EngineStatusDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personal_monitoring::{CaptureFormat, EngineStatus, GroupStatus, MusicianStatus};
+    use personal_monitoring::{
+        CaptureFormat, EngineStatus, GroupStatus, LinkHealth, LinkStatus, MusicianStatus,
+    };
 
     fn status_with(groups: Vec<GroupStatus>, channel_levels: Vec<u8>) -> EngineStatus {
         EngineStatus {
@@ -334,6 +358,96 @@ mod tests {
         assert_eq!(dto.client_name, None);
         assert_eq!(dto.name, None);
         assert!(!dto.name_is_local);
+    }
+
+    fn musician_with_link(link: LinkStatus) -> MusicianStatus {
+        MusicianStatus {
+            address: "192.168.1.30:50000".parse().expect("test address"),
+            name: None,
+            control_connected: true,
+            mix: Default::default(),
+            counters: Default::default(),
+            link,
+        }
+    }
+
+    #[test]
+    fn each_link_health_level_reaches_the_window_as_its_lowercase_name() {
+        for (health, name) in [
+            (LinkHealth::Unknown, "unknown"),
+            (LinkHealth::Good, "good"),
+            (LinkHealth::Warning, "warning"),
+            (LinkHealth::Bad, "bad"),
+        ] {
+            let musician = musician_with_link(LinkStatus {
+                health,
+                ..LinkStatus::default()
+            });
+
+            assert_eq!(MusicianDto::from(&musician).link_health, name);
+        }
+    }
+
+    #[test]
+    fn the_rates_the_health_was_judged_on_are_passed_through() {
+        let musician = musician_with_link(LinkStatus {
+            health: LinkHealth::Warning,
+            underruns_per_second: Some(0.5),
+            loss_percent: Some(1.25),
+            receive_timeouts_per_second: Some(0.0),
+        });
+
+        let dto = MusicianDto::from(&musician);
+
+        assert_eq!(dto.link_health, "warning");
+        assert_eq!(dto.underruns_per_second, Some(0.5));
+        assert_eq!(dto.loss_percent, Some(1.25));
+        assert_eq!(dto.receive_timeouts_per_second, Some(0.0));
+    }
+
+    #[test]
+    fn a_musician_without_a_fresh_report_has_no_rates() {
+        let never_reported = MusicianDto::from(&musician_with_link(LinkStatus::default()));
+        let lost = MusicianDto::from(&musician_with_link(LinkStatus {
+            health: LinkHealth::Bad,
+            ..LinkStatus::default()
+        }));
+
+        assert_eq!(never_reported.link_health, "unknown");
+        assert_eq!(
+            lost.link_health, "bad",
+            "a lost link is bad with no numbers"
+        );
+        for dto in [never_reported, lost] {
+            assert_eq!(dto.underruns_per_second, None);
+            assert_eq!(dto.loss_percent, None);
+            assert_eq!(dto.receive_timeouts_per_second, None);
+        }
+    }
+
+    #[test]
+    fn the_link_fields_are_camel_case_json_with_absent_rates_as_null() {
+        let lost = serde_json::to_value(MusicianDto::from(&musician_with_link(LinkStatus {
+            health: LinkHealth::Bad,
+            ..LinkStatus::default()
+        })))
+        .expect("a musician serializes");
+        let reporting = serde_json::to_value(MusicianDto::from(&musician_with_link(LinkStatus {
+            health: LinkHealth::Good,
+            underruns_per_second: Some(0.0),
+            loss_percent: Some(0.25),
+            receive_timeouts_per_second: Some(0.0),
+        })))
+        .expect("a musician serializes");
+
+        assert_eq!(lost["linkHealth"], "bad");
+        assert!(lost["underrunsPerSecond"].is_null());
+        assert!(lost["lossPercent"].is_null());
+        assert!(lost["receiveTimeoutsPerSecond"].is_null());
+        assert_eq!(reporting["linkHealth"], "good");
+        assert_eq!(reporting["underrunsPerSecond"], 0.0);
+        assert_eq!(reporting["lossPercent"], 0.25);
+        assert_eq!(reporting["receiveTimeoutsPerSecond"], 0.0);
     }
 
     #[test]

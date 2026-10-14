@@ -66,7 +66,7 @@ never counted. Reporting those numbers as they are would make the traffic light 
 - [x] T1 (server): `stats` message parse and its own routing branch in `control.rs`; latest report
   stored per target (surviving re-registration); pure `classify` function; health and rates in
   `MusicianStatus`. RED-first unit tests for parse, classify and routing.
-- [ ] T2 (desktop): health and rates in `MusicianDto`; a health column with a dot and a tooltip in
+- [x] T2 (desktop): health and rates in `MusicianDto`; a health column with a dot and a tooltip in
   the musicians table.
 - [ ] T3 (android): pure `SequenceTracker` (drop late/duplicate, count gaps once), counted receive
   timeouts, a pure stats accumulator and message builder, and the 1 s report sent through
@@ -109,8 +109,8 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | Slice | Content | Commit |
 |---|---|---|
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
-| 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, then the lost-link fix commit |
-| 3 | Desktop health column (T2) | pending |
+| 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
+| 3 | Desktop health column (T2) | this commit |
 | 4 | Android sequence tracker and stats report (T3) | pending |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
@@ -149,13 +149,26 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   lens). Its advisory R3-001 is fixed by the lost-link fix commit below.
 - Slice 2 committed as `71d02d7`; assessed medium and under budget, so its review is pending in the
   slice.
-- Lost-link fix (this commit, part of slice 2; advisory R3-001): stats travel over the same Wi-Fi as
+- Lost-link fix (`4692544`, part of slice 2; advisory R3-001): stats travel over the same Wi-Fi as
   the audio, so a phone that loses Wi-Fi can never send the report that would turn it red, and a
   stale report used to show grey. `classify` and `link_status` now take `control_connected`: no
   report ever is `unknown`; a fresh report keeps the thresholds; a stale report is `bad` (no rates)
   while the control channel is connected and `unknown` once it has closed. The engine passes the
   fact it already has, the connected control peer IPs, through a new pure `link_statuses` helper in
   `engine.rs`.
+- T2 done (this commit, slice 3; route: delegated direct, one writer). Desktop side of link health:
+  - `dto.rs`: `MusicianDto` gains `link_health` (`"unknown"`, `"good"`, `"warning"`, `"bad"`) and
+    the three optional rates, passed through from `MusicianStatus.link`; JSON keys are
+    `linkHealth`, `underrunsPerSecond`, `lossPercent`, `receiveTimeoutsPerSecond` (`null` when
+    absent). `commands.rs` only gains the new fields in a test fixture.
+  - `index.html` / `styles.css`: a "Link" column next to Control; column widths rebalanced to keep
+    100 %. Dot colours reuse the window's tokens: grey (unknown), `--green`, `--accent` (amber),
+    `--red`.
+  - `main.js`: `describeLink` turns a row into a level, a short word and a tooltip. Fresh numbers
+    show as `Underruns 0.0/s · Loss 0.00 % · Timeouts 0.0/s`; `bad` without numbers shows "lost"
+    with `Reports stopped: link lost`; no numbers otherwise shows `No reports from this phone`. The
+    dot is `role="img"` with an `aria-label` carrying the level and the tooltip text; the visible
+    word is `aria-hidden`. The cell is updated in place on each poll like the others.
 
 ## Verification
 
@@ -184,3 +197,21 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   - `cargo test -p personal-monitoring`: 151 passed, 0 failed.
   - `cargo test -p mixlink-desktop`: 17 passed, 0 failed.
   - `cargo check --workspace --all-targets`: finished, no errors or warnings.
+- T2 RED (new `MusicianDto` fields filled with a fixed `"unknown"` and no rates):
+  `cargo test -p mixlink-desktop` gave 17 passed and 4 failed:
+  `each_link_health_level_reaches_the_window_as_its_lowercase_name`,
+  `the_rates_the_health_was_judged_on_are_passed_through`,
+  `a_musician_without_a_fresh_report_has_no_rates` and
+  `the_link_fields_are_camel_case_json_with_absent_rates_as_null`.
+- T2 GREEN:
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo test -p personal-monitoring`: 151 passed, 0 failed.
+  - `cargo test -p mixlink-desktop`: 21 passed, 0 failed.
+  - `cargo check --workspace --all-targets`: finished, no errors or warnings.
+- T2 UI: the window's JS, HTML and CSS have no test runner (no Node toolchain in the repo), so there
+  is no RED for them. Smoke check instead: a scratch harness page outside the repository loaded the
+  real `index.html` and `main.js` in headless Chrome with a stubbed Tauri global serving one musician
+  per case. All five rows rendered 9 cells under a "Link" header with no script errors: `good`,
+  `warning` and `bad` with their numbers, `bad` without numbers as "lost" / `Reports stopped: link
+  lost`, and `unknown` / `No reports from this phone`; a screenshot at the window's default 1180 px
+  width showed no clipped columns.

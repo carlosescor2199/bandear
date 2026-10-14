@@ -8,6 +8,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -187,6 +188,26 @@ internal class ControlChannel(
         }
     }
 
+    /**
+     * Sends one link-stats report on the control executor, behind any registration or mix already
+     * queued. Called from the receive thread, so it only hands the report over and never waits.
+     *
+     * A report describes one interval and is worthless later, so it is dropped, never queued, when
+     * the channel is not open or has shut down. A rejected send is not shown as an error either: the
+     * next report follows within a second, and the server's view of a link that stops reporting is
+     * exactly what the report is for.
+     */
+    fun sendLinkStats(report: LinkStatsReport) {
+        if (controlWebSocket == null) return
+        try {
+            controlExecutor.execute {
+                controlWebSocket?.send(buildStatsMessage(report))
+            }
+        } catch (_: RejectedExecutionException) {
+            // The channel shut down while the receiver was still stopping.
+        }
+    }
+
     fun close(code: Int, reason: String) {
         controlWebSocket?.close(code, reason)
         controlWebSocket = null
@@ -241,6 +262,20 @@ internal fun buildRegisterMessage(name: String, udpPort: Int): String =
         .put("type", "register")
         .put("name", name.trim())
         .put("udp_port", udpPort)
+        .toString()
+
+/**
+ * Builds the link-stats message the client sends about once a second: the counts of one report
+ * interval, all integers. The server matches it to this musician by the socket's IP, like a mix.
+ */
+internal fun buildStatsMessage(report: LinkStatsReport): String =
+    JSONObject()
+        .put("type", "stats")
+        .put("interval_ms", report.intervalMs)
+        .put("packets_received", report.packetsReceived)
+        .put("packets_lost", report.packetsLost)
+        .put("underruns", report.underruns)
+        .put("receive_timeouts", report.receiveTimeouts)
         .toString()
 
 /**

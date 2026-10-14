@@ -458,6 +458,10 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         )
     }
 
+    override fun onLinkStats(report: LinkStatsReport) {
+        control.sendLinkStats(report)
+    }
+
     override fun onError(message: String) {
         showError(message)
     }

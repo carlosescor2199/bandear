@@ -259,7 +259,12 @@ internal class PmonPlayer(
         return AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_GAME)
+                    // USAGE_MEDIA, not USAGE_GAME: measured on a Galaxy S23 the two are equal
+                    // (playback backlog 33.8 ms against 34.0 ms, same framework track latency), so
+                    // the device's game effect chain was not the latency term. Media is kept
+                    // because it is the semantically right usage for music and it still qualifies
+                    // for the low-latency fast track.
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build(),
             )

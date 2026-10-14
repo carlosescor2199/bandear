@@ -26,9 +26,9 @@
           <div class="readout">
             <label class="readout-label" for="host-select">Driver</label>
             <select id="host-select" class="select">
-              <option value="auto">auto — prefer ASIO</option>
-              <option value="asio">ASIO</option>
+              <option value="auto" selected>auto — the system's own (safe)</option>
               <option value="wasapi">WASAPI (shared)</option>
+              <option value="asio">ASIO — kernel driver (risky)</option>
             </select>
           </div>
           <div class="readout readout--device">
@@ -76,11 +76,12 @@
         </div>
         <p class="hint">
           Driver, buffer and — under ASIO — the device restart the capture engine, the way a DAW does
-          when the driver changes: the phones reconnect on their own. ASIO can only hold one driver at
-          a time, so a device change has to restart; WASAPI switches device without restarting
-          anything. The buffer only takes effect on ASIO, where the driver honours it; WASAPI shared
-          mode pins the period to the device's own (10 ms). The sample rate is 48 kHz by design: it is
-          the format on the wire the phones receive, not a free choice.
+          when the driver changes: the phones reconnect on their own. <strong>ASIO loads a kernel-mode
+          driver</strong>: an unstable one can restart the whole machine, so it is never chosen
+          automatically — pick it deliberately, and prefer your interface's own driver over a
+          built-in one. The buffer only takes effect on ASIO, where the driver honours it; WASAPI
+          shared mode pins the period to the device's own (10 ms). The sample rate is 48 kHz by
+          design: it is the format on the wire the phones receive, not a free choice.
         </p>
       </section>
 

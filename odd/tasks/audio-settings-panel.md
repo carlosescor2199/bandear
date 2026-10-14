@@ -53,6 +53,23 @@ interface that actually honours a 256-frame period.
   `Universal Audio Volt`, printed `buffer=Fixed(256)`, and the wire measured 256-frame (5.33 ms)
   packets.
 
+## Safety: ASIO is opt-in
+
+Choosing ASIO loads a **kernel-mode driver**, and an unstable one takes the whole machine down. During
+testing a Realtek ASIO driver did exactly that: two bugchecks in one afternoon, `0x0000007E`
+(SYSTEM_THREAD_EXCEPTION, `0xC0000005`) and `0x00000139` (KERNEL_SECURITY_CHECK_FAILURE), both while
+the server was opening the Realtek ASIO device. The machine had also bugchecked before ASIO existed
+(`0x0000001A`, `0x00020001`, `0x0000000A` on earlier dates), so it is not perfectly stable on its own,
+but the ASIO ones line up with the server.
+
+The engine therefore never enters ASIO on its own:
+
+- `AudioHost::Auto` — the default — resolves to the platform's own host, which needs no third-party
+  driver.
+- ASIO is only loaded for an explicit `--host asio` or an explicit pick in the window, and the option
+  is labelled as a kernel driver.
+- Only an explicit ASIO request lists the ASIO drivers; `Auto` lists the system devices.
+
 ## Known rough edges (T4)
 
 - A driver that rejects an explicit buffer (the Realtek ASIO driver) prints one

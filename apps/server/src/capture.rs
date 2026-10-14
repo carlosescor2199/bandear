@@ -29,9 +29,10 @@ pub struct InputDevice {
 
 /// Which audio host the engine captures from.
 ///
-/// `Auto` is the default: prefer ASIO where it is compiled in and a driver loads, otherwise the
-/// platform default. The window exposes the concrete choice so an interface with an ASIO driver can
-/// be picked over a built-in one that reports a much larger period.
+/// `Auto` is the default and resolves to the platform's own host, which is the safe choice: it needs
+/// no third-party driver. ASIO is deliberately explicit, because choosing it loads a kernel-mode
+/// driver, and an unstable one takes the whole machine down: a Realtek ASIO driver did exactly that
+/// during testing, with two bugchecks in one afternoon.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AudioHost {
     #[default]
@@ -90,13 +91,12 @@ fn default_host() -> &'static cpal::Host {
 
 /// The cpal host the engine captures from, for the requested backend.
 ///
-/// ASIO bypasses the Windows audio stack entirely and, unlike WASAPI shared mode, it is a backend
-/// where `BufferSize::Fixed` actually shrinks the callback period - and that period is exactly the
-/// capture latency, because the engine sends one packet per callback. It is not always available (no
-/// driver, or the driver is held by another app), so `Auto` and `Asio` fall back to the default host
-/// instead of failing the session.
+/// Only an explicit [AudioHost::Asio] loads the ASIO driver. `Auto` resolves to the platform's own
+/// host: ASIO is a kernel-mode driver and an unstable one can restart the machine, so it is never
+/// entered by default. When ASIO is asked for and cannot load, the default host is used instead of
+/// failing the session.
 pub(crate) fn input_host(host: AudioHost) -> &'static cpal::Host {
-    let want_asio = !matches!(host, AudioHost::Wasapi);
+    let want_asio = matches!(host, AudioHost::Asio);
     #[cfg(all(target_os = "windows", feature = "asio"))]
     if want_asio {
         return asio_host();
@@ -115,8 +115,10 @@ pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<d
     // ASIO is listed from the registry instead of from cpal. cpal describes a device by loading its
     // driver, and ASIO only holds one driver at a time, so a running session hides every driver but
     // its own. The installed names are exactly what a DAW lists, and they are the names cpal uses.
+    // Only an explicit ASIO request lists them: `Auto` is the safe host and must not offer drivers
+    // that load a kernel-mode driver.
     #[cfg(all(target_os = "windows", feature = "asio"))]
-    if !matches!(host, AudioHost::Wasapi) {
+    if matches!(host, AudioHost::Asio) {
         let names = installed_asio_driver_names();
         if !names.is_empty() {
             return Ok(names

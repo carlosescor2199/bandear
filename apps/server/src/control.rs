@@ -295,6 +295,9 @@ async fn handle_control_connection(
         }
     });
 
+    // Whether this connection has registered yet. Only its first registration starts a new link
+    // session; a later one on the same socket is a rename.
+    let mut session_registered = false;
     loop {
         // Safety net for a runtime that does not drive the watcher's timer while this task is parked
         // on a read: re-check the channel count before parking again, so the next client message also
@@ -331,6 +334,14 @@ async fn handle_control_connection(
                                 name.clone(),
                                 &groups,
                             );
+                            // A new session starts with no link report: the one left by an earlier
+                            // session describes a link that is gone, and kept it would turn stale
+                            // while this session is connected and read as a lost link. A rename on
+                            // this same session re-registers too, and keeps the current report.
+                            if !session_registered {
+                                targets.clear_link_report(peer.ip());
+                                session_registered = true;
+                            }
                             match &name {
                                 Some(name) => println!(
                                     "control registration from {peer}: {address} as \"{name}\""
@@ -1220,6 +1231,110 @@ mod tests {
 
         assert_eq!(removed, vec![target]);
         assert!(targets.read().is_empty());
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    const REGISTER_ANA: &str = r#"{"type":"register","name":"Ana","udp_port":50123}"#;
+
+    /// Sends `text`, then a mix, and waits for the mix acknowledgement. A connection handles its
+    /// messages in order, so once the acknowledgement arrives `text` has been fully handled.
+    async fn send_then_sync(client: &mut ClientStream, text: &str) {
+        client
+            .send(Message::Text(text.into()))
+            .await
+            .expect("client should send");
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        assert!(
+            read_message_of_type(client, "mix_ack").await.is_some(),
+            "the mix sent after {text} should be acknowledged"
+        );
+    }
+
+    /// A phone that comes back on a new control session starts as unknown, not as a lost link: the
+    /// report from its earlier session is forgotten when it registers, so neither a phone that is
+    /// about to report nor a build that never reports is shown red. The first report on the new
+    /// session is judged as usual.
+    #[tokio::test]
+    async fn a_new_control_session_starts_with_no_link_report() {
+        use crate::health::{link_status, LinkHealth, REPORT_STALE_AFTER};
+
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+
+        // The earlier session registers and reports, then goes away.
+        let mut first = connect_client(address).await;
+        send_then_sync(&mut first, REGISTER_ANA).await;
+        send_then_sync(&mut first, CLEAN_STATS).await;
+        let slot = targets.link_report(target_ip).expect("registered target");
+        let earlier = (*slot.lock().expect("report lock")).expect("the earlier report is stored");
+        first.close(None).await.expect("the client should close");
+        drop(first);
+
+        // The phone comes back on a new session. Judged once the earlier report is stale, with this
+        // session connected, a kept report would read as a lost link.
+        let mut second = connect_client(address).await;
+        send_then_sync(&mut second, REGISTER_ANA).await;
+        let later = earlier.received_at + REPORT_STALE_AFTER + Duration::from_secs(1);
+        let report = *slot.lock().expect("report lock");
+        assert_eq!(
+            link_status(report.as_ref(), true, later).health,
+            LinkHealth::Unknown,
+            "a new session is grey until its first report, not red"
+        );
+        assert_eq!(report, None, "the earlier session's report is forgotten");
+
+        // The first report on the new session is judged on its numbers as usual.
+        send_then_sync(&mut second, CLEAN_STATS).await;
+        let report = *slot.lock().expect("report lock");
+        let fresh = report.expect("the new session's report is stored");
+        let status = link_status(report.as_ref(), true, fresh.received_at);
+        assert_eq!(
+            status.health,
+            LinkHealth::Warning,
+            "one underrun is a warning"
+        );
+        assert!(
+            status.underruns_per_second.is_some(),
+            "a fresh report has rates"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A rename re-registers on the same session, so it keeps the current report: a musician typing
+    /// a name while streaming must not blank their light.
+    #[tokio::test]
+    async fn a_rename_on_the_same_session_keeps_the_link_report() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+        let mut client = connect_client(address).await;
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        send_then_sync(&mut client, CLEAN_STATS).await;
+        let slot = targets.link_report(target_ip).expect("registered target");
+        let before = *slot.lock().expect("report lock");
+        assert!(before.is_some(), "the report is stored");
+
+        send_then_sync(
+            &mut client,
+            r#"{"type":"register","name":"Bea","udp_port":50123}"#,
+        )
+        .await;
+
+        assert_eq!(registered_name(&targets, target_ip).as_deref(), Some("Bea"));
+        assert_eq!(
+            *slot.lock().expect("report lock"),
+            before,
+            "a rename keeps the report"
+        );
 
         stop_server(address, &stopped, server).await;
     }

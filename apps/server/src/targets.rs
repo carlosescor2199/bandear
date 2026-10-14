@@ -248,6 +248,20 @@ impl TargetRegistry {
             .find(|entry| entry.address.ip() == ip)
             .map(|entry| Arc::clone(&entry.link_report))
     }
+
+    /// Forgets the latest link report for `ip`, leaving the slot itself, the mix state and the
+    /// counters exactly as they were. An IP with no target is a no-op.
+    ///
+    /// A report describes the control session that sent it. When the phone comes back on a new
+    /// session, the old report says nothing about the new link: kept, it would go stale while the
+    /// new session is connected and show a lost link until the first new report, and forever for a
+    /// phone build that never reports. Cleared, the musician starts as unknown until the phone
+    /// speaks for itself.
+    pub(crate) fn clear_link_report(&self, ip: IpAddr) {
+        if let Some(slot) = self.link_report(ip) {
+            *slot.lock().expect("link report lock poisoned") = None;
+        }
+    }
 }
 
 /// Resolves one target value to a socket address, naming the value in every error.
@@ -631,6 +645,8 @@ mod tests {
         assert!(registry.link_report(ip("192.168.1.9")).is_none());
     }
 
+    /// The registry itself keeps the report across a registration, so a rename on the same session
+    /// does not blank the light; it is the control session that clears it when a new one begins.
     #[test]
     fn a_link_report_survives_re_registration_like_the_counters() {
         let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
@@ -659,6 +675,43 @@ mod tests {
             .expect("re-registered target");
         assert!(Arc::ptr_eq(&slot, &kept), "the slot is the same allocation");
         assert_eq!(*kept.lock().expect("report lock"), Some(report));
+    }
+
+    #[test]
+    fn clearing_a_link_report_forgets_only_the_report() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+        let slot = registry
+            .link_report(ip("192.168.1.50"))
+            .expect("registered target");
+        *slot.lock().expect("report lock") = Some(stored_report(Instant::now()));
+        let mix = registry
+            .mix_state(ip("192.168.1.50"))
+            .expect("registered target");
+        let counters = Arc::clone(&registry.read()[0].counters);
+
+        registry.clear_link_report(ip("192.168.1.50"));
+        // An IP with no target has nothing to clear and must not disturb the others.
+        registry.clear_link_report(ip("192.168.1.9"));
+
+        assert!(
+            slot.lock().expect("report lock").is_none(),
+            "the report is forgotten"
+        );
+        let entries = registry.read();
+        assert_eq!(entries.len(), 1);
+        assert!(Arc::ptr_eq(&slot, &entries[0].link_report), "same slot");
+        assert!(Arc::ptr_eq(&mix, &entries[0].mix_state), "mix kept");
+        assert!(
+            Arc::ptr_eq(&counters, &entries[0].counters),
+            "counters kept"
+        );
+        assert_eq!(entries[0].origin.name(), Some("Ana"));
     }
 
     #[test]

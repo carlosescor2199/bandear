@@ -26,8 +26,9 @@ never counted. Reporting those numbers as they are would make the traffic light 
   `{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}`.
   It is matched to the musician by the peer IP, exactly like `mix`.
 - **Health levels** (our own thresholds, tunable constants):
-  - `unknown`: no report ever (older phones never report), or the last one is older than 3 s and
-    the musician's control channel has closed (the musician stopped or left).
+  - `unknown`: no report yet on the current control session (older phones never report; a new
+    session starts with none), or the last one is older than 3 s and the musician's control channel
+    has closed (the musician stopped or left).
   - `bad`: the last report is older than 3 s while the control channel is still connected (stats
     travel over the same Wi-Fi as the audio, so a phone that lost its link can never report it; no
     rates are shown), or, on a fresh report, any receive timeout, or underruns >= 2/s, or
@@ -110,8 +111,8 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 |---|---|---|
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
-| 3 | Desktop health column (T2) | this commit |
-| 4 | Android sequence tracker and stats report (T3) | pending |
+| 3 | Desktop health column (T2) | `90f7a33` |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | this commit, T3 pending |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
@@ -156,7 +157,7 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   while the control channel is connected and `unknown` once it has closed. The engine passes the
   fact it already has, the connected control peer IPs, through a new pure `link_statuses` helper in
   `engine.rs`.
-- T2 done (this commit, slice 3; route: delegated direct, one writer). Desktop side of link health:
+- T2 done (`90f7a33`, slice 3; route: delegated direct, one writer). Desktop side of link health:
   - `dto.rs`: `MusicianDto` gains `link_health` (`"unknown"`, `"good"`, `"warning"`, `"bad"`) and
     the three optional rates, passed through from `MusicianStatus.link`; JSON keys are
     `linkHealth`, `underrunsPerSecond`, `lossPercent`, `receiveTimeoutsPerSecond` (`null` when
@@ -169,6 +170,21 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
     with `Reports stopped: link lost`; no numbers otherwise shows `No reports from this phone`. The
     dot is `role="img"` with an `aria-label` carrying the level and the tooltip text; the visible
     word is `aria-hidden`. The cell is updated in place on each poll like the others.
+- Review 2 (lineage `review-8741f049c86db454`, range `49da28a..90f7a33`): approved and
+  acknowledged. Advisory R3-001 is fixed by the new-session commit below. Advisory R3-002
+  (`describeLink` in `main.js` has no automated test) stays a known gap: the repository has no JS
+  test runner, and the T2 smoke check below is the only evidence for it.
+- New-session fix (this commit, slice 4; route: delegated direct, one writer; review 2 R3-001): the
+  report used to survive control close and re-registration, so a phone that came back on a new
+  control session showed red (a stale report with a connected control channel) until its first new
+  report, and an older build that never reports stayed red for good. A new control session now
+  starts with no report:
+  - `targets.rs`: `TargetRegistry::clear_link_report(ip)` forgets the stored report and keeps the
+    slot, the mix state, the counters and the origin; an IP with no target is a no-op.
+    `register` itself still keeps the report.
+  - `control.rs`: the first successful `register` of a connection clears the report. A later
+    `register` on the same socket is a rename (the phone re-announces its name while streaming) and
+    keeps the current report, so typing a name does not blank the light.
 
 ## Verification
 
@@ -215,3 +231,14 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   `warning` and `bad` with their numbers, `bad` without numbers as "lost" / `Reports stopped: link
   lost`, and `unknown` / `No reports from this phone`; a screenshot at the window's default 1180 px
   width showed no clipped columns.
+- New-session fix RED (`clear_link_report` as a no-op, wiring in place):
+  `cargo test -p personal-monitoring` gave 152 passed and 2 failed:
+  `control::tests::a_new_control_session_starts_with_no_link_report` (health `Bad` where `Unknown`
+  was expected) and `targets::tests::clearing_a_link_report_forgets_only_the_report` ("the report
+  is forgotten"). `control::tests::a_rename_on_the_same_session_keeps_the_link_report` already
+  passed and is kept as a guard for the rename path.
+- New-session fix GREEN:
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo test -p personal-monitoring`: 154 passed, 0 failed.
+  - `cargo test -p mixlink-desktop`: 21 passed, 0 failed.
+  - `cargo check --workspace --all-targets`: finished, no errors or warnings.

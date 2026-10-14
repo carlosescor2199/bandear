@@ -41,8 +41,8 @@ pub enum LinkHealth {
     Unknown,
     Good,
     Warning,
-    /// The numbers cross a bad threshold, or the reports stopped while the control channel is still
-    /// connected: the link is lost.
+    /// Nothing received, the numbers cross a bad threshold, or the reports stopped while the control
+    /// channel is still connected: the link is lost.
     Bad,
 }
 
@@ -79,8 +79,13 @@ impl LinkReport {
     }
 
     /// The level this report's numbers reach on the thresholds.
+    ///
+    /// Nothing received over the interval is bad whatever the other counts: a phone whose control
+    /// channel works but that hears no audio at all (UDP blocked, a wrong port, the engine stopped)
+    /// reports no loss and no timeouts, and must never look healthy.
     fn judge(&self) -> LinkHealth {
-        if self.receive_timeouts > 0
+        if self.packets_received == 0
+            || self.receive_timeouts > 0
             || self.rate_reaches(self.underruns, BAD_UNDERRUNS_PER_SECOND)
             || self.loss_reaches(BAD_LOSS_BASIS_POINTS)
         {
@@ -137,6 +142,8 @@ pub(crate) type LatestLinkReport = Arc<Mutex<Option<LinkReport>>>;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LinkStatus {
     pub health: LinkHealth,
+    /// Packets the phone received per second. 0 means it hears no audio at all.
+    pub packets_per_second: Option<f64>,
     pub underruns_per_second: Option<f64>,
     /// Lost packets as a percentage of the packets the phone expected (received plus lost).
     pub loss_percent: Option<f64>,
@@ -181,6 +188,7 @@ pub(crate) fn link_status(
     match report.filter(|report| report.is_fresh(now)) {
         Some(report) => LinkStatus {
             health,
+            packets_per_second: Some(report.per_second(report.packets_received)),
             underruns_per_second: Some(report.per_second(report.underruns)),
             loss_percent: Some(report.loss_percent()),
             receive_timeouts_per_second: Some(report.per_second(report.receive_timeouts)),
@@ -315,16 +323,54 @@ mod tests {
     }
 
     #[test]
-    fn nothing_received_and_nothing_lost_counts_as_no_loss() {
+    fn nothing_received_is_bad_even_with_no_loss_and_no_timeouts() {
+        let now = Instant::now();
+        let silent = one_second(0, 0, 0, now);
+
+        assert_eq!(
+            classify(Some(&silent), CONNECTED, now),
+            LinkHealth::Bad,
+            "a phone that hears nothing at all must never look healthy"
+        );
+        let status = link_status(Some(&silent), CONNECTED, now);
+        assert_eq!(status.packets_per_second, Some(0.0));
+        assert_eq!(
+            status.loss_percent,
+            Some(0.0),
+            "nothing expected is no loss, never 0/0"
+        );
+    }
+
+    #[test]
+    fn nothing_received_is_bad_whatever_the_other_counts() {
+        let now = Instant::now();
+
+        // One underrun alone would only be a warning.
+        assert_eq!(
+            classify(Some(&one_second(0, 0, 1, now)), CONNECTED, now),
+            LinkHealth::Bad
+        );
+        assert_eq!(
+            classify(Some(&report(2_000, 0, 0, 3, 0, now)), CONNECTED, now),
+            LinkHealth::Bad
+        );
+        assert_eq!(
+            classify(Some(&one_second(0, 5, 0, now)), CONNECTED, now),
+            LinkHealth::Bad
+        );
+        assert_eq!(
+            classify(Some(&report(1_000, 0, 0, 0, 2, now)), CONNECTED, now),
+            LinkHealth::Bad
+        );
+    }
+
+    #[test]
+    fn a_single_packet_received_is_not_silence() {
         let now = Instant::now();
 
         assert_eq!(
-            classify(Some(&one_second(0, 0, 0, now)), CONNECTED, now),
+            classify(Some(&one_second(1, 0, 0, now)), CONNECTED, now),
             LinkHealth::Good
-        );
-        assert_eq!(
-            link_status(Some(&one_second(0, 0, 0, now)), CONNECTED, now).loss_percent,
-            Some(0.0)
         );
     }
 
@@ -427,6 +473,7 @@ mod tests {
         let status = link_status(Some(&report(2_000, 990, 10, 1, 0, now)), CONNECTED, now);
 
         assert_eq!(status.health, LinkHealth::Warning);
+        assert_eq!(status.packets_per_second, Some(495.0));
         assert_eq!(status.underruns_per_second, Some(0.5));
         assert_eq!(status.loss_percent, Some(1.0));
         assert_eq!(status.receive_timeouts_per_second, Some(0.0));
@@ -450,6 +497,7 @@ mod tests {
             LinkStatus::default()
         );
         assert_eq!(LinkStatus::default().health, LinkHealth::Unknown);
+        assert_eq!(LinkStatus::default().packets_per_second, None);
     }
 
     #[test]
@@ -465,6 +513,7 @@ mod tests {
             ),
             LinkStatus {
                 health: LinkHealth::Bad,
+                packets_per_second: None,
                 underruns_per_second: None,
                 loss_percent: None,
                 receive_timeouts_per_second: None,

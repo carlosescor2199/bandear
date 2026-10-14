@@ -278,7 +278,8 @@ const LINK_LEVELS = ["unknown", "good", "warning", "bad"];
 
 // What the musician's phone reports about the audio it receives, as the server classified it. The
 // rates come only with a fresh report, so a bad link with no numbers is a phone that is still
-// connected but whose reports stopped arriving: its link is lost.
+// connected but whose reports stopped arriving: its link is lost. A bad link that reports zero
+// packets received is a phone that is there but hears no audio at all.
 function describeLink(musician) {
   const level = LINK_LEVELS.includes(musician.linkHealth) ? musician.linkHealth : "unknown";
   const rates = [
@@ -290,6 +291,9 @@ function describeLink(musician) {
     return level === "bad"
       ? { level, label: "lost", detail: "Reports stopped: link lost" }
       : { level: "unknown", label: "unknown", detail: "No reports from this phone" };
+  }
+  if (level === "bad" && musician.packetsPerSecond === 0) {
+    return { level, label: "silent", detail: "No audio received" };
   }
   const [underruns, loss, timeouts] = rates;
   return {

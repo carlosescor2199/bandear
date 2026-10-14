@@ -31,8 +31,9 @@ never counted. Reporting those numbers as they are would make the traffic light 
     has closed (the musician stopped or left).
   - `bad`: the last report is older than 3 s while the control channel is still connected (stats
     travel over the same Wi-Fi as the audio, so a phone that lost its link can never report it; no
-    rates are shown), or, on a fresh report, any receive timeout, or underruns >= 2/s, or
-    loss >= 2 %.
+    rates are shown), or, on a fresh report, nothing received over its interval whatever the other
+    counts (the phone hears no audio at all; the received rate is exposed as 0 so the window can say
+    so), any receive timeout, or underruns >= 2/s, or loss >= 2 %.
   - `warning`: any underrun, or loss >= 0.5 %.
   - `good`: otherwise.
 - **Late and duplicate packets are dropped, not played.** A packet whose sequence is not newer than
@@ -79,6 +80,8 @@ never counted. Reporting those numbers as they are would make the traffic light 
 - A phone that streams cleanly shows green within ~2 s of connecting.
 - Pulling the phone off Wi-Fi turns its dot red once its last report is older than 3 s, and grey
   once its control channel closes.
+- A phone whose control channel works but that receives no audio at all shows red, with
+  `No audio received` on hover; it is never green.
 - A phone build without stats support shows grey and keeps working.
 - A `stats` message from an IP with no target gets the existing no-target error and changes nothing.
 
@@ -114,14 +117,15 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, this commit (timeouts before the first packet) |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), this commit (no audio received is bad) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
 
 Slice 4 also lands above the budget: the new-session fix is about 170 authored lines (about 140 of
 them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), plus about
-50 for the timeouts-before-the-first-packet fix, so about 700 in all, not counting this document.
+50 for the timeouts-before-the-first-packet fix and about 100 for the no-audio fix (about 70 of
+them tests), so about 800 in all, not counting this document.
 Its commits are separate work units, so it can be split into pull requests at those commit
 boundaries if a smaller review is wanted.
 
@@ -214,18 +218,30 @@ boundaries if a smaller review is wanted.
     delta, unchanged. The local stats screen now shows played packets and the tracker's loss count.
     The `AudioAttributes` block is untouched.
   - `MainActivity.kt`: `onLinkStats` forwards the report to `ControlChannel.sendLinkStats`.
-- Timeouts before the first packet (this commit, slice 4; route: delegated direct, one writer): the
+- Timeouts before the first packet (`d46402c`, slice 4; route: delegated direct, one writer): the
   receiver starts before the server knows where to send audio, so T3's first report of a session
   could carry a receive timeout from before the first packet and show a phone that connected
   cleanly as red for its first second. `LinkStatsAccumulator` now counts a receive timeout only
   once the stream has started (a packet was played); once started it stays started, so a wait
   while a restarted server comes back is still counted.
-  - Open decision: a phone whose control channel works but which never receives audio (UDP
-    blocked, wrong port) now reports zero packets, zero loss and zero timeouts every second, and
-    the server judges such a report `good` (`judge` in `health.rs`; `loss_percent` is 0 when
-    nothing was expected). Before this commit it showed red. Candidates: send no report until the
-    stream starts (the light stays grey), or count timeouts before the first packet only after a
-    startup grace of a second or two (it turns red).
+  - Decision (resolved by the no-audio fix below): a phone whose control channel works but which
+    never receives audio (UDP blocked, wrong port) now reports zero packets, zero loss and zero
+    timeouts every second, and the server judged such a report `good` (`judge` in `health.rs`;
+    `loss_percent` is 0 when nothing was expected). Before `d46402c` it showed red. Candidates
+    were: send no report until the stream starts (the light stays grey), or count timeouts before
+    the first packet only after a startup grace of a second or two (it turns red).
+- No-audio fix (this commit, slice 4; route: delegated direct, one writer; resolves the decision
+  above). Rule: a fresh report whose `packets_received` is 0 over its interval is `bad`, whatever
+  the other counts. Reason: the objective is whether the phone hears clean audio, and a phone
+  hearing nothing must never be green; the server rule covers every cause (UDP blocked, a wrong
+  port, the engine stopped) without changing the phone.
+  - `health.rs`: `judge` checks `packets_received == 0` first. `LinkStatus` gains
+    `packets_per_second` (received packets over the interval; `None` without a fresh report, like
+    the other rates).
+  - `dto.rs`: `MusicianDto.packets_per_second`, JSON `packetsPerSecond` (`null` when absent).
+    `engine.rs` and `commands.rs` only gain the field in test fixtures.
+  - `main.js`: `describeLink` shows the word "silent" and the tooltip `No audio received` for
+    `bad` with `packetsPerSecond === 0`; every other case is unchanged.
 
 ## Verification
 
@@ -309,3 +325,22 @@ boundaries if a smaller review is wanted.
   - `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 77 tests, 0
     failures; the debug APK assembled with no Kotlin warnings.
   - `cargo fmt --all -- --check`: exit 0 (no Rust changes).
+- No-audio fix RED (`LinkStatus.packets_per_second` and `MusicianDto.packets_per_second` added as
+  always `None`, `judge` unchanged):
+  - `cargo test -p personal-monitoring` gave 153 passed and 3 failed:
+    `health::tests::nothing_received_is_bad_even_with_no_loss_and_no_timeouts` and
+    `health::tests::nothing_received_is_bad_whatever_the_other_counts` (`Good` and `Warning` where
+    `Bad` was expected), and `health::tests::link_status_reports_the_rates_normalised_by_the_interval`
+    (`packets_per_second` `None` where `Some(495.0)` was expected).
+    `a_single_packet_received_is_not_silence` already passed and is kept as the boundary guard.
+  - `cargo test -p mixlink-desktop` gave 19 passed and 2 failed:
+    `the_rates_the_health_was_judged_on_are_passed_through` and
+    `the_link_fields_are_camel_case_json_with_absent_rates_as_null`.
+- No-audio fix GREEN:
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo test -p personal-monitoring`: 156 passed, 0 failed (baseline 154).
+  - `cargo test -p mixlink-desktop`: 21 passed, 0 failed.
+  - `cargo check --workspace --all-targets`: finished, no errors or warnings.
+  - `main.js` has no test runner (known gap R3-002). The T2 scratch harness, rerun in headless Chrome
+    with a sixth musician (`bad`, all rates 0), showed "silent" / `No audio received` for it and
+    the five earlier cases unchanged, with no script errors.

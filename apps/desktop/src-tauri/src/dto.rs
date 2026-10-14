@@ -100,8 +100,11 @@ pub struct MusicianDto {
     pub packets_discarded: u64,
     /// The phone's link health as the server classified it: "unknown", "good", "warning" or "bad".
     pub link_health: &'static str,
-    /// The rates the health was judged on. All three are absent when there is no fresh report: a
+    /// The rates the health was judged on. All four are absent when there is no fresh report: a
     /// phone that never reported, one that left, or a lost link ("bad" with no numbers to show).
+    ///
+    /// Packets the phone received per second; 0 means it hears no audio at all.
+    pub packets_per_second: Option<f64>,
     pub underruns_per_second: Option<f64>,
     /// Lost packets as a percentage of the packets the phone expected.
     pub loss_percent: Option<f64>,
@@ -166,6 +169,7 @@ impl From<&MusicianStatus> for MusicianDto {
             packets_sent: musician.counters.packets_sent,
             packets_discarded: musician.counters.packets_discarded,
             link_health: link_health_name(musician.link.health),
+            packets_per_second: musician.link.packets_per_second,
             underruns_per_second: musician.link.underruns_per_second,
             loss_percent: musician.link.loss_percent,
             receive_timeouts_per_second: musician.link.receive_timeouts_per_second,
@@ -392,6 +396,7 @@ mod tests {
     fn the_rates_the_health_was_judged_on_are_passed_through() {
         let musician = musician_with_link(LinkStatus {
             health: LinkHealth::Warning,
+            packets_per_second: Some(187.5),
             underruns_per_second: Some(0.5),
             loss_percent: Some(1.25),
             receive_timeouts_per_second: Some(0.0),
@@ -400,6 +405,7 @@ mod tests {
         let dto = MusicianDto::from(&musician);
 
         assert_eq!(dto.link_health, "warning");
+        assert_eq!(dto.packets_per_second, Some(187.5));
         assert_eq!(dto.underruns_per_second, Some(0.5));
         assert_eq!(dto.loss_percent, Some(1.25));
         assert_eq!(dto.receive_timeouts_per_second, Some(0.0));
@@ -419,6 +425,7 @@ mod tests {
             "a lost link is bad with no numbers"
         );
         for dto in [never_reported, lost] {
+            assert_eq!(dto.packets_per_second, None);
             assert_eq!(dto.underruns_per_second, None);
             assert_eq!(dto.loss_percent, None);
             assert_eq!(dto.receive_timeouts_per_second, None);
@@ -434,20 +441,36 @@ mod tests {
         .expect("a musician serializes");
         let reporting = serde_json::to_value(MusicianDto::from(&musician_with_link(LinkStatus {
             health: LinkHealth::Good,
+            packets_per_second: Some(200.0),
             underruns_per_second: Some(0.0),
             loss_percent: Some(0.25),
             receive_timeouts_per_second: Some(0.0),
         })))
         .expect("a musician serializes");
+        let silent = serde_json::to_value(MusicianDto::from(&musician_with_link(LinkStatus {
+            health: LinkHealth::Bad,
+            packets_per_second: Some(0.0),
+            underruns_per_second: Some(0.0),
+            loss_percent: Some(0.0),
+            receive_timeouts_per_second: Some(0.0),
+        })))
+        .expect("a musician serializes");
 
         assert_eq!(lost["linkHealth"], "bad");
+        assert!(lost["packetsPerSecond"].is_null());
         assert!(lost["underrunsPerSecond"].is_null());
         assert!(lost["lossPercent"].is_null());
         assert!(lost["receiveTimeoutsPerSecond"].is_null());
         assert_eq!(reporting["linkHealth"], "good");
+        assert_eq!(reporting["packetsPerSecond"], 200.0);
         assert_eq!(reporting["underrunsPerSecond"], 0.0);
         assert_eq!(reporting["lossPercent"], 0.25);
         assert_eq!(reporting["receiveTimeoutsPerSecond"], 0.0);
+        assert_eq!(silent["linkHealth"], "bad");
+        assert_eq!(
+            silent["packetsPerSecond"], 0.0,
+            "a phone hearing nothing is a number the window can tell from a lost link"
+        );
     }
 
     #[test]

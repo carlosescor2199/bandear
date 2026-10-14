@@ -108,6 +108,47 @@ pub(crate) fn parse_register_command(json: &str) -> Result<RegisterCommand, Stri
     Ok(command)
 }
 
+/// The longest reporting interval a `stats` message may cover, in milliseconds.
+///
+/// A phone reports about once a second; an interval of a minute or more would describe a link the
+/// engineer can no longer act on, so it is rejected rather than averaged into a misleading rate.
+pub(crate) const MAX_STATS_INTERVAL_MS: u32 = 60_000;
+
+/// A `stats` control message: what the phone experienced over the last interval.
+///
+/// The counts are deltas for that interval, not running totals, so a report stands on its own and a
+/// lost report never skews the next one.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StatsCommand {
+    #[serde(rename = "type")]
+    pub(crate) message_type: String,
+    pub(crate) interval_ms: u32,
+    pub(crate) packets_received: u64,
+    pub(crate) packets_lost: u64,
+    pub(crate) underruns: u64,
+    pub(crate) receive_timeouts: u64,
+}
+
+/// Parses a `stats` control message, rejecting an interval the rates cannot be normalised by.
+// The control channel starts routing `stats` here in the next commit.
+#[allow(dead_code)]
+pub(crate) fn parse_stats_command(json: &str) -> Result<StatsCommand, String> {
+    let command: StatsCommand = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    if command.message_type != "stats" {
+        return Err(format!(
+            "unsupported control message type: {}",
+            command.message_type
+        ));
+    }
+    if command.interval_ms == 0 || command.interval_ms > MAX_STATS_INTERVAL_MS {
+        return Err(format!(
+            "stats interval_ms must be between 1 and {MAX_STATS_INTERVAL_MS}, got {}",
+            command.interval_ms
+        ));
+    }
+    Ok(command)
+}
+
 /// Normalizes the name a client announced: trimmed, capped, and `None` when nothing is left.
 ///
 /// Truncating instead of rejecting is deliberate: a musician who types a very long name must still
@@ -317,6 +358,82 @@ mod tests {
         let name = registered_name(&long).expect("a long name still registers");
 
         assert_eq!(name.chars().count(), MAX_MUSICIAN_NAME_LENGTH);
+    }
+
+    #[test]
+    fn parses_a_stats_report_with_its_interval_and_counts() {
+        let command = parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":3,"underruns":1,"receive_timeouts":2,"battery":80}"#,
+        )
+        .expect("a stats report should parse, ignoring unknown fields");
+
+        assert_eq!(command.interval_ms, 1_000);
+        assert_eq!(command.packets_received, 200);
+        assert_eq!(command.packets_lost, 3);
+        assert_eq!(command.underruns, 1);
+        assert_eq!(command.receive_timeouts, 2);
+    }
+
+    #[test]
+    fn a_stats_report_with_a_zero_interval_is_rejected() {
+        let error = parse_stats_command(
+            r#"{"type":"stats","interval_ms":0,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}"#,
+        )
+        .expect_err("a zero interval cannot normalise a rate");
+
+        assert!(
+            error.contains("interval_ms"),
+            "message names the field: {error}"
+        );
+    }
+
+    #[test]
+    fn a_stats_interval_is_accepted_up_to_a_minute_and_rejected_above_it() {
+        let at_limit = format!(
+            r#"{{"type":"stats","interval_ms":{MAX_STATS_INTERVAL_MS},"packets_received":0,"packets_lost":0,"underruns":0,"receive_timeouts":0}}"#
+        );
+        let above_limit = format!(
+            r#"{{"type":"stats","interval_ms":{},"packets_received":0,"packets_lost":0,"underruns":0,"receive_timeouts":0}}"#,
+            MAX_STATS_INTERVAL_MS + 1
+        );
+
+        assert!(parse_stats_command(&at_limit).is_ok());
+        let error = parse_stats_command(&above_limit).expect_err("an interval above a minute");
+        assert!(
+            error.contains("interval_ms"),
+            "message names the field: {error}"
+        );
+    }
+
+    #[test]
+    fn a_stats_report_missing_a_count_is_rejected() {
+        let error = parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"receive_timeouts":0}"#,
+        )
+        .expect_err("a report without underruns is incomplete");
+
+        assert!(
+            error.contains("underruns"),
+            "message names the field: {error}"
+        );
+    }
+
+    #[test]
+    fn a_stats_report_with_a_negative_count_is_rejected() {
+        assert!(parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":-1,"packets_lost":0,"underruns":0,"receive_timeouts":0}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_message_of_another_type_is_not_a_stats_report() {
+        let error = parse_stats_command(
+            r#"{"type":"mix","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}"#,
+        )
+        .expect_err("a mix is not a stats report");
+
+        assert!(error.contains("mix"), "message names the type: {error}");
     }
 
     #[test]

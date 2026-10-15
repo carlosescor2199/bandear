@@ -71,7 +71,7 @@ test("a channel strip per input, named by number, with its group, levels and but
   assert.deepEqual(strips[0], {
     index: 0,
     label: "CH 1",
-    group: { name: "Drums", tone: "teal", invalid: false },
+    group: { id: "drums", name: "Drums", tone: "teal", invalid: false },
     gain: 62,
     pan: 50,
     muted: false,
@@ -80,8 +80,27 @@ test("a channel strip per input, named by number, with its group, levels and but
     readout: "62%",
   });
   assert.equal(strips[3].group, null, "CH 4 is in no group");
-  assert.deepEqual(strips[4].group, { name: "Vocals", tone: "blue", invalid: false });
+  assert.deepEqual(strips[4].group, { id: "vocals", name: "Vocals", tone: "blue", invalid: false });
   assert.equal(strips[5].pan, 40);
+});
+
+test("a channel strip finds its group by id, so two groups may share a name", () => {
+  const status = sampleStatus();
+  status.groups = [
+    { id: "kit-a", name: "Drums", channels: [0], invalid: false },
+    { id: "kit-b", name: "Drums", channels: [1], invalid: false },
+  ];
+  status.channels = status.channels.map((channel, index) => ({
+    ...channel,
+    group: index < 2 ? "Drums" : null,
+    groupId: ["kit-a", "kit-b"][index] ?? null,
+  }));
+
+  const strips = channelStrips(reduce([actions.status(status)]), LEAD);
+
+  assert.deepEqual(strips[0].group, { id: "kit-a", name: "Drums", tone: "teal", invalid: false });
+  assert.deepEqual(strips[1].group, { id: "kit-b", name: "Drums", tone: "blue", invalid: false });
+  assert.equal(strips[2].group, null);
 });
 
 test("a muted channel's strip says so in words, not only in colour", () => {
@@ -108,8 +127,8 @@ test("a group strip per configured group, in its chip's tone, with the musician'
   const edited = reduce([actions.mixEdit(LEAD, { "groupLevels.1": 70 })], running);
 
   assert.deepEqual(groupStrips(edited, LEAD), [
-    { index: 0, name: "Drums", tone: "teal", invalid: false, level: 100, readout: "100%" },
-    { index: 1, name: "Vocals", tone: "blue", invalid: false, level: 70, readout: "70%" },
+    { index: 0, id: "drums", name: "Drums", tone: "teal", invalid: false, level: 100, readout: "100%" },
+    { index: 1, id: "vocals", name: "Vocals", tone: "blue", invalid: false, level: 70, readout: "70%" },
   ]);
 });
 

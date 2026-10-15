@@ -50,6 +50,11 @@ pub enum EngineEvent {
         address: SocketAddr,
         origin: MixOrigin,
     },
+    /// The groups the status reports changed: the engineer edited them, or a device switch changed
+    /// which of them the device can feed. It comes before the [Self::MixChanged] of every mix whose
+    /// group levels moved with an edit, so a consumer can show the new groups before levels placed
+    /// for them.
+    GroupsChanged,
 }
 
 /// Where a mix change came from.
@@ -684,7 +689,7 @@ pub(crate) fn plan_switch_from_attempt(
 /// Otherwise every mix moves its group levels by group id ([MixState::regroup]): a kept group takes
 /// its level to its new position, a new group starts neutral and a deleted group's level is
 /// dropped. Each moved mix takes a new revision and is announced as a change made through the
-/// engine, so the desktop and the musician's phone are sent it.
+/// engine, so the desktop and the musician's phone are sent it, after [EngineEvent::GroupsChanged].
 ///
 /// The order is what keeps a phone's levels on the right groups: the new configuration is
 /// published before any level moves, so a phone's connection, which reads the mix before it checks
@@ -709,22 +714,25 @@ pub(crate) fn apply_groups(
     else {
         return false;
     };
-    if previous.layout.same_positions(&layout) {
+    let moved: Vec<SocketAddr> = if previous.layout.same_positions(&layout) {
         for entry in entries.iter() {
             entry.mix_state.set_group_layout(&layout);
         }
-        return true;
-    }
-    let sources = group_sources(&previous.layout, &layout);
-    let moved: Vec<SocketAddr> = entries
-        .iter()
-        .map(|entry| {
-            entry.mix_state.regroup(&layout, &sources);
-            entry.address
-        })
-        .collect();
-    // Announced once the registry is released: a listener may read it at once.
+        Vec::new()
+    } else {
+        let sources = group_sources(&previous.layout, &layout);
+        entries
+            .iter()
+            .map(|entry| {
+                entry.mix_state.regroup(&layout, &sources);
+                entry.address
+            })
+            .collect()
+    };
+    // Announced once the registry is released, since a listener may read it at once: the new
+    // groups first, then every mix whose levels moved.
     drop(entries);
+    events.emit(EngineEvent::GroupsChanged);
     for address in moved {
         events.emit(EngineEvent::MixChanged {
             address,
@@ -2039,12 +2047,16 @@ mod tests {
         assert_eq!(first.channel_group[3], Some(2));
         assert_eq!(config.snapshot().groups, groups);
         let announced: Vec<EngineEvent> = observed.try_iter().collect();
-        assert_eq!(
-            announced,
-            ["192.168.1.3:50000", "192.168.1.4:50000"].map(|address| EngineEvent::MixChanged {
+        let mut expected = vec![EngineEvent::GroupsChanged];
+        expected.extend(["192.168.1.3:50000", "192.168.1.4:50000"].map(|address| {
+            EngineEvent::MixChanged {
                 address: address.parse().unwrap(),
                 origin: MixOrigin::Engine,
-            })
+            }
+        }));
+        assert_eq!(
+            announced, expected,
+            "the new groups are announced before the levels placed for them"
         );
     }
 
@@ -2081,7 +2093,11 @@ mod tests {
             "the phones get the new names"
         );
         assert_eq!(config.snapshot().groups[0].name, "Kit");
-        assert!(observed.try_recv().is_err(), "no mix changed");
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [EngineEvent::GroupsChanged],
+            "the groups changed, no mix did"
+        );
     }
 
     /// A group naming a channel the device lacks is kept, invalid and mapping nothing, exactly as

@@ -4,14 +4,16 @@
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return.
 
+use std::collections::HashSet;
+use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
 use personal_monitoring::{
-    start, AudioHost, EngineConfig, EngineEvent, EngineHandle, GroupDefinition, MixValues,
-    MusicianStatus,
+    check_groups, start, AudioHost, EngineConfig, EngineEvent, EngineHandle, GroupDefinition,
+    MixValues, MusicianStatus,
 };
 
 use crate::dto::{
@@ -19,7 +21,7 @@ use crate::dto::{
     MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
-use crate::session::SessionStore;
+use crate::session::{SessionGroup, SessionStore};
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
@@ -94,20 +96,68 @@ fn to_engine_config(request: StartRequest) -> EngineConfig {
         device_filter: request.device_filter,
         targets: request.targets,
         control_port: request.control_port.unwrap_or(DEFAULT_CONTROL_PORT),
-        // Numbered by order, as the command line numbers its groups.
-        groups: request
-            .groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group): (usize, GroupRequest)| GroupDefinition {
-                id: (index + 1).to_string(),
-                name: group.name,
-                channels: group.channels,
-            })
-            .collect(),
+        groups: group_definitions(request.groups),
         buffer_frames: request.buffer_frames,
         host: parse_host(request.host.as_deref()),
     }
+}
+
+/// Gives every requested group its definition: the id the window sent back, or a new one for a
+/// group the window has just created (no id, or an empty one). Names are trimmed.
+fn group_definitions(groups: Vec<GroupRequest>) -> Vec<GroupDefinition> {
+    let mut taken: HashSet<String> = groups
+        .iter()
+        .filter_map(|group| group.id.clone())
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    groups
+        .into_iter()
+        .map(|group| GroupDefinition {
+            id: match group.id {
+                Some(id) if !id.trim().is_empty() => id,
+                _ => new_group_id(&mut taken),
+            },
+            name: group.name.trim().to_owned(),
+            channels: group.channels,
+        })
+        .collect()
+}
+
+/// A new group id: `g` and 16 random hex digits, never one in `taken`, which it joins.
+///
+/// Random rather than counted, so an id is never handed out twice across restarts and a new group
+/// never inherits a level kept for a deleted one. The randomness is the standard library's hash
+/// seed: an id needs to be unique, not secret.
+fn new_group_id(taken: &mut HashSet<String>) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let seed = NEXT.fetch_add(1, Ordering::Relaxed);
+        let id = format!("g{:016x}", RandomState::new().hash_one(seed));
+        if taken.insert(id.clone()) {
+            return id;
+        }
+    }
+}
+
+/// The groups to apply right after a start, through the same live path as an edit.
+///
+/// A request that names no groups (the window's, which always sends none) gets the session's: they
+/// are applied once the engine runs, so a group naming a channel the chosen device lacks is kept and
+/// shows as invalid instead of failing the start. A request that names groups starts with exactly
+/// those, checked strictly as the command line's are, and the session is neither read nor changed.
+fn session_groups_for(request: &StartRequest, session: &SessionStore) -> Vec<GroupDefinition> {
+    if !request.groups.is_empty() {
+        return Vec::new();
+    }
+    session
+        .groups()
+        .into_iter()
+        .map(|group| GroupDefinition {
+            id: group.id,
+            name: group.name,
+            channels: group.channels,
+        })
+        .collect()
 }
 
 /// Maps a window value to a backend. An unknown or absent value falls back to `auto`, which is what
@@ -126,7 +176,14 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 ///
 /// Every start, even one that fails, begins a new engine run: the previous engine has ended either
 /// way, so the window can tell its late events from the new engine's.
+///
+/// The engineer's groups come from the session: a request that names none (the window always sends
+/// none) gets the session's groups applied as soon as the engine runs (see [session_groups_for]).
+/// Groups the engine refuses there (a hand-edited session) are logged and the engine runs without
+/// them: the groups are a convenience and must not stop the server.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
+    // Read before the engine lock is taken: the two locks are never held together.
+    let saved_groups = session_groups_for(&request, &state.session);
     let config = to_engine_config(request);
     let mut pump = state
         .pump
@@ -147,7 +204,18 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     }
 
     match start(config).map_err(|error| error.to_string())? {
-        Some(handle) => {
+        Some(mut handle) => {
+            if !saved_groups.is_empty() {
+                let count = saved_groups.len();
+                match handle.set_groups(saved_groups) {
+                    Ok(_) => {
+                        println!("[mixlink-desktop] start_engine: {count} saved groups applied")
+                    }
+                    Err(error) => {
+                        eprintln!("[mixlink-desktop] start_engine: the saved groups were not applied: {error}")
+                    }
+                }
+            }
             let summary = StartSummary {
                 run,
                 device_name: handle.device_name().to_owned(),
@@ -364,6 +432,46 @@ fn label_musician(
     let kept_for = client_id.map_or_else(|| "address".to_owned(), |id| format!("phone {id}"));
     println!("[mixlink-desktop] set_musician_name: {address} ({kept_for}) -> \"{name}\"");
     Ok(())
+}
+
+/// Replaces the engineer's groups: keeps them in the session and, while an engine runs, applies
+/// them live. Returns the groups as kept, in their order and each with its id.
+///
+/// `groups` is the whole list in its order (see [GroupRequest]); a group with no id is new and gets
+/// one. The list is checked as a running engine checks it ([check_groups]) before anything changes:
+/// at most 16 groups, a name each and no channel in two groups; a group naming a channel the current
+/// device lacks is kept and shows as invalid. The session is saved first and the running engine is
+/// changed only then, so a refused list or a failed save changes nothing at all. In the engine
+/// every musician's group levels follow their groups by id and every phone is sent the new groups
+/// (see [EngineHandle::set_groups]). An engine that is stopping refuses the change; the saved groups
+/// then apply at the next start.
+pub fn set_groups(
+    state: &DesktopState,
+    groups: Vec<GroupRequest>,
+) -> Result<Vec<SessionGroup>, String> {
+    let definitions = group_definitions(groups);
+    check_groups(&definitions)?;
+    let kept: Vec<SessionGroup> = definitions
+        .iter()
+        .map(|group| SessionGroup {
+            id: group.id.clone(),
+            name: group.name.clone(),
+            channels: group.channels.clone(),
+        })
+        .collect();
+    state.session.set_groups(kept.clone())?;
+    // The session's lock is released before the engine's is taken, as everywhere else.
+    let mut guard = state
+        .engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    if let Some(handle) = guard.as_mut() {
+        handle
+            .set_groups(definitions)
+            .map_err(|error| error.to_string())?;
+    }
+    println!("[mixlink-desktop] set_groups: {} groups", kept.len());
+    Ok(kept)
 }
 
 /// Stops the engine's event pump, then the engine, and joins their threads. Stopping when idle is
@@ -797,5 +905,118 @@ mod tests {
 
         assert!(config.targets.is_empty());
         assert_eq!(config.control_port, DEFAULT_CONTROL_PORT);
+    }
+
+    fn request(id: Option<&str>, name: &str, channels: &[usize]) -> GroupRequest {
+        GroupRequest {
+            id: id.map(str::to_owned),
+            name: name.to_owned(),
+            channels: channels.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_new_group_gets_a_fresh_id_and_a_known_one_keeps_its_own() {
+        let definitions = group_definitions(vec![
+            request(Some("kit"), "Drums", &[1]),
+            request(None, "Vocals", &[2]),
+            request(Some(" "), "Keys", &[3]),
+            request(None, "Bass", &[4]),
+        ]);
+
+        assert_eq!(definitions[0].id, "kit");
+        let fresh: Vec<&str> = definitions[1..]
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect();
+        assert!(fresh.iter().all(|id| !id.trim().is_empty() && *id != "kit"));
+        assert_ne!(fresh[0], fresh[1]);
+        assert_ne!(fresh[1], fresh[2]);
+        assert_ne!(fresh[0], fresh[2]);
+        assert_eq!(definitions[3].name, "Bass");
+        assert_eq!(definitions[3].channels, vec![4]);
+    }
+
+    #[test]
+    fn groups_set_without_an_engine_are_kept_with_their_ids_for_the_next_start() {
+        let state = DesktopState::new(SessionStore::open(&session_directory("groups-idle")));
+
+        let kept = set_groups(
+            &state,
+            vec![
+                request(None, " Drums ", &[1, 2]),
+                request(None, "Vocals", &[3]),
+            ],
+        )
+        .expect("the groups are kept");
+
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].name, "Drums", "names are trimmed");
+        assert_eq!(state.session.groups(), kept);
+        // The window sends the ids back with the next edit, and they stay.
+        let renamed = set_groups(
+            &state,
+            vec![
+                request(Some(&kept[1].id), "Lead vocal", &[3]),
+                request(Some(&kept[0].id), "Drums", &[1, 2]),
+            ],
+        )
+        .expect("the groups are kept");
+        assert_eq!(renamed[0].id, kept[1].id);
+        assert_eq!(renamed[1].id, kept[0].id);
+    }
+
+    #[test]
+    fn groups_a_running_engine_would_refuse_are_refused_and_nothing_is_saved() {
+        let state = DesktopState::new(SessionStore::open(&session_directory("groups-refused")));
+        set_groups(&state, vec![request(Some("kit"), "Drums", &[1])]).expect("kept");
+
+        let error = set_groups(
+            &state,
+            vec![
+                request(Some("kit"), "Drums", &[1, 2]),
+                request(None, "Vocals", &[2]),
+            ],
+        )
+        .expect_err("channel 2 cannot be in two groups");
+
+        assert!(
+            error.contains("Drums") && error.contains("Vocals"),
+            "{error}"
+        );
+        assert_eq!(
+            state.session.groups().len(),
+            1,
+            "the kept groups are unchanged"
+        );
+    }
+
+    #[test]
+    fn a_start_that_names_no_groups_applies_the_sessions_and_one_that_names_some_uses_its_own() {
+        let session = SessionStore::open(&session_directory("groups-start"));
+        session
+            .set_groups(vec![crate::session::SessionGroup {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            }])
+            .expect("kept");
+
+        let from_session = session_groups_for(&StartRequest::default(), &session);
+        let own = StartRequest {
+            groups: vec![request(None, "Vocals", &[3])],
+            ..StartRequest::default()
+        };
+
+        assert_eq!(
+            from_session,
+            vec![GroupDefinition {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            }]
+        );
+        assert!(session_groups_for(&own, &session).is_empty());
+        assert_eq!(to_engine_config(own).groups[0].name, "Vocals");
     }
 }

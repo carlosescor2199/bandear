@@ -95,6 +95,10 @@ test("the engine API calls each command with the argument names the desktop comm
   await api.removeTarget("192.168.1.9:50000");
   await api.setMusicianName("192.168.1.9:50000", "Keys");
   await api.setMix("192.168.1.9:50000", { volumePercent: 80 });
+  await api.setGroups([
+    { id: "kit", name: "Drums", channels: [1, 2] },
+    { name: "Vocals", channels: [3] },
+  ]);
 
   assert.deepEqual(bridge.calls, [
     ["engine_status", undefined],
@@ -108,6 +112,15 @@ test("the engine API calls each command with the argument names the desktop comm
     ["remove_target", { address: "192.168.1.9:50000" }],
     ["set_musician_name", { address: "192.168.1.9:50000", name: "Keys" }],
     ["set_mix", { address: "192.168.1.9:50000", mix: { volumePercent: 80 } }],
+    [
+      "set_groups",
+      {
+        groups: [
+          { id: "kit", name: "Drums", channels: [1, 2] },
+          { name: "Vocals", channels: [3] },
+        ],
+      },
+    ],
   ]);
 });
 
@@ -376,6 +389,169 @@ test("clearing a phone's label clears what the row shows", async () => {
   const row = musicians.find((musician) => musician.address === silent.address);
   assert.equal(row.name, null);
   assert.equal(row.nameIsLocal, false);
+});
+
+const LEAD = sampleStatus().musicians[0].address;
+
+// Every listened event, in order, as `[event, payload]`.
+async function recordEvents(fake) {
+  const seen = [];
+  for (const event of ["status", "mix-changed"]) {
+    await fake.listen(event, (payload) => seen.push([event, payload]));
+  }
+  return seen;
+}
+
+test("the sample's groups and the channels in them carry the groups' ids", () => {
+  const status = sampleStatus();
+
+  assert.deepEqual(
+    status.groups.map(({ id, name }) => [id, name]),
+    [
+      ["drums", "Drums"],
+      ["vocals", "Vocals"],
+    ],
+  );
+  assert.deepEqual(
+    status.channels.map((channel) => channel.groupId),
+    ["drums", "drums", "drums", null, "vocals", "vocals"],
+  );
+});
+
+test("editing the fake engine's groups moves every musician's levels with their groups by id", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_mix", { address: LEAD, mix: { groupLevels: [40, 70] } });
+  const before = (await fake.invoke("engine_status")).musicians[0].revision;
+  const seen = await recordEvents(fake);
+
+  // Vocals first and renamed, Drums deleted, Keys new.
+  const kept = await fake.invoke("set_groups", {
+    groups: [
+      { id: "vocals", name: "Vox", channels: [5, 6] },
+      { name: "Keys", channels: [4] },
+    ],
+  });
+
+  assert.equal(kept[0].id, "vocals");
+  assert.ok(kept[1].id && kept[1].id !== "drums", `a new id: ${kept[1].id}`);
+  assert.deepEqual(kept[1], { id: kept[1].id, name: "Keys", channels: [4] });
+  const status = await fake.invoke("engine_status");
+  assert.deepEqual(
+    status.groups.map(({ id, name, channels, invalid }) => [id, name, channels, invalid]),
+    [
+      ["vocals", "Vox", [4, 5], false],
+      [kept[1].id, "Keys", [3], false],
+    ],
+  );
+  assert.deepEqual(
+    status.channels.map((channel) => channel.groupId),
+    [null, null, null, kept[1].id, "vocals", "vocals"],
+  );
+  const lead = status.musicians[0];
+  assert.deepEqual(lead.groupLevels.slice(0, 3), [70, 100, 100]);
+  assert.ok(lead.revision > before, "the move is a newer revision");
+  assert.deepEqual(
+    seen.map(([event, payload]) => [event, payload.address ?? null, payload.origin ?? null]),
+    [
+      ["status", null, null],
+      ...status.musicians.map((musician) => ["mix-changed", musician.address, "desktop"]),
+    ],
+    "the new groups are announced before the levels placed for them",
+  );
+  assert.deepEqual(seen[1][1].mix.groupLevels.slice(0, 2), [70, 100]);
+});
+
+test("renaming a fake group or giving it other channels keeps every level in place", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_mix", { address: LEAD, mix: { groupLevels: [40, 70] } });
+  const seen = await recordEvents(fake);
+
+  await fake.invoke("set_groups", {
+    groups: [
+      { id: "drums", name: "Kit", channels: [1, 2, 3, 4] },
+      { id: "vocals", name: "Vocals", channels: [5, 6] },
+    ],
+  });
+
+  const lead = (await fake.invoke("engine_status")).musicians[0];
+  assert.deepEqual(lead.groupLevels.slice(0, 2), [40, 70]);
+  assert.deepEqual(
+    seen.map(([event]) => event),
+    ["status"],
+  );
+
+  // The same groups again change nothing and announce nothing.
+  await fake.invoke("set_groups", {
+    groups: [
+      { id: "drums", name: "Kit", channels: [1, 2, 3, 4] },
+      { id: "vocals", name: "Vocals", channels: [5, 6] },
+    ],
+  });
+  assert.equal(seen.length, 1);
+});
+
+test("the fake engine refuses the groups the desk refuses and keeps the ones it had", async () => {
+  const fake = createFakeBridge({ running: true });
+  const before = (await fake.invoke("engine_status")).groups;
+
+  for (const groups of [
+    [
+      { name: "Drums", channels: [1, 2] },
+      { name: "Bass", channels: [2] },
+    ],
+    [{ name: " ", channels: [1] }],
+    [
+      { id: "a", name: "Drums", channels: [1] },
+      { id: "a", name: "Bass", channels: [2] },
+    ],
+    Array.from({ length: 17 }, (_, index) => ({ name: `Group ${index}`, channels: [] })),
+  ]) {
+    await assert.rejects(fake.invoke("set_groups", { groups }), /./);
+  }
+
+  assert.deepEqual((await fake.invoke("engine_status")).groups, before);
+});
+
+test("groups set while the fake engine is stopped apply at the next start, a missing input marked", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("stop_engine");
+
+  await fake.invoke("set_groups", {
+    groups: [
+      { id: "drums", name: "Drums", channels: [1, 2] },
+      { id: "rack", name: "Rack", channels: [9] },
+    ],
+  });
+  await fake.invoke("start_engine", { config: {} });
+  const status = await fake.invoke("engine_status");
+
+  assert.deepEqual(
+    status.groups.map(({ id, invalid }) => [id, invalid]),
+    [
+      ["drums", false],
+      ["rack", true],
+    ],
+  );
+  assert.equal(status.channels.some((channel) => channel.groupId === "rack"), false);
+});
+
+test("a device switch marks the fake groups the new device cannot feed", async () => {
+  const fake = createFakeBridge({ running: true });
+
+  await fake.invoke("switch_device", { device: "Microphone (USB audio)" });
+  const status = await fake.invoke("engine_status");
+
+  assert.deepEqual(
+    status.groups.map(({ id, invalid }) => [id, invalid]),
+    [
+      ["drums", true],
+      ["vocals", true],
+    ],
+  );
+  assert.deepEqual(
+    status.channels.map((channel) => channel.groupId),
+    [null, null],
+  );
 });
 
 test("unlistening stops the deliveries", async () => {

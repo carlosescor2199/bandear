@@ -60,7 +60,8 @@ function groupsWithTones(state) {
 /**
  * One strip per input of the device, for `address`'s mix as it shows (with local edits):
  * `{ index, label, group, gain, pan, muted, solo, tone, readout }`. Channels have no names yet,
- * so a strip is called by its number. A muted strip reads "muted", not only a duller fill.
+ * so a strip is called by its number. A muted strip reads "muted", not only a duller fill. A
+ * channel's group is found by id: two groups may share a name.
  */
 export function channelStrips(state, address) {
   const mix = viewMix(state, address);
@@ -70,12 +71,16 @@ export function channelStrips(state, address) {
   }
   const groups = groupsWithTones(state);
   return status.channels.slice(0, status.sourceChannels).map((channel, index) => {
-    const group = groups.find((candidate) => candidate.name === channel.group);
+    const group = channel.groupId
+      ? groups.find((candidate) => candidate.id === channel.groupId)
+      : null;
     const muted = mix.channelMuted[index];
     return {
       index,
       label: `CH ${channel.number}`,
-      group: group ? { name: group.name, tone: group.tone, invalid: group.invalid } : null,
+      group: group
+        ? { id: group.id, name: group.name, tone: group.tone, invalid: group.invalid }
+        : null,
       gain: mix.channelGains[index],
       pan: mix.pans[index],
       muted,
@@ -86,14 +91,18 @@ export function channelStrips(state, address) {
   });
 }
 
-/** One strip per configured group: `{ index, name, tone, invalid, level, readout }`. */
+/**
+ * One strip per configured group: `{ index, id, name, tone, invalid, level, readout }`. `index` is
+ * the group's position, which is where its level is in the mix.
+ */
 export function groupStrips(state, address) {
   const mix = viewMix(state, address);
   if (!mix) {
     return [];
   }
-  return groupsWithTones(state).map(({ index, name, tone, invalid }) => ({
+  return groupsWithTones(state).map(({ index, id, name, tone, invalid }) => ({
     index,
+    id,
     name,
     tone,
     invalid,

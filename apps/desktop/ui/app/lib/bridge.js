@@ -60,6 +60,12 @@ export function createEngineApi(bridge) {
     setMusicianName: (address, name) => bridge.invoke("set_musician_name", { address, name }),
     /** `mix` is a partial `set_mix` request (see buildMixRequest); resolves to the whole mix. */
     setMix: (address, mix) => bridge.invoke("set_mix", { address, mix }),
+    /**
+     * Replaces the groups: the whole list in its order, `[{ id, name, channels }]` with 1-based
+     * channels and no `id` for a new group. Resolves to the groups as kept, each with its id. The
+     * groups are saved and apply live; every musician's group levels follow their groups by id.
+     */
+    setGroups: (groups) => bridge.invoke("set_groups", { groups }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

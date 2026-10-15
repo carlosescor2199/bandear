@@ -182,7 +182,9 @@ fn parse_buffer_frames(value: &str) -> Result<u32, Box<dyn Error>> {
 /// Channel numbers are not compared with a device here. At start-up [validate_groups] rejects one
 /// the device lacks; a running engine keeps such a group but marks it invalid, as after a device
 /// switch, so the engineer's definition survives until the channel is back.
-pub(crate) fn check_groups(definitions: &[GroupDefinition]) -> Result<(), String> {
+///
+/// Public so a UI can check groups it keeps for later the way a running engine would.
+pub fn check_groups(definitions: &[GroupDefinition]) -> Result<(), String> {
     if definitions.len() > MAX_GROUPS {
         return Err(format!(
             "at most {MAX_GROUPS} groups are supported, received {}",

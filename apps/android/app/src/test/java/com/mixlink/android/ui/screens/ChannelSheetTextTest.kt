@@ -1,9 +1,45 @@
 package com.mixlink.android.ui.screens
 
+import com.mixlink.android.ui.state.ChannelUiState
+import com.mixlink.android.ui.state.channelName
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class ChannelSheetTextTest {
+    private fun channel(index: Int) = ChannelUiState(
+        index = index,
+        label = channelName(index),
+        group = null,
+        level = 80,
+        pan = 50,
+        muted = false,
+        soloed = false,
+    )
+
+    @Test
+    fun theOpenSheetFindsItsChannelByIndexNotByPosition() {
+        // A strip reports its channel's index; the list's positions need not match it.
+        val channels = listOf(channel(2), channel(5))
+
+        assertEquals(channel(5), sheetChannelFor(channels, openChannel = 5))
+        assertEquals(channel(2), sheetChannelFor(channels, openChannel = 2))
+        assertNull(sheetChannelFor(channels, openChannel = 1))
+    }
+
+    @Test
+    fun aChannelTheServerNoLongerAnnouncesHasNoSheet() {
+        val channels = (0 until 4).map(::channel)
+
+        assertNull(sheetChannelFor(channels, openChannel = 6))
+        assertNull(sheetChannelFor(emptyList(), openChannel = 0))
+    }
+
+    @Test
+    fun noSheetIsOpenWithoutAChannel() {
+        assertNull(sheetChannelFor((0 until 4).map(::channel), openChannel = null))
+    }
+
     @Test
     fun theLabelButtonIsNamedForItsChannel() {
         // Channel indexes are 0-based; the strip reads "CH 3" for index 2.

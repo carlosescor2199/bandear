@@ -1,23 +1,53 @@
 package com.mixlink.android.ui.theme
 
 import androidx.compose.material3.Typography
+import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import com.mixlink.android.R
 
 /**
  * The two faces of the MixLink look: one for text, one for numbers (levels, channel labels,
  * addresses), so digits keep their width while a level changes.
  *
- * This is the single seam for fonts. Until the bundled IBM Plex Sans and JetBrains Mono arrive
- * (task T5) the system faces stand in; T5 only replaces these two values.
+ * This is the single seam for fonts. Both are bundled with the app (`res/font`), under the SIL
+ * Open Font License 1.1, whose texts ship in `assets/licenses`: IBM Plex Sans for text and
+ * JetBrains Mono for numbers. Each is one variable font file, set to the weights the styles use.
  */
 object MixLinkFonts {
-    val Text: FontFamily = FontFamily.SansSerif
-    val Numbers: FontFamily = FontFamily.Monospace
+    /** The weights the text styles use: regular, medium and semibold. */
+    val TextWeights: List<FontWeight> = listOf(FontWeight.Normal, FontWeight.Medium, FontWeight.SemiBold)
+
+    /** The weights the number styles use: medium and semibold. */
+    val NumberWeights: List<FontWeight> = listOf(FontWeight.Medium, FontWeight.SemiBold)
+
+    val Text: FontFamily = variableFontFamily(R.font.ibm_plex_sans_variable, TextWeights)
+    val Numbers: FontFamily = variableFontFamily(R.font.jetbrains_mono_variable, NumberWeights)
 }
+
+/**
+ * A family drawn from one variable font file ([resId]): one font per weight in [weights], each set
+ * to that weight on the file's weight axis, so a style asking for a weight gets the font's own
+ * design for it rather than the nearest one or a bolder rendering.
+ *
+ * The overload of [Font] that takes the variation settings is still marked experimental in
+ * Compose 1.7; it is the one that names the axis instead of leaving it to a library default.
+ */
+@OptIn(ExperimentalTextApi::class)
+fun variableFontFamily(resId: Int, weights: List<FontWeight>): FontFamily = FontFamily(
+    weights.map { weight ->
+        Font(
+            resId = resId,
+            weight = weight,
+            variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
+        )
+    },
+)
 
 /** Text styles outside Material's roles: numbers and the small capitals of section labels. */
 object MixLinkType {

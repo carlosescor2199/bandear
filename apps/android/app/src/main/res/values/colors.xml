@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- The window's colours before Compose draws; the same as MixLinkColors' ground and accent. -->
+    <!--
+        The colours Android draws before and outside Compose (the window, the launcher icon); the same
+        as MixLinkColors' ground, accent and text.
+    -->
     <color name="mixlink_ground">#FF0D1117</color>
     <color name="mixlink_accent">#FFF5A524</color>
+    <color name="mixlink_text">#FFE6EDF3</color>
 </resources>

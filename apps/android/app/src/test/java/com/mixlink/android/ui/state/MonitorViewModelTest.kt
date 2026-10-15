@@ -74,20 +74,24 @@ class MonitorViewModelTest {
         return viewModel
     }
 
-    /** How many of the phone's mixes on the current socket the server has answered so far. */
-    private var mixesAnswered = 0
+    /** How many of the phone's mixes on each socket the server has answered so far. */
+    private val mixesAnswered = mutableMapOf<FakeSocket, Int>()
 
-    /** The server answers every mix the phone sent and it has not answered yet, in order, as it does. */
+    /**
+     * The server answers every mix the phone sent on the current socket and it has not answered yet,
+     * in order, as it does: with the mix as applied and the mix's own number.
+     */
     private fun answerMixes() {
-        val mixes = socket().sentOfType("mix")
-        mixes.drop(mixesAnswered).forEach { socket().receive(it.put("type", "mix_ack").toString()) }
-        mixesAnswered = mixes.size
+        val socket = socket()
+        val mixes = socket.sentOfType("mix")
+        mixes.drop(mixesAnswered[socket] ?: 0).forEach { socket.receive(it.put("type", "mix_ack").toString()) }
+        mixesAnswered[socket] = mixes.size
     }
 
     /**
      * A mix report of [type] as the server writes it (`mix_state` when the mix changed elsewhere,
-     * `mix_ack` answering the phone): its full 32-channel and 16-group tables, with [levels] on the
-     * first channels and the rest neutral.
+     * `mix_ack` answering the phone's mix number [seq]): its full 32-channel and 16-group tables,
+     * with [levels] on the first channels and the rest neutral.
      */
     private fun mixState(
         levels: List<Int>,
@@ -95,8 +99,10 @@ class MonitorViewModelTest {
         cap: Int = 100,
         muted: Boolean = false,
         type: String = "mix_state",
+        seq: Long? = null,
     ): String = JSONObject()
         .put("type", type)
+        .put("seq", seq)
         .put("volume_percent", volume)
         .put("max_level_percent", cap)
         .put("muted", muted)
@@ -605,14 +611,15 @@ class MonitorViewModelTest {
         answerMixes()
         viewModel.setChannelLevel(0, 40)
         viewModel.setChannelLevel(0, 50)
+        val (first, second) = socket().sentOfType("mix").takeLast(2).map { it.getLong("seq") }
         val sent = socket().sent.size
 
-        socket().receive(mixState(levels = listOf(40, 100), type = "mix_ack"))
+        socket().receive(mixState(levels = listOf(40, 100), type = "mix_ack", seq = first))
 
         assertEquals(listOf(50, 100), state.mix.levels)
 
         // What the server answers to the newest mix is what it plays, so the phone takes it.
-        socket().receive(mixState(levels = listOf(50, 60), volume = 70, type = "mix_ack"))
+        socket().receive(mixState(levels = listOf(50, 60), volume = 70, type = "mix_ack", seq = second))
 
         assertEquals(listOf(50, 60), state.mix.levels)
         assertEquals(70, state.mix.masterVolume)
@@ -635,6 +642,91 @@ class MonitorViewModelTest {
         assertEquals(before.moreOfMe, state.moreOfMe)
         assertTrue(state.moreOfMe.enabled)
         assertEquals(sent, socket().sent.size)
+    }
+
+    @Test
+    fun anAnswerArrivingBeforeAQueuedChangeIsSentNeitherUndoesNorLosesIt() {
+        connected(channels = 2)
+        viewModel.setMusicianChannel(1)
+        viewModel.setMoreOfMe(true)
+        answerMixes()
+        scheduler.holding = true
+        viewModel.setChannelLevel(0, 40)
+        scheduler.runHeld()
+
+        // The musician moves on while the control thread is busy, so that send waits; meanwhile the
+        // answer to the mix already sent arrives.
+        viewModel.setChannelLevel(0, 50)
+        answerMixes()
+
+        assertEquals(listOf(50, 100), state.mix.levels)
+        assertTrue(state.moreOfMe.enabled)
+
+        scheduler.runHeld()
+
+        assertEquals(listOf(25, 100), lastMix().ints("channels"))
+
+        answerMixes()
+
+        assertEquals(listOf(50, 100), state.mix.levels)
+        assertTrue(state.moreOfMe.enabled)
+    }
+
+    @Test
+    fun anErrorWithoutANumberNeverMakesAnOlderAnswerTheNewest() {
+        connected(channels = 2)
+        answerMixes()
+        viewModel.setChannelLevel(0, 40)
+        viewModel.setChannelLevel(0, 50)
+        val (first, second) = socket().sentOfType("mix").takeLast(2)
+
+        // An error answering a stats report, then the answer to the first mix, then a push: the second
+        // mix is still on its way, so none of them is the server's latest word.
+        socket().receive("""{"type":"error","message":"no UDP target configured for client IP"}""")
+        socket().receive(first.put("type", "mix_ack").toString())
+        socket().receive(mixState(levels = listOf(80, 70)))
+
+        assertEquals(listOf(50, 100), state.mix.levels)
+
+        socket().receive(mixState(levels = listOf(50, 60), type = "mix_ack", seq = second.getLong("seq")))
+
+        assertEquals(listOf(50, 60), state.mix.levels)
+    }
+
+    @Test
+    fun anAckWithoutANumberOnlySaysTheServerHoldsTheMix() {
+        connected(channels = 2)
+        answerMixes()
+
+        socket().receive(mixState(levels = listOf(80, 70), type = "mix_ack"))
+
+        assertEquals(listOf(100, 100), state.mix.levels)
+        assertTrue(state.connection.mixHeldByServer)
+    }
+
+    @Test
+    fun aReconnectSendsTheMixAgainUnderItsNewestNumberAndItsAnswerSettlesIt() {
+        connected(channels = 2)
+        answerMixes()
+        viewModel.setChannelLevel(0, 40)
+        val newest = lastMix().getLong("seq")
+        socket().fail("wifi gone")
+        scheduler.runDelayed()
+
+        socket().open()
+
+        assertEquals(newest, lastMix().getLong("seq"))
+        assertEquals(listOf(40, 100), lastMix().ints("channels"))
+
+        // Pushed before the server answered the mix sent again: that answer is the latest word.
+        socket().receive(mixState(levels = listOf(80, 70)))
+
+        assertEquals(listOf(40, 100), state.mix.levels)
+
+        answerMixes()
+        socket().receive(mixState(levels = listOf(80, 70)))
+
+        assertEquals(listOf(80, 70), state.mix.levels)
     }
 
     @Test

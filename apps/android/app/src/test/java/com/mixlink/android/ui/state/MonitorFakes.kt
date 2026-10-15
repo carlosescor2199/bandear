@@ -140,16 +140,29 @@ internal class FakeScanner(val listener: ServerDiscovery.Listener) : ServerScann
     }
 }
 
-/** Runs immediate work at once; keeps delayed work until [runDelayed]. */
+/**
+ * Runs immediate work at once, or, while [holding], keeps it until [runHeld], as a busy control thread
+ * would; keeps delayed work until [runDelayed].
+ */
 internal class FakeControlScheduler : ControlScheduler {
     private class Delayed(val delayMs: Long, val task: () -> Unit)
 
     private val delayed = mutableListOf<Delayed>()
+    private val held = ArrayDeque<() -> Unit>()
     var shutDown = false
         private set
 
+    /** While true, immediate work waits for [runHeld] instead of running at once. */
+    var holding = false
+
     override fun execute(task: () -> Unit) {
-        if (!shutDown) task()
+        if (shutDown) return
+        if (holding) held.addLast(task) else task()
+    }
+
+    /** Runs the immediate work held so far, in order, then whatever it queued in turn. */
+    fun runHeld() {
+        while (held.isNotEmpty()) held.removeFirst()()
     }
 
     override fun schedule(delayMs: Long, task: () -> Unit): ScheduledTask? {
@@ -171,6 +184,7 @@ internal class FakeControlScheduler : ControlScheduler {
     override fun shutdown() {
         shutDown = true
         delayed.clear()
+        held.clear()
     }
 }
 

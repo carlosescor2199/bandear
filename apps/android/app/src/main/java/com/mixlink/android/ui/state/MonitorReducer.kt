@@ -24,9 +24,11 @@ import com.mixlink.android.ui.state.MonitorEvent.ManualAddressEdited
 import com.mixlink.android.ui.state.MonitorEvent.MasterMuteChanged
 import com.mixlink.android.ui.state.MonitorEvent.MasterVolumeChanged
 import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
+import com.mixlink.android.ui.state.MonitorEvent.MixAnswered
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
+import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -34,7 +36,6 @@ import com.mixlink.android.ui.state.MonitorEvent.MixesLoaded
 import com.mixlink.android.ui.state.MonitorEvent.MoreOfMeToggled
 import com.mixlink.android.ui.state.MonitorEvent.MusicianChannelChosen
 import com.mixlink.android.ui.state.MonitorEvent.NameChanged
-import com.mixlink.android.ui.state.MonitorEvent.ServerMixReceived
 import com.mixlink.android.ui.state.MonitorEvent.ServersChanged
 import com.mixlink.android.ui.state.MonitorEvent.SessionEnded
 import com.mixlink.android.ui.state.MonitorEvent.SessionStarted
@@ -110,7 +111,9 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
     is MasterVolumeChanged -> state.copy(mix = state.mix.copy(masterVolume = event.level.coerceIn(PERCENT)))
     is MasterMuteChanged -> state.copy(mix = state.mix.copy(masterMuted = event.muted))
     is LevelCapChanged -> state.copy(mix = state.mix.copy(levelCap = event.level.coerceIn(PERCENT)))
-    is ServerMixReceived -> applyServerMix(state, event.snapshot)
+    // A push while a change of the phone's is on its way is overtaken by that change's answer.
+    is MixPushed -> if (state.mixSync.settled) applyServerMix(state, event.snapshot) else state
+    is MixAnswered -> answerMix(state, event.seq, event.applied)
 
     is MoreOfMeToggled -> state.copy(moreOfMe = toggleMoreOfMe(state.moreOfMe, event.on))
     is MusicianChannelChosen -> chooseMusicianChannel(state, event.channel)
@@ -163,6 +166,21 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
 
     is NameChanged -> state.copy(musicianName = event.name)
     is TabSelected -> state.copy(tab = event.tab)
+}
+
+/**
+ * [reduce] for a change the musician made. When [sends] says the change goes to the server, the same
+ * step numbers it as the phone's newest mix ([MixSyncState.changed]): the change and its number land
+ * in one state, so a send still queued already counts, and no answer from the server can be matched
+ * to a mix older than the one on screen.
+ */
+internal fun reduceChange(
+    state: MonitorUiState,
+    event: MonitorEvent,
+    sends: (before: MonitorUiState, after: MonitorUiState) -> Boolean,
+): MonitorUiState {
+    val next = reduce(state, event)
+    return if (sends(state, next)) next.copy(mixSync = next.mixSync.changed()) else next
 }
 
 /** The connection showing a control channel in [controlState], with the mix held where [mixAcknowledged] says. */
@@ -271,8 +289,19 @@ private fun MixUiState.recalled(snapshot: MixSnapshot): MixUiState {
 }
 
 /**
+ * The server answered the phone's change number [seq], with the whole mix it now plays ([applied])
+ * or with nothing (it refused the mix). The server answers in order, so every older change is
+ * answered too. Only the answer to the newest change is shown: an older one's mix is overtaken by
+ * a change still on its way, whose own answer follows.
+ */
+private fun answerMix(state: MonitorUiState, seq: Long, applied: MixSnapshot?): MonitorUiState {
+    val answered = state.copy(mixSync = state.mixSync.answeredUpTo(seq))
+    return if (applied != null && seq == state.mixSync.latest) applyServerMix(answered, applied) else answered
+}
+
+/**
  * The server's whole mix, pushed because it changed elsewhere (such as on the desktop) or answering
- * the phone's newest mix: it becomes the phone's current mix, exactly as the server plays it. The
+ * the phone's newest change: it becomes the phone's current mix, exactly as the server plays it. The
  * saved mixes are left alone.
  *
  * A report belongs to a session, so a late one changes nothing once the session ended. A report of

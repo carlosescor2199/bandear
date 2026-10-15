@@ -31,9 +31,11 @@ import com.mixlink.android.ui.state.MonitorEvent.ManualAddressEdited
 import com.mixlink.android.ui.state.MonitorEvent.MasterMuteChanged
 import com.mixlink.android.ui.state.MonitorEvent.MasterVolumeChanged
 import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
+import com.mixlink.android.ui.state.MonitorEvent.MixAnswered
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
+import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -41,7 +43,6 @@ import com.mixlink.android.ui.state.MonitorEvent.MixesLoaded
 import com.mixlink.android.ui.state.MonitorEvent.MoreOfMeToggled
 import com.mixlink.android.ui.state.MonitorEvent.MusicianChannelChosen
 import com.mixlink.android.ui.state.MonitorEvent.NameChanged
-import com.mixlink.android.ui.state.MonitorEvent.ServerMixReceived
 import com.mixlink.android.ui.state.MonitorEvent.ServersChanged
 import com.mixlink.android.ui.state.MonitorEvent.SessionEnded
 import com.mixlink.android.ui.state.MonitorEvent.SessionStarted
@@ -163,7 +164,9 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             dispatch(MixAcknowledged(control.controlState))
         }
 
-        override fun onServerMix(mix: MixSnapshot) = serverMixReceived(mix)
+        override fun onMixPushed(mix: MixSnapshot) = serverMixReported(MixPushed(mix))
+
+        override fun onMixAnswered(seq: Long, applied: MixSnapshot?) = serverMixReported(MixAnswered(seq, applied))
 
         override fun onClosed() = publishControlState()
 
@@ -186,6 +189,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         currentSnapshot = { _state.value.mix.toSnapshot() },
         moreOfMeEnabled = { _state.value.moreOfMe.enabled },
         musicianChannel = { _state.value.moreOfMe.musicianChannel },
+        mixSequence = { _state.value.mixSync.latest },
         transport = collaborators.controlTransport,
         scheduler = collaborators.controlScheduler,
     )
@@ -283,11 +287,12 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
 
     /** A `config`; when it drops the musician's channel the phone forgets it, and resends if More of me went off. */
     private fun configReceived(channels: Int, groups: List<GroupInfo>) {
-        val (before, after) = dispatch(ConfigReceived(channels, groups))
+        val (before, after) = change(ConfigReceived(channels, groups)) { before, after ->
+            before.moreOfMe.enabled && !after.moreOfMe.enabled
+        }
         if (before.moreOfMe.musicianChannel != after.moreOfMe.musicianChannel) {
             store.setMusicianChannel(after.moreOfMe.musicianChannel)
         }
-        if (before.moreOfMe.enabled && !after.moreOfMe.enabled) control.sendMixControl()
     }
 
     // The mix. A change that changes nothing (a value already set, a channel that does not exist)
@@ -310,24 +315,44 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     override fun setLevelCap(level: Int) = changeMix(LevelCapChanged(level))
 
     private fun changeMix(event: MonitorEvent) {
-        val (before, after) = dispatch(event)
-        if (before.mix == after.mix) return
-        syncPlayerMix()
-        control.sendMixControl()
+        change(event) { before, after -> before.mix != after.mix }
     }
 
     /**
-     * The server reported the musician's whole mix with none of the phone's mixes left unanswered:
-     * pushed because it changed on the desktop, or answering the newest mix sent. It arrives on the
-     * control thread. The screen and the receive thread follow it, but it is never sent back: the
-     * server already plays it, so a send would only echo it.
+     * Applies a change the musician made and, when [sends] says it goes to the server, numbers it as
+     * the phone's newest mix in the same atomic step ([reduceChange]) and sends it. The number is
+     * taken now, as the change lands, not when the control thread gets to the send, so an answer to
+     * an earlier mix arriving in between can never be taken for the server's latest word.
+     */
+    private fun change(
+        event: MonitorEvent,
+        sends: (before: MonitorUiState, after: MonitorUiState) -> Boolean,
+    ): Pair<MonitorUiState, MonitorUiState> {
+        while (true) {
+            val before = _state.value
+            val after = reduceChange(before, event, sends)
+            if (!_state.compareAndSet(before, after)) continue
+            if (after.mixSync.latest != before.mixSync.latest) {
+                syncPlayerMix()
+                control.sendMixControl()
+            }
+            return before to after
+        }
+    }
+
+    /**
+     * The server pushed the musician's mix (changed on the desktop) or answered one of the phone's
+     * mixes; it arrives on the control thread. The reducer shows it only when it is the server's
+     * latest word: a push while none of the phone's changes is on its way, or the answer to the
+     * newest change. The screen and the receive thread then follow it, but it is never sent back:
+     * the server already plays it, so a send would only echo it.
      *
      * A fader the musician is still moving is not held back: a push lands at once, and the next
      * step of the gesture sends its own value with the pushed mix around it. The server keeps
      * whichever whole mix it got last, and its answer to the phone's last mix brings the screen to it.
      */
-    private fun serverMixReceived(mix: MixSnapshot) {
-        val (before, after) = dispatch(ServerMixReceived(mix))
+    private fun serverMixReported(event: MonitorEvent) {
+        val (before, after) = dispatch(event)
         if (before.mix != after.mix) syncPlayerMix()
     }
 
@@ -349,17 +374,16 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
 
     /** Turns More of me on or off; it stays off, with a notice, until a channel is chosen. */
     override fun setMoreOfMe(on: Boolean) {
-        val (before, after) = dispatch(MoreOfMeToggled(on))
-        if (before.moreOfMe.enabled != after.moreOfMe.enabled) control.sendMixControl()
+        change(MoreOfMeToggled(on)) { before, after -> before.moreOfMe.enabled != after.moreOfMe.enabled }
     }
 
     /** Takes [channel] as the musician's, or none, and remembers it on the phone. */
     override fun setMusicianChannel(channel: Int?) {
-        val (before, after) = dispatch(MusicianChannelChosen(channel))
-        if (after.moreOfMe.musicianChannel != channel) return
-        store.setMusicianChannel(channel)
         // Either More of me now lifts another channel, or it just went off: the mix sent changes.
-        if (before.moreOfMe.enabled) control.sendMixControl()
+        val (_, after) = change(MusicianChannelChosen(channel)) { before, after ->
+            after.moreOfMe.musicianChannel == channel && before.moreOfMe.enabled
+        }
+        if (after.moreOfMe.musicianChannel == channel) store.setMusicianChannel(channel)
     }
 
     // Saved mixes. They hold the stored mix, never the More of me derivation.
@@ -386,9 +410,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             dispatch(MixMissing(name, savedNames()))
             return
         }
-        dispatch(MixRecalled(name, bank.snapshot))
-        syncPlayerMix()
-        control.sendMixControl()
+        change(MixRecalled(name, bank.snapshot)) { _, _ -> true }
     }
 
     /** Renames a saved mix. A name another mix already has is refused, so no mix is overwritten. */

@@ -16,8 +16,9 @@ use crate::engine::{EngineEvent, EventBus, MixOrigin};
 use crate::health::LinkReport;
 use crate::mix::GroupLayout;
 use crate::protocol::{
-    control_error, control_message_type, mix_ack, mix_state_message, parse_mix_update,
-    parse_register_command, parse_stats_command, registered_name, ControlConfig, GroupConfig,
+    control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
+    parse_mix_update, parse_register_command, parse_stats_command, registered_name, ControlConfig,
+    GroupConfig,
 };
 use crate::targets::TargetRegistry;
 
@@ -562,8 +563,16 @@ async fn handle_control_connection(
                     // The join is live: a peer whose target was removed at runtime finds no mix
                     // state here and gets the same error an IP that was never configured has always
                     // received. The control channel itself is deliberately left open.
+                    //
+                    // A `mix` may carry the phone's number for it; the answer, ack or error, carries
+                    // it back. Any other type that ends up here is never numbered.
+                    let seq = if message_type == "mix" {
+                        mix_sequence(&text)
+                    } else {
+                        None
+                    };
                     Some(match targets.mix_state(peer.ip()) {
-                        None => control_error(NO_TARGET_ERROR.to_owned())?,
+                        None => mix_error(NO_TARGET_ERROR.to_owned(), seq)?,
                         Some(mix_state) => {
                             match parse_mix_update(&text)
                                 .and_then(|update| mix_state.apply(&update))
@@ -573,9 +582,9 @@ async fn handle_control_connection(
                                         address: peer,
                                         origin: MixOrigin::Client { peer },
                                     });
-                                    mix_ack(values)?
+                                    mix_ack(values, seq)?
                                 }
-                                Err(error) => control_error(error)?,
+                                Err(error) => mix_error(error, seq)?,
                             }
                         }
                     })
@@ -1397,6 +1406,92 @@ mod tests {
             "the error names the field: {message}"
         );
         assert!(slot.lock().expect("report lock").is_none());
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    async fn send_text(client: &mut ClientStream, text: &str) {
+        client
+            .send(Message::Text(text.into()))
+            .await
+            .expect("client should send");
+    }
+
+    /// A phone numbers its mixes with `seq`, and the answer to each one, an ack or an error, carries
+    /// the same number back. A mix without one is answered without one, exactly as before.
+    #[tokio::test]
+    async fn the_answer_to_a_mix_echoes_its_sequence() {
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &GroupLayout::default(),
+            )
+            .expect("registry should build"),
+        );
+        let (address, stopped, server) = start_registration_server(targets);
+        let mut client = connect_client(address).await;
+
+        send_text(
+            &mut client,
+            r#"{"type":"mix","seq":7,"volume_percent":80,"max_level_percent":90,"muted":false}"#,
+        )
+        .await;
+        let ack = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(ack["type"], "mix_ack");
+        assert_eq!(ack["seq"], 7);
+
+        // More channels than the engine mixes, so the mix is refused.
+        let oversized = format!(
+            r#"{{"type":"mix","seq":8,"volume_percent":80,"max_level_percent":90,"muted":false,"channels":[{}]}}"#,
+            vec!["100"; 33].join(",")
+        );
+        send_text(&mut client, &oversized).await;
+        let refused = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["seq"], 8);
+
+        send_text(
+            &mut client,
+            r#"{"type":"mix","volume_percent":70,"max_level_percent":90,"muted":false}"#,
+        )
+        .await;
+        let unnumbered = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(unnumbered["type"], "mix_ack");
+        assert!(unnumbered.get("seq").is_none(), "{unnumbered}");
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// Only an answer to a mix carries a sequence. An error answering a registration, a stats report
+    /// or a message of another type never does, whatever that message carried; a mix refused because
+    /// the peer has no target still gets its own number back.
+    #[tokio::test]
+    async fn errors_answering_other_messages_never_carry_a_sequence() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(targets);
+        let mut client = connect_client(address).await;
+
+        for other in [
+            r#"{"type":"stats","seq":4,"interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}"#,
+            r#"{"type":"register","seq":5}"#,
+            r#"{"type":"mix_preview","seq":6}"#,
+        ] {
+            send_text(&mut client, other).await;
+            let reply = read_next_reply(&mut client).await.expect("an error reply");
+            assert_eq!(reply["type"], "error", "{other}");
+            assert!(reply.get("seq").is_none(), "{other} -> {reply}");
+        }
+
+        send_text(
+            &mut client,
+            r#"{"type":"mix","seq":9,"volume_percent":80,"max_level_percent":90,"muted":false}"#,
+        )
+        .await;
+        let refused = read_next_reply(&mut client).await.expect("an error reply");
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["message"], NO_TARGET_ERROR);
+        assert_eq!(refused["seq"], 9);
 
         stop_server(address, &stopped, server).await;
     }

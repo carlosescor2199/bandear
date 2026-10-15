@@ -58,6 +58,30 @@ pub(crate) fn parse_mix_update(json: &str) -> Result<MixUpdate, String> {
     })
 }
 
+/// The number a phone gave its `mix`, so the answer to it can carry the number back. Newer phones
+/// number their mixes in order, which lets them tell the answer to their newest mix from the
+/// answers to older ones still on their way. Read leniently: anything but an unsigned integer, or
+/// a message that is not JSON, is read as no number, and the answer then carries none.
+pub(crate) fn mix_sequence(json: &str) -> Option<u64> {
+    serde_json::from_str::<MixSequence>(json)
+        .ok()
+        .and_then(|numbered| numbered.seq)
+}
+
+#[derive(Deserialize)]
+struct MixSequence {
+    #[serde(default, deserialize_with = "lenient_sequence")]
+    seq: Option<u64>,
+}
+
+fn lenient_sequence<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(serde_json::Value::as_u64))
+}
+
 /// Parses a `mix` control message and merges it into `current`, the two steps a connection takes
 /// in one call, so the tests can pin the parse and the merge together.
 #[cfg(test)]
@@ -200,11 +224,14 @@ pub(crate) fn control_message_type(json: &str) -> Result<String, String> {
 ///
 /// Two messages share this shape: `mix_ack` answers the phone's own `mix`, and `mix_state` tells
 /// the phone its mix was changed from elsewhere (the desktop, or another socket of the same
-/// musician). A phone that predates `mix_state` ignores it, as it ignores any unknown type.
+/// musician). A phone that predates `mix_state` ignores it, as it ignores any unknown type. An ack
+/// carries the number of the `mix` it answers when that mix had one; a push never does.
 #[derive(Serialize)]
 struct MixReport {
     #[serde(rename = "type")]
     message_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
     volume_percent: u8,
     max_level_percent: u8,
     muted: bool,
@@ -231,11 +258,15 @@ pub(crate) struct ControlConfig {
     pub(crate) groups: Vec<GroupConfig>,
 }
 
+/// An `error` reply. It carries `seq` only when it refuses a numbered `mix`, so a phone can tell
+/// which of its mixes was refused; an error answering anything else never carries one.
 #[derive(Serialize)]
 struct ControlError {
     #[serde(rename = "type")]
     message_type: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
 }
 
 // Packet layout: magic[4], version[1], channels[1], sample_rate[4 LE],
@@ -254,19 +285,26 @@ pub(crate) fn serialize_packet(packet: &AudioPacket) -> Vec<u8> {
     bytes
 }
 
-pub(crate) fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
-    mix_report("mix_ack", values)
+/// The `mix_ack` message: the whole mix now applied, answering a phone's `mix`, with that mix's
+/// number when it had one (see [mix_sequence]).
+pub(crate) fn mix_ack(values: MixValues, seq: Option<u64>) -> Result<String, serde_json::Error> {
+    mix_report("mix_ack", values, seq)
 }
 
 /// The `mix_state` message: the musician's whole current mix, pushed when it changed without the
 /// phone asking, so the phone's screen can follow without sending the change back.
 pub(crate) fn mix_state_message(values: MixValues) -> Result<String, serde_json::Error> {
-    mix_report("mix_state", values)
+    mix_report("mix_state", values, None)
 }
 
-fn mix_report(message_type: &'static str, values: MixValues) -> Result<String, serde_json::Error> {
+fn mix_report(
+    message_type: &'static str,
+    values: MixValues,
+    seq: Option<u64>,
+) -> Result<String, serde_json::Error> {
     serde_json::to_string(&MixReport {
         message_type,
+        seq,
         volume_percent: values.volume_percent,
         max_level_percent: values.max_level_percent,
         muted: values.muted,
@@ -278,10 +316,21 @@ fn mix_report(message_type: &'static str, values: MixValues) -> Result<String, s
     })
 }
 
+/// An `error` answering anything but a `mix`; it never carries a number.
 pub(crate) fn control_error(message: String) -> Result<String, serde_json::Error> {
+    error_reply(message, None)
+}
+
+/// The `error` that refuses a phone's `mix`, with that mix's number when it had one.
+pub(crate) fn mix_error(message: String, seq: Option<u64>) -> Result<String, serde_json::Error> {
+    error_reply(message, seq)
+}
+
+fn error_reply(message: String, seq: Option<u64>) -> Result<String, serde_json::Error> {
     serde_json::to_string(&ControlError {
         message_type: "error",
         message,
+        seq,
     })
 }
 
@@ -316,7 +365,7 @@ mod tests {
         )
         .unwrap();
 
-        let ack = mix_ack(values).unwrap();
+        let ack = mix_ack(values, None).unwrap();
 
         assert!(ack.contains(r#""type":"mix_ack""#));
         assert!(ack.contains(r#""channels":[100,40,100"#));
@@ -330,9 +379,49 @@ mod tests {
         )
         .unwrap();
 
-        let ack = mix_ack(values).unwrap();
+        let ack = mix_ack(values, None).unwrap();
 
         assert!(ack.contains(r#""group_levels":[80,"#));
+    }
+
+    #[test]
+    fn a_mix_sequence_is_read_only_as_an_unsigned_integer() {
+        assert_eq!(
+            mix_sequence(r#"{"type":"mix","seq":7,"volume_percent":80}"#),
+            Some(7)
+        );
+        assert_eq!(mix_sequence(r#"{"type":"mix","volume_percent":80}"#), None);
+        for odd in [
+            r#"{"type":"mix","seq":-1}"#,
+            r#"{"type":"mix","seq":"7"}"#,
+            r#"{"type":"mix","seq":1.5}"#,
+            r#"{"type":"mix","seq":null}"#,
+            "not json",
+        ] {
+            assert_eq!(mix_sequence(odd), None, "{odd}");
+        }
+    }
+
+    #[test]
+    fn answers_to_a_mix_echo_its_sequence_and_nothing_else_carries_one() {
+        let parse = |json: String| serde_json::from_str::<serde_json::Value>(&json).unwrap();
+
+        let ack = parse(mix_ack(MixValues::default(), Some(7)).unwrap());
+        let refused = parse(mix_error("too many channels".to_owned(), Some(8)).unwrap());
+
+        assert_eq!(ack["type"], "mix_ack");
+        assert_eq!(ack["seq"], 7);
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["message"], "too many channels");
+        assert_eq!(refused["seq"], 8);
+        for unnumbered in [
+            parse(mix_ack(MixValues::default(), None).unwrap()),
+            parse(mix_error("too many channels".to_owned(), None).unwrap()),
+            parse(control_error("no UDP target configured for client IP".to_owned()).unwrap()),
+            parse(mix_state_message(MixValues::default()).unwrap()),
+        ] {
+            assert!(unnumbered.get("seq").is_none(), "{unnumbered}");
+        }
     }
 
     #[test]

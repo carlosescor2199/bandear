@@ -177,6 +177,31 @@ user's decision.
   `aPushOlderThanAMixStillInFlightGivesWayToTheAnswerToThatMix`,
   `withTwoMixesInFlightOnlyTheAnswerToTheNewestIsTaken`). GREEN: `:app:testDebugUnitTest
   assembleDebug --rerun-tasks` ok, 365 tests (8 new), 0 failures. Commit: this commit.
+- [x] T3c (server and Android, review R3-001 and R3-002 of T3b): correlate the server's answers
+  with the phone's mixes by sequence number instead of counting them. Counting lost a step when an
+  answer arrived before a queued send was counted (R3-001), and counted errors that answered
+  registrations or stats reports (R3-002). Server: a `mix` may carry an unsigned `seq`
+  (`mix_sequence`, read leniently); the `mix_ack` and the `error` (`mix_error`) answering that mix
+  echo it, and nothing else ever carries one (`control_error`, `mix_state`, errors for other
+  types). Android: the number lives in the UI state (`MixSyncState(latest, answered)`) so a change
+  and its number land in one compare-and-set: `reduceChange` numbers every change that is sent
+  (faders, pans, mutes, solos, groups, master, More of me, recall, a `config` that turns More of
+  me off) as it lands, and a queued send reads the number, then the mix, when it runs.
+  `ControlChannel` only carries `seq` both ways (`mixSequence`, `Listener.onMixAnswered`,
+  `Listener.onMixPushed`); the counting is gone. The reducer shows an answer only when it names
+  `latest` (`MixAnswered`), shows a push only when `answered >= latest` (`MixPushed`), and an ack
+  or error without `seq` never touches the mixes (`mixAcknowledged` unchanged). Numbers only grow:
+  every open already re-sends the mix after the registration, under `latest`, so its answer
+  settles whatever a lost connection left outstanding; a push that lands before that answer is
+  dropped. Route: delegated writer. RED observed: server 9 compile errors (`mix_sequence`,
+  `mix_error` missing, `mix_ack` arity); Android compile errors (`mixSequence`, `onMixPushed`,
+  `onMixAnswered`, `MixPushed`, `MixAnswered`, `reduceChange` missing), and against the T3b code 5
+  ViewModel tests failed, among them the R3-001 reproduction with a holding scheduler
+  (`anAnswerArrivingBeforeAQueuedChangeIsSentNeitherUndoesNorLosesIt`) and R3-002
+  (`anErrorWithoutANumberNeverMakesAnOlderAnswerTheNewest`). GREEN: `cargo fmt -p
+  personal-monitoring` clean, `cargo test -p personal-monitoring` 200 passed (4 new);
+  `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 374 tests (14 new, 5 T3b counting
+  tests replaced), 0 failures. Commit: this commit.
 - [x] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
   about 30 Hz; the UI keeps one `engine_status` call for the first paint. The network thread
   meters each musician's mixed stereo output (`OutputMeter` on the target: one pass and two

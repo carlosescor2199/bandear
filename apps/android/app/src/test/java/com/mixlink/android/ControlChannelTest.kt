@@ -7,6 +7,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicBoolean
@@ -20,33 +21,33 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ControlChannelTest {
     private val events = RecordingListener()
     private val transport = FakeTransport()
-    private val scheduler = FakeControlScheduler()
+
+    /** The number of the phone's newest mix change, as the ViewModel would hand it to the channel. */
+    private var newestMix: Long? = 12
     private val channel = ControlChannel(
         listener = events,
         running = AtomicBoolean(true),
         currentSnapshot = { MixSnapshot() },
         moreOfMeEnabled = { false },
         musicianChannel = { null },
+        mixSequence = { newestMix },
         transport = transport,
-        scheduler = scheduler,
+        scheduler = FakeControlScheduler(),
     )
 
-    /**
-     * Opens the channel, lets the server announce itself as it does right after connect, and answers
-     * the mix every open sends with a bare acknowledgement, so no mix is left unanswered.
-     */
+    /** Opens the channel and lets the server announce itself, as it does right after connect. */
     private fun openChannel(): FakeSocket {
         channel.connect("192.168.1.20", 50001, 50000, "Ana")
         return transport.sockets.single().also { socket ->
             socket.open()
             socket.receive("""{"type":"config","source_channels":2,"groups":[]}""")
-            socket.receive("""{"type":"mix_ack"}""")
         }
     }
 
-    /** A mix report as the server writes it: its full 32-channel and 16-group tables. */
-    private fun mixReport(type: String, firstLevel: Int = 10): String = JSONObject()
+    /** A mix report as the server writes it: its full 32-channel and 16-group tables, and [seq] if any. */
+    private fun mixReport(type: String, firstLevel: Int = 10, seq: Long? = null): String = JSONObject()
         .put("type", type)
+        .put("seq", seq)
         .put("volume_percent", 80)
         .put("max_level_percent", 90)
         .put("muted", true)
@@ -64,7 +65,7 @@ class ControlChannelTest {
 
         socket.receive(mixReport("mix_state"))
 
-        val mix = events.serverMixes.single()
+        val mix = events.pushed.single()
         assertArrayEquals(IntArray(32) { 10 + it }, mix.channelGains)
         assertArrayEquals(IntArray(32) { if (it == 1) 25 else defaultPan(it) }, mix.channelPans)
         assertArrayEquals(BooleanArray(32) { it == 2 }, mix.channelMutes)
@@ -83,7 +84,7 @@ class ControlChannelTest {
 
         socket.receive("""{"type":"mix_preview","channels":[1,2]}""")
 
-        assertTrue(events.serverMixes.isEmpty())
+        assertTrue(events.pushed.isEmpty())
         assertTrue(events.errors.isEmpty())
     }
 
@@ -93,76 +94,75 @@ class ControlChannelTest {
 
         socket.receive("""{"type":"mix_state","volume_percent":80,"channels":[100,100]}""")
 
-        assertTrue(events.serverMixes.isEmpty())
+        assertTrue(events.pushed.isEmpty())
         assertTrue(events.errors.single(), events.errors.single().startsWith("Invalid control response"))
     }
 
-    // Which reports are the server's latest word on the mix.
+    // The numbers that match the server's answers to the phone's mixes.
 
     @Test
-    fun theAnswerToTheNewestMixIsHandedOnAndAnAnswerToAnOlderOneIsNot() {
+    fun aMixCarriesTheNumberOfTheNewestChangeAndNoneWithoutOne() {
         val socket = openChannel()
+
+        newestMix = null
         channel.sendMixControl()
-        channel.sendMixControl()
 
-        socket.receive(mixReport("mix_ack", firstLevel = 40))
-
-        assertTrue(events.serverMixes.isEmpty())
-
-        socket.receive(mixReport("mix_ack", firstLevel = 50))
-
-        assertEquals(50, events.serverMixes.single().channelGains[0])
-        assertEquals(3, events.acknowledged)
+        val (opening, unnumbered) = socket.sentOfType("mix")
+        assertEquals(12L, opening.getLong("seq"))
+        assertFalse(unnumbered.has("seq"))
     }
 
     @Test
-    fun aPushWhileAMixIsUnansweredIsDroppedForTheAnswerThatFollows() {
+    fun aNumberedAckAnswersItsMixWithTheMixTheServerPlays() {
         val socket = openChannel()
-        channel.sendMixControl()
 
-        socket.receive(mixReport("mix_state", firstLevel = 80))
-        socket.receive(mixReport("mix_ack", firstLevel = 40))
+        socket.receive(mixReport("mix_ack", firstLevel = 40, seq = 12))
 
-        assertEquals(listOf(40), events.serverMixes.map { it.channelGains[0] })
-    }
-
-    @Test
-    fun aRefusedMixCountsAsAnswered() {
-        val socket = openChannel()
-        channel.sendMixControl()
-        socket.receive("""{"type":"error","message":"no target for this address"}""")
-        channel.sendMixControl()
-
-        socket.receive(mixReport("mix_ack", firstLevel = 40))
-
-        assertEquals(listOf(40), events.serverMixes.map { it.channelGains[0] })
-    }
-
-    @Test
-    fun aNewConnectionStartsWithNoMixUnanswered() {
-        val first = openChannel()
-        channel.sendMixControl()
-        first.fail("wifi gone")
-        scheduler.runDelayed()
-        val second = transport.sockets.last()
-
-        // The open sends the mix again; its answer is the newest, whatever the lost socket left.
-        second.open()
-        second.receive(mixReport("mix_ack", firstLevel = 40))
-
-        assertEquals(listOf(40), events.serverMixes.map { it.channelGains[0] })
-    }
-
-    @Test
-    fun anAcknowledgementWithoutAReadableMixStillAcknowledges() {
-        val socket = openChannel()
-        channel.sendMixControl()
-
-        socket.receive("""{"type":"mix_ack","channels":[100]}""")
-
-        assertEquals(2, events.acknowledged)
+        val (seq, mix) = events.answers.single()
+        assertEquals(12L, seq)
+        assertEquals(40, mix?.channelGains?.get(0))
+        assertEquals(1, events.acknowledged)
         assertTrue(channel.mixAcknowledged)
-        assertTrue(events.serverMixes.isEmpty())
+    }
+
+    @Test
+    fun anAckWithoutANumberOnlyAcknowledges() {
+        val socket = openChannel()
+
+        socket.receive(mixReport("mix_ack", firstLevel = 40))
+
+        assertTrue(events.answers.isEmpty())
+        assertEquals(1, events.acknowledged)
+    }
+
+    @Test
+    fun aNumberedErrorAnswersItsMixWithNothingToShow() {
+        val socket = openChannel()
+
+        socket.receive("""{"type":"error","message":"too many channels","seq":12}""")
+
+        assertEquals(listOf(12L to null), events.answers)
+        assertEquals(listOf("too many channels"), events.errors)
+    }
+
+    @Test
+    fun anErrorWithoutANumberNeverTouchesTheMixes() {
+        val socket = openChannel()
+
+        socket.receive("""{"type":"error","message":"no UDP target configured for client IP"}""")
+
+        assertTrue(events.answers.isEmpty())
+        assertEquals(listOf("no UDP target configured for client IP"), events.errors)
+    }
+
+    @Test
+    fun aNumberedAckWhoseMixCannotBeReadStillAnswersItsNumber() {
+        val socket = openChannel()
+
+        socket.receive("""{"type":"mix_ack","seq":12,"channels":[100]}""")
+
+        assertEquals(listOf(12L to null), events.answers)
+        assertEquals(1, events.acknowledged)
         assertTrue(events.errors.isEmpty())
     }
 
@@ -226,7 +226,8 @@ class ControlChannelTest {
     }
 
     private class RecordingListener : ControlChannel.Listener {
-        val serverMixes = mutableListOf<MixSnapshot>()
+        val pushed = mutableListOf<MixSnapshot>()
+        val answers = mutableListOf<Pair<Long, MixSnapshot?>>()
         val errors = mutableListOf<String>()
         var acknowledged = 0
 
@@ -238,8 +239,12 @@ class ControlChannelTest {
             acknowledged++
         }
 
-        override fun onServerMix(mix: MixSnapshot) {
-            serverMixes += mix
+        override fun onMixPushed(mix: MixSnapshot) {
+            pushed += mix
+        }
+
+        override fun onMixAnswered(seq: Long, applied: MixSnapshot?) {
+            answers += seq to applied
         }
 
         override fun onClosed() = Unit

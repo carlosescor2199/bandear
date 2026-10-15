@@ -3,7 +3,6 @@ package com.mixlink.android.ui.screens
 import com.mixlink.android.ui.components.PillKind
 import com.mixlink.android.ui.state.ConnectionUiState
 import com.mixlink.android.ui.state.ServerEndpoint
-import com.mixlink.android.ui.state.channelName
 import com.mixlink.android.ui.theme.ColorToken
 
 /** What the row of strips on the Mix screen shows: one strip per channel, or one per group. */
@@ -38,9 +37,9 @@ fun stripFaderDescription(label: String, mine: Boolean, muted: Boolean): String 
     if (muted) append(", muted")
 }
 
-/** The channels of a group, as their strips name them. */
-fun groupMembersText(channels: List<Int>): String =
-    if (channels.isEmpty()) "No channels" else channels.joinToString(" · ") { channelName(it) }
+/** The channels of a group, as their strips name them ([com.mixlink.android.ui.state.GroupUiState.members]). */
+fun groupMembersText(members: List<String>): String =
+    if (members.isEmpty()) "No channels" else members.joinToString(" · ")
 
 /** The small capitals over the row of strips, with how many it holds. */
 fun sectionTitle(view: MixView, count: Int): String = "${view.label.uppercase()} · $count"

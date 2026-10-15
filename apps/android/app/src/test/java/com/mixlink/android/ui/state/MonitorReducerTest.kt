@@ -571,7 +571,7 @@ class MonitorReducerTest {
 
         assertTrue(on.moreOfMe.enabled)
         assertNull(on.moreOfMe.notice)
-        assertEquals("CH 2", on.moreOfMe.channelLabel)
+        assertEquals("CH 2", on.mix.labelOf(on.moreOfMe.musicianChannel!!))
         assertFalse(on.after(MoreOfMeToggled(false)).moreOfMe.enabled)
     }
 

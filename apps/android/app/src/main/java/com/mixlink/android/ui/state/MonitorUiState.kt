@@ -299,11 +299,7 @@ data class MoreOfMeUiState(
     val enabled: Boolean = false,
     val musicianChannel: Int? = null,
     val notice: MoreOfMeNotice? = null,
-) {
-    /** The musician's channel as its strip names it, or null when none is chosen. */
-    val channelLabel: String?
-        get() = musicianChannel?.let(::channelName)
-}
+)
 
 /** One saved mix in the list. [active] marks the mix last saved or recalled. */
 data class SavedMixUiState(val name: String, val active: Boolean)

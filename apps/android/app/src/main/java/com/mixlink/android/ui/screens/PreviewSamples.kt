@@ -1,5 +1,7 @@
 package com.mixlink.android.ui.screens
 
+import com.mixlink.android.ChannelInfo
+import com.mixlink.android.ChannelKind
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.ui.components.LinkHealth
 import com.mixlink.android.ui.components.MainTab
@@ -34,12 +36,23 @@ internal object PreviewSamples {
         groupDefinitions = listOf(
             GroupInfo("Drums", listOf(0, 1)),
             GroupInfo("Vocals", listOf(2, 7)),
-            GroupInfo("Keys", listOf(3)),
-            GroupInfo("Guitar", listOf(4, 5)),
+            GroupInfo("Keys", listOf(3, 4)),
+            GroupInfo("Guitar", listOf(5, 6)),
         ),
         groupLevels = listOf(80, 92, 70, 65),
         masterVolume = 85,
         levelCap = 100,
+        // Named inputs, a keys pair on CH 4 and CH 5 shown as one strip, and a spare input hidden.
+        channelDetails = listOf(
+            ChannelInfo("Kick", ChannelKind.DRUMS),
+            ChannelInfo("Snare", ChannelKind.DRUMS),
+            ChannelInfo("Vox", ChannelKind.VOICE),
+            ChannelInfo("Keys", ChannelKind.KEYS, link = true),
+            ChannelInfo("", ChannelKind.KEYS),
+            ChannelInfo("Gtr", ChannelKind.GUITAR),
+            ChannelInfo("Bass", ChannelKind.BASS),
+            ChannelInfo("Spare", hidden = true),
+        ),
     )
 
     private val healthy = DiagnosticsUiState(
@@ -53,7 +66,7 @@ internal object PreviewSamples {
         linkHealth = LinkHealth.GOOD,
     )
 
-    /** On stage: connected, the server holds the mix, More of me lifts CH 3. */
+    /** On stage: connected, the server holds the mix, More of me lifts Vox (CH 3). */
     val connected = MonitorUiState(
         musicianName = "Carlos D",
         connection = ConnectionUiState(
@@ -76,6 +89,9 @@ internal object PreviewSamples {
     )
 
     val moreOfMeOff = connected.copy(moreOfMe = MoreOfMeUiState(enabled = false, musicianChannel = 2))
+
+    /** A server that announces no channel details: every input by number, no icons, nothing joined. */
+    val olderServer = connected.copy(mix = mix.copy(channelDetails = null))
 
     /** More of me asked for before a channel was chosen. */
     val noChannelChosen = connected.copy(

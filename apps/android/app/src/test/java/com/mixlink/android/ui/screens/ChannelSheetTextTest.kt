@@ -1,5 +1,6 @@
 package com.mixlink.android.ui.screens
 
+import com.mixlink.android.ChannelKind
 import com.mixlink.android.ui.state.ChannelUiState
 import com.mixlink.android.ui.state.channelName
 import org.junit.Assert.assertEquals
@@ -43,7 +44,14 @@ class ChannelSheetTextTest {
     @Test
     fun theLabelButtonIsNamedForItsChannel() {
         // Channel indexes are 0-based; the strip reads "CH 3" for index 2.
-        assertEquals("Channel 3 settings", channelSettingsLabel(2))
+        assertEquals("Channel 3 settings", channelSettingsLabel(channel(2)))
+        assertEquals("Vox settings", channelSettingsLabel(channel(0).copy(label = "Vox", kind = ChannelKind.VOICE)))
+    }
+
+    @Test
+    fun aStereoPairsLabelButtonSaysItIsAPair() {
+        assertEquals("Keys stereo pair settings", channelSettingsLabel(channel(3).copy(label = "Keys", pairedWith = 4)))
+        assertEquals("Channel 4 stereo pair settings", channelSettingsLabel(channel(3).copy(pairedWith = 4)))
     }
 
     @Test
@@ -51,6 +59,15 @@ class ChannelSheetTextTest {
         assertEquals("Pan left 30", channelPanState(35))
         assertEquals("Pan centre", channelPanState(50))
         assertEquals("Pan right 100", channelPanState(100))
+    }
+
+    @Test
+    fun aStereoPairsPanIsABalance() {
+        assertEquals("Balance left 30", channelPanState(35, stereo = true))
+        assertEquals("Balance centre", channelPanState(50, stereo = true))
+        assertEquals("BALANCE", panTitle(stereo = true))
+        assertEquals("PAN", panTitle(stereo = false))
+        assertEquals("Keys balance", channelPanDescription("Keys", stereo = true))
     }
 
     @Test

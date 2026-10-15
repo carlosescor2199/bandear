@@ -53,11 +53,11 @@ import com.mixlink.android.ui.components.MoreOfMeToggle
 import com.mixlink.android.ui.components.SegmentedChoice
 import com.mixlink.android.ui.components.StatusBanner
 import com.mixlink.android.ui.components.StatusPill
+import com.mixlink.android.ui.state.ChannelChoice
 import com.mixlink.android.ui.state.ConnectionUiState
 import com.mixlink.android.ui.state.MixUiState
 import com.mixlink.android.ui.state.MonitorUiState
 import com.mixlink.android.ui.state.MoreOfMeUiState
-import com.mixlink.android.ui.state.channelName
 import com.mixlink.android.ui.theme.MixLinkShapes
 import com.mixlink.android.ui.theme.MixLinkTheme
 import com.mixlink.android.ui.theme.MixLinkType
@@ -129,7 +129,13 @@ fun MixScreen(
                     .fillMaxWidth(),
             )
         }
-        MoreOfMeRow(moreOfMe, mix.sourceChannels, onMoreOfMe, onMusicianChannel)
+        MoreOfMeRow(
+            moreOfMe = moreOfMe,
+            channelLabel = moreOfMe.musicianChannel?.let(mix::labelOf),
+            choices = mix.musicianChoices,
+            onMoreOfMe = onMoreOfMe,
+            onMusicianChannel = onMusicianChannel,
+        )
         SectionHeader(
             view = view,
             count = if (view == MixView.CHANNELS) channels.size else groups.size,
@@ -208,10 +214,12 @@ private fun MixHeader(musicianName: String, connection: ConnectionUiState) {
     }
 }
 
+/** More of me and the musician's channel, named [channelLabel] as its strip names it. */
 @Composable
 private fun MoreOfMeRow(
     moreOfMe: MoreOfMeUiState,
-    channelCount: Int,
+    channelLabel: String?,
+    choices: List<ChannelChoice>,
     onMoreOfMe: (Boolean) -> Unit,
     onMusicianChannel: (Int?) -> Unit,
 ) {
@@ -228,7 +236,7 @@ private fun MoreOfMeRow(
         ) {
             MoreOfMeToggle(
                 on = moreOfMe.enabled,
-                channelLabel = moreOfMe.channelLabel.orEmpty(),
+                channelLabel = channelLabel.orEmpty(),
                 onToggle = onMoreOfMe,
                 modifier = Modifier
                     .weight(1f)
@@ -236,7 +244,8 @@ private fun MoreOfMeRow(
             )
             MyChannelPicker(
                 selected = moreOfMe.musicianChannel,
-                channelCount = channelCount,
+                selectedLabel = channelLabel,
+                choices = choices,
                 onSelect = onMusicianChannel,
                 modifier = Modifier
                     .width(PickerWidth)
@@ -255,17 +264,21 @@ private fun MoreOfMeRow(
     }
 }
 
-/** The musician's channel, and a menu of the announced channels to change it. */
+/**
+ * The musician's channel, and a menu of the announced channels to change it: one entry per strip,
+ * by name, so a hidden channel is not offered and a stereo pair is offered once.
+ */
 @Composable
 private fun MyChannelPicker(
     selected: Int?,
-    channelCount: Int,
+    selectedLabel: String?,
+    choices: List<ChannelChoice>,
     onSelect: (Int?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = MixLinkTheme.colors
     var open by remember { mutableStateOf(false) }
-    val label = selected?.let(::channelName)
+    val label = selectedLabel
 
     fun choose(channel: Int?) {
         open = false
@@ -293,7 +306,15 @@ private fun MyChannelPicker(
                 maxLines = 1,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(myChannelText(label), style = MixLinkType.NumberLarge, color = colors.text)
+                // A long name is cut short here; the menu and the button's spoken name carry it whole.
+                Text(
+                    text = myChannelText(label),
+                    modifier = Modifier.weight(1f, fill = false),
+                    style = MixLinkType.NumberLarge,
+                    color = colors.text,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 Icon(LineIcons.ChevronDown, contentDescription = null, tint = colors.text, modifier = Modifier.size(16.dp))
             }
         }
@@ -305,7 +326,7 @@ private fun MyChannelPicker(
             border = BorderStroke(1.dp, colors.border),
         ) {
             ChannelMenuItem(text = "None", chosen = selected == null, onClick = { choose(null) })
-            if (channelCount == 0) {
+            if (choices.isEmpty()) {
                 DropdownMenuItem(
                     text = { Text("Waiting for the server's channels") },
                     onClick = {},
@@ -313,8 +334,8 @@ private fun MyChannelPicker(
                     colors = MenuDefaults.itemColors(disabledTextColor = colors.textSecondary),
                 )
             }
-            repeat(channelCount) { channel ->
-                ChannelMenuItem(text = channelName(channel), chosen = selected == channel, onClick = { choose(channel) })
+            choices.forEach { choice ->
+                ChannelMenuItem(text = choice.label, chosen = selected == choice.index, onClick = { choose(choice.index) })
             }
         }
     }
@@ -402,6 +423,16 @@ private fun MixConnectedPreview() = MixPreview(PreviewSamples.connected)
 )
 @Composable
 private fun MixMoreOfMeOffPreview() = MixPreview(PreviewSamples.moreOfMeOff)
+
+@Preview(
+    name = "Mix · older server, channels by number",
+    widthDp = PREVIEW_WIDTH_DP,
+    heightDp = PREVIEW_HEIGHT_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun MixOlderServerPreview() = MixPreview(PreviewSamples.olderServer)
 
 @Preview(
     name = "Mix · no channel chosen",

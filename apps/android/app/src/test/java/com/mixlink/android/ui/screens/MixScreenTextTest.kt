@@ -44,9 +44,9 @@ class MixScreenTextTest {
     }
 
     @Test
-    fun aGroupStripListsItsChannels() {
-        assertEquals("CH 1 · CH 2", groupMembersText(listOf(0, 1)))
-        assertEquals("CH 5", groupMembersText(listOf(4)))
+    fun aGroupStripListsItsChannelsAsTheirStripsNameThem() {
+        assertEquals("CH 1 · CH 2", groupMembersText(listOf("CH 1", "CH 2")))
+        assertEquals("Vox · Keys", groupMembersText(listOf("Vox", "Keys")))
         assertEquals("No channels", groupMembersText(emptyList()))
     }
 

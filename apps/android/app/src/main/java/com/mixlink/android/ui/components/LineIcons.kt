@@ -40,6 +40,11 @@ object LineIcons {
 
     /** A tick: the chosen item of a list. */
     val Check: ImageVector by lazy { lineIcon("Check", "M5 12l5 5L20 7") }
+
+    /** Two overlapping rings, left and right: a stereo pair. */
+    val Stereo: ImageVector by lazy {
+        lineIcon("Stereo", "M3 12a5 5 0 1 0 10 0a5 5 0 1 0-10 0", "M11 12a5 5 0 1 0 10 0a5 5 0 1 0-10 0")
+    }
 }
 
 /** A 24-unit line icon drawn with round two-unit strokes, one stroke per path. */

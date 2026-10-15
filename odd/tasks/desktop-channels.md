@@ -353,10 +353,62 @@ slice. Push and PRs are the user's decision.
     added); `cargo fmt` clean; clippy: no new warnings. About 300 authored changed lines.
   - Commit: this commit (`fix(engine): keep channel details for inputs that come back after a
     switch`).
-- [ ] T3b (channel metadata, Android): read `config.channels` (lenient: absent on older servers,
+- [x] T3b (channel metadata, Android): read `config.channels` (lenient: absent on older servers,
   unknown kinds as `other`); show names (else "CH n") and kind icons; drop hidden channels;
   collapse linked pairs into one strip whose level, mute and solo write both channels and whose
-  pan is a balance (`balanceToPans` rule above). Route: delegated writer.
+  pan is a balance (`balanceToPans` rule above). Route: delegated writer (trigger: 2+ non-trivial
+  files across the control channel, the UI state and the screens).
+  - Parsing (`ControlChannel.kt`): `ChannelInfo { name, kind: ChannelKind, hidden, link }` and
+    `ChannelKind` (wire names as the engine's; `fromWire` maps a missing or unknown kind to `OTHER`)
+    live next to `GroupInfo`. `parseChannelDetails(value, count)` returns null when `config` has no
+    `channels` array, else exactly one entry per announced channel: an entry past the count is
+    dropped, a missing one, a non-object or a field of the wrong type reads as the default.
+    `Listener.onConfig` gains `details`; `ConfigReceived(channels, groups, details = null)`.
+  - Strips (pure, `ui/state/ChannelLayout.kt`): `stripLayout(count, details)` gives
+    `StripChannels(first, second?)` left to right: a hidden channel has none, a link makes one
+    strip of a channel and the next when both are shown (a link on the last channel or into a
+    hidden one makes no pair), and null details give one strip per channel as before.
+    `balanceToPans(b)` = `(max(0, 2b-100), min(100, 2b))`, `pansToBalance` = the mean, halves up
+    (the desktop's `Math.round`), `channelLabel(index, detail)` = trimmed name or "CH n".
+    `MixUiState.channelDetails` (null from an older server) feeds `layout`, `channels` (a strip is
+    known by its first channel; `kind` null without details so no icon shows, `pairedWith`, the
+    pair's level/mute/solo from its first side and its pan as the balance), `groups[].members`
+    (shown strips by name, a pair once; by number as before without details), `musicianChoices`
+    and `stripSides(channel)`.
+  - Edits (reducer): a channel edit names a strip; `withStrip` writes `stripSides` (both sides of
+    a pair's strip, else the channel alone) and a pair's pan is written through `balanceToPans`.
+    The per-channel lists stay positional and whole, so the whole-mix send (with its `seq`) and
+    the saved mixes (`MixBankStore`, by channel index) are unchanged; a mix recalled with a pair's
+    sides unequal shows the first side and the server makes them equal. More of me lifts both sides
+    of a pair (`MixSnapshot.moreOfMeFor`, used at send time through the channel's new
+    `musicianChannels` and by the reducer's echo check), so a pushed lifted mix does not turn it off.
+  - My channel: the picker offers one entry per strip of the announced channels, by name; a hidden
+    channel or a pair's second side cannot be chosen. On every `config` the remembered channel is
+    fitted: on a pair's second side it moves to the pair's first (More of me stays on, the store is
+    updated, nothing is sent: the server's `mix_state` with the link's pans follows); a hidden one is
+    forgotten like a dropped one (More of me off with "your channel is no longer in the mix").
+  - UI: the strip's label button shows the kind icon (`kindIcon`, 11 line icons drawn with the
+    existing `lineIcon` builder, no new dependency) and the name (one line, ellipsis), and under it
+    the pan, preceded for a pair by the stereo rings (`LineIcons.Stereo`); it is read as "Keys
+    stereo pair settings" with "Balance centre". The sheet's header shows the icon, the name (two
+    lines at most), the group chip, "Stereo pair" in words and "Your channel"; a pair's pan control
+    is titled BALANCE and named "Keys balance". Group strips list `members`. Previews: the sample
+    mix names its inputs, pairs the keys and hides a spare; a new "older server" preview shows the
+    unchanged look.
+  - RED: (a) against stubs (every channel its own strip, the balance written to both pans as is,
+    labels by number, `parseChannelDetails` returning null), 21 of 400 failed: parsing 2 of 4
+    (the older-server and wire-name tests passed), layout 8 of 9 (no details passed), reducer 9 of
+    11 (the older-server and single-strip tests passed), ViewModel 2 of 2. (b) against stubs (every
+    kind and the stereo mark drawn as the tick, the settings label always by number, pan wording
+    ignoring pairs), 5 of 404 failed: the two icon tests and three sheet-text tests.
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 404 tests, 0 failures, 0
+    errors (374 before: 30 new; the group-members text test now takes labels and one More of me
+    label assertion reads `labelOf`); no compiler warnings.
+  - Size: about 785 authored changed lines in the first commit (about 330 of them tests) and 360
+    in the second plus this document, above the 400-line heuristic mostly in tests; not split
+    artificially.
+  - Commits: 73d5d9c `feat(android): read channel names, kinds, hidden channels and pairs`; this
+    commit (`feat(android): show named channels and stereo pairs on the mix`).
 - [ ] T4 (Channels and groups screen): board 3 in the desktop UI; the Mix screen uses names,
   icons, hidden channels, linked strips and group ids. Route: delegated writer.
 - [ ] T5 (engineer limit and locks): engine fields set only by the engineer path and enforced on
@@ -413,6 +465,13 @@ slice. Push and PRs are the user's decision.
   switch "drops" details (true of what is shown). Linking a pair whose second side the device
   lacks pans its first input hard left while it shows alone.
 
+- T3b done (channel metadata on Android); see its entry for evidence. Follow-ups: live check on
+  the Galaxy S23 against the engine (names, icons and long-name ellipsis on the 104 dp strips and
+  the "My channel" button, a pair's balance and its stereo mark, a hidden input gone, a mid-session
+  rename, hide and link from the desktop); with every channel hidden the empty row and the picker
+  still say they are waiting for the server's channels; an older phone still shows a pair's sides
+  apart (T3a); T7's adopt-after-`config` follow-up still applies (a `config` sends nothing).
+
 ## Next step
 
-T3b (Android).
+T4 (Channels and groups screen).

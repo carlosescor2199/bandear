@@ -12,11 +12,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -35,9 +37,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mixlink.android.ui.components.GroupChip
 import com.mixlink.android.ui.components.HorizontalFader
+import com.mixlink.android.ui.components.LineIcons
 import com.mixlink.android.ui.components.MuteSoloButtons
 import com.mixlink.android.ui.components.VerticalFader
 import com.mixlink.android.ui.components.groupToneFor
+import com.mixlink.android.ui.components.kindIcon
 import com.mixlink.android.ui.components.panText
 import com.mixlink.android.ui.state.ChannelUiState
 import com.mixlink.android.ui.state.GroupUiState
@@ -188,7 +192,7 @@ private fun GroupStrip(group: GroupUiState, onLevel: (Int) -> Unit) {
         )
         Text(stripValueText(group.level, muted = false), style = MixLinkType.Number, color = colors.text)
         Text(
-            text = groupMembersText(group.channels),
+            text = groupMembersText(group.members),
             modifier = Modifier.heightIn(min = 44.dp),
             style = MaterialTheme.typography.labelSmall,
             color = colors.textSecondary,
@@ -200,9 +204,11 @@ private fun GroupStrip(group: GroupUiState, onLevel: (Int) -> Unit) {
 }
 
 /**
- * The channel's label as a button that opens its sheet, with the channel's pan written under it
- * ("L30", "C", "R20") so the pan shows without opening anything. A full 44 dp tall and as wide as
- * the strip.
+ * The channel's label as a button that opens its sheet: the channel's name, after the icon of what
+ * it carries when the server announced one, and its pan written under it ("L30", "C", "R20") so the
+ * pan shows without opening anything. A stereo pair's pan is its balance, marked by the stereo rings
+ * in front of it, so a pair is told by a shape and by its spoken name, not by colour. A full 44 dp
+ * tall and as wide as the strip; a long name is cut short here and read in full in the sheet.
  */
 @Composable
 private fun StripLabelButton(channel: ChannelUiState, onOpen: () -> Unit) {
@@ -216,14 +222,32 @@ private fun StripLabelButton(channel: ChannelUiState, onOpen: () -> Unit) {
             .border(1.dp, colors.border, MixLinkShapes.Key)
             .clickable(role = Role.Button, onClickLabel = "Open the channel's settings", onClick = onOpen)
             .semantics {
-                contentDescription = channelSettingsLabel(channel.index)
-                stateDescription = channelPanState(channel.pan)
-            },
+                contentDescription = channelSettingsLabel(channel)
+                stateDescription = channelPanState(channel.pan, channel.stereo)
+            }
+            .padding(horizontal = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text(channel.label, style = MixLinkType.Number, color = colors.text)
-        Text(panText(channel.pan), style = MixLinkType.NumberSmall.copy(fontSize = 11.sp), color = colors.textSecondary)
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
+            val kind = channel.kind
+            if (kind != null) {
+                Icon(kindIcon(kind), contentDescription = null, tint = colors.textSecondary, modifier = Modifier.size(14.dp))
+            }
+            Text(
+                text = channel.label,
+                style = MixLinkType.Number,
+                color = colors.text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (channel.stereo) {
+                Icon(LineIcons.Stereo, contentDescription = null, tint = colors.textSecondary, modifier = Modifier.size(12.dp))
+            }
+            Text(panText(channel.pan), style = MixLinkType.NumberSmall.copy(fontSize = 11.sp), color = colors.textSecondary)
+        }
     }
 }
 

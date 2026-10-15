@@ -472,6 +472,16 @@ slice. Push and PRs are the user's decision.
   still say they are waiting for the server's channels; an older phone still shows a pair's sides
   apart (T3a); T7's adopt-after-`config` follow-up still applies (a `config` sends nothing).
 
+- Review `review-ab49ad766e14ed1c` over 42009e6..879dd8b (T3a-fix and T3b) approved and
+  acknowledged; next review base 879dd8b. One WARNING folded into T7 (which reworks the phone's
+  handling of `config`): R3-config-pairs-musician-channel-moreofme-on-unsent — with More of me
+  on, a `config` that makes the musician's channel the second side of a pair moves My channel to
+  the first side and expects both sides lifted, but nothing is sent, so the server keeps the old
+  one-sided lift and the following `mix_state` can trip the echo check. Send the lifted mix (or
+  turn More of me off with a notice) and test it.
+- Live (2026-10-15): the new phone app (T3b) was installed on the Galaxy S23 and the desktop app
+  rebuilt with T1-T3; channel and group editing awaits T4's screen.
+
 ## Next step
 
 T4 (Channels and groups screen).

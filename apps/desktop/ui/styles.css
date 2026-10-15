@@ -461,15 +461,19 @@ body {
 }
 
 .musicians .col-name {
-  width: 17%;
+  width: 16%;
 }
 
 .musicians .col-address {
-  width: 23%;
+  width: 17%;
 }
 
 .musicians .col-control {
   width: 11%;
+}
+
+.musicians .col-link {
+  width: 9%;
 }
 
 .musicians .col-mix {
@@ -477,7 +481,7 @@ body {
 }
 
 .musicians .col-count {
-  width: 10%;
+  width: 9%;
 }
 
 .musicians .col-loss {
@@ -540,9 +544,21 @@ body {
   vertical-align: middle;
 }
 
-.dot--on {
+.dot--on,
+.dot--good {
   background: var(--green);
   box-shadow: 0 0 8px rgba(55, 214, 122, 0.8);
+}
+
+/* Link health: an unknown link keeps the plain grey dot. */
+.dot--warning {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(255, 176, 32, 0.7);
+}
+
+.dot--bad {
+  background: var(--red);
+  box-shadow: 0 0 8px rgba(255, 90, 95, 0.8);
 }
 
 .tag--live {

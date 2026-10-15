@@ -269,6 +269,10 @@ mod tests {
                     muted: false,
                     packets_sent: 0,
                     packets_discarded: 0,
+                    link_health: "unknown",
+                    underruns_per_second: None,
+                    loss_percent: None,
+                    receive_timeouts_per_second: None,
                 })
                 .collect(),
         }

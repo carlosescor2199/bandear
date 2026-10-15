@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.MixLink" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#1565C0</item>
-        <item name="android:navigationBarColor">#FFFFFF</item>
-        <item name="android:statusBarColor">#FFFFFF</item>
-        <item name="android:windowLightStatusBar">true</item>
+    <!--
+        The window behind the Compose UI. It is the MixLink ground colour, dark like every screen,
+        so nothing white shows before the first frame or behind the system bars. The Activity then
+        draws edge to edge, with transparent bars and light icons.
+    -->
+    <style name="Theme.MixLink" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/mixlink_ground</item>
+        <item name="android:colorBackground">@color/mixlink_ground</item>
+        <item name="android:colorAccent">@color/mixlink_accent</item>
+        <item name="android:statusBarColor">@color/mixlink_ground</item>
+        <item name="android:navigationBarColor">@color/mixlink_ground</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>

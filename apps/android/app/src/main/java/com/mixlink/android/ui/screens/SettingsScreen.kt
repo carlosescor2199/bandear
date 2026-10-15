@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -50,6 +51,7 @@ import com.mixlink.android.ui.components.linkHealthDescription
 import com.mixlink.android.ui.components.pillToken
 import com.mixlink.android.ui.state.ConnectionUiState
 import com.mixlink.android.ui.state.DiagnosticsUiState
+import com.mixlink.android.ui.state.MAX_NAME_LENGTH
 import com.mixlink.android.ui.state.ManualAddress
 import com.mixlink.android.ui.state.MonitorUiState
 import com.mixlink.android.ui.theme.ColorToken
@@ -99,6 +101,7 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxWidth(),
                 placeholder = "Your name",
                 capitalization = KeyboardCapitalization.Words,
+                maxLength = MAX_NAME_LENGTH,
             )
         }
         ManualConnectionCard(connection, onManualAddressChange, onConnectManual)
@@ -303,8 +306,14 @@ private fun ReadingTile(reading: Reading, modifier: Modifier = Modifier) {
     }
 }
 
+/** Every counter and the recent errors; the text can be selected and copied, for a bug report. */
 @Composable
 private fun AllCounters(diagnostics: DiagnosticsUiState, controlStatus: String) {
+    SelectionContainer { AllCountersText(diagnostics, controlStatus) }
+}
+
+@Composable
+private fun AllCountersText(diagnostics: DiagnosticsUiState, controlStatus: String) {
     val colors = MixLinkTheme.colors
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         allReadings(diagnostics, controlStatus).forEach { reading ->

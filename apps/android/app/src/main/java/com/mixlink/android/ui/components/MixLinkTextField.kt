@@ -52,6 +52,33 @@ import com.mixlink.android.ui.theme.MixLinkType
  */
 fun adoptOutsideText(outside: String, shown: String, focused: Boolean): Boolean = !focused && outside != shown
 
+/**
+ * What a field limited to [maxLength] characters keeps when an edit turns [shown] into [proposed].
+ *
+ * An edit that fits, or that does not make the text longer, is kept as it is, so a text that is
+ * already too long (given from outside) can still be shortened. At the limit, further keys do
+ * nothing. A paste that would pass the limit keeps its first characters up to it, one fewer when
+ * the cut would split a character made of two UTF-16 units (an emoji, say).
+ */
+fun keptEdit(shown: String, proposed: String, maxLength: Int): String = when {
+    proposed.length <= maxLength || proposed.length <= shown.length -> proposed
+    shown.length >= maxLength -> shown
+    else -> {
+        val splitsPair = maxLength > 0 && Character.isHighSurrogate(proposed[maxLength - 1])
+        proposed.substring(0, if (splitsPair) maxLength - 1 else maxLength)
+    }
+}
+
+/** [proposed] as [keptEdit] keeps it, with the cursor kept inside the text. */
+private fun keptEdit(shown: TextFieldValue, proposed: TextFieldValue, maxLength: Int): TextFieldValue {
+    val text = keptEdit(shown.text, proposed.text, maxLength)
+    return when (text) {
+        proposed.text -> proposed
+        shown.text -> shown
+        else -> TextFieldValue(text, TextRange(proposed.selection.end.coerceAtMost(text.length)))
+    }
+}
+
 /** How a text field's text is set: in the text face, or in the number face for addresses and ports. */
 enum class FieldFace { TEXT, NUMBERS }
 
@@ -61,6 +88,7 @@ enum class FieldFace { TEXT, NUMBERS }
  *
  * It keeps what is typed itself and reports every change through [onValueChange], so a caller that
  * echoes the text back later (through a ViewModel's state) never moves the cursor or loses a key.
+ * With [maxLength] it takes no more characters than that (see [keptEdit]).
  */
 @Composable
 fun MixLinkTextField(
@@ -77,6 +105,7 @@ fun MixLinkTextField(
     imeAction: ImeAction = ImeAction.Done,
     onDone: () -> Unit = {},
     enabled: Boolean = true,
+    maxLength: Int = Int.MAX_VALUE,
 ) {
     val colors = MixLinkTheme.colors
     var shown by remember { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
@@ -89,7 +118,8 @@ fun MixLinkTextField(
 
     BasicTextField(
         value = shown,
-        onValueChange = { next ->
+        onValueChange = { proposed ->
+            val next = keptEdit(shown, proposed, maxLength)
             val changed = next.text != shown.text
             shown = next
             if (changed) onValueChange(next.text)

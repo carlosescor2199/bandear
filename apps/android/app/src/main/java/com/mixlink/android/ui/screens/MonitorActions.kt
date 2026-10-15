@@ -7,8 +7,8 @@ import com.mixlink.android.ui.state.ServerEndpoint
 /**
  * Everything the screens can ask for, in one place, so the app is bound to its state holder once.
  *
- * The names and parameters are the monitor ViewModel's intents, so the ViewModel can implement it
- * as it is. The screens only ever see this, never the ViewModel.
+ * The names and parameters are the monitor ViewModel's intents, and the ViewModel implements it.
+ * The screens only ever see this, never the ViewModel.
  */
 interface MonitorActions {
     fun connect(server: ServerEndpoint)

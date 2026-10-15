@@ -83,6 +83,12 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
   the XML screen. Commits: `a17522b` (fader fixes) and this commit (screens).
 - [ ] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
   state fixed; live check on the S23.
+  - [x] Code: T3 review follow-ups (`69f613d`), receiver stop ordering (`538f990`), the switch to
+    Compose (see Progress). Checks per commit in Progress.
+  - [ ] Live check on the S23 (parent).
+  - [ ] Pan: the old screen had a pan slider per channel; the new screens have none, so after the
+    switch pan cannot be changed (it is still kept, sent, saved and recalled). Needs a decision on
+    where pan lives in the redesign. Reopens the acceptance criterion "every existing control".
 - [ ] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
   download.
 
@@ -343,3 +349,40 @@ features.
     - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
       SUCCESSFUL, 41 tasks executed; 32 result files, 296 tests (291 plus 5), 0 failures, 0
       errors; no Kotlin warnings. Debug APK 26,300,706 bytes. `cargo fmt --all -- --check`: clean.
+  - `538f990` is the commit above. The switch to Compose, this commit:
+    - `MainActivity` is a `ComponentActivity`: `enableEdgeToEdge` with dark bar styles (transparent
+      bars, light icons whatever the phone's theme), `MonitorViewModel` from its `Factory` via
+      `viewModels`, state collected with `collectAsStateWithLifecycle`, and
+      `MixLinkTheme { MonitorApp(state, viewModel) }`. `MonitorViewModel` implements
+      `MonitorActions` (`setChannelPan` stays a ViewModel-only intent).
+    - Theme: `Theme.MixLink` now extends the dark `Theme.Material.NoActionBar` with the window
+      background, status bar and navigation bar in the ground `#0d1117` (new `values/colors.xml`)
+      and light bar icons, so nothing white shows at launch. The manifest label is
+      `@string/app_name`, now "MixLink" (was "MixLink M0"); the activity uses `adjustResize` so
+      the keyboard arrives as an inset the UI pads for.
+    - Deleted: `res/layout/activity_main.xml`; the old-UI view builders only `MainActivity` used:
+      `BankControlViews.kt` (`buildBankRows`, `buildMusicianChannelAdapter`),
+      `ChannelControlViews.kt` (`rebuildChannelControls`), `FoundServerViews.kt`
+      (`rebuildFoundServers`), `GroupControlViews.kt` (`rebuildGroupControls`). No other resource
+      was used only by the layout. `ControlStatus.kt`, `ClientMixState.kt` and the rest stay: the
+      ViewModel and reducer use them.
+    - Old-activity behaviour compared with the ViewModel: start and stop, validation messages, the
+      "still stopping" refusal, discovery stop and restart, registration with name, port and client
+      id, name re-announce, config resizing, groups, More of me, saved mixes, link reports, stop
+      handling and teardown are all the ViewModel's (T2, T2b). Carried over here, because only the
+      old layout had them: the name fields stop at 64 characters (`MAX_NAME_LENGTH`, the length
+      the server keeps; the old field had `maxLength="64"`), through the pure `keptEdit` in
+      `MixLinkTextField`; the full counters and recent errors can be selected and copied
+      (`SelectionContainer`; the old text was `textIsSelectable`).
+    - Changed on purpose: turning the phone no longer ends the session (the old `onDestroy` ran on
+      every rotation; the ViewModel survives it). The session still ends when the Activity
+      finishes for good. Back on the root screen moves the app to the background on Android 12
+      and later, as before.
+    - Found missing, not fixed (a design decision): the per-channel pan sliders (see the T4 task
+      items). The T3 note "No pan control: the old screen had none either" was wrong: the old
+      `ChannelControlViews` built a "Pan n" slider under every channel.
+    - RED: the 6 new `MixLinkTextFieldTest` tests against a `TODO` `keptEdit`: 9 run, 6 failed
+      (`NotImplementedError`). GREEN: all 9 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 32 result files, 302 tests (296 plus 6), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,248,536 bytes. `cargo fmt --all -- --check`: clean.

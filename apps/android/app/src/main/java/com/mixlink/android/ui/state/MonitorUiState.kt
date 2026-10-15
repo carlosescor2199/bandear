@@ -13,6 +13,9 @@ const val DEFAULT_AUDIO_PORT = 50000
 /** The server's WebSocket control port until the musician or a beacon says otherwise. */
 const val DEFAULT_CONTROL_PORT = 50001
 
+/** The longest musician name the server keeps (it cuts longer ones); the name fields stop there. */
+const val MAX_NAME_LENGTH = 64
+
 /** A neutral level for a channel, a group or the master: unchanged gain. */
 private const val NEUTRAL_LEVEL = 100
 

@@ -1,0 +1,224 @@
+/*
+ * MixLink console design tokens and base element styles.
+ *
+ * Every colour, size and radius the console uses is a custom property here; components read them
+ * through their Shadow DOM, since custom properties inherit across it. Text colours keep at least
+ * 4.5:1 contrast on the ground and both surfaces.
+ */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("../fonts/ibm_plex_sans_variable.ttf") format("truetype");
+  font-weight: 100 700;
+  font-stretch: 75% 100%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../fonts/jetbrains_mono_variable.ttf") format("truetype");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* Grounds and surfaces, from the darkest. */
+  --ml-sidebar: #0b0f14;
+  --ml-ground: #0d1117;
+  --ml-surface-sunken: #12171e;
+  --ml-surface: #161b22;
+  --ml-surface-raised: #1f2630;
+  --ml-border-subtle: #1f2630;
+  --ml-border: #2b3440;
+
+  /* Text. */
+  --ml-text: #e6edf3;
+  --ml-text-secondary: #c5ced8;
+  --ml-text-muted: #9ba8b5;
+  --ml-text-on-bright: #0d1117;
+
+  /* Signal colours. */
+  --ml-accent: #f5a524;
+  --ml-accent-hover: #ffc35c;
+  --ml-green: #3fb950;
+  --ml-red: #f85149;
+  --ml-blue: #4cc2ff;
+  --ml-focus: var(--ml-blue);
+
+  /* State fills: a dark ground with a matching border, as the design's pills and buttons. */
+  --ml-ok-bg: #10261a;
+  --ml-ok-border: #1f6f3a;
+  --ml-warn-bg: #2a1f0b;
+  --ml-warn-border: #6b4a12;
+  --ml-danger-bg: #2a1414;
+  --ml-danger-border: #6b2a2a;
+  --ml-danger-text: #ffb4ad;
+  --ml-accent-bg: #1a1610;
+
+  /* Faders and meters. */
+  --ml-track: #262f3a;
+  --ml-fader-fill: #5b6b7c;
+  --ml-fader-fill-muted: #3a4452;
+  --ml-thumb: #e6edf3;
+  --ml-thumb-shadow: 0 2px 6px rgb(0 0 0 / 50%);
+  --ml-meter-ground: #0b0f14;
+  --ml-meter-safe: var(--ml-green);
+  --ml-meter-hot: var(--ml-accent);
+  --ml-meter-clip: var(--ml-red);
+
+  /* Group chips: a dark tint with light text of the same hue. */
+  --ml-group-teal-bg: #123a3a;
+  --ml-group-teal-text: #7fe0d0;
+  --ml-group-blue-bg: #1c2a44;
+  --ml-group-blue-text: #9cc3ff;
+  --ml-group-violet-bg: #2a2346;
+  --ml-group-violet-text: #c3b5ff;
+  --ml-group-orange-bg: #3a2412;
+  --ml-group-orange-text: #ffc58a;
+  --ml-group-none-bg: #262f3a;
+  --ml-group-none-text: #c5ced8;
+
+  /* Type: IBM Plex Sans for text, JetBrains Mono for numbers. */
+  --ml-font-sans: "IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
+  --ml-font-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  --ml-text-2xs: 10px;
+  --ml-text-xs: 11px;
+  --ml-text-sm: 12px;
+  --ml-text-md: 13px;
+  --ml-text-base: 14px;
+  --ml-text-lg: 15px;
+  --ml-text-xl: 20px;
+  --ml-text-2xl: 26px;
+  --ml-weight-regular: 400;
+  --ml-weight-medium: 500;
+  --ml-weight-bold: 600;
+  --ml-tracking-caps: 0.1em;
+
+  /* Spacing on a 4 px grid. */
+  --ml-space-1: 4px;
+  --ml-space-2: 8px;
+  --ml-space-3: 12px;
+  --ml-space-4: 16px;
+  --ml-space-5: 20px;
+  --ml-space-6: 24px;
+  --ml-space-8: 32px;
+
+  /* Radii. */
+  --ml-radius-xs: 4px;
+  --ml-radius-sm: 6px;
+  --ml-radius-md: 10px;
+  --ml-radius-lg: 12px;
+  --ml-radius-xl: 16px;
+  --ml-radius-pill: 999px;
+
+  /* Hit targets: 32 px for every control, 40 px for primary ones. */
+  --ml-target: 32px;
+  --ml-target-primary: 40px;
+
+  --ml-sidebar-width: 200px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--ml-ground);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--ml-ground);
+  color: var(--ml-text);
+  font-family: var(--ml-font-sans);
+  font-size: var(--ml-text-base);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: var(--ml-weight-bold);
+  line-height: 1.25;
+}
+
+h1 {
+  font-size: var(--ml-text-2xl);
+}
+
+h2 {
+  font-size: var(--ml-text-lg);
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--ml-accent);
+}
+
+a:hover {
+  color: var(--ml-accent-hover);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+code,
+kbd,
+samp,
+.ml-mono {
+  font-family: var(--ml-font-mono);
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ml-focus);
+  outline-offset: 2px;
+}
+
+/* Hidden on screen, still read by screen readers. */
+.ml-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -26,8 +26,9 @@ never counted. Reporting those numbers as they are would make the traffic light 
   `{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}`.
   It is matched to the musician by the peer IP, exactly like `mix`.
 - **Health levels** (our own thresholds, tunable constants):
-  - `unknown`: no report ever (older phones never report), or the last one is older than 3 s and
-    the musician's control channel has closed (the musician stopped or left).
+  - `unknown`: no report yet on the current control session (older phones never report; a new
+    session starts with none), or the last one is older than 3 s and the musician's control channel
+    has closed (the musician stopped or left).
   - `bad`: the last report is older than 3 s while the control channel is still connected (stats
     travel over the same Wi-Fi as the audio, so a phone that lost its link can never report it; no
     rates are shown), or, on a fresh report, any receive timeout, or underruns >= 2/s, or
@@ -68,9 +69,10 @@ never counted. Reporting those numbers as they are would make the traffic light 
   `MusicianStatus`. RED-first unit tests for parse, classify and routing.
 - [x] T2 (desktop): health and rates in `MusicianDto`; a health column with a dot and a tooltip in
   the musicians table.
-- [ ] T3 (android): pure `SequenceTracker` (drop late/duplicate, count gaps once), counted receive
+- [x] T3 (android): pure `SequenceTracker` (drop late/duplicate, count gaps once), counted receive
   timeouts, a pure stats accumulator and message builder, and the 1 s report sent through
-  `ControlChannel`. JVM tests for each pure helper.
+  `ControlChannel`. JVM tests for each pure helper. Evidence: slice 4 commit (see Progress and
+  Verification).
 
 ## Acceptance criteria
 
@@ -87,6 +89,7 @@ never counted. Reporting those numbers as they are would make the traffic light 
 - `cargo test -p mixlink-desktop`
 - `cargo check --workspace --all-targets`
 - `gradle -p apps/android :app:testDebugUnitTest`
+- `gradle -p apps/android assembleDebug`
 
 ## Route
 
@@ -110,11 +113,16 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 |---|---|---|
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
-| 3 | Desktop health column (T2) | this commit |
-| 4 | Android sequence tracker and stats report (T3) | pending |
+| 3 | Desktop health column (T2) | `90f7a33` |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, this commit |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
+
+Slice 4 also lands above the budget: the new-session fix is about 170 authored lines (about 140 of
+them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), so about
+650 in all, not counting this document. Its two commits are separate work units, so it can be
+split into two pull requests at those commit boundaries if a smaller review is wanted.
 
 ## Progress
 
@@ -156,7 +164,7 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   while the control channel is connected and `unknown` once it has closed. The engine passes the
   fact it already has, the connected control peer IPs, through a new pure `link_statuses` helper in
   `engine.rs`.
-- T2 done (this commit, slice 3; route: delegated direct, one writer). Desktop side of link health:
+- T2 done (`90f7a33`, slice 3; route: delegated direct, one writer). Desktop side of link health:
   - `dto.rs`: `MusicianDto` gains `link_health` (`"unknown"`, `"good"`, `"warning"`, `"bad"`) and
     the three optional rates, passed through from `MusicianStatus.link`; JSON keys are
     `linkHealth`, `underrunsPerSecond`, `lossPercent`, `receiveTimeoutsPerSecond` (`null` when
@@ -169,6 +177,45 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
     with `Reports stopped: link lost`; no numbers otherwise shows `No reports from this phone`. The
     dot is `role="img"` with an `aria-label` carrying the level and the tooltip text; the visible
     word is `aria-hidden`. The cell is updated in place on each poll like the others.
+- Review 2 (lineage `review-8741f049c86db454`, range `49da28a..90f7a33`): approved and
+  acknowledged. Advisory R3-001 is fixed by the new-session commit below. Advisory R3-002
+  (`describeLink` in `main.js` has no automated test) stays a known gap: the repository has no JS
+  test runner, and the T2 smoke check below is the only evidence for it.
+- New-session fix (`cb1923c`, slice 4; route: delegated direct, one writer; review 2 R3-001): the
+  report used to survive control close and re-registration, so a phone that came back on a new
+  control session showed red (a stale report with a connected control channel) until its first new
+  report, and an older build that never reports stayed red for good. A new control session now
+  starts with no report:
+  - `targets.rs`: `TargetRegistry::clear_link_report(ip)` forgets the stored report and keeps the
+    slot, the mix state, the counters and the origin; an IP with no target is a no-op.
+    `register` itself still keeps the report.
+  - `control.rs`: the first successful `register` of a connection clears the report. A later
+    `register` on the same socket is a rename (the phone re-announces its name while streaming) and
+    keeps the current report, so typing a name does not blank the light.
+- T3 done (this commit, slice 4; route: delegated direct, one writer). Android side of link health:
+  - `SequenceTracker.kt` (new, pure): the first packet starts the stream; a newer packet is played
+    and its gap counted once as lost; a duplicate or late packet is dropped (not written to the
+    track) and rewinds nothing; a packet `STREAM_RESTART_PACKETS` (256, about 2.5 s) or more behind
+    the last played one is a new stream (server restart), played without counting the jump.
+  - `LinkStats.kt` (new, pure, time injected): `LinkStatsReport` and `LinkStatsAccumulator`, which
+    counts played packets, lost packets and receive timeouts, turns the track's cumulative
+    `underrunCount` into a per-report delta, and reports once at least 1000 ms have passed, with
+    `interval_ms` the real elapsed time clamped to 1..60000; the interval counts then restart.
+    `packets_received` counts played packets, so received plus lost is the stretch of the stream the
+    interval covered.
+  - `ControlChannel.kt`: `buildStatsMessage` next to `buildRegisterMessage` (JSONObject, integer
+    values); `sendLinkStats` hands the report to the control executor, behind any queued
+    registration or mix, and drops it when the channel is not open or has shut down.
+  - `PmonPlayer.kt`: the receive loop uses the tracker (late and duplicate packets are no longer
+    played), counts each `SocketTimeoutException`, and polls the accumulator at the top of every
+    iteration (every packet and every 250 ms timeout), reading `underrunCount` only when a report is
+    due; `Listener.onLinkStats` hands the report out. The cushion controller keeps its own underrun
+    delta, unchanged. The local stats screen now shows played packets and the tracker's loss count.
+    The `AudioAttributes` block is untouched.
+  - `MainActivity.kt`: `onLinkStats` forwards the report to `ControlChannel.sendLinkStats`.
+  - Receive timeouts count from the moment the receiver starts, so the first report of a session can
+    carry one from before the first packet and show red for that one second; a phone that never
+    gets audio keeps reporting timeouts and stays red, which is the point.
 
 ## Verification
 
@@ -215,3 +262,31 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
   `warning` and `bad` with their numbers, `bad` without numbers as "lost" / `Reports stopped: link
   lost`, and `unknown` / `No reports from this phone`; a screenshot at the window's default 1180 px
   width showed no clipped columns.
+- New-session fix RED (`clear_link_report` as a no-op, wiring in place):
+  `cargo test -p personal-monitoring` gave 152 passed and 2 failed:
+  `control::tests::a_new_control_session_starts_with_no_link_report` (health `Bad` where `Unknown`
+  was expected) and `targets::tests::clearing_a_link_report_forgets_only_the_report` ("the report
+  is forgotten"). `control::tests::a_rename_on_the_same_session_keeps_the_link_report` already
+  passed and is kept as a guard for the rename path.
+- New-session fix GREEN:
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo test -p personal-monitoring`: 154 passed, 0 failed.
+  - `cargo test -p mixlink-desktop`: 21 passed, 0 failed.
+  - `cargo check --workspace --all-targets`: finished, no errors or warnings.
+- T3 toolchain: no Gradle wrapper and no `gradle` or `java` on PATH; the installed Gradle 9.6.0
+  distribution under `~/.gradle/wrapper/dists/gradle-9.6.0-bin/` was run with `JAVA_HOME` set to
+  Android Studio's bundled JBR and `ANDROID_HOME` to the local Android SDK. Baseline:
+  `:app:testDebugUnitTest` 59 tests, 0 failures.
+- T3 RED (stub bodies: `accept` always 0, `isDue` false, `poll` null, `buildStatsMessage` `{}`):
+  `gradle -p apps/android :app:testDebugUnitTest` gave 74 tests, 11 failed: both
+  `ControlChannelTest` tests, 5 `LinkStatsTest` tests and 4 `SequenceTrackerTest` tests. The 4 that
+  already passed (in-order play, the first packet starting anywhere, a server restart counting no
+  loss, no report before the interval) are kept as guards.
+- T3 GREEN:
+  - `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 74 tests, 0
+    failures (15 added: `SequenceTrackerTest` 7, `LinkStatsTest` 6, `ControlChannelTest` 2); the
+    debug APK assembled with no Kotlin warnings.
+  - `cargo fmt --all -- --check`: exit 0. `cargo test -p personal-monitoring`: 154 passed.
+    `cargo test -p mixlink-desktop`: 21 passed. `cargo check --workspace --all-targets`: clean.
+- T3 runtime check on a phone: not run here (no device in this session). The JVM tests cover the
+  pure helpers; the wiring in `PmonPlayer` and `MainActivity` is covered only by the debug build.

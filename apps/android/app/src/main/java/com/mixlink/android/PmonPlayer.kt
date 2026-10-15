@@ -13,6 +13,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** Packets between adaptive playback-buffer adjustments: about one second at 100 packets/s. */
 private const val ADJUST_INTERVAL_PACKETS = 100
 
+private const val NANOS_PER_MILLISECOND = 1_000_000L
+
 /**
  * The UDP receive loop, AudioTrack playback and the receiver metrics.
  *
@@ -42,6 +44,13 @@ internal class PmonPlayer(
             playbackBacklogMs: Double,
         )
 
+        /**
+         * One link report for the server, about once a second while the receiver runs, packets or
+         * not. Called on the receive thread, which also feeds the audio track, so it must only hand
+         * the report over and never block.
+         */
+        fun onLinkStats(report: LinkStatsReport)
+
         fun onError(message: String)
 
         fun onStopped()
@@ -65,13 +74,13 @@ internal class PmonPlayer(
 
     private fun receiveLoop(host: String, port: Int) {
         var packetsReceived = 0L
-        var sequencesLost = 0L
-        var expectedSequence: Long? = null
+        val sequenceTracker = SequenceTracker()
         var lastSampleRate: Int? = null
         var sourceSampleRate: Int? = null
         var audioTrack: AudioTrack? = null
         var playbackRate: Int? = null
         val metricsStartedAtNanos = System.nanoTime()
+        val linkStats = LinkStatsAccumulator(metricsStartedAtNanos / NANOS_PER_MILLISECOND)
         var previousPacketAtNanos: Long? = null
         var interArrivalMs = 0.0
         var jitterMs = 0.0
@@ -100,11 +109,22 @@ internal class PmonPlayer(
                 openedSocket.soTimeout = 250
             }.use { openedSocket ->
                 while (running.get()) {
+                    // The link report rides on the loop's own wake-ups: every packet and every
+                    // receive timeout passes here, so a report is at most one timeout late, and the
+                    // track's underrun count is read only when one is due.
+                    val nowMs = System.nanoTime() / NANOS_PER_MILLISECOND
+                    if (linkStats.isDue(nowMs)) {
+                        linkStats.poll(nowMs, audioTrack?.underrunCount ?: 0)?.let { report ->
+                            listener.onLinkStats(report)
+                        }
+                    }
+
                     val datagram = DatagramPacket(buffer, buffer.size)
                     datagram.setLength(buffer.size)
                     try {
                         openedSocket.receive(datagram)
                     } catch (_: java.net.SocketTimeoutException) {
+                        linkStats.onReceiveTimeout()
                         continue
                     }
 
@@ -115,10 +135,13 @@ internal class PmonPlayer(
                                 "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
                             )
                         }
-                        if (expectedSequence != null && packet.sequence > expectedSequence!!) {
-                            sequencesLost += packet.sequence - expectedSequence!!
+                        val lostBefore = sequenceTracker.accept(packet.sequence)
+                        if (lostBefore == SequenceTracker.DROPPED) {
+                            // A duplicate, or a packet that arrived after a newer one was played:
+                            // playing it now would be out of order, and its gap is already counted.
+                            continue
                         }
-                        expectedSequence = packet.sequence + 1
+                        linkStats.onPacket(lostBefore)
                         packetsReceived++
                         lastSampleRate = packet.sampleRate
                         val packetReceivedAtNanos = System.nanoTime()
@@ -193,7 +216,7 @@ internal class PmonPlayer(
                         }
                         listener.onStats(
                             packetsReceived,
-                            sequencesLost,
+                            sequenceTracker.lost,
                             lastSampleRate,
                             packetsPerSecond,
                             interArrivalMs,

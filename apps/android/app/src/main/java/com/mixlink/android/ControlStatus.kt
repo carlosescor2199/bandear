@@ -1,6 +1,6 @@
 package com.mixlink.android
 
-internal enum class ControlState { IDLE, CONNECTING, CONNECTED, UNAVAILABLE, CLOSED }
+internal enum class ControlState { IDLE, CONNECTING, CONNECTED, RECONNECTING, UNAVAILABLE, CLOSED }
 
 /**
  * Describes who currently owns this client's mix.
@@ -18,6 +18,13 @@ internal fun controlStatusLabel(state: ControlState, remoteMixAcknowledged: Bool
         "connected - mix applied on the server"
     } else {
         "connected - waiting for the server to take over"
+    }
+    // The connection dropped and the channel is retrying on its own. Ownership is unchanged until
+    // it reopens: a server that took the mix keeps applying it, otherwise this device still mixes.
+    ControlState.RECONNECTING -> if (remoteMixAcknowledged) {
+        "reconnecting - mix held at the server"
+    } else {
+        "reconnecting - mixing on this device"
     }
     ControlState.UNAVAILABLE, ControlState.CLOSED -> if (remoteMixAcknowledged) {
         "channel lost - mix held at the server's last setting"

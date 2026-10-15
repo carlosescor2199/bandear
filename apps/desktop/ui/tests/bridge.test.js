@@ -315,6 +315,69 @@ test("a local label names a musician that announced no name, and never one that 
   assert.equal(named.nameIsLocal, false);
 });
 
+test("the fake engine's phones carry client ids and a musician added by address has none", async () => {
+  const fake = createFakeBridge({ running: true });
+  const added = await fake.invoke("add_target", { address: "192.168.1.42" });
+
+  const { musicians } = await fake.invoke("engine_status");
+
+  const phones = musicians.filter((musician) => musician.address !== added);
+  assert.ok(
+    phones.every((musician) => typeof musician.clientId === "string" && musician.clientId !== ""),
+    JSON.stringify(phones.map((musician) => musician.clientId)),
+  );
+  assert.equal(new Set(phones.map((musician) => musician.clientId)).size, phones.length);
+  assert.equal(musicians.find((musician) => musician.address === added).clientId, null);
+});
+
+test("a phone back from a new IP keeps the label the desk gave it", async () => {
+  const fake = createFakeBridge({ running: true });
+  const silent = sampleStatus().musicians.find((musician) => !musician.clientName);
+  await fake.invoke("set_musician_name", { address: silent.address, name: "Drum kit" });
+  const statuses = [];
+  await fake.listen("status", (status) => statuses.push(status));
+
+  fake.movePhone(silent.address, "192.168.1.77:50000");
+  const { musicians } = await fake.invoke("engine_status");
+
+  assert.equal(
+    musicians.some((musician) => musician.address === silent.address),
+    false,
+    "the row moved instead of doubling",
+  );
+  const moved = musicians.find((musician) => musician.address === "192.168.1.77:50000");
+  assert.equal(moved.clientId, silent.clientId);
+  assert.equal(moved.name, "Drum kit");
+  assert.equal(moved.nameIsLocal, true);
+  assert.equal(statuses.length, 1, "the move shows in the next status, as the engine's would");
+});
+
+test("the sample's local label is kept for its phone, and one given by address stays there", async () => {
+  const fake = createFakeBridge({ running: true });
+  const silent = sampleStatus().musicians.find((musician) => !musician.clientName);
+  const rack = await fake.invoke("add_target", { address: "192.168.1.43" });
+  await fake.invoke("set_musician_name", { address: rack, name: "Rack A" });
+
+  fake.movePhone(silent.address, "192.168.1.78:50000");
+  const { musicians } = await fake.invoke("engine_status");
+
+  assert.equal(musicians.find((musician) => musician.address === "192.168.1.78:50000").name, silent.name);
+  assert.equal(musicians.find((musician) => musician.address === rack).name, "Rack A");
+  assert.throws(() => fake.movePhone(rack, "192.168.1.79:50000"), /client id/);
+});
+
+test("clearing a phone's label clears what the row shows", async () => {
+  const fake = createFakeBridge({ running: true });
+  const silent = sampleStatus().musicians.find((musician) => !musician.clientName);
+
+  await fake.invoke("set_musician_name", { address: silent.address, name: "  " });
+  const { musicians } = await fake.invoke("engine_status");
+
+  const row = musicians.find((musician) => musician.address === silent.address);
+  assert.equal(row.name, null);
+  assert.equal(row.nameIsLocal, false);
+});
+
 test("unlistening stops the deliveries", async () => {
   const fake = createFakeBridge({ running: true });
   const payloads = [];

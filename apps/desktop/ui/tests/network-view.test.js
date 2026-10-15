@@ -33,9 +33,11 @@ test("a row per musician with the name, who owns it, the link and the counts", (
   assert.equal(rows.length, 4);
   assert.deepEqual(rows[0], {
     address: "192.168.1.3:50000",
+    clientId: status.musicians[0].clientId,
     name: "Lead vocal",
     editable: false,
     nameIsLocal: false,
+    labelFollows: "phone",
     connected: true,
     link: {
       level: "good",
@@ -53,6 +55,20 @@ test("a row per musician with the name, who owns it, the link and the counts", (
   assert.equal(rows[3].nameIsLocal, true);
   assert.equal(rows[1].loss, "0.00%");
   assert.equal(rows[1].lossHigh, false);
+});
+
+test("a label follows a phone that has a client id and stays with the address otherwise", () => {
+  const status = sampleStatus();
+  status.musicians[1].clientId = null;
+  delete status.musicians[2].clientId;
+  const rows = musicianRows(reduce([actions.status(status)]));
+
+  assert.equal(rows[3].clientId, status.musicians[3].clientId);
+  assert.equal(rows[3].labelFollows, "phone");
+  assert.equal(rows[1].clientId, null, "a configured target or an older phone");
+  assert.equal(rows[1].labelFollows, "address");
+  assert.equal(rows[2].clientId, null, "a status without the field reads as no id");
+  assert.equal(rows[2].labelFollows, "address");
 });
 
 test("a muted musician's mix reads muted", () => {

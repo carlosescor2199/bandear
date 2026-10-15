@@ -109,10 +109,46 @@ slice. Push and PRs are the user's decision.
 
 ## Tasks
 
-- [ ] T1 (identity and session file): expose `client_id` in the engine status and the desktop
+- [x] T1 (identity and session file): expose `client_id` in the engine status and the desktop
   DTO; a versioned session store in the app config dir with atomic writes, a recovery path for
   a corrupt file, and migration of `musicians.json`; labels keyed by `client_id` with the
-  address fallback. Route: delegated writer (engine and desktop Rust).
+  address fallback. Route: delegated writer (engine and desktop Rust, desktop UI; trigger: 2+
+  non-trivial files across two crates and the UI).
+  - Engine: `MusicianStatus.client_id` (None for configured targets and phones that sent none),
+    filled by `announced_identities` from the target registry; the desktop row carries it as
+    `clientId` (null when absent).
+  - Session (`apps/desktop/src-tauri/src/session.rs`, replaces `names.rs`): `session.json` =
+    `{"version": 1, "musicians": {"client:<id>" | "address:<ip:port>": {"label": ...}},
+    "channels": [], "groups": [], "presets": []}`; the reserved sections are written back as read.
+    Labels resolve `client:` first, then `address:`. A rename stores under the phone's key when
+    the running engine lists a client id at that address (and drops the address's label so the
+    row shows what was set), else under the address. Saves write `session.json.tmp`, sync and
+    rename; a failed save changes neither the file nor what is shown. A corrupt, unreadable or
+    misshapen file is moved to `session.json.corrupt-<unix ms>` and the desk starts empty (a file
+    that cannot be moved is not saved over); a newer `version` is left untouched and every save is
+    refused; both are logged and kept in `SessionStore::notice`. Migration: with no session and a
+    `musicians.json`, its labels become `address:` entries and the session is written;
+    `musicians.json` stays untouched and is no longer read.
+  - UI: rows carry `clientId` and `labelFollows` ("phone" or "address"), and the label field's
+    title says which; the fake bridge gives its phones client ids, keeps labels keyed as the
+    session does and offers `movePhone(from, to)` (a phone back from a new IP keeps its label).
+  - RED: server tests failed to compile (no `client_id` field, no `announced_identities`); the DTO
+    test failed (no `clientId`); 14 of 15 session tests failed against an empty skeleton (the
+    reserved-sections one passed vacuously); the command tests failed to compile (no
+    `SessionStore`, no `client_id_at`); 6 of 187 UI tests failed.
+  - GREEN: `cargo test -p personal-monitoring` 210 passed; `cargo test -p mixlink-desktop` 61
+    passed (5 `names.rs` tests replaced by 15 session tests, 2 new command tests, 1 new DTO test);
+    `cargo build -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok; UI 187 passed;
+    clippy: no new warnings. IP-change proof: `a_musician_keeps_their_label_after_their_phones_ip_changes`
+    (command layer), `a_phone_keeps_its_label_when_its_ip_changes` (session) and the UI's
+    `a musician's label stays on screen when their phone comes back from a new IP`. Runtime:
+    `name_precedence_probe` imported a copy of the real `musicians.json` (1 label), the phone's
+    own name still wins, the real config directory gained no `session.json`.
+  - Size: about 1,540 authored changed lines over the two commits, above the 400-line heuristic
+    because the session store's recovery, migration and refusal paths each carry their tests
+    (about 380 lines of session tests); not split artificially.
+  - Commits: d8e5a70 `feat(engine): expose the phone's client id in the status`; this commit
+    (`feat(desktop): keep labels in a versioned session file keyed by client id`).
 - [ ] T2 (runtime groups): stable group ids; `EngineHandle::set_groups`; layout generation
   re-sending `config`; register and add_target using the live layout; group-level remap on
   delete or reorder; groups persisted in the session and applied at start; Tauri command.
@@ -137,6 +173,11 @@ slice. Push and PRs are the user's decision.
 - Branch `feat/desktop-channels` from `feat/desktop-console` (0a448e8). Last reviewed boundary:
   0c926dd (phase 1's review `review-6c08ce0320b9f147`); 0a448e8 holds the applied suggestion.
 
+- T1 done (identity and session file); see its entry for evidence. Follow-ups: a label migrated
+  from `musicians.json` stays keyed by address until the engineer renames that musician (it is
+  not moved to the phone's key on its own); the session notice is only logged, the UI does not
+  show it yet (T7 can surface it with session load).
+
 ## Next step
 
-T1.
+T2.

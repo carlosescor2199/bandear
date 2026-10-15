@@ -51,13 +51,16 @@ function channelRows(count, groups) {
   }));
 }
 
-function musicianRow(address, names, link, mixChanges = {}) {
+// `identity` is what the phone announced (`clientName`, `clientId`) and the desk's label (`name`,
+// `nameIsLocal`); a musician added by address announced nothing.
+function musicianRow(address, identity, link, mixChanges = {}) {
   return {
     address,
     clientName: null,
+    clientId: null,
     name: null,
     nameIsLocal: false,
-    ...names,
+    ...identity,
     ...mergeMixUpdate(defaultMix(), mixChanges),
     revision: 1,
     packetsSent: 0,
@@ -66,9 +69,16 @@ function musicianRow(address, names, link, mixChanges = {}) {
   };
 }
 
+// The key the desk keeps a musician's local label under, as the desktop's session does: the
+// phone's client id when it has one, so the label follows it to any IP, else the address.
+function labelKey(row) {
+  return row.clientId ? `client:${row.clientId}` : `address:${row.address}`;
+}
+
 /**
  * A running six-channel engine with two groups (Drums on CH 1-3, Vocals on CH 5-6) and four
- * musicians whose links are good, a warning, unreported and lost.
+ * musicians whose links are good, a warning, unreported and lost. All four are phones with client
+ * ids; the last announced no name and shows the desk's local label.
  */
 export function sampleStatus() {
   const groups = [
@@ -89,19 +99,38 @@ export function sampleStatus() {
     packetsSent: 0,
     packetsDiscarded: 0,
     musicians: [
-      musicianRow("192.168.1.3:50000", { clientName: "Lead vocal", name: "Lead vocal" }, GOOD, {
-        channelGains: [62, 55, 40, 58, 88, 52],
-        pans: [50, 50, 50, 50, 50, 40],
-        volumePercent: 85,
-        maxLevelPercent: 90,
-      }),
-      musicianRow("192.168.1.12:50000", { clientName: "Bass", name: "Bass" }, WARNING),
-      musicianRow("192.168.1.17:50000", { clientName: "Keys", name: "Keys" }, NO_REPORTS, {
-        pans: [50, 50, 50, 50, 30, 70],
-      }),
-      musicianRow("192.168.1.20:50000", { name: "Drums", nameIsLocal: true }, LOST, {
-        channelMuted: [false, false, false, true],
-      }),
+      musicianRow(
+        "192.168.1.3:50000",
+        {
+          clientName: "Lead vocal",
+          clientId: "5f0c2a8e-1b7d-4c3a-9e6f-2d8b4a7c1e90",
+          name: "Lead vocal",
+        },
+        GOOD,
+        {
+          channelGains: [62, 55, 40, 58, 88, 52],
+          pans: [50, 50, 50, 50, 50, 40],
+          volumePercent: 85,
+          maxLevelPercent: 90,
+        },
+      ),
+      musicianRow(
+        "192.168.1.12:50000",
+        { clientName: "Bass", clientId: "a3d9e7b1-6c2f-4e8a-b5d0-7f1c9e3a2b64", name: "Bass" },
+        WARNING,
+      ),
+      musicianRow(
+        "192.168.1.17:50000",
+        { clientName: "Keys", clientId: "c81e4f2a-9b3d-4a7e-8c6f-0d2b5e9a1f37", name: "Keys" },
+        NO_REPORTS,
+        { pans: [50, 50, 50, 50, 30, 70] },
+      ),
+      musicianRow(
+        "192.168.1.20:50000",
+        { clientId: "e4b7c1d9-2a6f-4d3e-9b8c-5f0a7e2d6c18", name: "Drums", nameIsLocal: true },
+        LOST,
+        { channelMuted: [false, false, false, true] },
+      ),
     ],
   };
 }
@@ -171,8 +200,10 @@ function withPort(address) {
  * answer before its `mix-changed` event, an order the desktop's two channels allow (by default
  * the event comes first); `statusOnStart: false` starts without announcing a status, as a window
  * without an event pump. Every stored mix change takes a higher `revision`, as in the engine.
- * Besides `invoke` and `listen` it offers
+ * Local labels are kept as the desktop's session keeps them: for the phone's client id when it has
+ * one, else for the address. Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
+ * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
  * (timers until the returned stop function is called), `holdAnswers(command)` and
  * `releaseAnswers()` (answers that arrive late), `failNext(command, message)` (one failed call),
@@ -193,6 +224,22 @@ export function createFakeBridge({
   let run = running ? engine.run : 0;
   let startError = failStart;
   let revision = Math.max(0, ...engine.musicians.map((musician) => musician.revision ?? 0));
+  // The desk's local labels by labelKey; the labels the status already shows are kept ones.
+  const labels = new Map();
+  for (const row of engine.musicians) {
+    if (row.nameIsLocal && row.name) {
+      labels.set(labelKey(row), row.name);
+    }
+  }
+
+  // Shows on `row` the label kept for its phone, else the one kept for its address. A name the
+  // phone announced always wins over the desk's label.
+  function showLabel(row) {
+    const forPhone = row.clientId ? labels.get(`client:${row.clientId}`) : undefined;
+    const local = forPhone ?? labels.get(`address:${row.address}`) ?? null;
+    row.name = row.clientName ?? local;
+    row.nameIsLocal = !row.clientName && local !== null;
+  }
 
   function emit(event, payload) {
     for (const handler of [...(listeners.get(event) ?? [])]) {
@@ -301,7 +348,10 @@ export function createFakeBridge({
       if (engine.musicians.some((musician) => hostOf(musician.address) === host)) {
         throw `a musician at ${host} is already listed`;
       }
-      engine.musicians.push(musicianRow(resolved, {}, NOT_CONNECTED));
+      const row = musicianRow(resolved, {}, NOT_CONNECTED);
+      // A label the desk kept for this address before shows again, as in the desktop.
+      showLabel(row);
+      engine.musicians.push(row);
       return resolved;
     },
     remove_target({ address }) {
@@ -313,11 +363,15 @@ export function createFakeBridge({
     set_musician_name({ address, name }) {
       const row = musicianAt(address);
       const label = String(name ?? "").trim();
-      // A name the phone announced always wins over the desk's label.
-      if (!row.clientName) {
-        row.name = label || null;
-        row.nameIsLocal = Boolean(label);
+      // As in the desktop: a label kept for the phone replaces one kept for its address, so the
+      // row shows what was just set.
+      labels.delete(`address:${row.address}`);
+      if (label) {
+        labels.set(labelKey(row), label);
+      } else {
+        labels.delete(labelKey(row));
       }
+      showLabel(row);
       return null;
     },
     set_mix({ address, mix }) {
@@ -336,6 +390,24 @@ export function createFakeBridge({
   // A change made on the musician's phone: merged as the engine would, announced as "phone".
   function changeFromPhone(address, update) {
     announceMix(address, "phone", mergeInto(musicianAt(address), update));
+  }
+
+  // The phone at `from` comes back from another IP with its client id, as after a DHCP change: as
+  // the engine's registration does, its row (mix included) moves to `to` and any row already at
+  // that IP gives way. The label kept for the phone follows it; the next status shows the move.
+  function movePhone(from, to) {
+    const row = musicianAt(from);
+    if (!row.clientId) {
+      throw new Error(`the musician at ${from} has no client id, so a new IP would be a new row`);
+    }
+    engine.musicians = engine.musicians.filter(
+      (musician) => musician === row || hostOf(musician.address) !== hostOf(to),
+    );
+    row.address = to;
+    showLabel(row);
+    if (isRunning) {
+      emit("status", clone(engine));
+    }
   }
 
   // Commands whose answers wait for `releaseAnswers`, and the answers waiting.
@@ -405,6 +477,7 @@ export function createFakeBridge({
     emit,
     emitMeters,
     changeFromPhone,
+    movePhone,
     /** From now on the answers to `command` wait for `releaseAnswers`, as a slow link would. */
     holdAnswers(command) {
       held.add(command);

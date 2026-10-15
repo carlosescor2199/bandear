@@ -2,7 +2,10 @@
 //!
 //! It reproduces the exact input of the name-precedence defect: the app's own
 //! `%APPDATA%\com.mixlink.desktop\musicians.json`, which maps `192.168.1.10:50000` to `Carlos`.
-//! The store file is only read, never written, and the run fails if its bytes change.
+//! That file is only read, never written, and the run fails if its bytes change: it is copied
+//! into a scratch config directory, where opening the session imports it exactly as the app's
+//! first start after the session file arrived does, so the real config directory gains no
+//! `session.json` either.
 //!
 //! No host at `192.168.1.10` exists on this machine, so the engine's announcement is supplied at
 //! the boundary where the engine hands the command layer its snapshot: the probe builds the same
@@ -15,7 +18,7 @@ use std::path::PathBuf;
 
 use mixlink_desktop::commands;
 use mixlink_desktop::dto::EngineStatusDto;
-use mixlink_desktop::names::{MusicianNames, NAMES_FILE};
+use mixlink_desktop::session::{SessionStore, LEGACY_LABELS_FILE};
 use personal_monitoring::{CaptureFormat, EngineStatus, MusicianStatus};
 
 /// The address stored in the user's real label file, and the one the bug was reported at.
@@ -27,7 +30,7 @@ fn store_path() -> PathBuf {
     let appdata = std::env::var_os("APPDATA").expect("APPDATA should be set on Windows");
     PathBuf::from(appdata)
         .join("com.mixlink.desktop")
-        .join(NAMES_FILE)
+        .join(LEGACY_LABELS_FILE)
 }
 
 /// The snapshot the engine reports for the single musician at [ADDRESS], with or without an
@@ -63,10 +66,10 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
     }
 }
 
-/// Applies the real store's labels the way `engine_status` does and prints the resulting row.
-fn report(case: &str, names: &MusicianNames, client_name: Option<&str>) {
+/// Applies the imported labels the way `engine_status` does and prints the resulting row.
+fn report(case: &str, session: &SessionStore, client_name: Option<&str>) {
     let mut status = EngineStatusDto::from(&engine_status(client_name));
-    commands::apply_names(&mut status, names);
+    commands::apply_names(&mut status, session);
     let musician = &status.musicians[0];
     println!("--- {case} ---");
     println!("  clientName  -> {:?}", musician.client_name);
@@ -85,11 +88,20 @@ fn main() {
     println!("store bytes -> {}", raw.len());
     println!("store contents -> {raw}");
 
-    let names = MusicianNames::load(path.clone());
-    println!("loaded label for {ADDRESS} -> {:?}", names.get(ADDRESS));
+    let scratch = std::env::temp_dir().join("mixlink-name-precedence-probe");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("the scratch config directory should be created");
+    std::fs::copy(&path, scratch.join(LEGACY_LABELS_FILE))
+        .expect("the label file should copy into the scratch directory");
+    let session = SessionStore::open(&scratch);
+    println!("session notice -> {:?}", session.notice());
+    println!(
+        "loaded label for {ADDRESS} -> {:?}",
+        session.label_for(None, ADDRESS)
+    );
 
-    report("client announces a name", &names, Some(CLIENT_NAME));
-    report("client announces nothing", &names, None);
+    report("client announces a name", &session, Some(CLIENT_NAME));
+    report("client announces nothing", &session, None);
 
     let after =
         std::fs::read_to_string(&path).expect("the real name store should still be readable");

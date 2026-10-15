@@ -334,18 +334,30 @@ pub fn set_musician_name(
     name: String,
 ) -> Result<(), String> {
     // The engine lock is released before the session's is taken, as everywhere else.
-    let client_id = {
+    let musicians = {
         let guard = state
             .engine
             .lock()
             .map_err(|_| "engine state lock was poisoned".to_owned())?;
         guard
             .as_ref()
-            .and_then(|handle| client_id_at(&handle.status().musicians, &address))
+            .map(|handle| handle.status().musicians)
+            .unwrap_or_default()
     };
-    state
-        .session
-        .set_label(client_id.as_deref(), &address, &name)?;
+    label_musician(&state.session, &musicians, &address, &name)
+}
+
+/// Saves `name` as the label of the musician at `address`, keyed on the client id of the row
+/// `musicians` lists there (the running engine's rows, none without an engine), or on the
+/// address when that row has none or no row is there.
+fn label_musician(
+    session: &SessionStore,
+    musicians: &[MusicianStatus],
+    address: &str,
+    name: &str,
+) -> Result<(), String> {
+    let client_id = client_id_at(musicians, address);
+    session.set_label(client_id.as_deref(), address, name)?;
     let kept_for = client_id.map_or_else(|| "address".to_owned(), |id| format!("phone {id}"));
     println!("[mixlink-desktop] set_musician_name: {address} ({kept_for}) -> \"{name}\"");
     Ok(())
@@ -555,9 +567,7 @@ mod tests {
         let session = SessionStore::open(&session_directory("ip-change"));
         // The engineer labels the phone while it is at its first address, as the window does.
         let before = [engine_row("192.168.1.10:50000", Some(PHONE))];
-        let client_id = client_id_at(&before, "192.168.1.10:50000");
-        session
-            .set_label(client_id.as_deref(), "192.168.1.10:50000", "Ana")
+        label_musician(&session, &before, "192.168.1.10:50000", "Ana")
             .expect("setting a label should persist");
         // DHCP gives the phone another IP; the engine moves its row and keeps its client id.
         let mut status = status_with_musicians(&["192.168.1.22:50000"]);
@@ -567,6 +577,50 @@ mod tests {
 
         assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
         assert!(status.musicians[0].name_is_local);
+    }
+
+    /// The saved session's `musicians` section in `test`'s scratch directory.
+    fn saved_musicians(test: &str) -> serde_json::Value {
+        let path = std::env::temp_dir()
+            .join("mixlink-command-tests")
+            .join(test)
+            .join(crate::session::SESSION_FILE);
+        let text = std::fs::read_to_string(path).expect("the session should be saved");
+        serde_json::from_str::<serde_json::Value>(&text).expect("the session is JSON")["musicians"]
+            .clone()
+    }
+
+    #[test]
+    fn naming_a_musician_without_an_engine_keeps_the_label_for_the_address() {
+        let state = DesktopState::new(SessionStore::open(&session_directory("name-idle")));
+
+        set_musician_name(&state, "192.168.1.40:50000".to_owned(), "Rack A".to_owned())
+            .expect("the label is saved without an engine");
+
+        assert_eq!(
+            saved_musicians("name-idle"),
+            serde_json::json!({ "address:192.168.1.40:50000": { "label": "Rack A" } })
+        );
+    }
+
+    #[test]
+    fn naming_a_listed_phone_keeps_the_label_for_its_client_id() {
+        let session = SessionStore::open(&session_directory("name-phone"));
+        let rows = [
+            engine_row("192.168.1.10:50000", Some(PHONE)),
+            engine_row("192.168.1.40:50000", None),
+        ];
+
+        label_musician(&session, &rows, "192.168.1.10:50000", "Ana").expect("saved");
+        label_musician(&session, &rows, "192.168.1.40:50000", "Rack A").expect("saved");
+
+        assert_eq!(
+            saved_musicians("name-phone"),
+            serde_json::json!({
+                format!("client:{PHONE}"): { "label": "Ana" },
+                "address:192.168.1.40:50000": { "label": "Rack A" }
+            })
+        );
     }
 
     #[test]

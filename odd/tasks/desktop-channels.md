@@ -147,8 +147,22 @@ slice. Push and PRs are the user's decision.
   - Size: about 1,540 authored changed lines over the two commits, above the 400-line heuristic
     because the session store's recovery, migration and refusal paths each carry their tests
     (about 380 lines of session tests); not split artificially.
-  - Commits: d8e5a70 `feat(engine): expose the phone's client id in the status`; this commit
-    (`feat(desktop): keep labels in a versioned session file keyed by client id`).
+  - Commits: d8e5a70 `feat(engine): expose the phone's client id in the status`; 78dc65d
+    `feat(desktop): keep labels in a versioned session file keyed by client id`.
+- [x] T1b (review fixes for T1, review `review-c1a7cf3a01994207`): after a session file is moved
+  aside, the empty session is saved at once (same atomic write), so the next start never imports
+  `musicians.json` again (R3-legacy-reimport-after-recovery); a file that cannot be moved is still
+  not saved over. `set_musician_name` routes through `label_musician(session, rows, address,
+  name)`, now tested at the command level (R3-set-musician-name-routing-unproved). Route: inline
+  writer of the delegated T1 worker (two files, bounded fixes).
+  - RED: `after_a_recovery_the_old_label_file_is_never_imported_again` failed (the stale label came
+    back), and the two recovery tests updated to expect the saved empty session failed; the routing
+    tests failed to compile (no `label_musician`). The no-engine routing test characterises the
+    existing address-keyed path.
+  - GREEN: `cargo fmt -p mixlink-desktop -- --check` clean; `cargo test -p mixlink-desktop` 64
+    passed (3 new: the recovery re-import case, the no-engine address-keyed rename, the
+    client-keyed rename); clippy: no warnings in the desktop crate.
+  - Commit: this commit (`fix(desktop): never re-import legacy labels after a session recovery`).
 - [ ] T2 (runtime groups): stable group ids; `EngineHandle::set_groups`; layout generation
   re-sending `config`; register and add_target using the live layout; group-level remap on
   delete or reorder; groups persisted in the session and applied at start; Tauri command.
@@ -177,6 +191,9 @@ slice. Push and PRs are the user's decision.
   from `musicians.json` stays keyed by address until the engineer renames that musician (it is
   not moved to the phone's key on its own); the session notice is only logged, the UI does not
   show it yet (T7 can surface it with session load).
+- Review `review-c1a7cf3a01994207` over 0c926dd..78dc65d approved and acknowledged; next review
+  base 78dc65d. Its findings (R3-legacy-reimport-after-recovery,
+  R3-set-musician-name-routing-unproved) are fixed by T1b.
 
 ## Next step
 

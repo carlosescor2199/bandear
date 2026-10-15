@@ -270,7 +270,8 @@ fn parse(bytes: &[u8]) -> Parsed {
     }
 }
 
-/// Moves a session that cannot be used out of the way and starts an empty one. A file that cannot
+/// Moves a session that cannot be used out of the way and starts an empty one, saved at once: a
+/// session existed, so `musicians.json` must not be imported on the next start. A file that cannot
 /// be moved either is not saved over, so it is never lost.
 fn set_aside(path: &Path, problem: &str) -> Loaded {
     let millis = SystemTime::now()
@@ -279,12 +280,21 @@ fn set_aside(path: &Path, problem: &str) -> Loaded {
         .unwrap_or_default();
     let aside = path.with_file_name(format!("{SESSION_FILE}.corrupt-{millis}"));
     match fs::rename(path, &aside) {
-        Ok(()) => Loaded::fresh(Some(format!(
-            "the session file {} {problem}; it was moved to {} and the desk starts with an empty \
-             session",
-            path.display(),
-            aside.display()
-        ))),
+        Ok(()) => {
+            let saved = match write_atomically(path, &Session::default()) {
+                Ok(()) => String::new(),
+                Err(error) => format!(
+                    " ({error}; until a change is saved, the next start may import the old label \
+                     file again)"
+                ),
+            };
+            Loaded::fresh(Some(format!(
+                "the session file {} {problem}; it was moved to {} and the desk starts with an \
+                 empty session{saved}",
+                path.display(),
+                aside.display()
+            )))
+        }
         Err(error) => {
             let notice = format!(
                 "the session file {} {problem} and could not be moved aside ({error}); the desk \
@@ -618,15 +628,25 @@ mod tests {
         let notice = session.notice().expect("the problem is reported");
         assert!(notice.contains("moved"), "says what happened: {notice}");
         let files = files_in(&directory);
-        assert_eq!(files.len(), 1, "only the moved file: {files:?}");
+        assert_eq!(
+            files.len(),
+            2,
+            "the new session and the moved file: {files:?}"
+        );
+        assert_eq!(files[0], SESSION_FILE);
         assert!(
-            files[0].starts_with(&format!("{SESSION_FILE}.corrupt-")),
+            files[1].starts_with(&format!("{SESSION_FILE}.corrupt-")),
             "{files:?}"
         );
         assert_eq!(
-            fs::read_to_string(directory.join(&files[0])).expect("kept"),
+            fs::read_to_string(directory.join(&files[1])).expect("kept"),
             "this is not json",
             "the bad file is kept for inspection, byte for byte"
+        );
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)),
+            serde_json::to_value(Session::default()).expect("serializes"),
+            "the empty session it starts with is saved at once"
         );
         session
             .set_label(None, ADDRESS, "Ana")
@@ -634,6 +654,30 @@ mod tests {
         assert_eq!(
             SessionStore::open(&directory).label_for(None, ADDRESS),
             Some("Ana".to_owned())
+        );
+    }
+
+    #[test]
+    fn after_a_recovery_the_old_label_file_is_never_imported_again() {
+        let directory = test_directory("recovery-no-reimport");
+        let legacy = r#"{"192.168.1.30:50000": "Stale"}"#;
+        fs::write(directory.join(LEGACY_LABELS_FILE), legacy).expect("write");
+        fs::write(directory.join(SESSION_FILE), "this is not json").expect("write");
+
+        let recovered = SessionStore::open(&directory);
+        // Nothing is saved before the next start.
+        drop(recovered);
+        let reopened = SessionStore::open(&directory);
+
+        assert_eq!(
+            reopened.label_for(None, ADDRESS),
+            None,
+            "a session existed, so the old file's labels stay out"
+        );
+        assert_eq!(reopened.notice(), None, "the second start simply loads");
+        assert_eq!(
+            fs::read_to_string(directory.join(LEGACY_LABELS_FILE)).expect("kept"),
+            legacy
         );
     }
 
@@ -651,9 +695,18 @@ mod tests {
             let session = SessionStore::open(&directory);
 
             assert!(session.notice().is_some(), "{case} is reported");
-            assert!(
-                !directory.join(SESSION_FILE).exists(),
-                "{case} is moved aside"
+            let moved = files_in(&directory)
+                .into_iter()
+                .find(|name| name.starts_with(&format!("{SESSION_FILE}.corrupt-")))
+                .unwrap_or_else(|| panic!("{case} is moved aside"));
+            assert_eq!(
+                fs::read_to_string(directory.join(moved)).expect("kept"),
+                contents
+            );
+            assert_eq!(
+                read_json(&directory.join(SESSION_FILE)),
+                serde_json::to_value(Session::default()).expect("serializes"),
+                "{case}: an empty session replaces it"
             );
             session
                 .set_label(None, ADDRESS, "Ana")

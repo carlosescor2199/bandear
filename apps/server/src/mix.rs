@@ -25,9 +25,10 @@ pub(crate) struct Group {
 
 /// The groups plus the derived channel-to-group lookup.
 ///
-/// Membership is fixed at startup, so the lookup is built once and copied into every [MixValues]
-/// snapshot the network thread reads. A channel belongs to at most one group, which validation
-/// enforces; the lookup is therefore a single owner per channel.
+/// A layout is immutable: a change of groups (or of the device, which can invalidate one) builds a
+/// new layout, and each mix copies its lookup into the atomics the network thread reads. A channel
+/// belongs to at most one group, which validation enforces; the lookup is therefore a single owner
+/// per channel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GroupLayout {
     groups: Vec<Group>,
@@ -56,6 +57,22 @@ impl GroupLayout {
 
     pub(crate) fn channel_group(&self) -> [Option<usize>; MAX_MIX_CHANNELS] {
         self.channel_group
+    }
+}
+
+/// Where a new musician's mix takes its group membership from.
+///
+/// A fixed [GroupLayout] answers with itself; the engine's live configuration answers with the
+/// membership in force at the moment the mix is created. The target registry creates a mix under
+/// its own write lock, so a mix created while the groups change gets either the old membership
+/// (and is then moved with every other mix) or the new one, never a stale one left behind.
+pub(crate) trait Membership {
+    fn new_mix(&self) -> MixState;
+}
+
+impl Membership for GroupLayout {
+    fn new_mix(&self) -> MixState {
+        MixState::new(self)
     }
 }
 

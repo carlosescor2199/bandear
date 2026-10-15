@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::OutputMeter;
 use crate::health::LatestLinkReport;
-use crate::mix::{GroupLayout, MixState};
+use crate::mix::{GroupLayout, Membership, MixState};
 use crate::network::TargetCounters;
 
 /// How long a registered target survives after its last control channel closes.
@@ -140,7 +140,7 @@ impl TargetRegistry {
         udp_port: u16,
         name: Option<String>,
         client_id: Option<&str>,
-        layout: &GroupLayout,
+        membership: &dyn Membership,
     ) -> Registration {
         let address = SocketAddr::new(peer, udp_port);
         let origin = TargetOrigin::Registered {
@@ -180,7 +180,9 @@ impl TargetRegistry {
         }
         entries.push(TargetEntry {
             address,
-            mix_state: Arc::new(MixState::new(layout)),
+            // Created under the write lock, so it takes the membership in force now (see
+            // [Membership]).
+            mix_state: Arc::new(membership.new_mix()),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
             output_meter: OutputMeter::default(),
@@ -242,10 +244,14 @@ impl TargetRegistry {
 
     /// Resolves and validates `value`, then adds it as a new target.
     ///
-    /// The new entry starts with a neutral mix carrying the supplied group layout and zero counters.
-    /// A value that cannot be resolved, or whose IP is already configured, is rejected with an
-    /// error naming the value; the table is left exactly as it was.
-    pub(crate) fn add(&self, value: &str, layout: &GroupLayout) -> Result<SocketAddr, String> {
+    /// The new entry starts with a neutral mix carrying the group membership in force (see
+    /// [Membership]) and zero counters. A value that cannot be resolved, or whose IP is already
+    /// configured, is rejected with an error naming the value; the table is left exactly as it was.
+    pub(crate) fn add(
+        &self,
+        value: &str,
+        membership: &dyn Membership,
+    ) -> Result<SocketAddr, String> {
         let address = resolve_target(value)?;
         let mut entries = self.entries.write().expect("target registry lock poisoned");
         if let Some(existing) = entries
@@ -260,7 +266,7 @@ impl TargetRegistry {
         }
         entries.push(TargetEntry {
             address,
-            mix_state: Arc::new(MixState::new(layout)),
+            mix_state: Arc::new(membership.new_mix()),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
             output_meter: OutputMeter::default(),

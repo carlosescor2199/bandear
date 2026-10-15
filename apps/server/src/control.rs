@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,9 +12,9 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
-use crate::engine::{EngineEvent, EventBus, MixOrigin};
+use crate::engine::{EngineEvent, EventBus, GroupStatus, MixOrigin};
 use crate::health::LinkReport;
-use crate::mix::GroupLayout;
+use crate::mix::{GroupLayout, Membership, MixState};
 use crate::protocol::{
     control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
     parse_mix_update, parse_register_command, parse_stats_command, registered_name, ControlConfig,
@@ -32,7 +32,7 @@ const NO_TARGET_ERROR: &str = "no UDP target configured for client IP";
 /// above zero. The IP is the join key between [MixState], the UDP target and the control peer.
 pub(crate) type ControlPeers = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
-/// How often a control connection checks whether a device switch changed the channel count.
+/// How often a control connection checks whether the live configuration changed.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often a control connection sends its client a WebSocket ping.
@@ -65,43 +65,119 @@ impl Default for Heartbeat {
     }
 }
 
-/// The live control configuration shared between the engine and every connection.
+/// What `config` tells a phone, as one immutable value: the captured channel count and the groups.
 ///
-/// A device switch can change the captured channel count while the server runs. The engine stores the
-/// current count here; each connection notices a change on its next poll and re-sends `config` on the
-/// same socket, so a client rebuilds its per-channel controls without losing the control channel.
+/// A change publishes a whole new snapshot with a higher generation (see [ConfigState::publish]),
+/// so a reader never sees a channel count paired with the groups of another configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigSnapshot {
+    /// Which published configuration this is: every change has a higher one, so a connection can
+    /// tell whether its phone already has it.
+    pub(crate) generation: u64,
+    pub(crate) source_channels: u8,
+    /// The engineer's groups as the status reports them: 0-based channels, and whether the device
+    /// has every channel a group names.
+    pub(crate) groups: Vec<GroupStatus>,
+    /// The membership the mixer applies: an invalid group keeps its position, so group levels stay
+    /// aligned with the list, but maps no channel.
+    pub(crate) layout: GroupLayout,
+}
+
+/// The live control configuration, shared by the engine and every connection.
+///
+/// The engine publishes a new snapshot whenever what `config` says changes: a device switch that
+/// changes the channel count (and with it which groups are valid). Each connection notices the
+/// higher generation and re-sends `config` on the same socket, so a client rebuilds its controls
+/// without losing the control channel, and a phone that registers takes the live membership for its
+/// mix. The generation is an atomic, so a connection's poll is one load; the snapshot behind its lock
+/// is only read when it changed.
 pub(crate) struct ConfigState {
-    channels: AtomicU8,
+    current: RwLock<Arc<ConfigSnapshot>>,
+    generation: AtomicU64,
 }
 
 impl ConfigState {
-    pub(crate) fn new(channels: u8) -> Self {
+    pub(crate) fn new(source_channels: u8, groups: Vec<GroupStatus>, layout: GroupLayout) -> Self {
+        let first = ConfigSnapshot {
+            generation: 1,
+            source_channels,
+            groups,
+            layout,
+        };
         Self {
-            channels: AtomicU8::new(channels),
+            current: RwLock::new(Arc::new(first)),
+            generation: AtomicU64::new(1),
         }
     }
 
-    pub(crate) fn current(&self) -> u8 {
-        self.channels.load(Ordering::SeqCst)
+    /// The generation of the configuration in force: one atomic load, for a connection's poll.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
-    /// Publishes a new channel count. Storing an unchanged count is harmless: a connection compares
-    /// it against the count it last sent.
-    pub(crate) fn set_channels(&self, channels: u8) {
-        self.channels.store(channels, Ordering::SeqCst);
+    /// The configuration in force.
+    pub(crate) fn snapshot(&self) -> Arc<ConfigSnapshot> {
+        Arc::clone(
+            &self
+                .current
+                .read()
+                .expect("control configuration lock poisoned"),
+        )
+    }
+
+    /// Publishes a configuration and returns whether it differs from the one in force. An
+    /// unchanged one keeps its generation, so no connection re-sends `config` for nothing.
+    ///
+    /// The generation is raised while the new snapshot is held under the write lock, so a reader
+    /// that sees the new generation always reads the new snapshot.
+    pub(crate) fn publish(
+        &self,
+        source_channels: u8,
+        groups: Vec<GroupStatus>,
+        layout: GroupLayout,
+    ) -> bool {
+        let mut current = self
+            .current
+            .write()
+            .expect("control configuration lock poisoned");
+        if current.source_channels == source_channels
+            && current.groups == groups
+            && current.layout == layout
+        {
+            return false;
+        }
+        let generation = current.generation + 1;
+        *current = Arc::new(ConfigSnapshot {
+            generation,
+            source_channels,
+            groups,
+            layout,
+        });
+        self.generation.store(generation, Ordering::SeqCst);
+        true
     }
 }
 
-/// Builds the `config` control message for a channel count and group layout.
+/// A phone registering, or a target added by address, gets the membership in force at that moment.
+impl Membership for ConfigState {
+    fn new_mix(&self) -> MixState {
+        MixState::new(&self.snapshot().layout)
+    }
+}
+
+/// Builds the `config` control message for one configuration.
 ///
-/// Free of connection state so it can be sent on connect and re-sent on a device switch from the
-/// same code, which is what keeps the two messages identical in shape.
-fn config_message(source_channels: u8, groups: &GroupLayout) -> Result<String, serde_json::Error> {
+/// Free of connection state so it can be sent on connect and re-sent on a change from the same
+/// code, which is what keeps the two messages identical in shape. The groups are the mixer's: an
+/// invalid group is announced in its position with no channel, so the phone's group levels, which
+/// are positional, stay aligned with the server's.
+fn config_message(config: &ConfigSnapshot) -> Result<String, serde_json::Error> {
     serde_json::to_string(&ControlConfig {
         message_type: "config",
-        source_channels,
+        source_channels: config.source_channels,
         sample_rate: TARGET_SAMPLE_RATE,
-        groups: groups
+        groups: config
+            .layout
             .groups()
             .iter()
             .map(|group| GroupConfig {
@@ -112,12 +188,71 @@ fn config_message(source_channels: u8, groups: &GroupLayout) -> Result<String, s
     })
 }
 
+/// One connection's view of the live configuration: the generation its phone was last sent.
+///
+/// The connection loop and its watcher share it, and both send through [send_with_config], which
+/// checks and sends while holding the connection's writer, so each configuration goes out once and
+/// in order.
+struct ConfigFeed {
+    state: Arc<ConfigState>,
+    sent: AtomicU64,
+}
+
+impl ConfigFeed {
+    /// A feed whose phone has been sent nothing yet: generations start at 1, so the first check
+    /// always finds `config` to send.
+    fn new(state: Arc<ConfigState>) -> Self {
+        Self {
+            state,
+            sent: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether the phone lacks the configuration in force; one atomic load each side.
+    fn is_behind(&self) -> bool {
+        self.state.generation() != self.sent.load(Ordering::SeqCst)
+    }
+
+    /// The `config` for the configuration in force when the phone lacks it, marked as sent. Called
+    /// with the connection's writer held, by the code that then sends it.
+    fn take_pending(&self) -> Result<Option<String>, serde_json::Error> {
+        if !self.is_behind() {
+            return Ok(None);
+        }
+        let snapshot = self.state.snapshot();
+        let message = config_message(&snapshot)?;
+        self.sent.store(snapshot.generation, Ordering::SeqCst);
+        Ok(Some(message))
+    }
+}
+
+/// Sends `message` on the shared writer, preceded by `config` when the phone lacks the
+/// configuration in force, in one hold of the writer so nothing can come between them. With no
+/// message it only brings the phone's `config` up to date.
+async fn send_with_config<S>(
+    writer: &tokio::sync::Mutex<S>,
+    config: &ConfigFeed,
+    message: Option<Message>,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: Error + Send + Sync + 'static,
+{
+    let mut sink = writer.lock().await;
+    if let Some(update) = config.take_pending()? {
+        sink.send(Message::Text(update.into())).await?;
+    }
+    if let Some(message) = message {
+        sink.send(message).await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn spawn_control_thread(
     control_port: u16,
     targets: Arc<TargetRegistry>,
     stopped: Arc<AtomicBool>,
     config_state: Arc<ConfigState>,
-    groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
 ) -> JoinHandle<()> {
@@ -148,7 +283,6 @@ pub(crate) fn spawn_control_thread(
             targets,
             stopped,
             config_state,
-            groups,
             peers,
             events,
             Heartbeat::default(),
@@ -156,13 +290,11 @@ pub(crate) fn spawn_control_thread(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_control_server(
     listener: std::net::TcpListener,
     targets: Arc<TargetRegistry>,
     stopped: Arc<AtomicBool>,
     config_state: Arc<ConfigState>,
-    groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
     heartbeat: Heartbeat,
@@ -193,7 +325,6 @@ async fn run_control_server(
                 Ok((stream, peer)) => {
                     let targets = Arc::clone(&targets);
                     let config_state = Arc::clone(&config_state);
-                    let groups = Arc::clone(&groups);
                     let peers = Arc::clone(&peers);
                     let events = events.clone();
                     tokio::spawn(async move {
@@ -202,7 +333,6 @@ async fn run_control_server(
                             peer,
                             targets,
                             config_state,
-                            groups,
                             peers,
                             events,
                             heartbeat,
@@ -366,13 +496,11 @@ fn register_peer(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_control_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     targets: Arc<TargetRegistry>,
     config_state: Arc<ConfigState>,
-    groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
     heartbeat: Heartbeat,
@@ -387,38 +515,21 @@ async fn handle_control_connection(
     // The sink is shared between the read loop and the config watcher through an async mutex. The
     // read loop only holds it while sending, never while parked in a read.
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
-    let sent_channels = Arc::new(AtomicU8::new(config_state.current()));
-    writer
-        .lock()
-        .await
-        .send(Message::Text(
-            config_message(sent_channels.load(Ordering::SeqCst), &groups)?.into(),
-        ))
-        .await?;
+    let config = Arc::new(ConfigFeed::new(Arc::clone(&config_state)));
+    send_with_config(&writer, &config, None).await?;
 
-    // The watcher notices a device switch while the connection is idle and re-sends `config` on the
-    // SAME socket, so a client rebuilds its per-channel controls without losing the control channel.
+    // The watcher notices a new configuration (a device switch) while the connection is idle and
+    // re-sends `config` on the SAME socket, so a client rebuilds its controls without losing the
+    // control channel.
     let watcher_writer = Arc::clone(&writer);
-    let watcher_state = Arc::clone(&config_state);
-    let watcher_groups = Arc::clone(&groups);
-    let watcher_sent = Arc::clone(&sent_channels);
+    let watcher_config = Arc::clone(&config);
     let watcher_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
-            let current = watcher_state.current();
-            if current == watcher_sent.load(Ordering::SeqCst) {
-                continue;
-            }
-            watcher_sent.store(current, Ordering::SeqCst);
-            let Ok(config) = config_message(current, &watcher_groups) else {
-                break;
-            };
-            if watcher_writer
-                .lock()
-                .await
-                .send(Message::Text(config.into()))
-                .await
-                .is_err()
+            if watcher_config.is_behind()
+                && send_with_config(&watcher_writer, &watcher_config, None)
+                    .await
+                    .is_err()
             {
                 break;
             }
@@ -439,16 +550,10 @@ async fn handle_control_connection(
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         // Safety net for a runtime that does not drive the watcher's timer while this task is parked
-        // on a read: re-check the channel count before parking again, so the next client message also
-        // re-sends `config`. It is a cheap atomic load when nothing changed.
-        let current = config_state.current();
-        if current != sent_channels.load(Ordering::SeqCst) {
-            sent_channels.store(current, Ordering::SeqCst);
-            writer
-                .lock()
-                .await
-                .send(Message::Text(config_message(current, &groups)?.into()))
-                .await?;
+        // on a read: re-check the configuration before parking again, so the next client message
+        // also re-sends `config`. It is a cheap atomic load when nothing changed.
+        if config.is_behind() {
+            send_with_config(&writer, &config, None).await?;
         }
 
         let dead_at = last_inbound + heartbeat.dead_after;
@@ -516,7 +621,7 @@ async fn handle_control_connection(
                                 command.udp_port,
                                 name.clone(),
                                 command.client_id.as_deref(),
-                                &groups,
+                                &*config_state,
                             );
                             let address = registration.address;
                             // A new session starts with no link report: the one left by an earlier
@@ -631,32 +736,80 @@ fn log_missed_heartbeat(peer: SocketAddr, dead_after: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mix::Group;
+    use crate::cli::GroupDefinition;
+    use crate::engine::revalidate_groups;
 
-    fn drums() -> GroupLayout {
-        GroupLayout::new(vec![Group {
+    fn drums() -> Vec<GroupDefinition> {
+        vec![GroupDefinition {
             name: "Drums".to_owned(),
-            channels: vec![0, 1],
-        }])
+            channels: vec![1, 2],
+        }]
+    }
+
+    /// Drums on CH 1-2 and Vocals on CH 3-4: a four-channel device has both, a two-channel one
+    /// leaves Vocals invalid.
+    fn band() -> Vec<GroupDefinition> {
+        vec![
+            GroupDefinition {
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            },
+            GroupDefinition {
+                name: "Vocals".to_owned(),
+                channels: vec![3, 4],
+            },
+        ]
+    }
+
+    /// The live configuration the engine starts with for `definitions` on `channels` inputs.
+    fn live_config(definitions: &[GroupDefinition], channels: u8) -> Arc<ConfigState> {
+        let groups = revalidate_groups(definitions, usize::from(channels));
+        Arc::new(ConfigState::new(
+            channels,
+            groups.statuses,
+            groups.mixer_layout,
+        ))
+    }
+
+    /// What a device switch to `channels` inputs publishes, as the engine does.
+    fn publish_switch(config: &ConfigState, definitions: &[GroupDefinition], channels: u8) -> bool {
+        let groups = revalidate_groups(definitions, usize::from(channels));
+        config.publish(channels, groups.statuses, groups.mixer_layout)
     }
 
     #[test]
     fn config_message_carries_the_source_channels_and_groups() {
-        let json = config_message(4, &drums()).expect("config should serialize");
+        let json =
+            config_message(&live_config(&drums(), 4).snapshot()).expect("config should serialize");
 
         assert!(json.contains(r#""source_channels":4"#));
         assert!(json.contains(r#""groups":[{"name":"Drums","channels":[0,1]}]"#));
     }
 
     #[test]
-    fn config_state_reports_the_latest_channel_count() {
-        let state = ConfigState::new(2);
+    fn an_invalid_group_is_announced_in_its_place_with_no_channels() {
+        let json =
+            config_message(&live_config(&band(), 2).snapshot()).expect("config should serialize");
 
-        assert_eq!(state.current(), 2);
+        assert!(json.contains(
+            r#""groups":[{"name":"Drums","channels":[0,1]},{"name":"Vocals","channels":[]}]"#
+        ));
+    }
 
-        state.set_channels(4);
+    #[test]
+    fn a_published_change_takes_a_higher_generation_and_an_unchanged_one_does_not() {
+        let state = live_config(&band(), 4);
+        let first = state.generation();
 
-        assert_eq!(state.current(), 4);
+        assert!(publish_switch(&state, &band(), 2));
+        let switched = state.snapshot();
+        assert!(switched.generation > first);
+        assert_eq!(state.generation(), switched.generation);
+        assert_eq!(switched.source_channels, 2);
+        assert!(switched.groups[1].invalid);
+
+        assert!(!publish_switch(&state, &band(), 2), "nothing changed");
+        assert_eq!(state.generation(), switched.generation);
     }
 
     use tokio_tungstenite::connect_async;
@@ -715,7 +868,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
         let address = listener.local_addr().expect("listener address");
         let stopped = Arc::new(AtomicBool::new(false));
-        let config_state = Arc::new(ConfigState::new(2));
+        let config_state = live_config(&drums(), 2);
 
         let server_stopped = Arc::clone(&stopped);
         let server_config = Arc::clone(&config_state);
@@ -732,7 +885,6 @@ mod tests {
                 ),
                 server_stopped,
                 server_config,
-                Arc::new(drums()),
                 Arc::new(Mutex::new(HashMap::new())),
                 EventBus::default(),
                 Heartbeat::default(),
@@ -754,7 +906,7 @@ mod tests {
         );
 
         // The equivalent of the engine publishing a new device's channel count.
-        config_state.set_channels(4);
+        assert!(publish_switch(&config_state, &drums(), 4));
 
         // The connection re-checks the channel count before each read, so any client message makes
         // it re-send `config`. A mix command is the message a musician's client would send anyway.
@@ -811,8 +963,7 @@ mod tests {
                 listener,
                 server_targets,
                 server_stopped,
-                Arc::new(ConfigState::new(2)),
-                Arc::new(drums()),
+                live_config(&drums(), 2),
                 Arc::new(Mutex::new(HashMap::new())),
                 EventBus::default(),
                 Heartbeat::default(),
@@ -922,6 +1073,18 @@ mod tests {
         heartbeat: Heartbeat,
         events: EventBus,
     ) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        start_server_on(targets, peers, heartbeat, events, live_config(&drums(), 2))
+    }
+
+    /// Starts a control server like [start_server_with_events] on the live configuration the test
+    /// supplies, so a test can publish a change the way the engine does and watch the phones.
+    fn start_server_on(
+        targets: Arc<TargetRegistry>,
+        peers: ControlPeers,
+        heartbeat: Heartbeat,
+        events: EventBus,
+        config: Arc<ConfigState>,
+    ) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
         let address = listener.local_addr().expect("listener address");
         // Non-blocking, as `spawn_control_thread` sets it. On Windows an accepted socket inherits
@@ -941,14 +1104,111 @@ mod tests {
                 listener,
                 targets,
                 server_stopped,
-                Arc::new(ConfigState::new(2)),
-                Arc::new(drums()),
+                config,
                 peers,
                 events,
                 heartbeat,
             ));
         });
         (address, stopped, server)
+    }
+
+    /// The groups a `config` message announces, as `(name, channels)` pairs in order.
+    fn announced_groups(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
+        config["groups"]
+            .as_array()
+            .expect("config carries a group list")
+            .iter()
+            .map(|group| {
+                (
+                    group["name"].as_str().expect("a group name").to_owned(),
+                    serde_json::from_value(group["channels"].clone()).expect("group channels"),
+                )
+            })
+            .collect()
+    }
+
+    /// The latent bug of the start-up layout, over a real socket: after a device switch a phone
+    /// that stays connected and sends nothing is sent the live groups (an invalid group in its
+    /// place with no channels), not the groups the server started with; and any later change of
+    /// the groups is sent too, whether or not the channel count moves.
+    #[tokio::test]
+    async fn after_a_device_switch_a_connected_phone_is_sent_the_live_groups() {
+        let config = live_config(&band(), 4);
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_server_on(
+            targets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            EventBus::default(),
+            Arc::clone(&config),
+        );
+        let mut client = connect_client(address).await;
+
+        assert!(publish_switch(&config, &band(), 2));
+
+        let switched = read_message_of_type(&mut client, "config")
+            .await
+            .expect("the switch is pushed without the phone asking");
+        assert_eq!(switched["source_channels"], 2);
+        assert_eq!(
+            announced_groups(&switched),
+            vec![
+                ("Drums".to_owned(), vec![0, 1]),
+                ("Vocals".to_owned(), vec![]),
+            ]
+        );
+
+        // The same channel count with other groups: a new generation is pushed all the same.
+        let regrouped = vec![GroupDefinition {
+            name: "Keys".to_owned(),
+            channels: vec![2],
+        }];
+        assert!(publish_switch(&config, &regrouped, 2));
+        let pushed = read_message_of_type(&mut client, "config")
+            .await
+            .expect("a change of groups alone is pushed");
+        assert_eq!(pushed["source_channels"], 2);
+        assert_eq!(
+            announced_groups(&pushed),
+            vec![("Keys".to_owned(), vec![1])]
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The other half of the latent bug: a phone that registers after a device switch mixes with
+    /// the live membership, so a group the device lost does not scale a channel it no longer names.
+    #[tokio::test]
+    async fn a_phone_registering_after_a_device_switch_mixes_with_the_live_groups() {
+        let config = live_config(&band(), 4);
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_server_on(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            EventBus::default(),
+            Arc::clone(&config),
+        );
+        // The server is up (it answered with `config`) before the switch.
+        let mut client = connect_client(address).await;
+        assert!(publish_switch(&config, &band(), 2));
+
+        send_then_sync(&mut client, REGISTER_ANA).await;
+
+        let mix = targets
+            .mix_state("127.0.0.1".parse().expect("loopback IP"))
+            .expect("registered target")
+            .snapshot();
+        assert_eq!(mix.channel_group[0], Some(0), "Drums still owns CH 1");
+        assert_eq!(
+            mix.channel_group[2], None,
+            "the invalid Vocals owns nothing"
+        );
+
+        stop_server(address, &stopped, server).await;
     }
 
     async fn stop_server(

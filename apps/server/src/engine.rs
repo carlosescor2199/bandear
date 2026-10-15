@@ -636,27 +636,21 @@ pub(crate) fn revalidate_groups(
 /// Everything a successful device switch changes, computed before anything is mutated.
 pub(crate) struct DeviceSwitchPlan {
     pub(crate) source_channels: u8,
-    pub(crate) groups: Vec<GroupStatus>,
-    pub(crate) mixer_layout: GroupLayout,
-    pub(crate) resend_config: bool,
+    pub(crate) groups: GroupRevalidation,
 }
 
 /// Plans the state change for a capture device that now has `new_channels` channels.
 ///
-/// Pure and non-mutating: the previous group definitions are read, the groups are re-validated, and
-/// `resend_config` is set only when the channel count actually changed, which is when connected
-/// clients must rebuild.
+/// Pure and non-mutating: the previous group definitions are read and re-validated. Whether
+/// connected clients must be sent a new `config` is decided when the plan is published (see
+/// [apply_groups]): only a configuration that differs from the one in force is re-sent.
 pub(crate) fn plan_device_switch(
-    current_channels: u8,
     definitions: &[GroupDefinition],
     new_channels: u8,
 ) -> DeviceSwitchPlan {
-    let revalidation = revalidate_groups(definitions, usize::from(new_channels));
     DeviceSwitchPlan {
         source_channels: new_channels,
-        groups: revalidation.statuses,
-        mixer_layout: revalidation.mixer_layout,
-        resend_config: new_channels != current_channels,
+        groups: revalidate_groups(definitions, usize::from(new_channels)),
     }
 }
 
@@ -666,16 +660,37 @@ pub(crate) fn plan_device_switch(
 /// function is what makes the "a failed switch preserves the previous state" rule testable without
 /// an audio device.
 pub(crate) fn plan_switch_from_attempt(
-    current_channels: u8,
     definitions: &[GroupDefinition],
     attempt: Result<u16, Box<dyn Error>>,
 ) -> Result<DeviceSwitchPlan, Box<dyn Error>> {
     let new_channels = attempt?.min(u16::from(u8::MAX)) as u8;
-    Ok(plan_device_switch(
-        current_channels,
-        definitions,
-        new_channels,
-    ))
+    Ok(plan_device_switch(definitions, new_channels))
+}
+
+/// Publishes `source_channels` and `groups` as the live configuration and points every musician's
+/// mixer at the new membership. Returns whether anything changed; an unchanged configuration
+/// touches nothing and makes no connection re-send `config`.
+///
+/// The registry is held for reading throughout, and a new musician's mix is created under its write
+/// lock from the live configuration (see [crate::mix::Membership]). A phone registering at the same
+/// moment therefore either exists already and is moved here, or comes after the publish and starts
+/// with the new membership; none is left on the old one. Group positions do not change here, so
+/// every stored group level stays with its group.
+pub(crate) fn apply_groups(
+    targets: &TargetRegistry,
+    config: &ConfigState,
+    source_channels: u8,
+    groups: GroupRevalidation,
+) -> bool {
+    let entries = targets.read();
+    let layout = groups.mixer_layout.clone();
+    if !config.publish(source_channels, groups.statuses, groups.mixer_layout) {
+        return false;
+    }
+    for entry in entries.iter() {
+        entry.mix_state.set_group_layout(&layout);
+    }
+    true
 }
 
 /// The live engine. Dropping it does not stop the engine; call [EngineHandle::stop].
@@ -693,14 +708,10 @@ pub struct EngineHandle {
     /// The engineer's groups exactly as configured, kept so a device switch can re-validate them
     /// against the new channel count without ever rewriting them.
     group_definitions: Vec<GroupDefinition>,
-    groups: Vec<GroupStatus>,
     levels: Arc<LevelMeter>,
     /// The live routing table, shared with the network and control threads so targets can be added
     /// and removed while both keep running.
     targets: Arc<TargetRegistry>,
-    /// The group layout the last committed device switch produced, used to give a newly added
-    /// target the same channel-to-group membership the existing mix states carry.
-    current_layout: GroupLayout,
     stopped: Arc<AtomicBool>,
     samples_seen: Arc<AtomicU64>,
     /// The packet sequence shared with whichever capture stream is currently running, so a switch
@@ -708,6 +719,8 @@ pub struct EngineHandle {
     sequence: Arc<AtomicU64>,
     packet_stats: Arc<PacketStats>,
     peers: ControlPeers,
+    /// The live configuration (channel count and groups), shared with the control connections:
+    /// what every phone is sent as `config`, and the membership a new musician's mix starts with.
     config_state: Arc<ConfigState>,
     events: EventBus,
     stream: Option<cpal::Stream>,
@@ -779,7 +792,7 @@ impl EngineHandle {
             control_port: self.control_port,
             sample_rate: TARGET_SAMPLE_RATE,
             source_channels: self.source_channels,
-            groups: self.groups.clone(),
+            groups: self.config_state.snapshot().groups.clone(),
             channel_levels: self.levels.read(usize::from(self.source_channels)),
             stopped: self.is_stopped(),
             samples_received: self.samples_seen.load(Ordering::Relaxed),
@@ -851,11 +864,8 @@ impl EngineHandle {
             .play()
             .map_err(|error| format!("could not start input capture: {error}"))?;
 
-        let plan = plan_switch_from_attempt(
-            self.source_channels,
-            &self.group_definitions,
-            Ok(supported_config.channels()),
-        )?;
+        let plan =
+            plan_switch_from_attempt(&self.group_definitions, Ok(supported_config.channels()))?;
 
         // Commit: the new capture is confirmed working.
         self.stream = Some(new_stream);
@@ -867,14 +877,14 @@ impl EngineHandle {
             buffer_size: describe_buffer(effective_buffer),
         };
         self.source_channels = plan.source_channels;
-        self.groups = plan.groups;
-        for entry in self.targets.read().iter() {
-            entry.mix_state.set_group_layout(&plan.mixer_layout);
-        }
-        self.current_layout = plan.mixer_layout;
-        if plan.resend_config {
-            self.config_state.set_channels(plan.source_channels);
-        }
+        // Every phone is sent the new `config` (channel count and groups) when it differs, and every
+        // musician, connected now or registering later, mixes with the new membership.
+        apply_groups(
+            &self.targets,
+            &self.config_state,
+            plan.source_channels,
+            plan.groups,
+        );
         // The old device's levels describe a stream that is gone, and channels the new device lacks
         // would keep theirs frozen until a switch back; the new stream raises its own at once.
         self.levels.clear();
@@ -894,7 +904,7 @@ impl EngineHandle {
             return Err("the engine is stopping".into());
         }
         self.targets
-            .add(value, &self.current_layout)
+            .add(value, &*self.config_state)
             .map_err(|error| -> Box<dyn Error> { error.into() })
     }
 
@@ -1017,13 +1027,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
 
     let stopped = Arc::new(AtomicBool::new(false));
     let source_channels = supported_config.channels().min(u16::from(u8::MAX)) as u8;
-    let group_layout = Arc::new(validate_groups(
-        &config.groups,
-        usize::from(source_channels),
-    )?);
+    let group_layout = validate_groups(&config.groups, usize::from(source_channels))?;
     let target_registry = Arc::new(TargetRegistry::new(&targets, &group_layout)?);
     let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
-    let config_state = Arc::new(ConfigState::new(source_channels));
+    let config_state = Arc::new(ConfigState::new(
+        source_channels,
+        group_statuses(&group_layout),
+        group_layout,
+    ));
     let events = EventBus::default();
 
     let control_thread = spawn_control_thread(
@@ -1031,7 +1042,6 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         Arc::clone(&target_registry),
         Arc::clone(&stopped),
         Arc::clone(&config_state),
-        Arc::clone(&group_layout),
         Arc::clone(&peers),
         events.clone(),
     );
@@ -1084,10 +1094,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         host: config.host,
         source_channels,
         group_definitions: config.groups,
-        groups: group_statuses(&group_layout),
         levels,
         targets: target_registry,
-        current_layout: (*group_layout).clone(),
         stopped,
         samples_seen,
         sequence,
@@ -1736,18 +1744,22 @@ mod tests {
             channels: vec![1, 2, 3, 4],
         }];
 
-        let smaller = plan_device_switch(4, &definitions, 2);
+        let smaller = plan_device_switch(&definitions, 2);
         assert_eq!(smaller.source_channels, 2);
-        assert!(smaller.resend_config);
-        assert!(smaller.groups[0].invalid);
-        assert_eq!(smaller.mixer_layout.channel_group()[0], None);
+        assert!(smaller.groups.statuses[0].invalid);
+        assert_eq!(smaller.groups.mixer_layout.channel_group()[0], None);
 
-        let restored = plan_device_switch(2, &definitions, 4);
+        let restored = plan_device_switch(&definitions, 4);
         assert_eq!(restored.source_channels, 4);
-        assert!(restored.resend_config);
-        assert!(!restored.groups[0].invalid);
-        assert_eq!(restored.mixer_layout.channel_group()[0], Some(0));
-        assert_eq!(restored.mixer_layout.channel_group()[3], Some(0));
+        assert!(!restored.groups.statuses[0].invalid);
+        assert_eq!(restored.groups.mixer_layout.channel_group()[0], Some(0));
+        assert_eq!(restored.groups.mixer_layout.channel_group()[3], Some(0));
+    }
+
+    /// The engine's start-up configuration for `definitions` on a device with `channels` inputs.
+    fn config_for(definitions: &[GroupDefinition], channels: u8) -> ConfigState {
+        let groups = revalidate_groups(definitions, usize::from(channels));
+        ConfigState::new(channels, groups.statuses, groups.mixer_layout)
     }
 
     #[test]
@@ -1756,10 +1768,70 @@ mod tests {
             name: "Drums".to_owned(),
             channels: vec![1, 2],
         }];
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        let config = config_for(&definitions, 2);
+        let before = config.generation();
 
-        let plan = plan_device_switch(2, &definitions, 2);
+        let plan = plan_device_switch(&definitions, 2);
+        let changed = apply_groups(&registry, &config, plan.source_channels, plan.groups);
 
-        assert!(!plan.resend_config);
+        assert!(!changed);
+        assert_eq!(config.generation(), before, "no connection re-sends config");
+    }
+
+    /// The latent bug of the start-up layout: after a switch, the live configuration (what every
+    /// `config` and every new musician's mix is built from) is the switched one, and the musicians
+    /// already there mix with it too.
+    #[test]
+    fn a_device_switch_publishes_the_live_groups_and_moves_every_mix_onto_them() {
+        let definitions = vec![
+            GroupDefinition {
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            },
+            GroupDefinition {
+                name: "Vocals".to_owned(),
+                channels: vec![3, 4],
+            },
+        ];
+        let config = config_for(&definitions, 4);
+        let registry = TargetRegistry::new(
+            &["192.168.1.3:50000".parse().unwrap()],
+            &config.snapshot().layout,
+        )
+        .expect("registry should build");
+        let before = config.generation();
+
+        let plan = plan_device_switch(&definitions, 2);
+        assert!(apply_groups(
+            &registry,
+            &config,
+            plan.source_channels,
+            plan.groups
+        ));
+
+        let live = config.snapshot();
+        assert!(live.generation > before, "every connection re-sends config");
+        assert_eq!(live.source_channels, 2);
+        assert!(live.groups[1].invalid);
+        assert_eq!(live.layout.groups()[1].channels, Vec::<usize>::new());
+        let existing = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .snapshot();
+        assert_eq!(existing.channel_group[0], Some(0));
+        assert_eq!(
+            existing.channel_group[2], None,
+            "Vocals no longer maps CH 3"
+        );
+        registry
+            .add("192.168.1.4:50000", &config)
+            .expect("a fresh address is accepted");
+        let added = registry
+            .mix_state(ip("192.168.1.4"))
+            .expect("added")
+            .snapshot();
+        assert_eq!(added.channel_group, existing.channel_group);
     }
 
     #[test]
@@ -1770,7 +1842,7 @@ mod tests {
         }];
         let error: Box<dyn Error> = "input device \"Gone\" is no longer available".into();
 
-        let result = plan_switch_from_attempt(4, &definitions, Err(error));
+        let result = plan_switch_from_attempt(&definitions, Err(error));
 
         assert!(result.is_err());
         // Nothing was planned or mutated: the previous configuration stands.
@@ -1784,10 +1856,9 @@ mod tests {
             channels: vec![1, 2, 3, 4],
         }];
 
-        let plan = plan_switch_from_attempt(4, &definitions, Ok(2)).expect("plan should build");
+        let plan = plan_switch_from_attempt(&definitions, Ok(2)).expect("plan should build");
 
         assert_eq!(plan.source_channels, 2);
-        assert!(plan.resend_config);
-        assert!(plan.groups[0].invalid);
+        assert!(plan.groups.statuses[0].invalid);
     }
 }

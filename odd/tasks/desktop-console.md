@@ -143,6 +143,16 @@ user's decision.
 ## Progress
 
 - Branch `feat/desktop-console` from `main` (963881f).
+- T1 dd4a5bd: assessed medium, `under_budget` (pending in the slice).
+- T2 0c4b94e: assessed medium, `slice_budget_reached`; review granted, lineage
+  `review-5b4c5e4e2b2acb8f` over 963881f..0c4b94e (T1 + T2) approved with one reliability lens and
+  acknowledged. Next review base: 0c4b94e.
+- Review follow-ups (non-blocking, folded into T4 as a T2b commit):
+  - R3-001: no test covers the control connection's live-event recovery paths (broadcast lagged
+    pushes the whole mix, broadcast closed keeps the connection, failed push closes it).
+  - R3-002: `MixState::update` is still a lock-free `pub(crate)` store beside the locking
+    `apply`; today only tests call it, but route remaining writers through `apply` (or lock in
+    `update`) and add a two-thread test with disjoint fields.
 
 ## Next step
 

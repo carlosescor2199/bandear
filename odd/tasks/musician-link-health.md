@@ -126,6 +126,21 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 3 | Desktop health column (T2) | `90f7a33` |
 | 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001), `0fc844c` (T4, control-channel heartbeat; found in the live test) |
 
+Delivered as six stacked pull requests (slice 4 above was split at commit boundaries once it grew
+past 1400 lines). Each PR targets the previous branch; after a parent merges, the next is
+retargeted to `main`.
+
+| PR | Branch | Commits | Changed lines |
+|---|---|---|---|
+| [#1](https://github.com/carlosescor2199/mixlink/pull/1) | `feat/link-health-1-model` | `e50b8bc`, `49da28a` | 657 (`size:exception`, mostly tests) |
+| [#2](https://github.com/carlosescor2199/mixlink/pull/2) | `feat/link-health-2-server` | `71d02d7`, `4692544` | 643 (`size:exception`, mostly tests) |
+| [#3](https://github.com/carlosescor2199/mixlink/pull/3) | `feat/link-health-3-desktop` | `90f7a33` | 230 |
+| [#4](https://github.com/carlosescor2199/mixlink/pull/4) | `feat/link-health-4-android` | `cb1923c`, `6c93b9f` | 736 (`size:exception`, mostly tests) |
+| [#5](https://github.com/carlosescor2199/mixlink/pull/5) | `feat/link-health-5-startup` | `d46402c`, `7b7e194`, `9fbbd13`, `336314b` | 424 |
+| [#6](https://github.com/carlosescor2199/mixlink/pull/6) | `feat/link-health-6-heartbeat` | `0fc844c`, `b94d55a`, `6f0afcb`, and this record | 392 |
+
+`main` was pushed first (`f231dad..0441501`) so the chain shows only this feature.
+
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
 

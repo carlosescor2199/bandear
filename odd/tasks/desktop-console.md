@@ -177,8 +177,31 @@ user's decision.
   `aPushOlderThanAMixStillInFlightGivesWayToTheAnswerToThatMix`,
   `withTwoMixesInFlightOnlyTheAnswerToTheNewestIsTaken`). GREEN: `:app:testDebugUnitTest
   assembleDebug --rerun-tasks` ok, 365 tests (8 new), 0 failures. Commit: this commit.
-- [ ] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
-  about 30 Hz; the UI keeps one `engine_status` call for the first paint. Route: delegated writer.
+- [x] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
+  about 30 Hz; the UI keeps one `engine_status` call for the first paint. The network thread
+  meters each musician's mixed stereo output (`OutputMeter` on the target: one pass and two
+  `Relaxed` atomic maxima per packet, no allocation, lock or clock), `EngineHandle::meters()`
+  reads input and output peaks without building the status, and `EngineHandle::musician_mix`
+  is the IP join a mix change needs. The desktop's `EventPump` (`events.rs`, which documents the
+  shapes) runs one thread per engine: `meters` about 30 times a second
+  (`{ channels, musicians: { "<address>": { left, right } } }`), `status` about 4 times a second
+  (the `engine_status` DTO, names applied) and `mix-changed` at once
+  (`{ address, origin: "phone" | "desktop", mix }`, the address joined on IP to the status row).
+  `start_engine` stops the previous pump before it takes the engine lock and starts a new one
+  with the new engine, `stop_engine` stops it first, and the pump lock serializes both, so there
+  is never a second pump; stopping joins the thread. `engine_status` is unchanged. The 7/8 decay
+  per read is kept: at about 30 reads a second a peak falls about 35 dB a second. Output peaks
+  are in the meters payload but not in `EngineStatus`: a field there breaks the struct literal in
+  `apps/desktop/src-tauri/examples/name_precedence_probe.rs`, outside this task's edit surface,
+  so it is a one-line follow-up if wanted. Route: delegated writer. RED observed (server: 13
+  compile errors, `stereo_peak`, `OutputMeter`, `read_meters`, `musician_mix`, `EngineMeters`,
+  `MusicianMeters`, `TargetEntry::output_meter` missing; desktop: 85 compile errors, `EventPump`,
+  `PumpSource`, `PumpSink`, `Schedule`, `mix_changed`, `MetersDto`, `MixChangedDto`,
+  `engine_meters`, `musician_mix` missing). GREEN: `cargo test -p personal-monitoring` 196 passed
+  (5 new), `cargo test -p mixlink-desktop` 41 passed (16 new, 5 repeated runs green),
+  `cargo build -p mixlink-desktop` ok, no new clippy warnings. About 1,230 changed lines, mostly
+  tests and docs: over the 400-line heuristic because the pump's lifecycle is only proven with its
+  thread, fakes and the command layer together. Commit: this commit.
 - [ ] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the
   state store and pure helpers with `node --test` tests; the old UI still runs. Route: delegated
   writer.
@@ -205,4 +228,4 @@ user's decision.
 
 ## Next step
 
-T4.
+T5.

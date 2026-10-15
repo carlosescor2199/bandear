@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
+use crate::engine::OutputMeter;
 use crate::health::LatestLinkReport;
 use crate::mix::{GroupLayout, MixState};
 use crate::network::TargetCounters;
@@ -69,6 +70,9 @@ pub(crate) struct TargetEntry {
     /// The latest link report the musician's phone sent. Only the control connection writes it and
     /// only the status snapshot reads it; the network thread never touches it.
     pub(crate) link_report: LatestLinkReport,
+    /// The peak of the stereo mix this musician is sent. Only the network thread raises it, with
+    /// lock-free atomics, and the meter read decays it.
+    pub(crate) output_meter: OutputMeter,
     pub(crate) origin: TargetOrigin,
 }
 
@@ -104,6 +108,7 @@ impl TargetRegistry {
                 mix_state: Arc::new(MixState::new(layout)),
                 counters: Arc::new(TargetCounters::default()),
                 link_report: LatestLinkReport::default(),
+                output_meter: OutputMeter::default(),
                 origin: TargetOrigin::Configured,
             });
         }
@@ -178,6 +183,7 @@ impl TargetRegistry {
             mix_state: Arc::new(MixState::new(layout)),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
+            output_meter: OutputMeter::default(),
             origin,
         });
         Registration {
@@ -257,6 +263,7 @@ impl TargetRegistry {
             mix_state: Arc::new(MixState::new(layout)),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
+            output_meter: OutputMeter::default(),
             origin: TargetOrigin::Configured,
         });
         Ok(address)

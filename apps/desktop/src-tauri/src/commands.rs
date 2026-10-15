@@ -4,32 +4,67 @@
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return.
 
+use std::net::SocketAddr;
+use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
-use personal_monitoring::{start, AudioHost, EngineConfig, EngineHandle, GroupDefinition};
+use personal_monitoring::{
+    start, AudioHost, EngineConfig, EngineEvent, EngineHandle, GroupDefinition, MixValues,
+};
 
 use crate::dto::{
-    CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, MixDto, MixUpdateRequest,
-    StartRequest, StartSummary,
+    CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, MetersDto, MixDto,
+    MixUpdateRequest, StartRequest, StartSummary,
 };
+use crate::events::EventPump;
 use crate::names::MusicianNames;
 
-/// The state the desktop commands share: the running engine, and the desktop-only name store.
+/// Starts the event pump for a new engine, given that engine's event bus.
+pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>) -> EventPump + Send + Sync>;
+
+/// The state the desktop commands share: the running engine, its event pump, and the desktop-only
+/// name store.
 ///
 /// The engine handle is behind a [Mutex] because the engine is already internally concurrent: the
 /// commands only need exclusive access to start, stop and take a snapshot. The name store has its
 /// own lock, and the two are never held in the opposite order, so they cannot deadlock.
+///
+/// The pump's lock is taken first by start and stop and held throughout, so two quick starts can
+/// never leave two pumps running. The pump thread itself takes the engine lock to read, so a pump
+/// is always stopped before the engine lock is taken, never while it is held.
 pub struct DesktopState {
     engine: Mutex<Option<EngineHandle>>,
+    pump: Mutex<Option<EventPump>>,
+    start_pump: Option<PumpStarter>,
     names: MusicianNames,
 }
 
 impl DesktopState {
+    /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
     pub fn new(names: MusicianNames) -> Self {
         Self {
             engine: Mutex::new(None),
+            pump: Mutex::new(None),
+            start_pump: None,
             names,
         }
+    }
+
+    /// Streams every engine started from now on through a pump that `start_pump` builds.
+    pub fn with_event_pump(
+        mut self,
+        start_pump: impl Fn(Receiver<EngineEvent>) -> EventPump + Send + Sync + 'static,
+    ) -> Self {
+        self.start_pump = Some(Box::new(start_pump));
+        self
+    }
+}
+
+/// Stops the running pump, if any, leaving the slot empty. Called with the pump lock held and the
+/// engine lock free, because the pump's thread may be waiting on the engine lock.
+fn stop_pump(pump: &mut Option<EventPump>) {
+    if let Some(running) = pump.take() {
+        running.stop();
     }
 }
 
@@ -69,9 +104,16 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 
 /// Starts the engine and returns the device and capture format the window shows.
 ///
-/// Starting while one is already running replaces it rather than stacking a second capture stream.
+/// Starting while one is already running replaces it rather than stacking a second capture stream,
+/// and its event pump with it: the previous pump is stopped before anything else, and the new one
+/// starts with the new engine.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let config = to_engine_config(request);
+    let mut pump = state
+        .pump
+        .lock()
+        .map_err(|_| "event pump lock was poisoned".to_owned())?;
+    stop_pump(&mut pump);
     let mut guard = state
         .engine
         .lock()
@@ -94,7 +136,13 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                 summary.device_name,
                 summary.capture_format.describe()
             );
+            // Subscribed before the engine is shared, so the pump misses no event.
+            let events = state.start_pump.as_ref().map(|_| handle.subscribe());
             *guard = Some(handle);
+            drop(guard);
+            if let (Some(start_pump), Some(events)) = (&state.start_pump, events) {
+                *pump = Some(start_pump(events));
+            }
             Ok(summary)
         }
         None => Err(
@@ -116,6 +164,26 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     let mut status = EngineStatusDto::from(&handle.status());
     apply_names(&mut status, &state.names);
     Ok(status)
+}
+
+/// Returns the live input and output levels, for the `meters` event.
+///
+/// The engine's cheap read: it does not build the status, so it can run many times a second.
+pub fn engine_meters(state: &DesktopState) -> Result<MetersDto, String> {
+    let guard = state
+        .engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let handle = guard
+        .as_ref()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    Ok(MetersDto::from(&handle.meters()))
+}
+
+/// The musician at `address`'s IP, at the address the status rows show, and their current mix;
+/// `None` when no engine runs or that IP is no musician. The `mix-changed` event's lookup.
+pub fn musician_mix(state: &DesktopState, address: SocketAddr) -> Option<(SocketAddr, MixValues)> {
+    state.engine.lock().ok()?.as_ref()?.musician_mix(address)
 }
 
 /// Fills each musician row's displayed name, joining the local label store on the address string.
@@ -214,8 +282,14 @@ pub fn set_musician_name(
     Ok(())
 }
 
-/// Stops the engine and joins its threads. Stopping when idle is a no-op.
+/// Stops the engine's event pump, then the engine, and joins their threads. Stopping when idle is
+/// a no-op.
 pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
+    let mut pump = state
+        .pump
+        .lock()
+        .map_err(|_| "event pump lock was poisoned".to_owned())?;
+    stop_pump(&mut pump);
     let mut guard = state
         .engine
         .lock()
@@ -263,6 +337,7 @@ pub fn switch_device(state: &DesktopState, device: String) -> Result<StartSummar
 mod tests {
     use super::*;
     use crate::dto::MusicianDto;
+    use crate::events::{EventPump, PumpSink, PumpSource};
 
     fn status_with_musicians(addresses: &[&str]) -> EngineStatusDto {
         EngineStatusDto {
@@ -383,6 +458,109 @@ mod tests {
         .expect_err("there is no engine to set a mix on");
 
         assert_eq!(error, "the engine is not running");
+    }
+
+    /// An engine that reports nothing. It holds `alive` so a test can tell when the pump's thread
+    /// has ended and dropped it.
+    struct Silent {
+        _alive: std::sync::Arc<()>,
+    }
+
+    impl PumpSource for Silent {
+        fn meters(&self) -> Option<crate::dto::MetersDto> {
+            None
+        }
+
+        fn status(&self) -> Option<EngineStatusDto> {
+            None
+        }
+
+        fn musician_mix(
+            &self,
+            _: std::net::SocketAddr,
+        ) -> Option<(std::net::SocketAddr, personal_monitoring::MixValues)> {
+            None
+        }
+    }
+
+    struct Nowhere;
+
+    impl PumpSink for Nowhere {
+        fn emit<P: serde::Serialize + Clone>(&self, _: &str, _: P) {}
+    }
+
+    /// Puts a running pump in the state, as a start with a window does, and returns its liveness
+    /// marker and the sender that keeps its event feed open.
+    fn install_pump(
+        state: &DesktopState,
+    ) -> (
+        std::sync::Arc<()>,
+        std::sync::mpsc::Sender<personal_monitoring::EngineEvent>,
+    ) {
+        let alive = std::sync::Arc::new(());
+        let (bus, events) = std::sync::mpsc::channel();
+        let pump = EventPump::start(
+            events,
+            Silent {
+                _alive: std::sync::Arc::clone(&alive),
+            },
+            Nowhere,
+        );
+        *state.pump.lock().expect("pump lock") = Some(pump);
+        (alive, bus)
+    }
+
+    #[test]
+    fn stopping_the_engine_stops_its_event_pump() {
+        let state = DesktopState::new(MusicianNames::load(names_path("stop-pump")));
+        let (alive, _bus) = install_pump(&state);
+
+        stop_engine(&state).expect("stopping is fine without an engine");
+
+        assert!(state.pump.lock().expect("pump lock").is_none());
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "the pump's thread has ended"
+        );
+    }
+
+    #[test]
+    fn a_restart_stops_the_previous_event_pump_even_when_the_new_engine_fails() {
+        let state = DesktopState::new(MusicianNames::load(names_path("restart-pump")));
+        let (alive, _bus) = install_pump(&state);
+
+        // An invalid target fails the start before any audio device is touched.
+        let error = start_engine(
+            &state,
+            StartRequest {
+                targets: vec!["not a target".to_owned()],
+                ..StartRequest::default()
+            },
+        )
+        .expect_err("the new engine cannot start");
+
+        assert!(error.contains("not a target"), "names the value: {error}");
+        assert!(state.pump.lock().expect("pump lock").is_none());
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "the previous pump's thread has ended"
+        );
+    }
+
+    #[test]
+    fn reading_meters_or_a_mix_without_a_running_engine_finds_nothing() {
+        let state = DesktopState::new(MusicianNames::load(names_path("meters-idle")));
+
+        assert_eq!(
+            engine_meters(&state).expect_err("there is no engine to read"),
+            "the engine is not running"
+        );
+        assert_eq!(
+            musician_mix(&state, "192.168.1.30:41000".parse().expect("address")),
+            None
+        );
     }
 
     #[test]

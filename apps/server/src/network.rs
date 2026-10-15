@@ -46,6 +46,8 @@ pub(crate) fn spawn_network_thread(
                     usize::from(packet.channels),
                     entry.mix_state.snapshot(),
                 );
+                // Two atomic maxima on the buffer just mixed: no allocation, lock or clock.
+                entry.output_meter.observe(&samples);
                 let target_packet = AudioPacket {
                     channels: OUTPUT_CHANNELS,
                     sample_rate: packet.sample_rate,
@@ -72,7 +74,7 @@ pub(crate) fn spawn_network_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mix::GroupLayout;
+    use crate::mix::{GroupLayout, MixUpdate};
     use std::net::SocketAddr;
     use std::sync::mpsc::sync_channel;
     use std::time::Duration;
@@ -135,6 +137,40 @@ mod tests {
         sender.send(packet()).expect("packet should queue");
         assert!(receive(&kept, Duration::from_secs(2)).is_some());
         assert!(receive(&removed, Duration::from_millis(300)).is_none());
+
+        drop(sender);
+        thread
+            .join()
+            .expect("thread should exit when the sender drops");
+    }
+
+    /// Each musician's meter reads the stereo mix that musician is sent, after their own gains and
+    /// master, not the input: here the input peaks near 91 and 61 and the half-volume mix at 45 and
+    /// 30.
+    #[test]
+    fn the_send_loop_meters_each_musicians_mixed_output() {
+        let phone = bind("127.0.0.1:0");
+        let targets = registry(&[phone.local_addr().expect("phone address")]);
+        targets.read()[0]
+            .mix_state
+            .apply(&MixUpdate {
+                volume_percent: Some(50),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let (sender, receiver) = sync_channel(4);
+        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats())
+            .expect("network thread should spawn");
+
+        sender
+            .send(AudioPacket {
+                samples: vec![30_000, 20_000],
+                ..packet()
+            })
+            .expect("packet should queue");
+        assert!(receive(&phone, Duration::from_secs(2)).is_some());
+
+        assert_eq!(targets.read()[0].output_meter.decayed(), [45, 30]);
 
         drop(sender);
         thread

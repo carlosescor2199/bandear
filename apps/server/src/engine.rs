@@ -290,12 +290,31 @@ pub(crate) fn link_statuses(
 
 /// The fixed decay applied to a held peak each time the level is read.
 ///
-/// A read happens once per UI poll (a few hertz), so an integer multiply by 7/8 per read makes the
-/// meter fall smoothly between polls. It is deliberately not a time source: the audio callback
-/// must stay free of clock reads, and a poll-rate-relative falloff is enough for a level that only
-/// has to look alive.
+/// The desktop's meter stream reads about 30 times a second, so an integer multiply by 7/8 per
+/// read halves a peak in about 150 ms (roughly 35 dB a second, a usual digital meter release); a
+/// status read at a few hertz adds one more step. It is deliberately not a time source: the audio
+/// callback must stay free of clock reads, and a read-rate-relative falloff is enough for a level
+/// that only has to look alive.
 const LEVEL_DECAY_NUMERATOR: u8 = 7;
 const LEVEL_DECAY_DENOMINATOR: u8 = 8;
+
+/// One read's decay of a held peak.
+fn decay_level(value: u8) -> u8 {
+    // Widened so a full-scale 100 times the numerator cannot overflow a u8.
+    (u16::from(value) * u16::from(LEVEL_DECAY_NUMERATOR) / u16::from(LEVEL_DECAY_DENOMINATOR)) as u8
+}
+
+/// Reads a held peak and decays it for the next read.
+///
+/// `fetch_update` retries against a concurrent raise instead of clobbering a peak the audio or
+/// network thread raised in between, so a busy reader never eats a transient.
+fn take_decayed(level: &AtomicU8) -> u8 {
+    level
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(decay_level(value))
+        })
+        .unwrap_or(0)
+}
 
 /// Converts a full-scale-relative sample magnitude into a 0-100 peak.
 ///
@@ -346,27 +365,112 @@ impl LevelMeter {
 
     /// Reads the held peaks and decays them for the next read.
     ///
-    /// Returns one level per source channel, in channel order. `fetch_update` retries against a
-    /// concurrent [observe] instead of clobbering a peak the audio thread raised in between, so a
-    /// busy poll never eats a transient. Channels beyond the metered maximum read as zero, matching
+    /// Returns one level per source channel, in channel order. A concurrent [observe] is never
+    /// clobbered (see [take_decayed]). Channels beyond the metered maximum read as zero, matching
     /// the mixer, which also ignores them.
     pub(crate) fn decayed(&self, channels: usize) -> Vec<u8> {
         (0..channels)
-            .map(|channel| match self.levels.get(channel) {
-                Some(level) => level
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                        // Widened so a full-scale 100 times the numerator cannot overflow a u8.
-                        Some(
-                            (u16::from(value) * u16::from(LEVEL_DECAY_NUMERATOR)
-                                / u16::from(LEVEL_DECAY_DENOMINATOR))
-                                as u8,
-                        )
-                    })
-                    .unwrap_or(0),
-                None => 0,
-            })
+            .map(|channel| self.levels.get(channel).map_or(0, take_decayed))
             .collect()
     }
+}
+
+/// The 0-100 peak of each side of an interleaved stereo buffer, left then right.
+///
+/// One pass, no allocation, the same linear scale as the input meters. A trailing sample that is
+/// not a whole frame is left out.
+fn stereo_peak(stereo: &[i16]) -> [u8; 2] {
+    let mut left = 0u16;
+    let mut right = 0u16;
+    for frame in stereo.chunks_exact(2) {
+        left = left.max(frame[0].unsigned_abs());
+        right = right.max(frame[1].unsigned_abs());
+    }
+    [peak_to_level(left), peak_to_level(right)]
+}
+
+/// The left and right peak of one musician's mixed output, held for the meter read.
+///
+/// The send loop raises it right after mixing, so it reads what that musician's phone is sent:
+/// after their gains, pans, solos, mutes, master and level cap. Like [LevelMeter], raising costs
+/// one pass over the block and two `Relaxed` atomic maxima, with no allocation, lock or clock, and
+/// reading decays.
+#[derive(Default)]
+pub(crate) struct OutputMeter {
+    levels: [AtomicU8; 2],
+}
+
+impl OutputMeter {
+    /// Raises the held peaks to this block's. A buffer that is not whole stereo frames is not a
+    /// mixed output and is ignored, as [LevelMeter::observe] ignores incomplete frames.
+    pub(crate) fn observe(&self, stereo: &[i16]) {
+        if !stereo.len().is_multiple_of(2) {
+            return;
+        }
+        for (level, peak) in self.levels.iter().zip(stereo_peak(stereo)) {
+            level.fetch_max(peak, Ordering::Relaxed);
+        }
+    }
+
+    /// Reads the held left and right peaks and decays them for the next read.
+    pub(crate) fn decayed(&self) -> [u8; 2] {
+        [take_decayed(&self.levels[0]), take_decayed(&self.levels[1])]
+    }
+}
+
+/// The live levels, cheap enough to read many times a second.
+///
+/// The meter stream's read: it touches only the held peaks and the target list, never the mixes,
+/// the control peers or the link reports, so it costs a fraction of [EngineHandle::status].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineMeters {
+    /// One 0-100 input peak per source channel, as [EngineStatus::channel_levels] reports it.
+    pub channel_levels: Vec<u8>,
+    /// Each musician's output peak, in the order [EngineStatus::musicians] lists them.
+    pub musicians: Vec<MusicianMeters>,
+}
+
+/// One musician's output peak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MusicianMeters {
+    /// The musician's address as [EngineStatus::musicians] reports it.
+    pub address: SocketAddr,
+    /// The 0-100 peak of the stereo mix the musician is sent, left then right.
+    pub output_levels: [u8; 2],
+}
+
+/// Reads and decays the input peaks of `channels` source channels and every musician's output peak.
+pub(crate) fn read_meters(
+    levels: &LevelMeter,
+    channels: usize,
+    entries: &[TargetEntry],
+) -> EngineMeters {
+    EngineMeters {
+        channel_levels: levels.decayed(channels),
+        musicians: entries
+            .iter()
+            .map(|entry| MusicianMeters {
+                address: entry.address,
+                output_levels: entry.output_meter.decayed(),
+            })
+            .collect(),
+    }
+}
+
+/// The musician at `address`'s IP, at the address the status reports, with the mix stored now.
+///
+/// The same IP join as a phone's `mix`, so an address from [EngineEvent::MixChanged] (a control
+/// peer's for a phone's change) finds the row the status shows. `None` when the IP is no musician,
+/// for instance one removed since the change.
+pub(crate) fn musician_mix(
+    targets: &TargetRegistry,
+    address: SocketAddr,
+) -> Option<(SocketAddr, MixValues)> {
+    targets
+        .read()
+        .iter()
+        .find(|entry| entry.address.ip() == address.ip())
+        .map(|entry| (entry.address, entry.mix_state.snapshot()))
 }
 
 /// Snapshots the fixed group layout into the observation-friendly [GroupStatus] list.
@@ -595,6 +699,26 @@ impl EngineHandle {
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
             musicians: join_musicians(&targets, &connected, &counters, &mixes, &names, &links),
         }
+    }
+
+    /// The live input and output levels, without building the rest of the status.
+    ///
+    /// Each read decays the held peaks (see [EngineStatus::channel_levels]), so this is meant for
+    /// one steady reader, the desktop's meter stream; the status reads add a step each.
+    pub fn meters(&self) -> EngineMeters {
+        read_meters(
+            &self.levels,
+            usize::from(self.source_channels),
+            &self.targets.read(),
+        )
+    }
+
+    /// The musician at `address`'s IP, at the address [Self::status] reports, and their current mix.
+    ///
+    /// This is the join a consumer of [EngineEvent::MixChanged] needs: a phone's change names the
+    /// control peer, whose port is not the musician's. `None` when that IP is no musician.
+    pub fn musician_mix(&self, address: SocketAddr) -> Option<(SocketAddr, MixValues)> {
+        musician_mix(&self.targets, address)
     }
 
     /// Switches the input device while the rest of the engine keeps running.
@@ -1195,6 +1319,94 @@ mod tests {
         // A fresh block raises it straight back to the block peak.
         meter.observe(&[32_767, 32_767], 2);
         assert_eq!(meter.decayed(2), vec![100, 100]);
+    }
+
+    #[test]
+    fn a_stereo_peak_reads_each_side_of_an_interleaved_buffer() {
+        // Left peaks at half scale (on its negative swing), right at full scale.
+        assert_eq!(stereo_peak(&[8_000, 100, -16_384, 32_767]), [50, 100]);
+        assert_eq!(stereo_peak(&[]), [0, 0]);
+        assert_eq!(stereo_peak(&[0, i16::MIN]), [0, 100]);
+    }
+
+    #[test]
+    fn an_output_meter_holds_each_sides_peak_until_read_and_then_decays() {
+        let meter = OutputMeter::default();
+
+        meter.observe(&[16_384, 32_767]);
+        // A quieter block does not lower the held peak.
+        meter.observe(&[100, 100]);
+        assert_eq!(meter.decayed(), [50, 100]);
+        // No new audio: both sides fall on the next read, like the input meters.
+        assert_eq!(meter.decayed(), [43, 87]);
+        // A buffer that is not whole stereo frames is ignored.
+        meter.observe(&[32_767, 32_767, 32_767]);
+        assert_eq!(meter.decayed(), [37, 76]);
+    }
+
+    #[test]
+    fn the_meter_read_carries_input_peaks_and_each_musicians_output_peaks() {
+        let first: SocketAddr = "192.168.1.3:50000".parse().unwrap();
+        let second: SocketAddr = "192.168.1.4:50000".parse().unwrap();
+        let registry = TargetRegistry::new(&[first, second], &GroupLayout::default())
+            .expect("registry should build");
+        registry.read()[0].output_meter.observe(&[32_767, -16_384]);
+        let inputs = LevelMeter::new();
+        inputs.observe(&[16_384, 0, -32_767, 0], 2);
+
+        let meters = read_meters(&inputs, 2, &registry.read());
+
+        assert_eq!(
+            meters,
+            EngineMeters {
+                channel_levels: vec![100, 0],
+                musicians: vec![
+                    MusicianMeters {
+                        address: first,
+                        output_levels: [100, 50],
+                    },
+                    MusicianMeters {
+                        address: second,
+                        output_levels: [0, 0],
+                    },
+                ],
+            }
+        );
+        // It is the meters' own read: the held peaks decay for the next one.
+        assert_eq!(
+            read_meters(&inputs, 2, &registry.read()).musicians[0].output_levels,
+            [87, 43]
+        );
+    }
+
+    #[test]
+    fn a_musicians_mix_is_found_by_ip_at_the_address_the_status_shows() {
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+            ],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let stored = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .apply(&MixUpdate {
+                volume_percent: Some(42),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        // A phone's change names its control peer: same IP, another port.
+        let found = musician_mix(&registry, "192.168.1.3:41000".parse().unwrap());
+
+        assert_eq!(found, Some(("192.168.1.3:50000".parse().unwrap(), stored)));
+        assert_eq!(
+            musician_mix(&registry, "192.168.1.9:41000".parse().unwrap()),
+            None,
+            "an IP with no musician has no mix"
+        );
     }
 
     #[test]

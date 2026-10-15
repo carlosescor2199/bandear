@@ -286,6 +286,16 @@ user's decision.
 - Follow-up (T3c report): on the first connect the phone sends its mix before `config` arrives,
   with empty channel lists; the server keeps its earlier levels while the phone shows neutral
   strips. Adopt the server's answer after `config`.
+- T4b 1b0ec7d: lineage `review-e2b77be032063f05` over f272010..1b0ec7d approved and acknowledged.
+  Next review base: 1b0ec7d. Non-blocking notes, deferred to the phase 3 engine refactor (which
+  rewrites the send loop):
+  - WARNING R3-001: the 100 ms idle fall is added on top of each block's own length, so blocks
+    longer than 100 ms (the CLI accepts buffers up to 48,000 frames) or bursty delivery count the
+    same time twice and the meters fall faster. Count a timeout only for audio time not already
+    covered by received frames.
+  - SUGGESTION R3-002: the stall test sleeps a fixed 1 s; poll until zero with an upper limit.
+  - SUGGESTION R3-003: the meter clears on device switch and on stop are not tested through
+    `EngineHandle`.
 
 ## Next step
 

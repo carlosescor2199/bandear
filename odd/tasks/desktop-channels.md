@@ -227,8 +227,38 @@ slice. Push and PRs are the user's decision.
     the 400-line heuristic mostly in tests (socket ordering, remap rules, session and fake bridge);
     not split artificially.
   - Commits: 2050f8f `fix(control): send the live groups after a device switch`; 57639f9
-    `feat(engine): edit groups while running with stable ids`; this commit (`feat(desktop): keep
-    groups in the session and apply them live`).
+    `feat(engine): edit groups while running with stable ids`; 8ef33ad `feat(desktop): keep
+    groups in the session and apply them live`.
+- [x] T2b (review fixes for T2, review `review-2d016eb5546e25ae`): a group edit is one step under
+  the engine lock with the session's inside it (the order every command holding both follows; a
+  start now reads the saved groups under it too), so the session and the engine always end with
+  the same groups (R3-set-groups-save-apply-not-atomic). With an engine running the engine takes
+  the groups first and they are saved only then; a stopping engine refuses and nothing changes;
+  with no engine they are saved for the next start. `set_groups` answers `{ groups, applied,
+  saved, saveError }` (a save that fails after the engine took them is reported, not an error),
+  the fake bridge answers the same and `formatGroupsSet` words it ("Groups saved; they apply at
+  the next start.") (R3-set-groups-error-after-persist). The session reads its sections one by
+  one: a damaged `groups`, `channels` or `presets` section is kept as
+  `session.json.<section>-damaged-<unix ms>`, starts empty, and the session is saved without it
+  at once, keeping the labels; only a file that is not JSON, has no usable version or unreadable
+  labels is moved aside whole; a section that cannot be written aside stops all saves
+  (R3-misshapen-group-discards-labels). Route: inline writer of the delegated T2 worker (bounded
+  fixes in three desktop files and the UI).
+  - The group edit runs through `edit_groups` over a `GroupEngine` trait (the engine in the app,
+    a stand-in in tests), so the running-engine branch is tested without audio hardware.
+  - RED: `an_engine_that_is_stopping_refuses_the_groups_and_nothing_is_saved` (the session held
+    the refused list) and `groups_a_running_engine_took_but_the_session_could_not_keep_say_so`
+    failed against the old save-then-apply order; the concurrency test
+    `two_group_edits_at_once_leave_the_session_and_the_engine_with_the_same_groups` (30 rounds,
+    both edits arriving while the engine lock is busy) passed against the old order too: Windows
+    hands the lock over in arrival order, so that interleaving needs a preemption between save and
+    lock; it now holds by construction and the test guards it. UI: `formatGroupsSet` did not exist
+    (the suite failed to load). Session: both new tests failed (the label was lost, `None`).
+  - GREEN: `cargo test -p mixlink-desktop` 80 passed (6 new, 1 replaced), three runs for the
+    commands; `cargo build -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok; UI 195
+    passed (1 new); `cargo fmt --check` clean; clippy: no warnings in the desktop crate.
+  - Commits: 9fe0901 `fix(desktop): edit groups as one step and say when they apply later`; this
+    commit (`fix(desktop): keep labels when one session section is damaged`).
 - [ ] T3 (channel metadata, engine and phone): the channel table in the engine and session;
   `config` carries names, kinds, hidden and links; hidden channels silent in every mix; link
   rules kept equal on the server; Android shows names, drops hidden channels and collapses
@@ -262,6 +292,10 @@ slice. Push and PRs are the user's decision.
   the new positions (phones send no ids; last writer wins, as decided); the window's pending group
   edits are keyed by position, so T4's editor should settle or drop them when the groups change;
   the window has no group editor yet (T4) and nothing shows the session notice (T7).
+- Review `review-2d016eb5546e25ae` over 78dc65d..8ef33ad approved and acknowledged; next review
+  base 8ef33ad. Its three WARNINGs (R3-set-groups-save-apply-not-atomic,
+  R3-set-groups-error-after-persist, R3-misshapen-group-discards-labels) are fixed by T2b. The
+  window shows `formatGroupsSet` once T4's group editor calls `setGroups`.
 
 ## Next step
 

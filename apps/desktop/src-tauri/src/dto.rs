@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use personal_monitoring::{CaptureFormat, EngineStatus, InputDevice, LinkHealth, MusicianStatus};
+use personal_monitoring::{
+    CaptureFormat, EngineStatus, InputDevice, LinkHealth, MixUpdate, MixValues, MusicianStatus,
+};
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
@@ -93,9 +95,10 @@ pub struct MusicianDto {
     /// client that announced one always wins, which is why the two cases need telling apart.
     pub name_is_local: bool,
     pub control_connected: bool,
-    pub volume_percent: u8,
-    pub max_level_percent: u8,
-    pub muted: bool,
+    /// The musician's whole mix, flat on the row so `volumePercent`, `maxLevelPercent` and `muted`
+    /// keep the names the window already reads.
+    #[serde(flatten)]
+    pub mix: MixDto,
     pub packets_sent: u64,
     pub packets_discarded: u64,
     /// The phone's link health as the server classified it: "unknown", "good", "warning" or "bad".
@@ -109,6 +112,81 @@ pub struct MusicianDto {
     /// Lost packets as a percentage of the packets the phone expected.
     pub loss_percent: Option<f64>,
     pub receive_timeouts_per_second: Option<f64>,
+}
+
+/// One musician's whole mix.
+///
+/// The per-channel tables always hold the engine's full 32 entries (16 for groups), index-aligned
+/// with the 0-based source channels and the group list; the window shows as many as the current
+/// device has. Entries past that are the stored values for channels the device lacks.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixDto {
+    pub volume_percent: u8,
+    pub max_level_percent: u8,
+    pub muted: bool,
+    pub channel_gains: Vec<u8>,
+    pub pans: Vec<u8>,
+    pub channel_muted: Vec<bool>,
+    pub channel_solo: Vec<bool>,
+    pub group_levels: Vec<u8>,
+}
+
+impl From<&MixValues> for MixDto {
+    fn from(mix: &MixValues) -> Self {
+        Self {
+            volume_percent: mix.volume_percent,
+            max_level_percent: mix.max_level_percent,
+            muted: mix.muted,
+            channel_gains: mix.channel_gains.to_vec(),
+            pans: mix.pans.to_vec(),
+            channel_muted: mix.channel_muted.to_vec(),
+            channel_solo: mix.channel_solo.to_vec(),
+            group_levels: mix.group_levels.to_vec(),
+        }
+    }
+}
+
+/// A partial mix change the webview sends to [crate::commands::set_mix].
+///
+/// Every field is optional and an absent one keeps its value. A list replaces the values from the
+/// first channel (or group) on, so the window can send a whole table or just its first entries;
+/// levels are 0-100 and are clamped by the engine. A field the engine does not know is rejected
+/// instead of ignored, so a misspelt name fails loudly rather than silently changing nothing.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MixUpdateRequest {
+    #[serde(default)]
+    pub volume_percent: Option<i32>,
+    #[serde(default)]
+    pub max_level_percent: Option<i32>,
+    #[serde(default)]
+    pub muted: Option<bool>,
+    #[serde(default)]
+    pub channel_gains: Option<Vec<i32>>,
+    #[serde(default)]
+    pub pans: Option<Vec<i32>>,
+    #[serde(default)]
+    pub channel_muted: Option<Vec<bool>>,
+    #[serde(default)]
+    pub channel_solo: Option<Vec<bool>>,
+    #[serde(default)]
+    pub group_levels: Option<Vec<i32>>,
+}
+
+impl From<MixUpdateRequest> for MixUpdate {
+    fn from(request: MixUpdateRequest) -> Self {
+        Self {
+            channel_gains: request.channel_gains,
+            pans: request.pans,
+            channel_muted: request.channel_muted,
+            channel_solo: request.channel_solo,
+            group_levels: request.group_levels,
+            volume_percent: request.volume_percent,
+            max_level_percent: request.max_level_percent,
+            muted: request.muted,
+        }
+    }
 }
 
 /// One configured group, with the same 0-based source indices the engine uses.
@@ -163,9 +241,7 @@ impl From<&MusicianStatus> for MusicianDto {
             name: None,
             name_is_local: false,
             control_connected: musician.control_connected,
-            volume_percent: musician.mix.volume_percent,
-            max_level_percent: musician.mix.max_level_percent,
-            muted: musician.mix.muted,
+            mix: MixDto::from(&musician.mix),
             packets_sent: musician.counters.packets_sent,
             packets_discarded: musician.counters.packets_discarded,
             link_health: link_health_name(musician.link.health),
@@ -471,6 +547,71 @@ mod tests {
             silent["packetsPerSecond"], 0.0,
             "a phone hearing nothing is a number the window can tell from a lost link"
         );
+    }
+
+    #[test]
+    fn the_full_mix_reaches_the_window_in_camel_case() {
+        let mut mix = MixValues {
+            volume_percent: 42,
+            max_level_percent: 90,
+            muted: true,
+            ..MixValues::default()
+        };
+        mix.channel_gains[1] = 30;
+        mix.pans[0] = 50;
+        mix.channel_muted[2] = true;
+        mix.channel_solo[3] = true;
+        mix.group_levels[0] = 70;
+        let musician = MusicianStatus {
+            mix,
+            ..musician_with_link(LinkStatus::default())
+        };
+
+        let dto = MusicianDto::from(&musician);
+        let json = serde_json::to_value(&dto).expect("a musician serializes");
+
+        assert_eq!(dto.mix.channel_gains, mix.channel_gains.to_vec());
+        assert_eq!(dto.mix.pans, mix.pans.to_vec());
+        assert_eq!(dto.mix.channel_muted, mix.channel_muted.to_vec());
+        assert_eq!(dto.mix.channel_solo, mix.channel_solo.to_vec());
+        assert_eq!(dto.mix.group_levels, mix.group_levels.to_vec());
+        // The mix sits flat on the row, so the fields the window already reads keep their names.
+        assert_eq!(json["volumePercent"], 42);
+        assert_eq!(json["maxLevelPercent"], 90);
+        assert_eq!(json["muted"], true);
+        assert_eq!(json["channelGains"][1], 30);
+        assert_eq!(json["pans"][0], 50);
+        assert_eq!(json["channelMuted"][2], true);
+        assert_eq!(json["channelSolo"][3], true);
+        assert_eq!(json["groupLevels"][0], 70);
+        assert!(json.get("mix").is_none(), "no nested object: {json}");
+    }
+
+    #[test]
+    fn a_mix_request_reads_camel_case_and_leaves_absent_fields_unset() {
+        let request: MixUpdateRequest =
+            serde_json::from_str(r#"{"pans":[10,90],"volumePercent":80,"channelSolo":[true]}"#)
+                .expect("a partial mix parses");
+
+        let update = MixUpdate::from(request);
+
+        assert_eq!(
+            update,
+            MixUpdate {
+                pans: Some(vec![10, 90]),
+                volume_percent: Some(80),
+                channel_solo: Some(vec![true]),
+                ..MixUpdate::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_mix_request_with_an_unknown_field_is_rejected_instead_of_ignored() {
+        let error = serde_json::from_str::<MixUpdateRequest>(r#"{"volume":80}"#)
+            .expect_err("a misspelt field must not be a silent no-op");
+
+        assert!(error.to_string().contains("volume"), "names it: {error}");
     }
 
     #[test]

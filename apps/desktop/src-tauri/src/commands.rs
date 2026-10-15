@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use personal_monitoring::{start, AudioHost, EngineConfig, EngineHandle, GroupDefinition};
 
 use crate::dto::{
-    CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, StartRequest, StartSummary,
+    CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, MixDto, MixUpdateRequest,
+    StartRequest, StartSummary,
 };
 use crate::names::MusicianNames;
 
@@ -176,6 +177,31 @@ pub fn remove_target(state: &DesktopState, address: String) -> Result<String, St
     Ok(removed.to_string())
 }
 
+/// Changes a musician's mix from the desk, returning the whole mix now applied.
+///
+/// `address` is the row's address as the status reports it, and `mix` is partial: absent fields
+/// keep their values. The engine applies it to the audio at once and pushes the result to the
+/// musician's phone, so the phone's screen follows. An unknown musician, an address that does not
+/// parse or a list longer than the mix holds is rejected with an error naming it, and nothing
+/// changes. Not logged: a fader sends many of these a second.
+pub fn set_mix(
+    state: &DesktopState,
+    address: String,
+    mix: MixUpdateRequest,
+) -> Result<MixDto, String> {
+    let guard = state
+        .engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let handle = guard
+        .as_ref()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    let applied = handle
+        .set_mix(&address, &mix.into())
+        .map_err(|error| error.to_string())?;
+    Ok(MixDto::from(&applied))
+}
+
 /// Sets or clears a musician's label. The label never reaches the engine or any client, and it is
 /// only shown for a client that has not announced a name of its own: a client's own name wins.
 pub fn set_musician_name(
@@ -264,9 +290,7 @@ mod tests {
                     name: None,
                     name_is_local: false,
                     control_connected: false,
-                    volume_percent: 100,
-                    max_level_percent: 100,
-                    muted: false,
+                    mix: MixDto::from(&personal_monitoring::MixValues::default()),
                     packets_sent: 0,
                     packets_discarded: 0,
                     link_health: "unknown",
@@ -345,6 +369,20 @@ mod tests {
 
         assert_eq!(status.musicians[0].name, None);
         assert!(!status.musicians[0].name_is_local);
+    }
+
+    #[test]
+    fn setting_a_mix_without_a_running_engine_says_so() {
+        let state = DesktopState::new(MusicianNames::load(names_path("set-mix-idle")));
+
+        let error = set_mix(
+            &state,
+            "192.168.1.30:50000".to_owned(),
+            MixUpdateRequest::default(),
+        )
+        .expect_err("there is no engine to set a mix on");
+
+        assert_eq!(error, "the engine is not running");
     }
 
     #[test]

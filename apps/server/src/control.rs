@@ -8,15 +8,16 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
-use crate::engine::{EngineEvent, EventBus};
+use crate::engine::{EngineEvent, EventBus, MixOrigin};
 use crate::health::LinkReport;
 use crate::mix::GroupLayout;
 use crate::protocol::{
-    control_error, control_message_type, mix_ack, parse_mix_command, parse_register_command,
-    parse_stats_command, registered_name, ControlConfig, GroupConfig,
+    control_error, control_message_type, mix_ack, mix_state_message, parse_mix_update,
+    parse_register_command, parse_stats_command, registered_name, ControlConfig, GroupConfig,
 };
 use crate::targets::TargetRegistry;
 
@@ -251,6 +252,20 @@ impl Drop for PeerGuard {
     }
 }
 
+/// Whether a connection with `peer` should be sent its musician's mix because of `event`.
+///
+/// Only a mix change for the same IP counts, and never one this very connection made: the phone
+/// already holds that mix and got `mix_ack` for it. A change from the engine, or from another
+/// socket of the same phone, is pushed so the phone's screen follows.
+fn should_push_mix(event: &EngineEvent, peer: SocketAddr) -> bool {
+    match event {
+        EngineEvent::MixChanged { address, origin } => {
+            address.ip() == peer.ip() && *origin != MixOrigin::Client { peer }
+        }
+        _ => false,
+    }
+}
+
 /// Registers a live connection and returns the guard that deregisters it, so the caller never has
 /// to remember to undo this on every exit path.
 fn register_peer(
@@ -289,6 +304,10 @@ async fn handle_control_connection(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = accept_async(stream).await?;
     let _peer = register_peer(&peers, &events, &targets, peer);
+    // Subscribed before `config` goes out, so a client that has seen `config` cannot miss a mix
+    // change made after it.
+    let mut live_events = events.subscribe_live();
+    let mut live_events_open = true;
     let (writer, mut reader) = websocket.split();
 
     // The sink is shared between the read loop and the config watcher through an async mutex. The
@@ -366,6 +385,42 @@ async fn handle_control_connection(
             _ = tokio::time::sleep_until(dead_at) => {
                 log_missed_heartbeat(peer, heartbeat.dead_after);
                 break;
+            }
+            event = live_events.recv(), if live_events_open => {
+                let push = match event {
+                    Ok(event) => should_push_mix(&event, peer),
+                    // Events were missed, so one may have been for this musician: sending the
+                    // current mix is always correct, because it is the whole mix, not a delta.
+                    Err(RecvError::Lagged(_)) => true,
+                    Err(RecvError::Closed) => {
+                        live_events_open = false;
+                        false
+                    }
+                };
+                if !push {
+                    continue;
+                }
+                // A peer whose target is gone has no mix to follow; it keeps its channel as before.
+                let Some(mix_state) = targets.mix_state(peer.ip()) else {
+                    continue;
+                };
+                let message = mix_state_message(mix_state.snapshot())?;
+                // Bounded like the ping: a push that cannot be written in time means a dead peer.
+                let send = async {
+                    writer
+                        .lock()
+                        .await
+                        .send(Message::Text(message.into()))
+                        .await
+                };
+                match tokio::time::timeout_at(dead_at, send).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        log_missed_heartbeat(peer, heartbeat.dead_after);
+                        break;
+                    }
+                }
             }
             _ = ping_timer.tick() => {
                 // A write to a vanished peer can stall once its buffers fill, so the ping is bounded
@@ -463,14 +518,20 @@ async fn handle_control_connection(
                     // received. The control channel itself is deliberately left open.
                     Some(match targets.mix_state(peer.ip()) {
                         None => control_error(NO_TARGET_ERROR.to_owned())?,
-                        Some(mix_state) => match parse_mix_command(&text, mix_state.snapshot()) {
-                            Ok(values) => {
-                                mix_state.update(values);
-                                events.emit(EngineEvent::MixChanged { address: peer });
-                                mix_ack(mix_state.snapshot())?
+                        Some(mix_state) => {
+                            match parse_mix_update(&text)
+                                .and_then(|update| mix_state.apply(&update))
+                            {
+                                Ok(values) => {
+                                    events.emit(EngineEvent::MixChanged {
+                                        address: peer,
+                                        origin: MixOrigin::Client { peer },
+                                    });
+                                    mix_ack(values)?
+                                }
+                                Err(error) => control_error(error)?,
                             }
-                            Err(error) => control_error(error)?,
-                        },
+                        }
                     })
                 };
                 if let Some(response) = response {
@@ -795,6 +856,17 @@ mod tests {
         peers: ControlPeers,
         heartbeat: Heartbeat,
     ) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        start_server_with_events(targets, peers, heartbeat, EventBus::default())
+    }
+
+    /// Starts a control server like [start_server] on the event bus the test supplies, so a test
+    /// can change a mix through the engine path and watch what the connections do with it.
+    fn start_server_with_events(
+        targets: Arc<TargetRegistry>,
+        peers: ControlPeers,
+        heartbeat: Heartbeat,
+        events: EventBus,
+    ) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
         let address = listener.local_addr().expect("listener address");
         // Non-blocking, as `spawn_control_thread` sets it. On Windows an accepted socket inherits
@@ -817,7 +889,7 @@ mod tests {
                 Arc::new(ConfigState::new(2)),
                 Arc::new(drums()),
                 peers,
-                EventBus::default(),
+                events,
                 heartbeat,
             ));
         });
@@ -1724,6 +1796,143 @@ mod tests {
         );
 
         drop(older);
+        stop_server(address, &stopped, server).await;
+    }
+
+    #[test]
+    fn a_mix_change_is_pushed_to_its_musicians_connections_except_the_one_that_made_it() {
+        let phone: SocketAddr = "192.168.1.3:41000".parse().unwrap();
+        let second_socket: SocketAddr = "192.168.1.3:41001".parse().unwrap();
+        let other_phone: SocketAddr = "192.168.1.4:41000".parse().unwrap();
+        let from_engine = EngineEvent::MixChanged {
+            address: "192.168.1.3:50000".parse().unwrap(),
+            origin: MixOrigin::Engine,
+        };
+        let from_phone = EngineEvent::MixChanged {
+            address: phone,
+            origin: MixOrigin::Client { peer: phone },
+        };
+
+        assert!(should_push_mix(&from_engine, phone));
+        assert!(!should_push_mix(&from_engine, other_phone));
+        assert!(
+            !should_push_mix(&from_phone, phone),
+            "a phone's own change is answered with mix_ack, never pushed back"
+        );
+        assert!(
+            should_push_mix(&from_phone, second_socket),
+            "another socket of the same musician still follows the change"
+        );
+        assert!(!should_push_mix(&from_phone, other_phone));
+        assert!(!should_push_mix(
+            &EngineEvent::ClientConnected { address: phone },
+            phone
+        ));
+    }
+
+    /// Starts a server with one configured target at the loopback IP the test client connects
+    /// from, on an event bus the test shares, and returns the connected client too.
+    async fn start_mix_push_server() -> (
+        Arc<TargetRegistry>,
+        EventBus,
+        ClientStream,
+        SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &GroupLayout::default(),
+            )
+            .expect("registry should build"),
+        );
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+        );
+        // The connection subscribes before it sends `config`, so once `config` has arrived a change
+        // made through the engine cannot be missed.
+        let client = connect_client(address).await;
+        (targets, events, client, address, stopped, server)
+    }
+
+    /// The desktop's path over a real socket: a change made through the engine API reaches the
+    /// musician's phone as `mix_state`, carrying the whole resulting mix rather than the delta.
+    #[tokio::test]
+    async fn a_mix_change_made_through_the_engine_reaches_the_phone_as_mix_state() {
+        let (targets, events, mut client, address, stopped, server) = start_mix_push_server().await;
+
+        let applied = crate::engine::set_target_mix(
+            &targets,
+            &events,
+            "127.0.0.1:50000",
+            &crate::mix::MixUpdate {
+                channel_gains: Some(vec![10, 20]),
+                volume_percent: Some(42),
+                ..Default::default()
+            },
+        )
+        .expect("the configured target's mix is set");
+
+        let pushed = read_message_of_type(&mut client, "mix_state")
+            .await
+            .expect("the phone should be told about the change");
+        assert_eq!(pushed["volume_percent"], 42);
+        assert_eq!(pushed["max_level_percent"], 100);
+        assert_eq!(pushed["muted"], false);
+        let channels: Vec<u8> = serde_json::from_value(pushed["channels"].clone()).unwrap();
+        assert_eq!(channels, applied.channel_gains.to_vec());
+        assert_eq!(&channels[..3], &[10, 20, 100]);
+        let pans: Vec<u8> = serde_json::from_value(pushed["pans"].clone()).unwrap();
+        assert_eq!(pans, applied.pans.to_vec());
+        assert_eq!(pushed["mutes"].as_array().map(Vec::len), Some(32));
+        assert_eq!(pushed["solos"].as_array().map(Vec::len), Some(32));
+        assert_eq!(pushed["group_levels"].as_array().map(Vec::len), Some(16));
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A phone's own change is answered with `mix_ack` and is never pushed back to it. Proven by
+    /// order: the phone's own change is announced before any later one, so if it were echoed the
+    /// echo would be the next message, ahead of the push for the engine change that follows.
+    #[tokio::test]
+    async fn a_phones_own_mix_is_acknowledged_and_not_pushed_back() {
+        let (targets, events, mut client, address, stopped, server) = start_mix_push_server().await;
+
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        let ack = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(ack["type"], "mix_ack", "the phone's change is acknowledged");
+        assert_eq!(ack["volume_percent"], 80);
+
+        crate::engine::set_target_mix(
+            &targets,
+            &events,
+            "127.0.0.1:50000",
+            &crate::mix::MixUpdate {
+                volume_percent: Some(33),
+                ..Default::default()
+            },
+        )
+        .expect("the configured target's mix is set");
+
+        let next = read_next_reply(&mut client)
+            .await
+            .expect("the engine change is pushed");
+        assert_eq!(next["type"], "mix_state");
+        assert_eq!(
+            next["volume_percent"], 33,
+            "the next message is the engine's change, not an echo of the phone's own: {next}"
+        );
+        assert_eq!(next["max_level_percent"], 90, "the phone's values are kept");
+
         stop_server(address, &stopped, server).await;
     }
 }

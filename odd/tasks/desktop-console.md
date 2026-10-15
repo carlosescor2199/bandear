@@ -112,11 +112,21 @@ user's decision.
   over a stereo one; tests for the ranking. Route: inline (one mechanical file). RED observed
   (`input_config_rank` missing), GREEN: `cargo test -p personal-monitoring` 174 passed.
   Commit: this commit.
-- [ ] T2 (engine mix control): `EngineHandle::set_mix(address, partial mix)`; the mix-changed
-  event says where the change came from; the control channel pushes the full mix to the phone
-  when the change did not come from it (new server-to-phone message); full mix in `MusicianDto`;
-  Tauri command `set_mix`. Unit tests plus a control integration test (a desktop change reaches
-  the phone's socket; a phone change is not echoed). Route: delegated writer.
+- [x] T2 (engine mix control): `EngineHandle::set_mix(address, &MixUpdate)` merges a partial
+  update with the same code as a phone's `mix` (`MixUpdate::merge_into`, under a per-mix writer
+  lock so the phone and the desktop never drop each other's fields); `EngineEvent::MixChanged`
+  carries `origin: MixOrigin::{Client { peer }, Engine}`; each control connection listens on a
+  live (tokio broadcast) side of the event bus and pushes the whole mix as the new `mix_state`
+  message (the `mix_ack` shape) unless the change came from that same connection; the Android
+  app ignores unknown types, so older builds are unaffected; `MusicianDto` carries the full mix
+  (flattened `MixDto`); Tauri command `set_mix(address, mix)`. Route: delegated writer. RED
+  observed (server: 34 compile errors, `MixUpdate`, `MixState::apply`, `set_target_mix`,
+  `MixOrigin`, `should_push_mix`, `mix_state_message`, `parse_mix_update` missing; desktop:
+  `set_mix`, `MixUpdateRequest` missing). GREEN: `cargo test -p personal-monitoring` 184 passed
+  (10 new), `cargo test -p mixlink-desktop` 25 passed (4 new), `cargo build -p mixlink-desktop`
+  ok. About 940 changed lines, mostly tests: over the 400-line heuristic because the engine API,
+  the push and the desktop command only prove the behaviour together.
+  Commit: this commit.
 - [ ] T3 (Android): parse the pushed mix and apply it in the ViewModel without sending it back;
   JVM tests. Route: delegated writer.
 - [ ] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
@@ -136,4 +146,4 @@ user's decision.
 
 ## Next step
 
-T1.
+T3.

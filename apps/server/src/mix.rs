@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Mutex;
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
 pub(crate) const MAX_GROUPS: usize = 16;
@@ -62,6 +63,69 @@ pub(crate) struct MixState {
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
+    /// Serializes [MixState::apply], so two writers (the musician's phone and the desktop) never
+    /// interleave a read-merge-store and lose each other's fields. The network thread only loads
+    /// the atomics and never takes it, so the audio path stays lock-free.
+    writer: Mutex<()>,
+}
+
+/// A partial change to one client's mix: every absent field keeps its current value.
+///
+/// It is the engine's own form of a `mix` control message, so a change from the phone and a change
+/// through [crate::EngineHandle::set_mix] are merged by the same code. A list replaces the values
+/// from the first channel (or group) on and leaves the rest alone; levels are clamped to 0-100 and
+/// a list longer than the table is rejected, exactly as for a phone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MixUpdate {
+    pub channel_gains: Option<Vec<i32>>,
+    pub pans: Option<Vec<i32>>,
+    pub channel_muted: Option<Vec<bool>>,
+    pub channel_solo: Option<Vec<bool>>,
+    pub group_levels: Option<Vec<i32>>,
+    pub volume_percent: Option<i32>,
+    pub max_level_percent: Option<i32>,
+    pub muted: Option<bool>,
+}
+
+impl MixUpdate {
+    /// Merges this update into `current`, or names the list that cannot be applied.
+    ///
+    /// The list labels are the `mix` message's field names, so a phone's error text is unchanged.
+    pub(crate) fn merge_into(&self, current: MixValues) -> Result<MixValues, String> {
+        Ok(MixValues {
+            channel_gains: merge_levels(
+                "channels",
+                self.channel_gains.as_ref(),
+                &current.channel_gains,
+            )?,
+            pans: merge_levels("pans", self.pans.as_ref(), &current.pans)?,
+            channel_muted: merge_flags(
+                "mutes",
+                self.channel_muted.as_ref(),
+                &current.channel_muted,
+            )?,
+            channel_solo: merge_flags("solos", self.channel_solo.as_ref(), &current.channel_solo)?,
+            group_levels: merge_levels(
+                "group_levels",
+                self.group_levels.as_ref(),
+                &current.group_levels,
+            )?,
+            // Membership is server configuration, never client input: preserve whatever the source
+            // snapshot carried.
+            channel_group: current.channel_group,
+            volume_percent: self
+                .volume_percent
+                .map_or(current.volume_percent, clamp_percent),
+            max_level_percent: self
+                .max_level_percent
+                .map_or(current.max_level_percent, clamp_percent),
+            muted: self.muted.unwrap_or(current.muted),
+        })
+    }
+}
+
+fn clamp_percent(value: i32) -> u8 {
+    value.clamp(0, 100) as u8
 }
 
 /// A plain, copyable snapshot of one client's mix.
@@ -103,6 +167,7 @@ impl Default for MixState {
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
+            writer: Mutex::new(()),
         }
     }
 }
@@ -173,6 +238,19 @@ impl MixState {
         self.max_level_percent
             .store(values.max_level_percent, Ordering::Relaxed);
         self.muted.store(values.muted, Ordering::Relaxed);
+    }
+
+    /// Applies a partial update and returns the mix that is now stored.
+    ///
+    /// The read, merge and store happen under the writer lock, so the phone and the desktop can
+    /// both change different parts of the same mix without one undoing the other: the last writer
+    /// wins for the fields it carries, and nothing else. An update that cannot be applied leaves
+    /// the mix exactly as it was.
+    pub(crate) fn apply(&self, update: &MixUpdate) -> Result<MixValues, String> {
+        let _writer = self.writer.lock().expect("mix writer lock poisoned");
+        let merged = update.merge_into(self.snapshot())?;
+        self.update(merged);
+        Ok(merged)
     }
 
     pub(crate) fn snapshot(&self) -> MixValues {
@@ -754,6 +832,63 @@ mod tests {
 
         assert_eq!(values.channel_group[0], Some(0));
         assert_eq!(values.group_levels[0], 50);
+    }
+
+    #[test]
+    fn a_partial_update_changes_only_the_fields_it_carries() {
+        let state = MixState::new(&GroupLayout::default());
+        state.update(MixValues {
+            channel_gains: std::array::from_fn(|index| if index == 0 { 40 } else { 70 }),
+            channel_muted: std::array::from_fn(|index| index == 1),
+            volume_percent: 60,
+            max_level_percent: 80,
+            muted: true,
+            ..MixValues::default()
+        });
+        let before = state.snapshot();
+
+        let applied = state
+            .apply(&MixUpdate {
+                pans: Some(vec![50]),
+                volume_percent: Some(150),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        assert_eq!(
+            applied,
+            state.snapshot(),
+            "the applied mix is what is stored"
+        );
+        assert_eq!(applied.pans[0], 50);
+        assert_eq!(&applied.pans[1..], &before.pans[1..]);
+        assert_eq!(applied.volume_percent, 100, "clamped like a phone's value");
+        assert_eq!(applied.channel_gains, before.channel_gains);
+        assert_eq!(applied.channel_muted, before.channel_muted);
+        assert_eq!(applied.channel_solo, before.channel_solo);
+        assert_eq!(applied.group_levels, before.group_levels);
+        assert_eq!(applied.max_level_percent, 80);
+        assert!(applied.muted);
+    }
+
+    #[test]
+    fn an_invalid_partial_update_changes_nothing() {
+        let state = MixState::new(&GroupLayout::default());
+        let before = state.snapshot();
+
+        let error = state
+            .apply(&MixUpdate {
+                volume_percent: Some(10),
+                channel_gains: Some(vec![50; MAX_MIX_CHANNELS + 1]),
+                ..MixUpdate::default()
+            })
+            .expect_err("an oversized list is rejected");
+
+        assert!(
+            error.contains("channels"),
+            "the error names the list: {error}"
+        );
+        assert_eq!(state.snapshot(), before);
     }
 
     #[test]

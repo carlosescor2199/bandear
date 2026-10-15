@@ -17,7 +17,7 @@ use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
-use crate::mix::{Group, GroupLayout, MixValues, MAX_MIX_CHANNELS};
+use crate::mix::{Group, GroupLayout, MixUpdate, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
 use crate::targets::{TargetEntry, TargetRegistry};
@@ -36,16 +36,33 @@ const DEFAULT_BUFFER_FRAMES: u32 = 256;
 /// Something that changed while the engine was running.
 ///
 /// The engine emits these over an [EngineHandle::subscribe] channel. Connect and disconnect are the
-/// state a UI cannot cheaply poll for, and a mix change is the confirmation that a client's command
-/// was applied.
+/// state a UI cannot cheaply poll for, and a mix change is the confirmation that a command was
+/// applied. Every address identifies its musician by IP, the engine's join key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineEvent {
     /// A control channel became connected for this peer.
     ClientConnected { address: SocketAddr },
     /// The last control channel for this peer's IP closed.
     ClientDisconnected { address: SocketAddr },
-    /// A control command changed this peer's mix.
-    MixChanged { address: SocketAddr },
+    /// The mix of the musician at this address's IP changed. The address is the control peer's
+    /// for a change from the phone and the musician's UDP target for a change through the engine.
+    MixChanged {
+        address: SocketAddr,
+        origin: MixOrigin,
+    },
+}
+
+/// Where a mix change came from.
+///
+/// The control channel uses it to tell a phone about changes it did not make itself: a phone's
+/// own change is answered with `mix_ack`, and pushing it back would only echo it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixOrigin {
+    /// A `mix` message from the musician's phone, over the control connection with this peer
+    /// address. The peer's port tells two connections from the same phone apart.
+    Client { peer: SocketAddr },
+    /// [EngineHandle::set_mix], the engine API the desktop uses.
+    Engine,
 }
 
 /// The capture format the engine selected, as plain strings so a UI can render it without a cpal
@@ -132,14 +149,35 @@ pub struct EngineStatus {
     pub musicians: Vec<MusicianStatus>,
 }
 
+/// How many events a live subscriber may fall behind before it is told it lagged.
+///
+/// Events are a few bytes and a control connection drains them as they come, so only a connection
+/// stuck on a dead socket gets near this.
+const LIVE_EVENT_CAPACITY: usize = 256;
+
 /// A fan-out of [EngineEvent] to any number of observers.
 ///
 /// A channel was chosen over a listener trait: it decouples the engine threads from the consumer,
 /// needs no `Fn + Send + Sync` callback and no reentrancy care, and reuses `std::sync::mpsc` that
 /// the crate already depends on. Each [EventBus::subscribe] hands out an independent receiver.
-#[derive(Clone, Default)]
+///
+/// The control connections are async tasks, which cannot park on a `std` receiver, so the same
+/// events also go out on a `tokio` broadcast for [EventBus::subscribe_live]. Both sides are fed by
+/// the one [EventBus::emit], so they never disagree.
+#[derive(Clone)]
 pub(crate) struct EventBus {
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
+    live: tokio::sync::broadcast::Sender<EngineEvent>,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        let (live, _) = tokio::sync::broadcast::channel(LIVE_EVENT_CAPACITY);
+        Self {
+            subscribers: Arc::default(),
+            live,
+        }
+    }
 }
 
 impl EventBus {
@@ -152,13 +190,50 @@ impl EventBus {
         receiver
     }
 
+    /// Subscribes an async task to every event emitted from now on.
+    pub(crate) fn subscribe_live(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
+        self.live.subscribe()
+    }
+
     pub(crate) fn emit(&self, event: EngineEvent) {
+        // An error only means no live subscriber exists right now, which is not a failure.
+        let _ = self.live.send(event.clone());
         let mut subscribers = self
             .subscribers
             .lock()
             .expect("event subscribers mutex poisoned");
         subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
     }
+}
+
+/// Applies a partial mix update to the musician whose IP `value` names, and announces it as a
+/// change made through the engine.
+///
+/// `value` is the address string the engine reports, so a UI can hand back what it displayed; the
+/// musician is found by IP, the same join a phone's `mix` uses. The update is validated and merged
+/// exactly as a phone's is. An invalid address, an unknown musician or an update that cannot be
+/// applied is an error naming the problem, and then nothing changes and nothing is announced.
+pub(crate) fn set_target_mix(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    value: &str,
+    update: &MixUpdate,
+) -> Result<MixValues, String> {
+    let requested = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid target `{value}`: {error}"))?;
+    let (address, mix_state) = targets
+        .read()
+        .iter()
+        .find(|entry| entry.address.ip() == requested.ip())
+        .map(|entry| (entry.address, Arc::clone(&entry.mix_state)))
+        .ok_or_else(|| format!("target `{value}` is not configured"))?;
+    let applied = mix_state.apply(update)?;
+    events.emit(EngineEvent::MixChanged {
+        address,
+        origin: MixOrigin::Engine,
+    });
+    Ok(applied)
 }
 
 /// Joins the per-target state into one row per musician.
@@ -631,6 +706,24 @@ impl EngineHandle {
             .map_err(|error| -> Box<dyn Error> { error.into() })
     }
 
+    /// Changes a musician's mix from outside their phone, as the desktop does.
+    ///
+    /// `value` is the musician's address as [Self::status] reports it; the musician is found by IP.
+    /// The update is partial: every absent field keeps its value, lists replace from the first
+    /// channel on, and levels are clamped, exactly as for a phone's `mix`. The change is applied to
+    /// the audio at once, emitted as [EngineEvent::MixChanged] with [MixOrigin::Engine], and pushed
+    /// to the musician's phone as `mix_state` so its screen follows. Returns the mix now stored.
+    ///
+    /// An address that does not parse, a musician that is not configured, or a list longer than the
+    /// mix holds is an error naming the problem, and the mix is left exactly as it was.
+    pub fn set_mix(&self, value: &str, update: &MixUpdate) -> Result<MixValues, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        set_target_mix(&self.targets, &self.events, value, update)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
@@ -941,6 +1034,136 @@ mod tests {
             LinkHealth::Unknown,
             "connected but never reported: a phone without stats reports"
         );
+    }
+
+    #[test]
+    fn setting_a_mix_applies_a_partial_update_and_announces_it_as_an_engine_change() {
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+            ],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let state = registry.mix_state(ip("192.168.1.3")).expect("configured");
+        state.update(MixValues {
+            channel_gains: std::array::from_fn(|index| if index == 0 { 40 } else { 70 }),
+            volume_percent: 60,
+            muted: true,
+            ..MixValues::default()
+        });
+        let before = state.snapshot();
+        let other_before = registry
+            .mix_state(ip("192.168.1.4"))
+            .expect("configured")
+            .snapshot();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+
+        let applied = set_target_mix(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &MixUpdate {
+                channel_solo: Some(vec![false, true]),
+                group_levels: Some(vec![-5]),
+                max_level_percent: Some(75),
+                ..MixUpdate::default()
+            },
+        )
+        .expect("a configured target's mix is set");
+
+        assert_eq!(applied, state.snapshot());
+        assert!(applied.channel_solo[1]);
+        assert_eq!(applied.group_levels[0], 0, "clamped like a phone's value");
+        assert_eq!(applied.max_level_percent, 75);
+        assert_eq!(applied.channel_gains, before.channel_gains);
+        assert_eq!(applied.pans, before.pans);
+        assert_eq!(applied.channel_muted, before.channel_muted);
+        assert_eq!(applied.volume_percent, 60);
+        assert!(applied.muted);
+        assert_eq!(
+            registry
+                .mix_state(ip("192.168.1.4"))
+                .expect("configured")
+                .snapshot(),
+            other_before,
+            "no other musician is touched"
+        );
+        assert_eq!(
+            observed.try_recv(),
+            Ok(EngineEvent::MixChanged {
+                address: "192.168.1.3:50000".parse().unwrap(),
+                origin: MixOrigin::Engine,
+            })
+        );
+    }
+
+    #[test]
+    fn setting_the_mix_of_an_unknown_target_errors_and_announces_nothing() {
+        let registry = TargetRegistry::new(
+            &["192.168.1.3:50000".parse().unwrap()],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let update = MixUpdate {
+            volume_percent: Some(10),
+            ..MixUpdate::default()
+        };
+
+        let unknown = set_target_mix(&registry, &events, "192.168.1.9:50000", &update)
+            .expect_err("an unknown target is rejected");
+        let invalid = set_target_mix(&registry, &events, "not an address", &update)
+            .expect_err("an invalid address is rejected");
+
+        assert!(
+            unknown.contains("192.168.1.9:50000") && unknown.contains("not configured"),
+            "the error names the target: {unknown}"
+        );
+        assert!(
+            invalid.contains("not an address"),
+            "the error names the value: {invalid}"
+        );
+        assert!(observed.try_recv().is_err(), "nothing changed");
+    }
+
+    #[test]
+    fn an_invalid_mix_update_is_rejected_and_announces_nothing() {
+        let registry = TargetRegistry::new(
+            &["192.168.1.3:50000".parse().unwrap()],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let before = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .snapshot();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+
+        let error = set_target_mix(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &MixUpdate {
+                pans: Some(vec![50; MAX_MIX_CHANNELS + 1]),
+                ..MixUpdate::default()
+            },
+        )
+        .expect_err("an oversized list is rejected");
+
+        assert!(error.contains("pans"), "the error names the list: {error}");
+        assert_eq!(
+            registry
+                .mix_state(ip("192.168.1.3"))
+                .expect("configured")
+                .snapshot(),
+            before
+        );
+        assert!(observed.try_recv().is_err());
     }
 
     #[test]

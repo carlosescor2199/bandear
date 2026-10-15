@@ -76,8 +76,8 @@ never counted. Reporting those numbers as they are would make the traffic light 
   `ControlChannel`. JVM tests for each pure helper. Evidence: `6c93b9f`, refined by the slice 4
   commit that stops counting timeouts before the first packet (see Progress and Verification).
 - [x] T4 (server): control-channel heartbeat so a vanished phone's half-open connection is closed.
-  Evidence: the T4 commit in slice 4; RED 3 failed, GREEN 159 passed (see Progress and
-  Verification). A live recheck on a device is still pending.
+  Evidence: `0fc844c` in slice 4; RED 3 failed, GREEN 159 passed (see Progress and
+  Verification); rechecked live on the S23 (see Status and next steps).
 
 ## Acceptance criteria
 
@@ -124,7 +124,7 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001), the T4 commit (control-channel heartbeat; found in the live test) |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001), `0fc844c` (T4, control-channel heartbeat; found in the live test) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
@@ -289,7 +289,7 @@ boundaries if a smaller review is wanted.
   app closed: turning Wi-Fi off had left the first control connection half-open, nothing on the
   server detects a dead peer, and that zombie kept the IP's control connection count at 1, so the
   musician stayed "control connected" with a stale report (red "lost") instead of grey.
-- T4 done (this commit, slice 4; route: delegated direct, one writer): a server-side heartbeat on
+- T4 done (`0fc844c`, slice 4; route: delegated direct, one writer): a server-side heartbeat on
   the control channel, in `control.rs` only.
   - Each connection's read loop sends a WebSocket ping every `CONTROL_PING_INTERVAL` (2 s) and
     closes the connection when no frame of any kind (pong, text, ping, close) has arrived for
@@ -317,16 +317,26 @@ boundaries if a smaller review is wanted.
 ## Status and next steps
 
 - Code complete: T1 to T4 are done. Every slice range up to `9fbbd13` has an approved native
-  review; the T4 commit has not been reviewed yet.
+  review; `0fc844c` (T4) is reviewed together with this documentation commit.
 - Final checks: `cargo test -p personal-monitoring` 159 passed, `cargo test -p mixlink-desktop` 21
   passed, Android JVM tests 81 passed with the debug APK assembled (no Android change since).
 - Verified live on the S23 with the desktop: green on clean Wi-Fi, red ("lost") with Wi-Fi off,
   green again after reconnecting. Closing the app after that stayed red because of the half-open
   connection, which T4 fixes.
-- Pending: a live recheck of T4 on the S23: Wi-Fi off turns red ~3 s later and grey ~10 s after
-  the phone vanished; closing the app turns grey right away, also after a Wi-Fi off and reconnect;
-  the row disappears after the grace period. The UDP-blocked (red "silent") and older-build (grey)
-  checks were not reported from the first live test and are still open.
+- T4 rechecked live on the S23 with the rebuilt desktop. Twice, Wi-Fi off closed the phone's
+  control connection by the heartbeat (`control connection 192.168.1.10:48860 closed: nothing
+  received for 10s, heartbeat missed`, then the same for `:57978`); the row showed Control
+  "offline" and Link "unknown" (grey) during the grace period and disappeared after it
+  (`removed after the grace period`). The half-open zombie that kept the musician red no longer
+  survives.
+- Not rechecked live: closing the app after a manual reconnect (covered by
+  `a_half_open_connection_left_by_a_reconnect_does_not_keep_the_musician_connected`), red
+  "silent" with UDP blocked (would need a firewall change) and an older build (grey).
+- Found in the live test, outside this feature: the Android app never reconnects its control
+  channel on its own (`ControlChannel.kt` `onFailure` / `onClosed` only update state), and Start
+  is a silent no-op while the audio receiver still runs (`MainActivity.kt` `startReceiver`:
+  `if (running.get()) return`), so reconnecting today takes Stop then Start. Candidate next
+  feature: automatic reconnection that restores the musician's slot and mix.
 - Pending (user decision): push and the stacked-to-main pull requests, one per slice.
 - Known gaps: no JS test runner for `describeLink` (review 2 R3-002); the `PmonPlayer` receive loop
   is only covered through its pure helpers (review 3 R3-002); the startup-grace boundary test

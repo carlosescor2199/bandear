@@ -3,6 +3,9 @@ mod cli;
 mod control;
 mod discovery;
 mod engine;
+// The control channel and the engine status start using the classifier in the next commit.
+#[allow(dead_code)]
+mod health;
 mod mix;
 mod network;
 mod protocol;
@@ -14,4 +17,5 @@ pub use engine::{
     start, CaptureFormat, EngineEvent, EngineHandle, EngineStatus, GroupStatus, MusicianCounters,
     MusicianStatus,
 };
+pub use health::{LinkHealth, LinkStatus};
 pub use mix::MixValues;

@@ -536,6 +536,18 @@ user's decision.
   `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`; since T7 the console is
   `/index.html?fake` (the running server answers `/` with the new index only after a restart).
 
+- T7c 0c926dd: lineage `review-6c08ce0320b9f147` over 29a84cf..0c926dd approved and
+  acknowledged; its one SUGGESTION (assert the first switch was refused before the working one)
+  is applied in the commit that records this line. Every commit of phase 1 is now reviewed.
+- First live run (2026-10-15): the app opened the new console on the real engine (WASAPI,
+  the Realtek microphone array, 2 channels) and the Galaxy S23 registered as "Carlos D"; the
+  user approved the result ("elegante"). The engine was started three times, each from a user
+  action (the console starts it only on Start, Try again, an audio apply, or when none runs).
+  Still pending live: the Volt (not connected that day), the S23 running the new app (it was
+  not reachable over adb, so its screen following desk changes is unproven), and ASIO.
+
 ## Next step
 
-Live test with the Volt and the Galaxy S23, then PRs.
+Phase 1 is complete and reviewed. Remaining: the pending live checks above, and the pull
+requests (stacked-to-main) when the user approves pushing. Phase 2 (channels, groups and
+session) continues on a branch stacked on this one.

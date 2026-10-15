@@ -473,6 +473,7 @@ test("a switch that works clears the refusal of an earlier one", async () => {
   await app.applyAudio({ host: "wasapi" });
   fake.failNext("switch_device", "the device is busy");
   await app.switchDevice("Microphone (USB audio)");
+  assert.equal(app.store.getState().commandError?.action, "switch");
 
   await app.switchDevice("Microphone (USB audio)");
 

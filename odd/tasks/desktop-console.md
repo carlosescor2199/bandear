@@ -127,8 +127,21 @@ user's decision.
   ok. About 940 changed lines, mostly tests: over the 400-line heuristic because the engine API,
   the push and the desktop command only prove the behaviour together.
   Commit: this commit.
-- [ ] T3 (Android): parse the pushed mix and apply it in the ViewModel without sending it back;
-  JVM tests. Route: delegated writer.
+- [x] T3 (Android): parse the pushed mix and apply it in the ViewModel without sending it back;
+  JVM tests. Route: delegated writer. `mix_ack` parsed no values before, so nothing was reused:
+  `ControlChannel` reads `mix_state` with `parseMixReport` (every field required; a malformed push
+  is reported as an invalid control response, never applied) and calls the new
+  `Listener.onMixPushed` (default no-op, so other listeners are unaffected). `MonitorViewModel`
+  dispatches `MonitorEvent.MixPushed` and syncs the audio thread's master values, never calling
+  `sendMixControl` (no echo). The reducer maps the server's 32/16 tables onto the announced
+  channels and groups (the strips' count before the first `config`), clamps to 0-100, ignores a
+  push outside a session or one equal to the mix the phone already plays (the server's lagged
+  re-send), leaves saved mixes alone, and turns More of me off with a notice, since the pushed
+  levels are already lifted. A gesture in flight is not held back: the push lands at once and the
+  next gesture step sends its value with the pushed mix around it (last writer wins at the
+  server). RED observed (13 compile errors: `MixPushed`, `onMixPushed`, `MIX_CHANGED_ELSEWHERE`
+  missing). GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 357 tests (14 new),
+  0 failures. Commit: this commit.
 - [ ] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
   about 30 Hz; the UI keeps one `engine_status` call for the first paint. Route: delegated writer.
 - [ ] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the
@@ -156,4 +169,4 @@ user's decision.
 
 ## Next step
 
-T3.
+T4.

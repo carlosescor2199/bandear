@@ -178,6 +178,9 @@ enum class MoreOfMeNotice(val message: String) {
     NEEDS_CHANNEL("Choose your channel first, then turn More of me on"),
     NO_CHANNEL_SELECTED("More of me is off: no channel is chosen"),
     CHANNEL_OUT_OF_RANGE("More of me is off: your channel is no longer in the mix"),
+
+    /** The server pushed a mix changed elsewhere; the phone shows it as played, so nothing is lifted. */
+    MIX_CHANGED_ELSEWHERE("More of me is off: your mix was changed from the desktop"),
 }
 
 /**

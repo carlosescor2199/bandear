@@ -74,6 +74,22 @@ class MonitorViewModelTest {
         return viewModel
     }
 
+    /**
+     * A `mix_state` as the server pushes it when the mix changed from elsewhere: its full 32-channel
+     * and 16-group tables, with [levels] on the first channels and the rest neutral.
+     */
+    private fun mixState(levels: List<Int>, volume: Int = 100, cap: Int = 100, muted: Boolean = false): String = JSONObject()
+        .put("type", "mix_state")
+        .put("volume_percent", volume)
+        .put("max_level_percent", cap)
+        .put("muted", muted)
+        .put("channels", JSONArray(List(32) { levels.getOrElse(it) { 100 } }))
+        .put("pans", JSONArray(List(32) { if (it % 2 == 0) 0 else 100 }))
+        .put("mutes", JSONArray(List(32) { false }))
+        .put("solos", JSONArray(List(32) { false }))
+        .put("group_levels", JSONArray(List(16) { 100 }))
+        .toString()
+
     @Test
     fun startingRestoresTheNameTheChannelAndTheSavedMixesAndListensForServers() {
         store.channel = 1
@@ -472,6 +488,74 @@ class MonitorViewModelTest {
 
         assertNull(state.moreOfMe.musicianChannel)
         assertNull(store.channel)
+    }
+
+    // A mix the server pushed.
+
+    @Test
+    fun aPushedMixIsShownAndHeardWithoutBeingSentBack() {
+        connected(channels = 2)
+        val sent = socket().sent.size
+
+        socket().receive(mixState(levels = listOf(80, 70), volume = 50, cap = 90, muted = true))
+
+        assertEquals(listOf(80, 70), state.mix.levels)
+        assertEquals(50, state.mix.masterVolume)
+        assertEquals(50, receiver.mixState.volumePercent)
+        assertEquals(90, receiver.mixState.maxLevelPercent)
+        assertTrue(receiver.mixState.muted)
+        assertEquals(sent, socket().sent.size)
+    }
+
+    @Test
+    fun aPushDuringMoreOfMeTurnsItOffWithoutSendingAndTheNextMoveSendsThePushedMix() {
+        connected(channels = 2)
+        viewModel.setMusicianChannel(1)
+        viewModel.setMoreOfMe(true)
+        val sent = socket().sent.size
+
+        socket().receive(mixState(levels = listOf(80, 70)))
+
+        assertFalse(state.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.MIX_CHANGED_ELSEWHERE, state.moreOfMe.notice)
+        assertEquals(1, store.channel)
+        assertEquals(sent, socket().sent.size)
+
+        // A fader still moving when the push landed sends its own value with the pushed mix around it;
+        // the server keeps whichever whole mix it got last.
+        viewModel.setChannelLevel(1, 30)
+
+        assertEquals(listOf(80, 30), lastMix().ints("channels"))
+    }
+
+    @Test
+    fun theServerSendingBackTheMixThePhoneSentChangesNothing() {
+        connected(channels = 2)
+        viewModel.setMusicianChannel(1)
+        viewModel.setMoreOfMe(true)
+        val before = state
+        val sent = socket().sent.size
+
+        // After missing events the server re-sends the whole mix it holds, which is the phone's own.
+        socket().receive(lastMix().put("type", "mix_state").toString())
+
+        assertEquals(before, state)
+        assertEquals(sent, socket().sent.size)
+    }
+
+    @Test
+    fun aPushedMixIsTheCurrentMixAndLeavesTheSavedMixesAlone() {
+        connected(channels = 2)
+        viewModel.setChannelLevel(0, 30)
+        viewModel.saveMix("Verse")
+
+        socket().receive(mixState(levels = listOf(80, 70)))
+
+        assertEquals(listOf(30, 100), store.banks.single().snapshot.channelGains.toList())
+
+        viewModel.saveMix("Chorus")
+
+        assertEquals(listOf(80, 70), store.banks.single { it.name == "Chorus" }.snapshot.channelGains.toList())
     }
 
     @Test

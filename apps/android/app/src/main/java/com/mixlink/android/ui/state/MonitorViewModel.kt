@@ -10,6 +10,7 @@ import com.mixlink.android.ControlState
 import com.mixlink.android.DiscoveredServer
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
+import com.mixlink.android.MixSnapshot
 import com.mixlink.android.PmonPlayer
 import com.mixlink.android.ServerDiscovery
 import com.mixlink.android.ui.components.MainTab
@@ -33,6 +34,7 @@ import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
+import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -63,7 +65,8 @@ private val PORTS = 1..65535
  * read [state] and call the intent functions; collaborator callbacks become [MonitorEvent]s for the
  * pure [reduce]. The behaviour is `MainActivity`'s: what starts and stops a session, who owns the
  * mix, how More of me is derived at send time, what a saved mix stores and recalls, and how a name
- * change is re-announced.
+ * change is re-announced. A mix the server pushes (changed on the desktop) is shown and heard, and
+ * never sent back.
  *
  * Callbacks arrive on the receiver, control and discovery threads. The state is updated by an
  * atomic compare-and-set, so any thread may report. Starting and ending a session is serialised by
@@ -81,6 +84,9 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
 
     /** The master values the receive thread reads for local protection; mirrored from [state]. */
     private val playerMix = ClientMixState()
+
+    /** Serialises copies into [playerMix]; see [syncPlayerMix]. */
+    private val playerMixLock = Any()
 
     private val sessionLock = Any()
 
@@ -156,6 +162,8 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         override fun onAcknowledged() {
             dispatch(MixAcknowledged(control.controlState))
         }
+
+        override fun onMixPushed(mix: MixSnapshot) = mixPushed(mix)
 
         override fun onClosed() = publishControlState()
 
@@ -309,14 +317,31 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     }
 
     /**
-     * Copies the master values to the mix state the receive thread reads. Only the main thread
-     * changes them, so the copy always matches [state].
+     * The server pushed the musician's mix, changed on the desktop; it arrives on the control
+     * thread. The screen and the receive thread follow it, but it is never sent back: the server
+     * already plays it, so a send would only echo it.
+     *
+     * A fader the musician is still moving is not held back: the push lands at once, and the next
+     * step of the gesture sends its own value with the pushed mix around it. The server keeps
+     * whichever whole mix it got last.
+     */
+    private fun mixPushed(mix: MixSnapshot) {
+        val (before, after) = dispatch(MixPushed(mix))
+        if (before.mix != after.mix) syncPlayerMix()
+    }
+
+    /**
+     * Copies the master values to the mix state the receive thread reads. The main thread and the
+     * control thread (a pushed mix) both call it. Each copy reads the newest state under
+     * [playerMixLock], after its own change, so the last copy always matches [state].
      */
     private fun syncPlayerMix() {
-        val mix = _state.value.mix
-        playerMix.volumePercent = mix.masterVolume
-        playerMix.maxLevelPercent = mix.levelCap
-        playerMix.muted = mix.masterMuted
+        synchronized(playerMixLock) {
+            val mix = _state.value.mix
+            playerMix.volumePercent = mix.masterVolume
+            playerMix.maxLevelPercent = mix.levelCap
+            playerMix.muted = mix.masterMuted
+        }
     }
 
     // More of me.

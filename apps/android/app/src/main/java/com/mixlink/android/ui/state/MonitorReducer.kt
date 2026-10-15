@@ -27,6 +27,7 @@ import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
+import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -109,6 +110,7 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
     is MasterVolumeChanged -> state.copy(mix = state.mix.copy(masterVolume = event.level.coerceIn(PERCENT)))
     is MasterMuteChanged -> state.copy(mix = state.mix.copy(masterMuted = event.muted))
     is LevelCapChanged -> state.copy(mix = state.mix.copy(levelCap = event.level.coerceIn(PERCENT)))
+    is MixPushed -> applyPushedMix(state, event.snapshot)
 
     is MoreOfMeToggled -> state.copy(moreOfMe = toggleMoreOfMe(state.moreOfMe, event.on))
     is MusicianChannelChosen -> chooseMusicianChannel(state, event.channel)
@@ -266,6 +268,59 @@ private fun MixUiState.recalled(snapshot: MixSnapshot): MixUiState {
         levelCap = snapshot.maxLevelPercent,
         masterMuted = snapshot.muted,
     )
+}
+
+/**
+ * A mix the server pushed because it changed elsewhere, such as on the desktop: it becomes the
+ * phone's current mix, exactly as the server plays it. The saved mixes are left alone.
+ *
+ * A push belongs to a session, so a late one changes nothing once the session ended. A push of the
+ * mix the phone already plays (the server re-sends the whole mix after it missed events) changes
+ * nothing either. Otherwise More of me goes off and says why: the pushed levels are what the server
+ * plays, so lifting them again on the next send would lift them twice.
+ */
+private fun applyPushedMix(state: MonitorUiState, snapshot: MixSnapshot): MonitorUiState {
+    if (!state.connection.sessionRunning) return state
+    val pushed = state.mix.pushed(snapshot)
+    if (pushed == state.mix.asPlayed(state.moreOfMe)) return state
+    val moreOfMe = if (state.moreOfMe.enabled) {
+        state.moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.MIX_CHANGED_ELSEWHERE)
+    } else {
+        state.moreOfMe
+    }
+    return state.copy(mix = pushed, moreOfMe = moreOfMe)
+}
+
+/**
+ * The mix with the server's [snapshot] applied to the channels and groups the server announced; the
+ * snapshot holds its full tables (32 channels, 16 groups) and the rest is not shown. Before the first
+ * `config` the strips the phone shows keep their count. A value the snapshot lacks keeps what the
+ * phone has, and levels and pans stay between 0 and 100.
+ */
+private fun MixUiState.pushed(snapshot: MixSnapshot): MixUiState {
+    val announced = sourceChannels > 0
+    val channelCount = if (announced) sourceChannels else levels.size
+    val groupCount = if (announced) groupDefinitions.size else groupLevels.size
+    return copy(
+        levels = List(channelCount) { snapshot.channelGains.percentAt(it) ?: levels.getOrElse(it) { NEUTRAL } },
+        pans = List(channelCount) { snapshot.channelPans.percentAt(it) ?: pans.getOrElse(it) { defaultPan(it) } },
+        mutes = List(channelCount) { snapshot.channelMutes.getOrNull(it) ?: mutes.getOrElse(it) { false } },
+        solos = List(channelCount) { snapshot.channelSolos.getOrNull(it) ?: solos.getOrElse(it) { false } },
+        groupLevels = List(groupCount) { snapshot.groupLevels.percentAt(it) ?: groupLevels.getOrElse(it) { NEUTRAL } },
+        masterVolume = snapshot.volumePercent.coerceIn(PERCENT),
+        levelCap = snapshot.maxLevelPercent.coerceIn(PERCENT),
+        masterMuted = snapshot.muted,
+    )
+}
+
+/** The value at [index] kept between 0 and 100, or null when the array has no such entry. */
+private fun IntArray.percentAt(index: Int): Int? = getOrNull(index)?.coerceIn(PERCENT)
+
+/** The mix as the phone sends it: with More of me on, its channel lifted and the others lowered. */
+private fun MixUiState.asPlayed(moreOfMe: MoreOfMeUiState): MixUiState {
+    if (!moreOfMe.enabled) return this
+    val lifted = toSnapshot().moreOfMe(moreOfMe.musicianChannel) ?: return this
+    return copy(levels = lifted.channelGains.toList())
 }
 
 /** The saved mixes listing [names]; the active mix stays active only while it is still saved. */

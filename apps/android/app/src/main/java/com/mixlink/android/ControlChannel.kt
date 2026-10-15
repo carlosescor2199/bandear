@@ -21,8 +21,8 @@ private const val NORMAL_CLOSURE = 1000
  * The WebSocket control channel, its connection state machine, sending and closing.
  *
  * The channel owns its [transport] (OkHttp WebSockets in production) and its [scheduler] (one
- * background thread in production). It reports opened, acknowledged, config, error and closed
- * events through [Listener], so the Activity only renders and wires. [running] is the shared
+ * background thread in production). It reports opened, acknowledged, config, pushed mix, error and
+ * closed events through [Listener], so the Activity only renders and wires. [running] is the shared
  * session flag owned by the caller.
  *
  * While the session runs, a connection that fails or closes is reopened on its own, following
@@ -43,6 +43,14 @@ internal class ControlChannel(
         fun onOpened()
         fun onConfig(channels: Int, groups: List<GroupInfo>)
         fun onAcknowledged()
+
+        /**
+         * The server pushed this musician's whole mix (`mix_state`) because it changed elsewhere,
+         * such as on the desktop. The channel sends nothing back: the server already plays it. A
+         * listener that does not follow pushed mixes keeps this default and ignores them.
+         */
+        fun onMixPushed(mix: MixSnapshot) = Unit
+
         fun onClosed()
         fun onControlError(message: String)
     }
@@ -113,6 +121,7 @@ internal class ControlChannel(
                         mixAcknowledged = true
                         listener.onAcknowledged()
                     }
+                    "mix_state" -> listener.onMixPushed(parseMixReport(message))
                 }
             } catch (error: Exception) {
                 listener.onControlError("Invalid control response: ${error.message ?: "unknown error"}")
@@ -433,6 +442,28 @@ internal fun buildStatsMessage(report: LinkStatsReport): String =
         .put("underruns", report.underruns)
         .put("receive_timeouts", report.receiveTimeouts)
         .toString()
+
+/**
+ * Reads a whole mix as the server reports it, in the field names of the `mix` message: `mix_state`
+ * carries it, and `mix_ack` shares the shape. The lists are the server's full tables (32 channels,
+ * 16 groups); the client keeps the channels and groups it knows. The server always sends every
+ * field, so a missing or mistyped one throws and the message is reported as invalid, never applied.
+ */
+internal fun parseMixReport(message: JSONObject): MixSnapshot =
+    MixSnapshot(
+        channelGains = message.getJSONArray("channels").ints(),
+        channelPans = message.getJSONArray("pans").ints(),
+        channelMutes = message.getJSONArray("mutes").booleans(),
+        channelSolos = message.getJSONArray("solos").booleans(),
+        groupLevels = message.getJSONArray("group_levels").ints(),
+        volumePercent = message.getInt("volume_percent"),
+        maxLevelPercent = message.getInt("max_level_percent"),
+        muted = message.getBoolean("muted"),
+    )
+
+private fun JSONArray.ints(): IntArray = IntArray(length()) { getInt(it) }
+
+private fun JSONArray.booleans(): BooleanArray = BooleanArray(length()) { getBoolean(it) }
 
 /**
  * Reads the `groups` array from a `config` message. Missing or malformed entries are skipped, and a

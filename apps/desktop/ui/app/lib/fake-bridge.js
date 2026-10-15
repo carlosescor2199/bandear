@@ -106,6 +106,14 @@ export function sampleStatus() {
   };
 }
 
+/**
+ * The ASIO drivers `list_input_devices` offers for the "asio" host: named from the registry, as
+ * the desktop lists them, so their channel count is unknown (0) until one is loaded.
+ */
+export function sampleAsioDrivers() {
+  return [{ name: "Demo ASIO driver", channels: 0 }];
+}
+
 /** The input devices `list_input_devices` offers; a device with 0 channels is listed but unusable. */
 export function sampleDevices() {
   return [
@@ -210,6 +218,16 @@ export function createFakeBridge({
     return { run, deviceName: engine.deviceName, captureFormat: clone(engine.captureFormat) };
   }
 
+  // Captures from `device`; one whose channel count is unknown keeps the current count.
+  function useDevice(device) {
+    engine.deviceName = device.name;
+    if (device.channels > 0) {
+      engine.captureFormat = { ...engine.captureFormat, channels: device.channels };
+      engine.sourceChannels = device.channels;
+      engine.channels = channelRows(device.channels, engine.groups);
+    }
+  }
+
   function announceMix(address, origin, mix) {
     emit("mix-changed", { run, address, origin, mix: clone(mix) });
   }
@@ -238,12 +256,19 @@ export function createFakeBridge({
       // As the desktop answers: no engine running is an answer, not an error.
       return isRunning ? { state: "running", ...clone(engine) } : { state: "notRunning", run };
     },
-    start_engine() {
+    start_engine({ config } = {}) {
       // As in the desktop, a start ends the previous engine and takes a run even when it fails.
       run += 1;
       isRunning = false;
       if (startError) {
         throw startError;
+      }
+      // As the engine does: the named device, else the driver's first one when a driver is named.
+      const offered = config?.host === "asio" ? sampleAsioDrivers() : devices;
+      const named = offered.find((device) => device.name === config?.deviceFilter);
+      const wanted = named ?? (config?.host && !config?.deviceFilter ? offered[0] : null);
+      if (wanted) {
+        useDevice(wanted);
       }
       isRunning = true;
       engine.run = run;
@@ -257,8 +282,8 @@ export function createFakeBridge({
       isRunning = false;
       return null;
     },
-    list_input_devices() {
-      return clone(devices);
+    list_input_devices({ host } = {}) {
+      return clone(host === "asio" ? sampleAsioDrivers() : devices);
     },
     switch_device({ device }) {
       requireRunning();
@@ -266,10 +291,7 @@ export function createFakeBridge({
       if (!found || found.channels === 0) {
         throw `no usable input device named "${device}"`;
       }
-      engine.deviceName = found.name;
-      engine.captureFormat = { ...engine.captureFormat, channels: found.channels };
-      engine.sourceChannels = found.channels;
-      engine.channels = channelRows(found.channels, engine.groups);
+      useDevice(found);
       return summary();
     },
     add_target({ address }) {
@@ -322,8 +344,16 @@ export function createFakeBridge({
   // Commands whose next call fails: { message, afterEffect }.
   const failing = new Map();
 
+  const titles = [];
+
   return {
     calls,
+    /** Every window title set, in order. */
+    titles,
+    setTitle(title) {
+      titles.push(title);
+      return Promise.resolve();
+    },
     invoke(command, args) {
       calls.push({ command, args });
       // The command takes effect at once, events included; only its answer may be held back.

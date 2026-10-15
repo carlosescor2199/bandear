@@ -62,6 +62,19 @@ test("the Tauri bridge hands listeners the payload and returns the unlisten func
   assert.equal(result, unlisten);
 });
 
+test("the Tauri bridge titles the app's window", async () => {
+  const titles = [];
+  const tauri = {
+    core: { invoke: async () => null },
+    event: { listen: async () => () => {} },
+    window: { getCurrentWindow: () => ({ setTitle: async (title) => titles.push(title) }) },
+  };
+
+  await createTauriBridge(tauri).setTitle("MixLink Server — Volt 4");
+
+  assert.deepEqual(titles, ["MixLink Server — Volt 4"]);
+});
+
 test("without the Tauri globals the bridge says so", () => {
   assert.throws(() => createTauriBridge(undefined), /Tauri/);
   assert.throws(() => createTauriBridge({ core: {} }), /Tauri/);

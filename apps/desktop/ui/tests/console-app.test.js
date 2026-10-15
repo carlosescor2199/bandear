@@ -324,6 +324,112 @@ test("two quick reconnects listen to the engine only once", async () => {
   app.dispose();
 });
 
+function startConfigs(fake) {
+  return commands(fake, "start_engine").map(({ args }) => args.config);
+}
+
+test("devices are listed for the driver asked for, and a failure to list says so", async () => {
+  const { fake, app } = await connected();
+
+  await app.loadDevices("wasapi");
+  assert.equal(app.store.getState().devices.host, "wasapi");
+  assert.equal(app.store.getState().devices.list.length, 3);
+  assert.deepEqual(commands(fake, "list_input_devices").at(-1).args, { host: "wasapi" });
+
+  fake.failNext("list_input_devices", "no such backend");
+  await app.loadDevices("asio");
+  assert.deepEqual(app.store.getState().devices, {
+    host: "asio",
+    list: [],
+    error: "no such backend",
+  });
+  app.dispose();
+});
+
+test("a driver change restarts on it with no device named; a buffer change keeps the device", async () => {
+  const { fake, app } = await connected();
+
+  await app.applyAudio({ host: "wasapi" });
+  await app.applyAudio({ bufferFrames: 512 }, { keepDevice: true });
+
+  const [driver, buffer] = startConfigs(fake);
+  assert.equal(driver.host, "wasapi");
+  assert.equal(driver.deviceFilter, null);
+  assert.equal(buffer.host, "wasapi");
+  assert.equal(buffer.bufferFrames, 512);
+  assert.equal(buffer.deviceFilter, "Demo interface");
+  app.dispose();
+});
+
+test("ASIO starts only on a driver the engineer picked", async () => {
+  const { fake, app } = await connected();
+
+  const refused = await app.applyAudio({ host: "asio" });
+  assert.deepEqual(refused, { ok: false, message: "Pick an ASIO driver first." });
+  assert.equal(commands(fake, "start_engine").length, 0, "nothing loaded a driver");
+
+  await app.applyAudio({ host: "asio" }, { deviceFilter: "Volt ASIO" });
+  assert.deepEqual(startConfigs(fake).map(({ host, deviceFilter }) => [host, deviceFilter]), [
+    ["asio", "Volt ASIO"],
+  ]);
+  app.dispose();
+});
+
+test("a device switch is live under WASAPI and a restart on that device otherwise", async () => {
+  const { fake, app } = await connected();
+
+  await app.switchDevice("Microphone (USB audio)");
+  assert.equal(startConfigs(fake).at(-1).deviceFilter, "Microphone (USB audio)");
+  assert.equal(commands(fake, "switch_device").length, 0);
+
+  await app.applyAudio({ host: "wasapi" });
+  await app.switchDevice("Demo interface");
+  assert.deepEqual(commands(fake, "switch_device").at(-1).args, { device: "Demo interface" });
+  app.dispose();
+});
+
+test("a refused live switch is said, and the engine keeps its device", async () => {
+  const { fake, app } = await connected();
+  await app.applyAudio({ host: "wasapi" });
+  fake.failNext("switch_device", "the device is busy");
+
+  await app.switchDevice("Microphone (USB audio)");
+
+  const state = app.store.getState();
+  assert.deepEqual(state.commandError, { action: "switch", message: "the device is busy" });
+  assert.equal(state.engine.phase, "running");
+  assert.equal(state.engine.status.deviceName, "Demo interface");
+  app.dispose();
+});
+
+test("adding, removing and renaming musicians answer with the result, and the list follows", async () => {
+  const { app } = await connected();
+  const count = sampleStatus().musicians.length;
+
+  assert.deepEqual(await app.addTarget("192.168.1.40"), { ok: true });
+  assert.equal(app.store.getState().musicians.length, count + 1);
+  const twice = await app.addTarget("192.168.1.40:50001");
+  assert.equal(twice.ok, false);
+  assert.match(twice.message, /192\.168\.1\.40/);
+
+  assert.deepEqual(await app.rename("192.168.1.40:50000", "Keys 2"), { ok: true });
+  const added = app.store.getState().musicians.at(-1);
+  assert.equal(added.name, "Keys 2");
+  assert.equal(added.nameIsLocal, true);
+
+  assert.deepEqual(await app.removeTarget("192.168.1.40:50000"), { ok: true });
+  assert.equal(app.store.getState().musicians.length, count);
+  app.dispose();
+});
+
+test("the window is titled after the input device, and plainly when no engine runs", async () => {
+  const { fake, app } = await connected();
+  await app.stop();
+
+  assert.deepEqual(fake.titles, ["MixLink Server — Demo interface", "MixLink Server"]);
+  app.dispose();
+});
+
 test("picking a musician opens their mix", async () => {
   const { app } = await connected();
 

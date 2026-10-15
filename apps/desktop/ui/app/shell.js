@@ -14,6 +14,7 @@ import { createConsoleApp } from "./lib/console-app.js";
 import { createFakeBridge } from "./lib/fake-bridge.js";
 import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
+import { mountNetworkScreen } from "./screens/network-screen.js";
 
 const ICONS = Object.freeze({
   mix: `<path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 14h4M10 8h4M16 12h4"/>`,
@@ -146,6 +147,7 @@ if (nav && main) {
     skipLink: document.querySelector("[data-skip-link]"),
     screens: {
       mix: app ? (screenMain) => mountMixScreen(screenMain, app) : unavailableScreen,
+      network: app ? (screenMain) => mountNetworkScreen(screenMain, app) : unavailableScreen,
     },
   });
   if (simulated) {

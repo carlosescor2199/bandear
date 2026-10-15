@@ -15,6 +15,9 @@
 //   coalescer: one request in flight per musician, the latest edits always sent, each answer
 //   settling the edits it carried and offering its mix by revision.
 // - Meters skip the store: `onMeters` listeners get each `meters` payload of the live run.
+// - The Network and system screen's commands: list devices, apply a driver or buffer (a
+//   restart; ASIO only on a picked driver), switch the device (live under WASAPI, a restart
+//   otherwise), add, remove and rename musicians. The window's title follows the device.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -26,8 +29,9 @@ import {
   musicianByAddress,
   pendingEdits,
 } from "./console-state.js";
-import { startRequest } from "./engine-config.js";
+import { audioChoice, startRequest } from "./engine-config.js";
 import { buildMixRequest } from "./mix.js";
+import { switchMethod, windowTitle } from "./network-view.js";
 import { createStore } from "./store.js";
 
 // After a start whose status could not be read: how often and how far apart to ask again.
@@ -115,10 +119,11 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     timer.unref?.();
   }
 
-  async function start() {
+  // Starts (or restarts) the engine with the applied audio choices, on `deviceFilter` when named.
+  async function start({ deviceFilter = null } = {}) {
     store.dispatch(actions.engine("starting"));
     try {
-      await api.start(startRequest(store.getState().audio));
+      await api.start(startRequest(store.getState().audio, { deviceFilter }));
     } catch (error) {
       // A failed start has stopped the engine it replaced and started none.
       store.dispatch(actions.engine("error", message(error)));
@@ -209,6 +214,67 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
   }
 
+  async function loadDevices(host = store.getState().audio.host) {
+    try {
+      store.dispatch(actions.devices(host, await api.listInputDevices(host)));
+    } catch (error) {
+      store.dispatch(actions.devices(host, [], message(error)));
+    }
+  }
+
+  // Applies a driver or buffer change by restarting the engine, as a DAW does: on the device in
+  // use with `keepDevice`, on `deviceFilter` when named, else on the driver's first device. ASIO
+  // loads a kernel-mode driver, so it is only ever started on a driver the engineer picked.
+  async function applyAudio(change, { deviceFilter = null, keepDevice = false } = {}) {
+    const state = store.getState();
+    const device = keepDevice ? (state.engine.status?.deviceName ?? null) : deviceFilter;
+    if (audioChoice(state.audio, change).host === "asio" && !device) {
+      return { ok: false, message: "Pick an ASIO driver first." };
+    }
+    store.dispatch(actions.audio(change));
+    await start({ deviceFilter: device });
+    return { ok: true };
+  }
+
+  // Switches the input device: live under WASAPI, by a restart on that device otherwise.
+  async function switchDevice(name) {
+    if (switchMethod(store.getState().audio) === "restart") {
+      await start({ deviceFilter: name });
+      return;
+    }
+    try {
+      await api.switchDevice(name);
+    } catch (error) {
+      // The engine keeps the device it had.
+      store.dispatch(actions.commandFailed("switch", message(error)));
+    }
+    await readStatus();
+  }
+
+  // Runs a musician command, then reloads the status so the table follows at once. Answers
+  // `{ ok: true }` or `{ ok: false, message }` with the engine's own words.
+  async function musicianCommand(run) {
+    try {
+      await run();
+    } catch (error) {
+      return { ok: false, message: message(error) };
+    }
+    await readStatus();
+    return { ok: true };
+  }
+
+  // The window's title follows the input device, as the old window's did.
+  let title = windowTitle(initialState);
+  store.subscribe((state) => {
+    const next = windowTitle(state);
+    if (next !== title && bridge.setTitle) {
+      title = next;
+      Promise.resolve()
+        .then(() => bridge.setTitle(next))
+        .catch((error) => console.warn("could not update the window title", error));
+    }
+  });
+
   // One connection attempt at a time: a second call while one is on its way joins it, so two
   // quick Try again presses can never listen twice.
   let connecting = null;
@@ -227,8 +293,18 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     ready,
     /** Connects again after a failure: listens if it does not yet, and reloads the status. */
     reconnect: connect,
-    start,
+    start: () => start(),
     stop,
+    loadDevices,
+    applyAudio,
+    /** Keeps an audio choice for the next start without restarting anything. */
+    setAudio(change) {
+      store.dispatch(actions.audio(change));
+    },
+    switchDevice,
+    addTarget: (address) => musicianCommand(() => api.addTarget(address)),
+    removeTarget: (address) => musicianCommand(() => api.removeTarget(address)),
+    rename: (address, name) => musicianCommand(() => api.setMusicianName(address, name)),
     select(address) {
       store.dispatch(actions.select(address));
     },

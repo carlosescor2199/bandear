@@ -16,8 +16,9 @@
 //   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
 //   connection { status, error }: "connecting", "ready" (the engine answered, or a status came)
 //              or "failed" with the reason the console cannot hear the engine.
-//   commandError { action, message }: a stop (or start) the engine refused while its run went
-//              on; cleared by the next start or stop.
+//   commandError { action, message }: a stop or a device switch the engine refused while its
+//              run went on; cleared by the next start or stop.
+//   devices    { host, list, error }: the input devices `list_input_devices` gave for `host`.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
 // never jumps back to an older value while its change is on the way. Each copy of a musician's mix
@@ -52,6 +53,7 @@ export const initialState = Object.freeze({
   audio: DEFAULT_AUDIO,
   connection: Object.freeze({ status: "connecting", error: null }),
   commandError: null,
+  devices: Object.freeze({ host: null, list: Object.freeze([]), error: null }),
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -76,8 +78,10 @@ export const actions = Object.freeze({
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
   /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
   audio: (change) => ({ type: "audio", change }),
+  /** The input devices listed for `host`, or the reason they could not be listed. */
+  devices: (host, list, error = null) => ({ type: "devices", devices: { host, list, error } }),
   /**
-   * The engine refused `action` ("stop" or "start") but its run goes on: the phase goes back to
+   * The engine refused `action` ("stop" or "switch") but its run goes on: the phase goes back to
    * what the last status said, and the refusal is kept to be shown.
    */
   commandFailed: (action, message) => ({ type: "command-failed", action, message }),
@@ -298,6 +302,8 @@ export function consoleReducer(state, action) {
       return commandFailed(state, action);
     case "connection":
       return { ...state, connection: action.connection };
+    case "devices":
+      return { ...state, devices: action.devices };
     default:
       return state;
   }

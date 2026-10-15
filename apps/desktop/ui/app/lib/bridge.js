@@ -2,7 +2,8 @@
 // takes any bridge: the Tauri one in the app, the fake one (fake-bridge.js) in tests, the gallery
 // and a browser preview.
 //
-// A bridge is `{ invoke(command, args) -> Promise, listen(event, handler) -> Promise<unlisten> }`.
+// A bridge is `{ invoke(command, args) -> Promise, listen(event, handler) -> Promise<unlisten>,
+// setTitle(title) -> Promise }`.
 // `listen` hands the handler the event's payload, not Tauri's event envelope. A command that fails
 // rejects with the command's error text.
 
@@ -29,6 +30,8 @@ export function createTauriBridge(tauri = globalThis.__TAURI__) {
   return {
     invoke: (command, args) => invoke(command, args),
     listen: (event, handler) => listen(event, (message) => handler(message.payload)),
+    /** Titles the app's window (the capability `core:window:allow-set-title` allows it). */
+    setTitle: async (title) => tauri.window?.getCurrentWindow?.().setTitle(title),
   };
 }
 

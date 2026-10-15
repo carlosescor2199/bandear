@@ -1,5 +1,6 @@
 package com.mixlink.android.ui.state
 
+import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ControlState
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
@@ -50,10 +51,19 @@ internal sealed interface MonitorEvent {
     /** The manual connection form now reads [address]. */
     data class ManualAddressEdited(val address: ManualAddress) : MonitorEvent
 
-    /** The server announced [channels] source channels and [groups]. */
-    data class ConfigReceived(val channels: Int, val groups: List<GroupInfo>) : MonitorEvent
+    /**
+     * The server announced [channels] source channels, [groups] and the channels' [details] (one per
+     * source channel; null when its `config` carried none, as an older server's does).
+     */
+    data class ConfigReceived(
+        val channels: Int,
+        val groups: List<GroupInfo>,
+        val details: List<ChannelInfo>? = null,
+    ) : MonitorEvent
 
-    // The mix. Channel and group indices are 0-based; levels are percentages.
+    // The mix. Channel and group indices are 0-based; levels are percentages. A channel edit names a
+    // strip by the channel it is known by: for a stereo pair's strip it writes both sides, and its
+    // pan is the pair's balance.
 
     data class ChannelLevelChanged(val channel: Int, val level: Int) : MonitorEvent
     data class ChannelPanChanged(val channel: Int, val pan: Int) : MonitorEvent

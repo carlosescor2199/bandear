@@ -38,7 +38,11 @@ internal class ControlChannel(
     private val running: AtomicBoolean,
     private val currentSnapshot: () -> MixSnapshot,
     private val moreOfMeEnabled: () -> Boolean,
-    private val musicianChannel: () -> Int?,
+    /**
+     * The channels More of me lifts: the musician's channel and, when its strip is a stereo pair, the
+     * other side too; empty when no channel is chosen.
+     */
+    private val musicianChannels: () -> List<Int>,
     /** The number of the phone's newest mix change, sent as `seq`; null sends none. */
     private val mixSequence: () -> Long? = { null },
     private val transport: ControlTransport = OkHttpControlTransport(),
@@ -46,7 +50,12 @@ internal class ControlChannel(
 ) {
     interface Listener {
         fun onOpened()
-        fun onConfig(channels: Int, groups: List<GroupInfo>)
+        /**
+         * The server announced [channels] source channels, its [groups] and the channels' [details]
+         * (names, kinds, hidden channels and stereo pairs, one per source channel); [details] is null
+         * when the `config` carried none, as an older server's does.
+         */
+        fun onConfig(channels: Int, groups: List<GroupInfo>, details: List<ChannelInfo>?)
         fun onAcknowledged()
 
         /**
@@ -131,7 +140,11 @@ internal class ControlChannel(
                     "config" -> {
                         val announcedChannels = message.optInt("source_channels", -1)
                         if (announcedChannels in 1..MAX_CHANNELS) {
-                            listener.onConfig(announcedChannels, parseGroups(message.optJSONArray("groups")))
+                            listener.onConfig(
+                                announcedChannels,
+                                parseGroups(message.optJSONArray("groups")),
+                                parseChannelDetails(message.opt("channels"), announcedChannels),
+                            )
                         }
                     }
                     "mix_ack" -> {
@@ -360,7 +373,7 @@ internal class ControlChannel(
             val stored = currentSnapshot()
             // `More of me` is derived here, at send time, and never written back. The stored values
             // stay exactly as the musician left them, so turning the control off re-sends them.
-            val outgoing = if (moreOfMeEnabled()) stored.moreOfMe(musicianChannel()) ?: stored else stored
+            val outgoing = if (moreOfMeEnabled()) stored.moreOfMeFor(musicianChannels()) ?: stored else stored
             if (!webSocket.send(buildMixMessage(outgoing, sequence)) && running.get()) {
                 listener.onControlError("WebSocket rejected mix update")
             }
@@ -523,4 +536,26 @@ private fun parseGroups(array: JSONArray?): List<GroupInfo> {
         groups.add(GroupInfo(name, channels))
     }
     return groups
+}
+
+/**
+ * Reads the `channels` array of a `config` message: one [ChannelInfo] per announced source channel,
+ * so exactly [count] entries. Returns null when the message has no array there, as an older
+ * server's has none.
+ *
+ * It is lenient, like [parseGroups]: an entry past [count] is dropped, a missing one, one that is not
+ * an object, or a field of the wrong type reads as the default (an untouched channel), and a kind
+ * this build does not know reads as [ChannelKind.OTHER].
+ */
+internal fun parseChannelDetails(value: Any?, count: Int): List<ChannelInfo>? {
+    val array = value as? JSONArray ?: return null
+    return List(count) { index ->
+        val entry = array.optJSONObject(index) ?: return@List ChannelInfo()
+        ChannelInfo(
+            name = entry.opt("name") as? String ?: "",
+            kind = ChannelKind.fromWire(entry.opt("kind") as? String),
+            hidden = entry.opt("hidden") == true,
+            link = entry.opt("link") == true,
+        )
+    }
 }

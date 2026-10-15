@@ -1,5 +1,7 @@
 package com.mixlink.android.ui.state
 
+import com.mixlink.android.ChannelInfo
+import com.mixlink.android.ChannelKind
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.MixSnapshot
 import com.mixlink.android.defaultPan
@@ -45,9 +47,16 @@ data class MonitorUiState(
      */
     val mixSync: MixSyncState = MixSyncState(),
 ) {
-    /** The channels the musician can call theirs: one per source channel the server announced. */
+    /** The channels the musician can call theirs: one per strip of the channels the server announced. */
     val musicianChannelChoices: List<Int>
-        get() = (0 until mix.sourceChannels).toList()
+        get() = mix.musicianChoices.map { it.index }
+
+    /**
+     * The channels More of me lifts: the musician's channel and, when its strip is a stereo pair, the
+     * other side too; empty when no channel is chosen.
+     */
+    val moreOfMeChannels: List<Int>
+        get() = moreOfMe.musicianChannel?.let(mix::stripSides).orEmpty()
 }
 
 /** A MixLink server's control endpoint: where it was heard from and its WebSocket port. */
@@ -96,10 +105,16 @@ data class ConnectionUiState(
 /**
  * The mix as this phone keeps it: the values sent to the server and saved in a mix.
  *
- * The per-channel lists always have one entry per channel strip. Their size is the source channel
- * count the server announced, or the size of a recalled mix until the server announces again,
- * exactly as the old controls behaved. [groupLevels] is kept as recalled or set, even before the
- * server announces its groups, so a mix recalled before connecting keeps its group levels.
+ * The per-channel lists always have one entry per source channel, hidden ones and both sides of a
+ * stereo pair included, since that is what the control channel sends and a saved mix stores. Their
+ * size is the source channel count the server announced, or the size of a recalled mix until the
+ * server announces again, exactly as the old controls behaved. [groupLevels] is kept as recalled or
+ * set, even before the server announces its groups, so a mix recalled before connecting keeps its
+ * group levels.
+ *
+ * The strips are derived from the lists and the server's [channelDetails] ([stripLayout]): a hidden
+ * channel has none, and a stereo pair has one, which reads its first channel and the mean of its
+ * two pans.
  */
 data class MixUiState(
     /** Source channels the server announced in its last `config`; 0 before the first one. */
@@ -115,31 +130,73 @@ data class MixUiState(
     val masterMuted: Boolean = false,
     /** The ceiling the phone never plays above, in percent. */
     val levelCap: Int = NEUTRAL_LEVEL,
+    /**
+     * The details the server announced for its channels (names, kinds, hidden channels and pairs),
+     * one per source channel; null when its `config` carried none, as an older server's does.
+     */
+    val channelDetails: List<ChannelInfo>? = null,
 ) {
-    /** One strip per channel, left to right. */
+    /** Which channels each strip controls, left to right. */
+    val layout: List<StripChannels>
+        get() = stripLayout(levels.size, channelDetails)
+
+    /** One strip per shown channel or stereo pair, left to right. */
     val channels: List<ChannelUiState>
-        get() = levels.indices.map { index ->
-            ChannelUiState(
-                index = index,
-                label = channelName(index),
-                group = groupOf(index),
-                level = levels[index],
-                pan = pans.getOrElse(index) { defaultPan(index) },
-                muted = mutes.getOrElse(index) { false },
-                soloed = solos.getOrElse(index) { false },
-            )
+        get() = layout.map(::stripState)
+
+    /**
+     * One fader per announced group; a group with no level yet reads neutral. Without details from
+     * the server its members are its channels by number, as they always were.
+     */
+    val groups: List<GroupUiState>
+        get() {
+            val strips = layout
+            return groupDefinitions.mapIndexed { index, group ->
+                GroupUiState(
+                    index = index,
+                    name = group.name,
+                    channels = group.channels,
+                    level = groupLevels.getOrElse(index) { NEUTRAL_LEVEL },
+                    members = if (channelDetails == null) {
+                        group.channels.map(::channelName)
+                    } else {
+                        strips.filter { strip -> strip.sides.any { it in group.channels } }.map { labelOf(it.first) }
+                    },
+                )
+            }
         }
 
-    /** One fader per announced group; a group with no level yet reads neutral. */
-    val groups: List<GroupUiState>
-        get() = groupDefinitions.mapIndexed { index, group ->
-            GroupUiState(
-                index = index,
-                name = group.name,
-                channels = group.channels,
-                level = groupLevels.getOrElse(index) { NEUTRAL_LEVEL },
-            )
-        }
+    /** The channels the musician can call theirs: one per strip of the announced channels, by name. */
+    val musicianChoices: List<ChannelChoice>
+        get() = stripLayout(sourceChannels, channelDetails).map { ChannelChoice(it.first, labelOf(it.first)) }
+
+    /** How [channel]'s strip is named: the engineer's name, or "CH n" when it has none. */
+    fun labelOf(channel: Int): String = channelLabel(channel, channelDetails?.getOrNull(channel))
+
+    /**
+     * The channels an edit of [channel] writes: both sides when [channel] is the first of a stereo
+     * pair's strip, otherwise [channel] alone.
+     */
+    fun stripSides(channel: Int): List<Int> = layout.firstOrNull { it.first == channel }?.sides ?: listOf(channel)
+
+    private fun stripState(strip: StripChannels): ChannelUiState {
+        val index = strip.first
+        val second = strip.second
+        val pan = if (second == null) panOf(index) else pansToBalance(panOf(index), panOf(second))
+        return ChannelUiState(
+            index = index,
+            label = labelOf(index),
+            group = groupOf(index),
+            level = levels[index],
+            pan = pan,
+            muted = mutes.getOrElse(index) { false },
+            soloed = solos.getOrElse(index) { false },
+            kind = channelDetails?.let { it.getOrNull(index)?.kind ?: ChannelKind.OTHER },
+            pairedWith = second,
+        )
+    }
+
+    private fun panOf(channel: Int): Int = pans.getOrElse(channel) { defaultPan(channel) }
 
     /** The first announced group that lists [channel], which is the one its strip names. */
     private fun groupOf(channel: Int): GroupTag? {
@@ -182,24 +239,47 @@ data class MixSyncState(val latest: Long = 0, val answered: Long = 0) {
     fun answeredUpTo(seq: Long): MixSyncState = copy(answered = maxOf(answered, seq))
 }
 
-/** One channel strip: its fader, pan, Mute and Solo. [index] is 0-based; [label] is "CH 1" up. */
+/**
+ * One channel strip: its fader, pan, Mute and Solo. [index] is the 0-based channel it is known by
+ * (a stereo pair's first channel); [label] is the engineer's name for it, or "CH 1" up.
+ */
 data class ChannelUiState(
     val index: Int,
     val label: String,
     /** The group the strip's chip names; null when no announced group lists the channel. */
     val group: GroupTag?,
     val level: Int,
-    /** 0 is hard left, 50 centre, 100 hard right. */
+    /** 0 is hard left, 50 centre, 100 hard right; a stereo pair's balance, read the same way. */
     val pan: Int,
     val muted: Boolean,
     val soloed: Boolean,
-)
+    /** What the channel carries; null when the server announced no details, so no icon shows. */
+    val kind: ChannelKind? = null,
+    /** The pair's second channel when the strip is a stereo pair; null for a single channel. */
+    val pairedWith: Int? = null,
+) {
+    /** True when the strip is a stereo pair, whose pan is a balance. */
+    val stereo: Boolean
+        get() = pairedWith != null
+}
 
 /** A group as a channel's chip names it; [index] picks the chip's tone. */
 data class GroupTag(val index: Int, val name: String)
 
-/** One group fader. [channels] are the 0-based channels the server put in the group. */
-data class GroupUiState(val index: Int, val name: String, val channels: List<Int>, val level: Int)
+/**
+ * One group fader. [channels] are the 0-based channels the server put in the group; [members] names
+ * the group's strips as they are shown, a hidden channel left out and a stereo pair named once.
+ */
+data class GroupUiState(
+    val index: Int,
+    val name: String,
+    val channels: List<Int>,
+    val level: Int,
+    val members: List<String> = channels.map(::channelName),
+)
+
+/** A channel the musician can call theirs, by the 0-based channel its strip is known by. */
+data class ChannelChoice(val index: Int, val label: String)
 
 /** Why More of me is not doing what the musician last asked; the toggle's caption shows it. */
 enum class MoreOfMeNotice(val message: String) {

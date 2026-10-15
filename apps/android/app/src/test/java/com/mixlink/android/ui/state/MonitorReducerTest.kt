@@ -1,9 +1,12 @@
 package com.mixlink.android.ui.state
 
+import com.mixlink.android.ChannelInfo
+import com.mixlink.android.ChannelKind
 import com.mixlink.android.ControlState
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
 import com.mixlink.android.MixSnapshot
+import com.mixlink.android.moreOfMeFor
 import com.mixlink.android.ui.components.LinkHealth
 import com.mixlink.android.ui.components.MainTab
 import com.mixlink.android.ui.components.PillKind
@@ -319,6 +322,144 @@ class MonitorReducerTest {
         val remembered = MonitorUiState(moreOfMe = MoreOfMeUiState(musicianChannel = 3))
 
         assertEquals(3, remembered.after(ConfigReceived(4, emptyList())).moreOfMe.musicianChannel)
+    }
+
+    // The channels' details: names, kinds, hidden channels and stereo pairs.
+
+    private val vox = ChannelInfo("Vox", ChannelKind.VOICE)
+    private val keys = ChannelInfo("Keys", ChannelKind.KEYS, link = true)
+    private val keysRight = ChannelInfo("Keys R", ChannelKind.KEYS)
+    private val spare = ChannelInfo("Spare", hidden = true)
+
+    /** Five channels: a voice, a keys pair on channels 1 and 2, a hidden spare and an untouched input. */
+    private val band = listOf(vox, keys, keysRight, spare, ChannelInfo())
+
+    private fun withBand(groups: List<GroupInfo> = emptyList()): MonitorUiState = idle.after(ConfigReceived(5, groups, band))
+
+    @Test
+    fun announcedDetailsNameTheStripsShowTheirKindsAndJoinPairs() {
+        val strips = withBand().mix.channels
+
+        assertEquals(listOf("Vox", "Keys", "CH 5"), strips.map { it.label })
+        assertEquals(listOf(ChannelKind.VOICE, ChannelKind.KEYS, ChannelKind.OTHER), strips.map { it.kind })
+        assertEquals(listOf(0, 1, 4), strips.map { it.index })
+        assertEquals(listOf(null, 2, null), strips.map { it.pairedWith })
+        assertTrue(strips[1].stereo)
+        assertFalse(strips[0].stereo)
+    }
+
+    @Test
+    fun withoutDetailsEveryChannelShowsByNumberWithNoKindAsBefore() {
+        val state = withChannels(3, listOf(GroupInfo("Band", listOf(0, 1))))
+
+        assertNull(state.mix.channelDetails)
+        assertEquals(listOf("CH 1", "CH 2", "CH 3"), state.mix.channels.map { it.label })
+        assertEquals(listOf(null, null, null), state.mix.channels.map { it.kind })
+        assertEquals(listOf(null, null, null), state.mix.channels.map { it.pairedWith })
+        assertEquals(listOf("CH 1", "CH 2"), state.mix.groups.single().members)
+    }
+
+    @Test
+    fun onlyShownStripsCanBeChosenAndAPairIsChosenByItsFirstChannel() {
+        val state = withBand()
+
+        assertEquals(listOf(0, 1, 4), state.musicianChannelChoices)
+        assertEquals(listOf(ChannelChoice(0, "Vox"), ChannelChoice(1, "Keys"), ChannelChoice(4, "CH 5")), state.mix.musicianChoices)
+        // The hidden spare and the pair's second side are not offered, so they cannot be chosen.
+        assertEquals(state, state.after(MusicianChannelChosen(3), MusicianChannelChosen(2)))
+        assertEquals(1, state.after(MusicianChannelChosen(1)).moreOfMe.musicianChannel)
+    }
+
+    @Test
+    fun aPairsLevelMuteAndSoloWriteBothChannels() {
+        val state = withBand().after(ChannelLevelChanged(1, 40), ChannelMuteChanged(1, true), ChannelSoloChanged(1, true))
+
+        assertEquals(listOf(100, 40, 40, 100, 100), state.mix.levels)
+        assertEquals(listOf(false, true, true, false, false), state.mix.mutes)
+        assertEquals(listOf(false, true, true, false, false), state.mix.solos)
+        val pair = state.mix.channels[1]
+        assertEquals(40, pair.level)
+        assertTrue(pair.muted)
+        assertTrue(pair.soloed)
+    }
+
+    @Test
+    fun aSingleStripsEditWritesOnlyItsChannel() {
+        val state = withBand().after(ChannelLevelChanged(0, 30), ChannelPanChanged(4, 70), ChannelMuteChanged(4, true))
+
+        assertEquals(listOf(30, 100, 100, 100, 100), state.mix.levels)
+        assertEquals(listOf(0, 100, 0, 100, 70), state.mix.pans)
+        assertEquals(listOf(false, false, false, false, true), state.mix.mutes)
+    }
+
+    @Test
+    fun aPairsPanIsABalanceWrittenAsBothPansAndReadBackAsTheirMean() {
+        val left = withBand().after(ChannelPanChanged(1, 25))
+        val right = left.after(ChannelPanChanged(1, 80))
+
+        assertEquals(listOf(0, 0, 50, 100, 0), left.mix.pans)
+        assertEquals(25, left.mix.channels[1].pan)
+        assertEquals(listOf(0, 60, 100, 100, 0), right.mix.pans)
+        assertEquals(80, right.mix.channels[1].pan)
+        // Pans set elsewhere read as their mean.
+        assertEquals(30, withBand().mix.copy(pans = listOf(0, 10, 50, 100, 0)).channels[1].pan)
+    }
+
+    @Test
+    fun aNewConfigMidSessionRebuildsTheStripsAndKeepsTheMix() {
+        val set = withBand().after(ChannelLevelChanged(4, 60), ChannelLevelChanged(1, 40))
+        val unlinked = listOf(vox, ChannelInfo("Keys L", ChannelKind.KEYS), keysRight, spare.copy(hidden = false), ChannelInfo("Click", ChannelKind.CLICK, hidden = true))
+
+        val rebuilt = set.after(ConfigReceived(5, emptyList(), unlinked))
+
+        assertEquals(listOf("Vox", "Keys L", "Keys R", "Spare"), rebuilt.mix.channels.map { it.label })
+        assertEquals(listOf(null, null, null, null), rebuilt.mix.channels.map { it.pairedWith })
+        assertEquals(set.mix.levels, rebuilt.mix.levels)
+        assertEquals(set.mix.pans, rebuilt.mix.pans)
+    }
+
+    @Test
+    fun theMusiciansChannelOnAPairsSecondSideMovesToThePair() {
+        val on = withChannels(5).after(MusicianChannelChosen(2), MoreOfMeToggled(true))
+
+        val paired = on.after(ConfigReceived(5, emptyList(), band))
+
+        assertEquals(1, paired.moreOfMe.musicianChannel)
+        assertTrue(paired.moreOfMe.enabled)
+        assertNull(paired.moreOfMe.notice)
+        assertEquals(listOf(1, 2), paired.moreOfMeChannels)
+    }
+
+    @Test
+    fun aHiddenMusicianChannelIsForgottenAndMoreOfMeSaysWhy() {
+        val on = withChannels(5).after(MusicianChannelChosen(3), MoreOfMeToggled(true))
+        val remembered = withChannels(5).after(MusicianChannelChosen(3))
+
+        val hiddenOn = on.after(ConfigReceived(5, emptyList(), band))
+        val hiddenRemembered = remembered.after(ConfigReceived(5, emptyList(), band))
+
+        assertNull(hiddenOn.moreOfMe.musicianChannel)
+        assertFalse(hiddenOn.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_OUT_OF_RANGE, hiddenOn.moreOfMe.notice)
+        assertNull(hiddenRemembered.moreOfMe.musicianChannel)
+        assertNull(hiddenRemembered.moreOfMe.notice)
+    }
+
+    @Test
+    fun moreOfMeLiftsBothSidesOfAPair() {
+        val lifted = running().after(ConfigReceived(5, emptyList(), band), MusicianChannelChosen(1), MoreOfMeToggled(true))
+        val played = lifted.mix.toSnapshot().moreOfMeFor(lifted.moreOfMeChannels)!!
+
+        assertEquals(listOf(50, 100, 100, 50, 50), played.channelGains.toList())
+        // The server plays both sides lifted; hearing that back keeps More of me on.
+        assertEquals(lifted, lifted.after(MixPushed(played)))
+    }
+
+    @Test
+    fun aGroupNamesItsShownStripsAPairOnce() {
+        val state = withBand(listOf(GroupInfo("Band", listOf(0, 1, 2, 3))))
+
+        assertEquals(listOf("Vox", "Keys"), state.mix.groups.single().members)
     }
 
     // The mix.

@@ -4,6 +4,55 @@ package com.mixlink.android
 data class GroupInfo(val name: String, val channels: List<Int>)
 
 /**
+ * What a source channel carries, as the engineer set it; a strip shows its icon. [wire] is the name
+ * the server writes in `config`. A kind this build does not know reads as [OTHER].
+ */
+enum class ChannelKind(val wire: String, val label: String) {
+    VOICE("voice", "Voice"),
+    GUITAR("guitar", "Guitar"),
+    BASS("bass", "Bass"),
+    KEYS("keys", "Keys"),
+    DRUMS("drums", "Drums"),
+    PERCUSSION("percussion", "Percussion"),
+    HORNS("horns", "Horns"),
+    STRINGS("strings", "Strings"),
+    PLAYBACK("playback", "Playback"),
+    CLICK("click", "Click"),
+    OTHER("other", "Other");
+
+    companion object {
+        /** The kind the server named [wire], or [OTHER] for a missing or unknown name. */
+        fun fromWire(wire: String?): ChannelKind = entries.firstOrNull { it.wire == wire } ?: OTHER
+    }
+}
+
+/**
+ * One source channel's details as the server announces them in `config` (its `channels`, one entry
+ * per source channel in channel order). [name] is empty when the engineer gave none, and the strip
+ * is then named by its number. A [hidden] channel is heard in no mix and has no strip. [link] on a
+ * channel makes it and the next one a stereo pair, shown as one strip. The defaults are a channel
+ * the engineer never touched, which is how every channel of an older server reads.
+ */
+data class ChannelInfo(
+    val name: String = "",
+    val kind: ChannelKind = ChannelKind.OTHER,
+    val hidden: Boolean = false,
+    val link: Boolean = false,
+)
+
+/**
+ * The `More of me` rule ([MixSnapshot.moreOfMe]) for a musician whose channel is [channels]: one
+ * input, or both sides of a stereo pair, so both sides are lifted alike and the server, which keeps
+ * a pair's sides equal, plays exactly what was sent. Null when no valid channel is given.
+ */
+internal fun MixSnapshot.moreOfMeFor(channels: List<Int>): MixSnapshot? {
+    val lifted = moreOfMe(channels.firstOrNull()) ?: return null
+    val gains = lifted.channelGains.copyOf()
+    channels.drop(1).filter { it in gains.indices }.forEach { gains[it] = MixSnapshot.MORE_OF_ME_CHANNEL_GAIN }
+    return lifted.copy(channelGains = gains)
+}
+
+/**
  * The device-local mix state shared by the receive loop, the control channel and the UI.
  *
  * The values keep the original `@Volatile` copy-on-write pattern: every update writes a fresh

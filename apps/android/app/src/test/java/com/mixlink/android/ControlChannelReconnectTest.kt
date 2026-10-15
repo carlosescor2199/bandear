@@ -24,7 +24,7 @@ class ControlChannelReconnectTest {
         running = running,
         currentSnapshot = { MixSnapshot() },
         moreOfMeEnabled = { false },
-        musicianChannel = { null },
+        musicianChannels = { emptyList() },
         transport = transport,
         scheduler = scheduler,
     )
@@ -325,7 +325,7 @@ class ControlChannelReconnectTest {
             opened++
         }
 
-        override fun onConfig(channels: Int, groups: List<GroupInfo>) = Unit
+        override fun onConfig(channels: Int, groups: List<GroupInfo>, details: List<ChannelInfo>?) = Unit
 
         override fun onAcknowledged() = Unit
 

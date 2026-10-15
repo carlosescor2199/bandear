@@ -74,7 +74,7 @@ class RegistrationMessageTest {
             running = AtomicBoolean(true),
             currentSnapshot = { MixSnapshot() },
             moreOfMeEnabled = { false },
-            musicianChannel = { null },
+            musicianChannels = { emptyList() },
             transport = transport,
             scheduler = scheduler,
         )
@@ -139,7 +139,7 @@ class RegistrationMessageTest {
 
     private class SilentListener : ControlChannel.Listener {
         override fun onOpened() = Unit
-        override fun onConfig(channels: Int, groups: List<GroupInfo>) = Unit
+        override fun onConfig(channels: Int, groups: List<GroupInfo>, details: List<ChannelInfo>?) = Unit
         override fun onAcknowledged() = Unit
         override fun onClosed() = Unit
         override fun onControlError(message: String) = Unit

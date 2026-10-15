@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ClientMixState
 import com.mixlink.android.ControlChannel
 import com.mixlink.android.ControlState
@@ -158,7 +159,8 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     private val controlEvents = object : ControlChannel.Listener {
         override fun onOpened() = publishControlState()
 
-        override fun onConfig(channels: Int, groups: List<GroupInfo>) = configReceived(channels, groups)
+        override fun onConfig(channels: Int, groups: List<GroupInfo>, details: List<ChannelInfo>?) =
+            configReceived(ConfigReceived(channels, groups, details))
 
         override fun onAcknowledged() {
             dispatch(MixAcknowledged(control.controlState))
@@ -188,7 +190,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         // turning More of me off sends the mix exactly as the musician left it.
         currentSnapshot = { _state.value.mix.toSnapshot() },
         moreOfMeEnabled = { _state.value.moreOfMe.enabled },
-        musicianChannel = { _state.value.moreOfMe.musicianChannel },
+        musicianChannels = { _state.value.moreOfMeChannels },
         mixSequence = { _state.value.mixSync.latest },
         transport = collaborators.controlTransport,
         scheduler = collaborators.controlScheduler,
@@ -285,9 +287,13 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         dispatch(ControlChanged(control.controlState, control.mixAcknowledged))
     }
 
-    /** A `config`; when it drops the musician's channel the phone forgets it, and resends if More of me went off. */
-    private fun configReceived(channels: Int, groups: List<GroupInfo>) {
-        val (before, after) = change(ConfigReceived(channels, groups)) { before, after ->
+    /**
+     * A `config`. When it moves the musician's channel (dropped, hidden, or now the second side of a
+     * stereo pair, which is known by its first) the phone remembers the new one, and it resends the
+     * mix only if More of me went off.
+     */
+    private fun configReceived(config: ConfigReceived) {
+        val (before, after) = change(config) { before, after ->
             before.moreOfMe.enabled && !after.moreOfMe.enabled
         }
         if (before.moreOfMe.musicianChannel != after.moreOfMe.musicianChannel) {

@@ -1,10 +1,12 @@
 package com.mixlink.android.ui.state
 
+import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ControlState
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.MixSnapshot
 import com.mixlink.android.controlStatusLabel
 import com.mixlink.android.defaultPan
+import com.mixlink.android.moreOfMeFor
 import com.mixlink.android.ui.components.LinkHealth
 import com.mixlink.android.ui.components.MainTab
 import com.mixlink.android.ui.components.pillKindFor
@@ -93,19 +95,19 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
         }
     is ServersChanged -> state.copy(servers = event.servers)
     is ManualAddressEdited -> state.copy(connection = state.connection.copy(manual = event.address))
-    is ConfigReceived -> applyConfig(state, event.channels, event.groups)
+    is ConfigReceived -> applyConfig(state, event.channels, event.groups, event.details)
 
-    is ChannelLevelChanged -> state.withChannel(event.channel) { mix ->
-        mix.copy(levels = mix.levels.replaced(event.channel, event.level.coerceIn(PERCENT)))
+    is ChannelLevelChanged -> state.withStrip(event.channel) { mix, sides ->
+        mix.copy(levels = mix.levels.replacedAt(sides, event.level.coerceIn(PERCENT)))
     }
-    is ChannelPanChanged -> state.withChannel(event.channel) { mix ->
-        mix.copy(pans = mix.pans.replaced(event.channel, event.pan.coerceIn(PERCENT)))
+    is ChannelPanChanged -> state.withStrip(event.channel) { mix, sides ->
+        mix.copy(pans = mix.pans.panned(sides, event.pan.coerceIn(PERCENT)))
     }
-    is ChannelMuteChanged -> state.withChannel(event.channel) { mix ->
-        mix.copy(mutes = mix.mutes.replaced(event.channel, event.muted))
+    is ChannelMuteChanged -> state.withStrip(event.channel) { mix, sides ->
+        mix.copy(mutes = mix.mutes.replacedAt(sides, event.muted))
     }
-    is ChannelSoloChanged -> state.withChannel(event.channel) { mix ->
-        mix.copy(solos = mix.solos.replaced(event.channel, event.soloed))
+    is ChannelSoloChanged -> state.withStrip(event.channel) { mix, sides ->
+        mix.copy(solos = mix.solos.replacedAt(sides, event.soloed))
     }
     is GroupLevelChanged -> setGroupLevel(state, event.group, event.level.coerceIn(PERCENT))
     is MasterVolumeChanged -> state.copy(mix = state.mix.copy(masterVolume = event.level.coerceIn(PERCENT)))
@@ -191,14 +193,20 @@ private fun ConnectionUiState.showing(controlState: ControlState, mixAcknowledge
 )
 
 /**
- * A `config`: resizes the strips when the channel count changed, takes the announced groups, and
- * forgets a musician channel the new count no longer has.
+ * A `config`: resizes the per-channel lists when the channel count changed, takes the announced
+ * groups and channel details (which rebuild the strips), and fits the musician's channel to them.
  *
- * The strips follow the old rule exactly: a channel that still exists keeps what the musician set,
+ * The lists follow the old rule exactly: a channel that still exists keeps what the musician set,
  * a new one starts neutral with the captured pan layout, and a repeated count changes nothing.
- * Group levels are kept by position and a new group starts neutral.
+ * Group levels are kept by position and a new group starts neutral. Nothing is sent: a pair the
+ * engineer just linked was panned apart on the server, and the `mix_state` that follows says so.
  */
-private fun applyConfig(state: MonitorUiState, channels: Int, groups: List<GroupInfo>): MonitorUiState {
+private fun applyConfig(
+    state: MonitorUiState,
+    channels: Int,
+    groups: List<GroupInfo>,
+    details: List<ChannelInfo>?,
+): MonitorUiState {
     val mix = state.mix
     val unchanged = mix.sourceChannels == channels && mix.levels.size == channels
     val resized = if (unchanged) mix else mix.copy(
@@ -208,30 +216,54 @@ private fun applyConfig(state: MonitorUiState, channels: Int, groups: List<Group
         mutes = List(channels) { mix.mutes.getOrElse(it) { false } },
         solos = List(channels) { mix.solos.getOrElse(it) { false } },
     )
-    val withGroups = resized.copy(
+    val announced = resized.copy(
         groupDefinitions = groups,
         groupLevels = List(groups.size) { mix.groupLevels.getOrElse(it) { NEUTRAL } },
+        channelDetails = details,
     )
-    return state.copy(mix = withGroups, moreOfMe = if (unchanged) state.moreOfMe else state.moreOfMe.fittedTo(channels))
+    return state.copy(mix = announced, moreOfMe = state.moreOfMe.fittedTo(announced))
 }
 
 /**
- * Forgets a musician channel outside [channels]. More of me, if it was on, goes off and says why;
- * a channel that was only remembered is dropped quietly.
+ * Fits the musician's channel to the strips of the channels [mix] announces. A channel on the second
+ * side of a stereo pair becomes the pair's first, the channel its strip is known by, and More of me
+ * keeps lifting the pair. A channel with no strip (past the announced count, or hidden, and so in no
+ * mix) is forgotten: More of me, if it was on, goes off and says why; a channel that was only
+ * remembered is dropped quietly.
  */
-private fun MoreOfMeUiState.fittedTo(channels: Int): MoreOfMeUiState {
+private fun MoreOfMeUiState.fittedTo(mix: MixUiState): MoreOfMeUiState {
     val channel = musicianChannel ?: return this
-    if (channels <= 0 || channel in 0 until channels) return this
-    return if (enabled) {
-        copy(musicianChannel = null, enabled = false, notice = MoreOfMeNotice.CHANNEL_OUT_OF_RANGE)
-    } else {
-        copy(musicianChannel = null)
+    if (mix.sourceChannels <= 0) return this
+    val strip = stripLayout(mix.sourceChannels, mix.channelDetails).firstOrNull { channel in it.sides }
+    return when {
+        strip == null && enabled -> copy(musicianChannel = null, enabled = false, notice = MoreOfMeNotice.CHANNEL_OUT_OF_RANGE)
+        strip == null -> copy(musicianChannel = null)
+        else -> copy(musicianChannel = strip.first)
     }
 }
 
-/** Applies [change] to the mix when [channel] has a strip; any other channel changes nothing. */
-private inline fun MonitorUiState.withChannel(channel: Int, change: (MixUiState) -> MixUiState): MonitorUiState =
-    if (channel in mix.levels.indices) copy(mix = change(mix)) else this
+/**
+ * Applies [change] to the mix when [channel] has an entry, with the channels the edit writes: both
+ * sides when [channel]'s strip is a stereo pair, otherwise [channel] alone. Any other channel changes
+ * nothing.
+ */
+private inline fun MonitorUiState.withStrip(
+    channel: Int,
+    change: (mix: MixUiState, sides: List<Int>) -> MixUiState,
+): MonitorUiState = if (channel in mix.levels.indices) copy(mix = change(mix, mix.stripSides(channel))) else this
+
+/**
+ * The pans with [pan] written for [sides]: a single channel takes it as it is, and a stereo pair
+ * takes it as its balance, written as both pans ([balanceToPans]).
+ */
+private fun List<Int>.panned(sides: List<Int>, pan: Int): List<Int> {
+    if (sides.size < 2) return replacedAt(sides, pan)
+    val (first, second) = balanceToPans(pan)
+    return toMutableList().also {
+        it[sides[0]] = first
+        it[sides[1]] = second
+    }
+}
 
 /**
  * Sets one group's level. The levels list is rebuilt to one entry per announced group, the others
@@ -255,11 +287,12 @@ private fun toggleMoreOfMe(moreOfMe: MoreOfMeUiState, on: Boolean): MoreOfMeUiSt
     }
 
 /**
- * Takes [channel] as the musician's, or none. Only an announced channel can be chosen. Choosing none
- * while More of me is on turns it off, since there is nothing left to lift.
+ * Takes [channel] as the musician's, or none. Only a channel the picker offers can be chosen: one
+ * the server announced, shown, and known by its strip (a stereo pair by its first channel). Choosing
+ * none while More of me is on turns it off, since there is nothing left to lift.
  */
 private fun chooseMusicianChannel(state: MonitorUiState, channel: Int?): MonitorUiState {
-    if (channel != null && channel !in 0 until state.mix.sourceChannels) return state
+    if (channel != null && channel !in state.musicianChannelChoices) return state
     val moreOfMe = state.moreOfMe
     val next = if (channel == null && moreOfMe.enabled) {
         moreOfMe.copy(musicianChannel = null, enabled = false, notice = MoreOfMeNotice.NO_CHANNEL_SELECTED)
@@ -347,10 +380,14 @@ private fun MixUiState.fromServer(snapshot: MixSnapshot): MixUiState {
 /** The value at [index] kept between 0 and 100, or null when the array has no such entry. */
 private fun IntArray.percentAt(index: Int): Int? = getOrNull(index)?.coerceIn(PERCENT)
 
-/** The mix as the phone sends it: with More of me on, its channel lifted and the others lowered. */
+/**
+ * The mix as the phone sends it: with More of me on, its channel lifted (both sides of a stereo
+ * pair) and the others lowered.
+ */
 private fun MixUiState.asPlayed(moreOfMe: MoreOfMeUiState): MixUiState {
     if (!moreOfMe.enabled) return this
-    val lifted = toSnapshot().moreOfMe(moreOfMe.musicianChannel) ?: return this
+    val channel = moreOfMe.musicianChannel ?: return this
+    val lifted = toSnapshot().moreOfMeFor(stripSides(channel)) ?: return this
     return copy(levels = lifted.channelGains.toList())
 }
 
@@ -358,5 +395,5 @@ private fun MixUiState.asPlayed(moreOfMe: MoreOfMeUiState): MixUiState {
 private fun SavedMixesUiState.listing(names: List<String>): SavedMixesUiState =
     copy(names = names, activeName = activeName?.takeIf { it in names })
 
-private fun <T> List<T>.replaced(index: Int, value: T): List<T> =
-    toMutableList().also { it[index] = value }
+private fun <T> List<T>.replacedAt(indices: List<Int>, value: T): List<T> =
+    toMutableList().also { list -> indices.forEach { list[it] = value } }

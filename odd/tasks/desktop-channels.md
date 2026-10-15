@@ -259,10 +259,81 @@ slice. Push and PRs are the user's decision.
     passed (1 new); `cargo fmt --check` clean; clippy: no warnings in the desktop crate.
   - Commits: 9fe0901 `fix(desktop): edit groups as one step and say when they apply later`; this
     commit (`fix(desktop): keep labels when one session section is damaged`).
-- [ ] T3 (channel metadata, engine and phone): the channel table in the engine and session;
-  `config` carries names, kinds, hidden and links; hidden channels silent in every mix; link
-  rules kept equal on the server; Android shows names, drops hidden channels and collapses
-  linked pairs. Route: delegated writer.
+- [x] T3a (channel metadata: engine, protocol, desktop): the channel table in the engine and the
+  session; `config` carries names, kinds, hidden and links; hidden channels silent in every mix;
+  link rules kept equal on the server; the Tauri command and the fake bridge. Route: delegated
+  writer (trigger: 2+ non-trivial files across the engine, the desktop and the UI).
+  - Engine: `ChannelMeta { name, kind: ChannelKind, hidden, linked_to_next }` (public, with
+    `check_channels` and `MAX_CHANNEL_NAME_LENGTH` = 32). Kinds, closed set, wire names: `voice`,
+    `guitar`, `bass`, `keys`, `drums`, `percussion`, `horns`, `strings`, `playback`, `click`,
+    `other` (default). Default detail: empty name (clients show "CH n"), `other`, shown, unlinked.
+    `check_channels`: at most 32 entries, names of at most 32 characters, a pair only between two
+    listed entries (not past the last), never overlapping another pair, both sides hidden or both
+    shown. The live `ConfigSnapshot` holds exactly one detail per input (`fit_channels`: kept for
+    inputs the device has, defaults past the list, dropped past the device, the last input never
+    linked); `publish` (switch, groups) keeps the fitted details and `publish_channels` replaces
+    them; both return `(previous, live)`. `EngineHandle::set_channels(Vec<ChannelMeta>)` (via
+    `edit_channels`); `EngineStatus.channels`; `EngineEvent::ChannelsChanged`.
+  - Hidden: every `MixState` holds the hidden channels as one `AtomicU32` (and the pairs as
+    another), set for every mix after the publish (`set_channel_flags`) and for a new mix by
+    `Membership::new_mix` (`MixState::configured`); `MixValues.hidden_channels` is read by
+    `mix_channels` with the rest of the mix (no lock, no allocation): a hidden channel is skipped
+    and its solo ignored. Hiding changes no stored value and takes no revision.
+  - Link: every writer's merge (`apply`, via `apply_locked` under the writer lock) runs
+    `keep_pairs_equal`: a side the update changed carries the other; when both sides changed to
+    different values (or the second did not change alone) the first channel wins; pans are left
+    as written. Linking a pair pans it apart (first 0, second 100) in every mix through the same
+    merge (the second side takes the first's level, mute and solo), each with a new revision,
+    announced after `ChannelsChanged`; a mix created later starts panned apart. Balance rule for
+    clients (documented on `ChannelConfig`): balance `b` writes pans `max(0, 2b-100)` and
+    `min(100, 2b)` and reads back as their mean.
+  - Protocol: `config` gains `channels: [{ name, kind, hidden, link }]`, one per source channel in
+    channel order, `link` on a pair's first channel only; old phones ignore it.
+  - Desktop: the session's `channels` section is typed `[{ name, kind, hidden, link }]` in channel
+    order (version stays 1: earlier builds wrote it empty and keep what they read; every field
+    defaults; a kind this build does not know is kept as written and applies as `other`; a
+    misshapen section is set aside on its own). Tauri `set_channels(channels)` with the
+    `set_groups` semantics (`ChannelRequest` refuses unknown fields and unknown kinds; names
+    trimmed; one step under the engine lock with the session's inside; apply then save; answer
+    `{ channels, applied, saved, saveError }`; a stopping engine refuses and nothing changes; no
+    engine saves for the next start; a `ChannelEngine` trait for the tests). Every start applies
+    the session's details after the groups. `ChannelDto` gains `name`, `kind`, `hidden`, `link`;
+    the pump sends a status at once on `ChannelsChanged`.
+  - UI: `channels.js` (`CHANNEL_KINDS`, `channelLabel`, `balanceToPans`/`pansToBalance`,
+    `checkChannels`, `fitChannels`, `keepPairsEqual`), `formatChannelsSet` (guards an empty reason
+    and a trailing full stop), `setChannels` in the engine API. The fake bridge names the sample's
+    inputs, implements `set_channels` with the same rules (status before the moved mixes, pairs
+    panned apart, both sides kept equal on desk and phone changes, details applied at start and
+    fitted on a switch) and mixes its meters from the shown inputs, so a hidden input is heard by
+    no one.
+  - RED: (a) the server tests failed to compile (no `ChannelMeta`, `ChannelKind`,
+    `check_channels`, `fit_channels`, `edit_channels`, `publish_channels`, `ChannelFlags`,
+    `MixState::configured`/`set_channel_flags`, `MixValues.hidden_channels`, `ChannelsChanged`,
+    `ControlConfig.channels`); (b) with the plumbing in place and none of the three behaviours, 8
+    of 247 failed: hidden silence (mixer and every mix), a hidden channel's solo, a pair's follow
+    (one side, both sides), the link's pans (mixer and every mix) and the socket test (no
+    `mix_state` came); (c) ordering: announcing the moved mixes before the publish failed the
+    socket test ("the moved pans ... [0,0,100,100,...] arrived before the channel details"); during
+    GREEN one expectation was corrected (a flag of an equal pair cannot change to different values
+    on both sides, so that case is levels only); (d) the desktop tests failed to compile (no
+    `SessionChannel`, `ChannelRequest`, `ChannelsSetDto`, `ChannelEngine`, `edit_channels`,
+    `set_channels`, `session_channels`), and the pump test with the old arm saw `["mix-changed"]`
+    first; (e) the UI suite failed to load (no `channels.js`), then 7 of 210 failed against the old
+    fake (no `set_channels`, no details, meters ignoring hidden).
+  - GREEN: `cargo test -p personal-monitoring` 247 passed (18 new), three runs; `cargo test -p
+    mixlink-desktop` 94 passed (14 new); `cargo build -p mixlink-desktop` after `cargo clean -p
+    mixlink-desktop` ok; UI 210 passed (15 new); `cargo fmt` clean; clippy: no new warnings.
+    Ordering proof: `after_linking_a_pair_the_phone_gets_the_channel_details_before_its_moved_pans`
+    (real socket; it also acks a one-sided phone `mix` with both sides equal).
+  - Size: about 1,280 authored changed lines in the engine commit and 1,500 in the desktop commit
+    (with this document), above the 400-line heuristic mostly in tests (about 1,300 lines); not
+    split artificially.
+  - Commits: aa8f8e3 `feat(engine): name, hide and link channels while running`; this commit
+    (`feat(desktop): keep channel details in the session and apply them live`).
+- [ ] T3b (channel metadata, Android): read `config.channels` (lenient: absent on older servers,
+  unknown kinds as `other`); show names (else "CH n") and kind icons; drop hidden channels;
+  collapse linked pairs into one strip whose level, mute and solo write both channels and whose
+  pan is a balance (`balanceToPans` rule above). Route: delegated writer.
 - [ ] T4 (Channels and groups screen): board 3 in the desktop UI; the Mix screen uses names,
   icons, hidden channels, linked strips and group ids. Route: delegated writer.
 - [ ] T5 (engineer limit and locks): engine fields set only by the engineer path and enforced on
@@ -304,6 +375,14 @@ slice. Push and PRs are the user's decision.
   - R3-format-groups-set-unguarded-save-error: `formatGroupsSet` can print a double period or
     "not saved: null."; guard both.
 
+- T3a done (channel metadata in the engine, protocol and desktop); see its entry for evidence.
+  Follow-ups: the engine drops the details of inputs a switched-to device lacks while the session
+  keeps them all, so after switching back to a larger device those inputs show the defaults until
+  the next start or edit (the desk does not re-apply the session on a switch; T4 may); an older
+  phone shows a pair's sides apart and the server keeps them equal; the Mix screen still labels
+  strips by number and shows hidden inputs and both sides of a pair (T4 uses `channelLabel`,
+  drops hidden inputs and collapses pairs with `balanceToPans`).
+
 ## Next step
 
-T3.
+T3b (Android).

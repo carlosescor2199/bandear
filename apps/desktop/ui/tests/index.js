@@ -4,6 +4,7 @@ import "./store.test.js";
 import "./values.test.js";
 import "./format.test.js";
 import "./mix.test.js";
+import "./channels.test.js";
 import "./console-state.test.js";
 import "./coalesce.test.js";
 import "./bridge.test.js";

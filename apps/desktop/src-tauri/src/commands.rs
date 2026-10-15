@@ -12,16 +12,17 @@ use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
 use personal_monitoring::{
-    check_groups, start, AudioHost, EngineConfig, EngineEvent, EngineHandle, GroupDefinition,
-    MixValues, MusicianStatus,
+    check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
+    EngineEvent, EngineHandle, GroupDefinition, MixValues, MusicianStatus,
 };
 
 use crate::dto::{
-    CaptureFormatDto, EngineStateDto, EngineStatusDto, GroupRequest, GroupsSetDto, InputDeviceDto,
-    MetersDto, MixDto, MixUpdateRequest, StartRequest, StartSummary,
+    CaptureFormatDto, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineStatusDto,
+    GroupRequest, GroupsSetDto, InputDeviceDto, MetersDto, MixDto, MixUpdateRequest, StartRequest,
+    StartSummary,
 };
 use crate::events::EventPump;
-use crate::session::{SessionGroup, SessionStore};
+use crate::session::{SessionChannel, SessionGroup, SessionStore};
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
@@ -30,10 +31,10 @@ pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Sen
 /// session (see [crate::session]).
 ///
 /// The engine handle is behind a [Mutex] because the engine is already internally concurrent: the
-/// commands only need exclusive access to start, stop, edit the groups and take a snapshot. The
-/// session has its own lock. Whenever both are held, the engine lock is taken first and the
-/// session's inside it (a status applies the labels, a start reads the groups, a group edit saves
-/// them), never the other way round, so they cannot deadlock.
+/// commands only need exclusive access to start, stop, edit the groups and the channel details and
+/// take a snapshot. The session has its own lock. Whenever both are held, the engine lock is taken
+/// first and the session's inside it (a status applies the labels, a start reads the groups and the
+/// channel details, an edit saves them), never the other way round, so they cannot deadlock.
 ///
 /// The pump's lock is taken first by start and stop and held throughout, so two quick starts can
 /// never leave two pumps running. The pump thread itself takes the engine lock to read, so a pump
@@ -162,6 +163,22 @@ fn session_groups_for(request: &StartRequest, session: &SessionStore) -> Vec<Gro
         .collect()
 }
 
+/// The session's channel details as the engine takes them, applied to every engine the desk starts
+/// (see [start_engine]). A kind this build does not know (a session from a newer build) applies as
+/// [ChannelKind::Other] rather than failing the start.
+fn session_channels(session: &SessionStore) -> Vec<ChannelMeta> {
+    session
+        .channels()
+        .into_iter()
+        .map(|channel| ChannelMeta {
+            kind: ChannelKind::from_name(&channel.kind).unwrap_or_default(),
+            name: channel.name,
+            hidden: channel.hidden,
+            linked_to_next: channel.link,
+        })
+        .collect()
+}
+
 /// Maps a window value to a backend. An unknown or absent value falls back to `auto`, which is what
 /// the window sends until the engineer picks something.
 fn parse_host(value: Option<&str>) -> AudioHost {
@@ -181,8 +198,9 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 ///
 /// The engineer's groups come from the session: a request that names none (the window always sends
 /// none) gets the session's groups applied as soon as the engine runs (see [session_groups_for]).
-/// Groups the engine refuses there (a hand-edited session) are logged and the engine runs without
-/// them: the groups are a convenience and must not stop the server.
+/// The session's channel details are applied the same way to every start ([session_channels]).
+/// Groups or details the engine refuses there (a hand-edited session) are logged and the engine
+/// runs without them: they are a convenience and must not stop the server.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let mut pump = state
         .pump
@@ -193,9 +211,10 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
         .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
-    // Read under the engine lock (the session's inside it), so a group edit cannot land between
-    // this read and the new engine taking the groups.
+    // Read under the engine lock (the session's inside it), so a group or channel edit cannot land
+    // between this read and the new engine taking them.
     let saved_groups = session_groups_for(&request, &state.session);
+    let saved_channels = session_channels(&state.session);
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
@@ -217,6 +236,17 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                     Err(error) => {
                         eprintln!("[mixlink-desktop] start_engine: the saved groups were not applied: {error}")
                     }
+                }
+            }
+            if !saved_channels.is_empty() {
+                let count = saved_channels.len();
+                match handle.set_channels(saved_channels) {
+                    Ok(_) => println!(
+                        "[mixlink-desktop] start_engine: {count} saved channel details applied"
+                    ),
+                    Err(error) => eprintln!(
+                        "[mixlink-desktop] start_engine: the saved channel details were not applied: {error}"
+                    ),
                 }
             }
             let summary = StartSummary {
@@ -519,6 +549,122 @@ fn edit_groups<E: GroupEngine>(
     };
     Ok(GroupsSetDto {
         groups: kept,
+        applied,
+        saved: save_error.is_none(),
+        save_error,
+    })
+}
+
+/// Replaces the engineer's channel details: applies them to the running engine, if any, and keeps
+/// them in the session, exactly as [set_groups] does for groups. Returns what was done
+/// ([ChannelsSetDto]).
+///
+/// `channels` is the whole list in channel order, the first entry CH 1 (see [ChannelRequest]).
+/// Names are trimmed, and the list is checked as the engine checks it ([check_channels]): a kind
+/// the engine knows, at most 32 entries, names of at most 32 characters, stereo pairs only between
+/// two listed inputs and never overlapping, both sides of a pair hidden or both shown. Then:
+///
+/// - With an engine running, the engine takes them first (every phone is sent them; a hidden input
+///   goes silent in every mix; a new pair is panned apart in every mix, see
+///   [EngineHandle::set_channels]) and only then are they saved. A save that fails then is reported
+///   in the answer, not as an error, because the phones already have them.
+/// - An engine that is stopping refuses them: an error, and nothing changed.
+/// - With no engine, they are saved and apply at the next start (`applied: false`).
+///
+/// A refused list is an error and changes nothing. Each edit is one step under the engine lock,
+/// with the session's inside it, so two edits at once never leave the session and the engine with
+/// different details.
+pub fn set_channels(
+    state: &DesktopState,
+    channels: Vec<ChannelRequest>,
+) -> Result<ChannelsSetDto, String> {
+    let outcome = edit_channels(&state.engine, &state.session, channels)?;
+    println!(
+        "[mixlink-desktop] set_channels: {} channels, applied={} saved={}",
+        outcome.channels.len(),
+        outcome.applied,
+        outcome.saved
+    );
+    Ok(outcome)
+}
+
+/// What a channel edit needs from the running engine, as [GroupEngine] is for a group edit.
+trait ChannelEngine {
+    fn set_channels(&mut self, channels: Vec<ChannelMeta>) -> Result<(), String>;
+}
+
+impl ChannelEngine for EngineHandle {
+    fn set_channels(&mut self, channels: Vec<ChannelMeta>) -> Result<(), String> {
+        EngineHandle::set_channels(self, channels)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The window's channel details as the engine takes them and as the session keeps them, names
+/// trimmed; a kind the engine does not know is an error naming it.
+fn channel_details(
+    requests: Vec<ChannelRequest>,
+) -> Result<(Vec<ChannelMeta>, Vec<SessionChannel>), String> {
+    let mut details = Vec::with_capacity(requests.len());
+    let mut kept = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        let kind = ChannelKind::from_name(&request.kind).ok_or_else(|| {
+            let known: Vec<&str> = ChannelKind::ALL.iter().map(|kind| kind.name()).collect();
+            format!(
+                "CH {} has the instrument kind `{}`, which is none of {}",
+                index + 1,
+                request.kind,
+                known.join(", ")
+            )
+        })?;
+        let name = request.name.trim().to_owned();
+        details.push(ChannelMeta {
+            name: name.clone(),
+            kind,
+            hidden: request.hidden,
+            linked_to_next: request.link,
+        });
+        kept.push(SessionChannel {
+            name,
+            kind: kind.name().to_owned(),
+            hidden: request.hidden,
+            link: request.link,
+        });
+    }
+    check_channels(&details)?;
+    Ok((details, kept))
+}
+
+/// [set_channels] over any engine slot and session.
+fn edit_channels<E: ChannelEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    channels: Vec<ChannelRequest>,
+) -> Result<ChannelsSetDto, String> {
+    let (details, kept) = channel_details(channels)?;
+    // One step per edit, in the lock order every command that holds both follows (see
+    // [edit_groups]).
+    let mut guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let applied = match guard.as_mut() {
+        // A refusal (an engine that is stopping) returns here, before anything is saved.
+        Some(engine) => {
+            engine.set_channels(details)?;
+            true
+        }
+        None => false,
+    };
+    let save_error = match session.set_channels(kept.clone()) {
+        Ok(()) => None,
+        // The phones already have the details: say that they were not kept.
+        Err(error) if applied => Some(error),
+        // Nothing took them, so nothing changed.
+        Err(error) => return Err(error),
+    };
+    Ok(ChannelsSetDto {
+        channels: kept,
         applied,
         saved: save_error.is_none(),
         save_error,
@@ -1030,6 +1176,7 @@ mod tests {
     #[derive(Default)]
     struct StandInEngine {
         applied: Option<Vec<GroupDefinition>>,
+        applied_channels: Option<Vec<ChannelMeta>>,
         stopping: bool,
     }
 
@@ -1040,6 +1187,16 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
             self.applied = Some(definitions);
+            Ok(())
+        }
+    }
+
+    impl ChannelEngine for StandInEngine {
+        fn set_channels(&mut self, channels: Vec<ChannelMeta>) -> Result<(), String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            self.applied_channels = Some(channels);
             Ok(())
         }
     }
@@ -1204,5 +1361,200 @@ mod tests {
         );
         assert!(session_groups_for(&own, &session).is_empty());
         assert_eq!(to_engine_config(own).groups[0].name, "Vocals");
+    }
+
+    fn detail(name: &str, kind: &str, hidden: bool, link: bool) -> ChannelRequest {
+        ChannelRequest {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            hidden,
+            link,
+        }
+    }
+
+    fn kept(name: &str, kind: &str, hidden: bool, link: bool) -> SessionChannel {
+        SessionChannel {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            hidden,
+            link,
+        }
+    }
+
+    fn applied_channels(engine: &Mutex<Option<StandInEngine>>) -> Option<Vec<ChannelMeta>> {
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .and_then(|engine| engine.applied_channels.clone())
+    }
+
+    #[test]
+    fn channels_set_without_an_engine_are_kept_for_the_next_start() {
+        let state = DesktopState::new(SessionStore::open(&session_directory("channels-idle")));
+
+        let outcome = set_channels(
+            &state,
+            vec![
+                detail(" Kick ", "drums", false, false),
+                detail("Keys L", "keys", false, true),
+                detail("Keys R", "keys", false, false),
+            ],
+        )
+        .expect("the details are kept");
+
+        assert!(!outcome.applied, "no engine took them");
+        assert!(outcome.saved);
+        assert_eq!(outcome.save_error, None);
+        assert_eq!(
+            outcome.channels,
+            vec![
+                kept("Kick", "drums", false, false),
+                kept("Keys L", "keys", false, true),
+                kept("Keys R", "keys", false, false),
+            ],
+            "names are trimmed"
+        );
+        assert_eq!(state.session.channels(), outcome.channels);
+    }
+
+    #[test]
+    fn a_running_engine_takes_the_channels_and_then_they_are_saved() {
+        let session = SessionStore::open(&session_directory("channels-running"));
+        let engine = running(StandInEngine::default());
+
+        let outcome = edit_channels(
+            &engine,
+            &session,
+            vec![detail("Spare", "other", true, false)],
+        )
+        .expect("the details are taken");
+
+        assert!(outcome.applied && outcome.saved, "{outcome:?}");
+        assert_eq!(
+            applied_channels(&engine),
+            Some(vec![ChannelMeta {
+                name: "Spare".to_owned(),
+                kind: ChannelKind::Other,
+                hidden: true,
+                linked_to_next: false,
+            }])
+        );
+        assert_eq!(session.channels(), outcome.channels);
+    }
+
+    #[test]
+    fn an_engine_that_is_stopping_refuses_the_channels_and_nothing_is_saved() {
+        let session = SessionStore::open(&session_directory("channels-stopping"));
+        session
+            .set_channels(vec![kept("Kick", "drums", false, false)])
+            .expect("kept");
+        let before = session.channels();
+        let engine = running(StandInEngine {
+            stopping: true,
+            ..StandInEngine::default()
+        });
+
+        let error = edit_channels(
+            &engine,
+            &session,
+            vec![detail("Bass", "bass", false, false)],
+        )
+        .expect_err("a stopping engine refuses");
+
+        assert!(error.contains("stopping"), "{error}");
+        assert_eq!(session.channels(), before, "a refused list changes nothing");
+        assert_eq!(applied_channels(&engine), None);
+    }
+
+    #[test]
+    fn channels_a_running_engine_took_but_the_session_could_not_keep_say_so() {
+        let directory = session_directory("channels-unsaved");
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(
+            directory.join(crate::session::SESSION_FILE),
+            r#"{"version":99}"#,
+        )
+        .expect("a newer session");
+        let session = SessionStore::open(&directory);
+        let engine = running(StandInEngine::default());
+
+        let outcome = edit_channels(
+            &engine,
+            &session,
+            vec![detail("Kick", "drums", false, false)],
+        )
+        .expect("the engine took them");
+
+        assert!(outcome.applied);
+        assert!(!outcome.saved);
+        assert!(
+            outcome
+                .save_error
+                .as_deref()
+                .is_some_and(|error| error.contains("newer")),
+            "{outcome:?}"
+        );
+        assert!(applied_channels(&engine).is_some());
+    }
+
+    #[test]
+    fn channel_details_the_engine_would_refuse_are_refused_and_nothing_is_saved() {
+        let session = SessionStore::open(&session_directory("channels-refused"));
+        session
+            .set_channels(vec![kept("Kick", "drums", false, false)])
+            .expect("kept");
+        let engine = running(StandInEngine::default());
+
+        for (refused, named) in [
+            (vec![detail("Kazoo", "kazoo", false, false)], "kazoo"),
+            (vec![detail("Pad", "keys", false, true)], "CH 1"),
+            (
+                vec![
+                    detail("L", "keys", false, true),
+                    detail("R", "keys", true, false),
+                ],
+                "CH 1",
+            ),
+            (vec![detail(&"x".repeat(33), "other", false, false)], "CH 1"),
+        ] {
+            let error = edit_channels(&engine, &session, refused).expect_err("refused");
+            assert!(error.contains(named), "names {named}: {error}");
+        }
+
+        assert_eq!(
+            session.channels(),
+            vec![kept("Kick", "drums", false, false)]
+        );
+        assert_eq!(applied_channels(&engine), None, "the engine took nothing");
+    }
+
+    #[test]
+    fn a_start_applies_the_sessions_channel_details_reading_an_unknown_kind_as_other() {
+        let session = SessionStore::open(&session_directory("channels-start"));
+        session
+            .set_channels(vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "theremin", true, false),
+            ])
+            .expect("kept");
+
+        assert_eq!(
+            session_channels(&session),
+            vec![
+                ChannelMeta {
+                    name: "Kick".to_owned(),
+                    kind: ChannelKind::Drums,
+                    hidden: false,
+                    linked_to_next: false,
+                },
+                ChannelMeta {
+                    name: "Theremin".to_owned(),
+                    kind: ChannelKind::Other,
+                    hidden: true,
+                    linked_to_next: false,
+                },
+            ]
+        );
     }
 }

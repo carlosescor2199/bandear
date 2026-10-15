@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { EVENTS, createEngineApi, createTauriBridge } from "../app/lib/bridge.js";
 import { createFakeBridge, sampleStatus, syntheticMeters } from "../app/lib/fake-bridge.js";
-import { formatGroupsSet } from "../app/lib/format.js";
+import { formatChannelsSet, formatGroupsSet } from "../app/lib/format.js";
 import { applyEdits, buildMixRequest, mixFromDto } from "../app/lib/mix.js";
 
 function recordingBridge() {
@@ -100,6 +100,7 @@ test("the engine API calls each command with the argument names the desktop comm
     { id: "kit", name: "Drums", channels: [1, 2] },
     { name: "Vocals", channels: [3] },
   ]);
+  await api.setChannels([{ name: "Kick", kind: "drums", hidden: false, link: false }]);
 
   assert.deepEqual(bridge.calls, [
     ["engine_status", undefined],
@@ -122,6 +123,7 @@ test("the engine API calls each command with the argument names the desktop comm
         ],
       },
     ],
+    ["set_channels", { channels: [{ name: "Kick", kind: "drums", hidden: false, link: false }] }],
   ]);
 });
 
@@ -561,6 +563,184 @@ test("a device switch marks the fake groups the new device cannot feed", async (
   assert.deepEqual(
     status.channels.map((channel) => channel.groupId),
     [null, null],
+  );
+});
+
+// Each channel's details as `[name, kind, hidden, link]`.
+function details(channels) {
+  return channels.map(({ name, kind, hidden, link }) => [name, kind, hidden, link]);
+}
+
+const KEYS = [
+  { name: " Kick ", kind: "drums" },
+  { name: "Keys L", kind: "keys", link: true },
+  { name: "Keys R", kind: "keys" },
+];
+
+test("the sample's channels carry the engineer's details", () => {
+  assert.deepEqual(details(sampleStatus().channels), [
+    ["Kick", "drums", false, false],
+    ["Snare", "drums", false, false],
+    ["Overheads", "drums", false, false],
+    ["Bass", "bass", false, false],
+    ["Lead vox", "voice", false, false],
+    ["Backing vox", "voice", false, false],
+  ]);
+});
+
+test("linking a pair on the fake engine pans it apart in every mix after the new details", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_mix", { address: LEAD, mix: { channelGains: [62, 70, 40] } });
+  const before = (await fake.invoke("engine_status")).musicians[0].revision;
+  const seen = await recordEvents(fake);
+
+  const outcome = await fake.invoke("set_channels", { channels: KEYS });
+
+  assert.deepEqual(outcome, {
+    channels: [
+      { name: "Kick", kind: "drums", hidden: false, link: false },
+      { name: "Keys L", kind: "keys", hidden: false, link: true },
+      { name: "Keys R", kind: "keys", hidden: false, link: false },
+    ],
+    applied: true,
+    saved: true,
+    saveError: null,
+  });
+  const status = await fake.invoke("engine_status");
+  assert.deepEqual(details(status.channels).slice(0, 4), [
+    ["Kick", "drums", false, false],
+    ["Keys L", "keys", false, true],
+    ["Keys R", "keys", false, false],
+    ["", "other", false, false],
+  ]);
+  for (const musician of status.musicians) {
+    assert.deepEqual(musician.pans.slice(1, 3), [0, 100], musician.address);
+    assert.equal(musician.channelGains[2], musician.channelGains[1], musician.address);
+  }
+  const lead = status.musicians[0];
+  assert.deepEqual(lead.channelGains.slice(1, 3), [70, 70], "the first side's level");
+  assert.ok(lead.revision > before, "the link is a newer revision");
+  assert.deepEqual(
+    seen.map(([event, payload]) => [event, payload.address ?? null]),
+    [["status", null], ...status.musicians.map((musician) => ["mix-changed", musician.address])],
+    "the new details are announced before the pans placed for them",
+  );
+
+  // The same details again change nothing and announce nothing.
+  await fake.invoke("set_channels", { channels: KEYS });
+  assert.equal(seen.length, 1 + status.musicians.length);
+});
+
+test("the fake engine keeps both sides of a pair equal whoever changes one", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_channels", { channels: KEYS });
+
+  const answer = await fake.invoke("set_mix", { address: LEAD, mix: { channelGains: [62, 30] } });
+  fake.changeFromPhone(LEAD, { channelMuted: [false, false, true] });
+  const row = (await fake.invoke("engine_status")).musicians[0];
+
+  assert.deepEqual(answer.channelGains.slice(1, 3), [30, 30], "the desk moved the first side");
+  assert.deepEqual(row.channelMuted.slice(1, 3), [true, true], "the phone muted the second side");
+});
+
+test("a hidden channel is heard in no mix of the fake engine, as if every musician had muted it", () => {
+  const status = sampleStatus();
+  const hidden = structuredClone(status);
+  hidden.channels[4].hidden = true;
+  const muted = structuredClone(status);
+  for (const musician of muted.musicians) {
+    musician.channelMuted[4] = true;
+  }
+  const everyHidden = structuredClone(status);
+  for (const channel of everyHidden.channels) {
+    channel.hidden = true;
+  }
+
+  for (const time of [500, 1234, 4321]) {
+    assert.deepEqual(syntheticMeters(hidden, time), syntheticMeters(muted, time), `at ${time} ms`);
+    assert.deepEqual(syntheticMeters(hidden, time).channels, syntheticMeters(status, time).channels);
+    assert.ok(
+      Object.values(syntheticMeters(everyHidden, time).musicians).every(
+        ({ left, right }) => left === 0 && right === 0,
+      ),
+      `nothing is heard at ${time} ms`,
+    );
+  }
+  const heard = Object.values(syntheticMeters(status, 1234).musicians);
+  assert.ok(
+    heard.some(({ left, right }) => left > 0 || right > 0),
+    "with every channel shown again, the musicians hear them",
+  );
+});
+
+test("hiding every channel on the fake engine silences every musician's meter", async () => {
+  const fake = createFakeBridge({ running: true });
+  const meters = [];
+  await fake.listen("meters", (payload) => meters.push(payload));
+
+  await fake.invoke("set_channels", {
+    channels: Array.from({ length: 6 }, () => ({ hidden: true })),
+  });
+  fake.emitMeters();
+
+  assert.ok(
+    Object.values(meters.at(-1).musicians).every(({ left, right }) => left === 0 && right === 0),
+    JSON.stringify(meters.at(-1).musicians),
+  );
+});
+
+test("the fake engine refuses the channel details the desk refuses and keeps the ones it had", async () => {
+  const fake = createFakeBridge({ running: true });
+  const before = (await fake.invoke("engine_status")).channels;
+
+  for (const channels of [
+    [{ kind: "kazoo" }],
+    [{ link: true }],
+    [{ link: true }, { hidden: true }],
+    [{ name: "x".repeat(33) }],
+    [{ hiden: true }],
+  ]) {
+    await assert.rejects(fake.invoke("set_channels", { channels }), /./, JSON.stringify(channels));
+  }
+
+  assert.deepEqual((await fake.invoke("engine_status")).channels, before);
+});
+
+test("channel details set while the fake engine is stopped apply at the next start", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("stop_engine");
+
+  const outcome = await fake.invoke("set_channels", {
+    channels: [{ name: "Click", kind: "click", hidden: true }],
+  });
+  assert.equal(outcome.applied, false);
+  assert.equal(outcome.saved, true);
+  assert.equal(formatChannelsSet(outcome), "Channel details saved; they apply at the next start.");
+  await fake.invoke("start_engine", { config: {} });
+  const status = await fake.invoke("engine_status");
+
+  assert.deepEqual(details(status.channels)[0], ["Click", "click", true, false]);
+  assert.deepEqual(details(status.channels)[1], ["", "other", false, false]);
+});
+
+test("a device switch keeps the fake details of the inputs that remain and drops the rest", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_channels", { channels: KEYS });
+
+  await fake.invoke("switch_device", { device: "Microphone (USB audio)" });
+  assert.deepEqual(details((await fake.invoke("engine_status")).channels), [
+    ["Kick", "drums", false, false],
+    ["Keys L", "keys", false, false],
+  ]);
+
+  await fake.invoke("switch_device", { device: "Demo interface" });
+  assert.deepEqual(
+    details((await fake.invoke("engine_status")).channels).slice(1, 3),
+    [
+      ["Keys L", "keys", false, false],
+      ["", "other", false, false],
+    ],
+    "a dropped detail does not come back",
   );
 });
 

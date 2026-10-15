@@ -18,6 +18,26 @@ export function formatGroupsSet({ applied, saved, saveError }) {
     : `Groups applied to every phone, but not saved: ${saveError}.`;
 }
 
+/**
+ * What a channel edit did, from the `set_channels` answer `{ channels, applied, saved, saveError }`,
+ * in the words of formatGroupsSet. A reason that ends with a full stop, or no reason at all, still
+ * gives one sentence.
+ */
+export function formatChannelsSet({ applied, saved, saveError }) {
+  if (!applied) {
+    return "Channel details saved; they apply at the next start.";
+  }
+  if (saved) {
+    return "Channel details applied to every phone.";
+  }
+  const reason = String(saveError ?? "")
+    .trim()
+    .replace(/\.+$/, "");
+  return reason
+    ? `Channel details applied to every phone, but not saved: ${reason}.`
+    : "Channel details applied to every phone, but not saved.";
+}
+
 /** "85%". */
 export function formatPercent(level) {
   return `${clampLevel(level)}%`;

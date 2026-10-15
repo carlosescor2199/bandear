@@ -13,7 +13,7 @@ use personal_monitoring::{
     MixValues, MusicianStatus,
 };
 
-use crate::session::SessionGroup;
+use crate::session::{SessionChannel, SessionGroup};
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
@@ -66,6 +66,44 @@ pub struct GroupRequest {
 pub struct GroupsSetDto {
     /// The groups in their order, each with its id (a new group's is the one the desk gave it).
     pub groups: Vec<SessionGroup>,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
+}
+
+/// One input's details as the window describes them, in a list in channel order (the first entry
+/// is CH 1); see [crate::commands::set_channels].
+///
+/// `kind` is one of the engine's instrument kinds (`voice`, `guitar`, `bass`, `keys`, `drums`,
+/// `percussion`, `horns`, `strings`, `playback`, `click`, `other`); `link` makes this input and the
+/// next one a stereo pair. Every field may be left out and then has its default (no name, `other`,
+/// shown, on its own). A field the desk does not know is rejected, so a misspelt name fails loudly
+/// rather than silently changing nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelRequest {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "other_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub link: bool,
+}
+
+fn other_kind() -> String {
+    personal_monitoring::ChannelKind::Other.name().to_owned()
+}
+
+/// What [crate::commands::set_channels] did with an accepted list of channel details, as
+/// [GroupsSetDto] says it for groups: `applied` whether a running engine took them (every phone has
+/// them now), `saved` whether the session keeps them, and `saveError` why not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelsSetDto {
+    /// The details as kept, in channel order, names trimmed.
+    pub channels: Vec<SessionChannel>,
     pub applied: bool,
     pub saved: bool,
     pub save_error: Option<String>,
@@ -332,16 +370,22 @@ impl From<&InputDevice> for InputDeviceDto {
     }
 }
 
-/// One source channel as the window shows it: a 1-based number, its group when the engineer
-/// configured one, and the live pre-mix peak.
-///
-/// There are no per-channel names in the system yet, so a channel is labelled by number and group
-/// rather than by a name like "Kick". Naming is engineer configuration that does not exist, and
-/// inventing names here would misrepresent the system.
+/// One source channel as the window shows it: a 1-based number, the engineer's details, its group
+/// when the engineer configured one, and the live pre-mix peak.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelDto {
     pub number: u8,
+    /// The engineer's name for the input; empty when it has none, and the window then calls it by
+    /// its number ("CH 3").
+    pub name: String,
+    /// The instrument kind's name (see [ChannelRequest]).
+    pub kind: &'static str,
+    /// Hidden inputs are heard in no mix; the window leaves them out of the mix.
+    pub hidden: bool,
+    /// This input and the next one are a stereo pair (set on the pair's first input): one strip
+    /// whose level, mute and solo write both channels, which the engine keeps equal.
+    pub link: bool,
     /// The name of the channel's group, for display.
     pub group: Option<String>,
     /// The id of the channel's group: two groups may share a name, so this is the join.
@@ -439,8 +483,13 @@ impl From<&EngineStatus> for EngineStatusDto {
                     .groups
                     .iter()
                     .find(|group| !group.invalid && group.channels.contains(&index));
+                let details = status.channels.get(index).cloned().unwrap_or_default();
                 ChannelDto {
                     number: (index + 1) as u8,
+                    name: details.name,
+                    kind: details.kind.name(),
+                    hidden: details.hidden,
+                    link: details.linked_to_next,
                     group: group.map(|group| group.name.clone()),
                     group_id: group.map(|group| group.id.clone()),
                     level: status.channel_levels.get(index).copied().unwrap_or(0),
@@ -1006,6 +1055,87 @@ mod tests {
         assert_eq!(requests[0].id.as_deref(), Some("kit"));
         assert_eq!(requests[1].id, None);
         assert_eq!(requests[1].channels, vec![3]);
+    }
+
+    #[test]
+    fn channels_carry_their_details_and_an_input_without_any_gets_the_defaults() {
+        let mut status = status_with(Vec::new(), vec![10, 20]);
+        status.channels = vec![personal_monitoring::ChannelMeta {
+            name: "Keys L".to_owned(),
+            kind: personal_monitoring::ChannelKind::Keys,
+            hidden: true,
+            linked_to_next: true,
+        }];
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+
+        assert_eq!(
+            json["channels"],
+            serde_json::json!([
+                {
+                    "number": 1, "name": "Keys L", "kind": "keys", "hidden": true, "link": true,
+                    "group": null, "groupId": null, "level": 10
+                },
+                {
+                    "number": 2, "name": "", "kind": "other", "hidden": false, "link": false,
+                    "group": null, "groupId": null, "level": 20
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn a_channel_edit_answers_what_was_done_in_camel_case() {
+        let answer = ChannelsSetDto {
+            channels: vec![SessionChannel {
+                name: "Kick".to_owned(),
+                kind: "drums".to_owned(),
+                hidden: false,
+                link: false,
+            }],
+            applied: true,
+            saved: false,
+            save_error: Some("disk full".to_owned()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(answer).expect("serializes"),
+            serde_json::json!({
+                "channels": [{ "name": "Kick", "kind": "drums", "hidden": false, "link": false }],
+                "applied": true,
+                "saved": false,
+                "saveError": "disk full"
+            })
+        );
+    }
+
+    #[test]
+    fn a_channel_request_takes_defaults_for_what_it_leaves_out_and_refuses_unknown_fields() {
+        let requests: Vec<ChannelRequest> = serde_json::from_str(
+            r#"[{"name":"Kick","kind":"drums","hidden":false,"link":true},{}]"#,
+        )
+        .expect("both shapes parse");
+
+        assert_eq!(
+            requests,
+            vec![
+                ChannelRequest {
+                    name: "Kick".to_owned(),
+                    kind: "drums".to_owned(),
+                    hidden: false,
+                    link: true,
+                },
+                ChannelRequest {
+                    name: String::new(),
+                    kind: "other".to_owned(),
+                    hidden: false,
+                    link: false,
+                },
+            ]
+        );
+        let error = serde_json::from_str::<ChannelRequest>(r#"{"hiden":true}"#)
+            .expect_err("a misspelt field must not be a silent no-op");
+        assert!(error.to_string().contains("hiden"), "names it: {error}");
     }
 
     #[test]

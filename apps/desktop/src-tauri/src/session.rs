@@ -2,7 +2,8 @@
 //! config directory.
 //!
 //! The session is a desktop-app concern only: the engine never reads the file, and only what the
-//! desk applies from it (the groups) ever reaches a client. Version 1 has this shape:
+//! desk applies from it (the channel details and the groups) ever reaches a client. Version 1 has
+//! this shape:
 //!
 //! ```json
 //! {
@@ -11,7 +12,11 @@
 //!     "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b": { "label": "Ana" },
 //!     "address:192.168.1.40:50000": { "label": "Rack A" }
 //!   },
-//!   "channels": [],
+//!   "channels": [
+//!     { "name": "Kick", "kind": "drums", "hidden": false, "link": false },
+//!     { "name": "Keys L", "kind": "keys", "hidden": false, "link": true },
+//!     { "name": "Keys R", "kind": "keys", "hidden": false, "link": false }
+//!   ],
 //!   "groups": [
 //!     { "id": "g3f9a0c1d2e4b5a6", "name": "Drums", "channels": [1, 2, 3] }
 //!   ],
@@ -30,8 +35,16 @@
 //!   every edit ([crate::commands::set_groups]). The section was reserved in the first version and
 //!   every earlier build wrote it empty and kept whatever it read, so giving its entries a shape
 //!   does not change the version: an earlier build still reads and keeps it.
-//! - `channels` and `presets` are reserved for the channel table and the engineer's mix presets.
-//!   Until the code that owns them lands they are written back exactly as they were read.
+//! - `channels` holds the engineer's details of each input, in channel order (the first entry is
+//!   CH 1): a name (empty for none), an instrument kind (one of the engine's kinds, `other` by
+//!   default), whether it is hidden, and `link` on the first input of a stereo pair. An entry may
+//!   leave out any field, which then has its default. They are applied to every engine the desk
+//!   starts and replaced by every edit ([crate::commands::set_channels]); an engine whose device has
+//!   fewer inputs uses the details of the inputs it has, and the session keeps them all. Like
+//!   `groups`, the section was reserved in the first version and every earlier build wrote it empty
+//!   and kept whatever it read, so its shape does not change the version.
+//! - `presets` is reserved for the engineer's mix presets. Until the code that owns it lands it is
+//!   written back exactly as it was read.
 //!
 //! Every save writes a temporary file next to the session, flushes it to disk and renames it over
 //! the session, so a crash or a full disk leaves the old file or the new one, never a torn one, and
@@ -74,9 +87,9 @@ pub struct Session {
     /// What the desk keeps about each musician, by [client_key] or [address_key].
     #[serde(default)]
     pub musicians: BTreeMap<String, MusicianEntry>,
-    /// Reserved for the channel table; kept as read.
+    /// The engineer's details of each input, in channel order.
     #[serde(default)]
-    pub channels: Vec<Value>,
+    pub channels: Vec<SessionChannel>,
     /// The engineer's groups, in their order.
     #[serde(default)]
     pub groups: Vec<SessionGroup>,
@@ -113,6 +126,27 @@ pub struct SessionGroup {
     pub name: String,
     /// 1-based channel numbers.
     pub channels: Vec<usize>,
+}
+
+/// The engineer's details of one input as the desk keeps them; the list is in channel order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionChannel {
+    /// The input's name; empty when it has none.
+    #[serde(default)]
+    pub name: String,
+    /// The instrument kind's name, as the engine names its kinds (`voice`, ..., `other`). Kept as
+    /// written, so a kind this build does not know survives a save; it applies as `other`.
+    #[serde(default = "other_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub hidden: bool,
+    /// This input and the next one are a stereo pair; set on the pair's first input only.
+    #[serde(default)]
+    pub link: bool,
+}
+
+fn other_kind() -> String {
+    "other".to_owned()
 }
 
 /// The key of what the desk keeps about the phone with this stable client id.
@@ -232,6 +266,27 @@ impl SessionStore {
         }
         let session = Session {
             groups,
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
+    /// The engineer's details of each input, in channel order.
+    pub fn channels(&self) -> Vec<SessionChannel> {
+        self.lock().session.channels.clone()
+    }
+
+    /// Replaces the engineer's channel details. The file is written before success is reported; a
+    /// save that fails, or is refused over a session this build must not replace, changes nothing.
+    pub fn set_channels(&self, channels: Vec<SessionChannel>) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            channels,
             ..loaded.session.clone()
         };
         write_atomically(&self.path, &session)?;
@@ -886,11 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_sections_are_written_back_as_they_were_read() {
+    fn the_reserved_section_and_the_others_are_written_back_as_they_were_read() {
         let directory = test_directory("reserved");
         fs::write(
             directory.join(SESSION_FILE),
-            r#"{"version":1,"musicians":{},"channels":[{"name":"Kick"}],"groups":[],"presets":[{"name":"Verse"}]}"#,
+            r#"{"version":1,"musicians":{},"channels":[{"name":"Kick","kind":"drums","hidden":false,"link":false}],"groups":[],"presets":[{"name":"Verse"}]}"#,
         )
         .expect("write");
 
@@ -899,7 +954,10 @@ mod tests {
             .expect("set");
 
         let saved = read_json(&directory.join(SESSION_FILE));
-        assert_eq!(saved["channels"], serde_json::json!([{ "name": "Kick" }]));
+        assert_eq!(
+            saved["channels"],
+            serde_json::json!([{ "name": "Kick", "kind": "drums", "hidden": false, "link": false }])
+        );
         assert_eq!(saved["presets"], serde_json::json!([{ "name": "Verse" }]));
         assert_eq!(
             saved["musicians"],
@@ -973,7 +1031,8 @@ mod tests {
         fs::write(
             directory.join(SESSION_FILE),
             r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
-                "channels":[{"name":"Kick"}],"groups":[{"id":1}],"presets":[]}"#,
+                "channels":[{"name":"Kick","kind":"drums","hidden":false,"link":false}],
+                "groups":[{"id":1}],"presets":[]}"#,
         )
         .expect("write");
 
@@ -1006,7 +1065,10 @@ mod tests {
         );
         let saved = read_json(&directory.join(SESSION_FILE));
         assert_eq!(saved["groups"], serde_json::json!([]));
-        assert_eq!(saved["channels"], serde_json::json!([{ "name": "Kick" }]));
+        assert_eq!(
+            saved["channels"],
+            serde_json::json!([{ "name": "Kick", "kind": "drums", "hidden": false, "link": false }])
+        );
         assert_eq!(
             saved["musicians"],
             serde_json::json!({ "address:192.168.1.30:50000": { "label": "Ana" } })
@@ -1036,6 +1098,123 @@ mod tests {
             .expect("the damaged section is kept for recovery");
         assert_eq!(read_json(&directory.join(aside)), serde_json::json!(5));
         assert!(session.notice().expect("reported").contains("channels"));
+    }
+
+    fn channel(name: &str, kind: &str, hidden: bool, link: bool) -> SessionChannel {
+        SessionChannel {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            hidden,
+            link,
+        }
+    }
+
+    #[test]
+    fn channel_details_are_kept_in_channel_order_and_survive_a_reload() {
+        let directory = test_directory("channels");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("set");
+        let channels = vec![
+            channel("Kick", "drums", false, false),
+            channel("Keys L", "keys", false, true),
+            channel("Keys R", "keys", false, false),
+            channel("", "other", true, false),
+        ];
+
+        session
+            .set_channels(channels.clone())
+            .expect("the details are saved");
+
+        assert_eq!(session.channels(), channels);
+        assert_eq!(SessionStore::open(&directory).channels(), channels);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)),
+            serde_json::json!({
+                "version": 1,
+                "musicians": { "address:192.168.1.30:50000": { "label": "Ana" } },
+                "channels": [
+                    { "name": "Kick", "kind": "drums", "hidden": false, "link": false },
+                    { "name": "Keys L", "kind": "keys", "hidden": false, "link": true },
+                    { "name": "Keys R", "kind": "keys", "hidden": false, "link": false },
+                    { "name": "", "kind": "other", "hidden": true, "link": false }
+                ],
+                "groups": [],
+                "presets": []
+            }),
+            "the same version 1 file: every earlier build wrote the section empty and keeps it"
+        );
+    }
+
+    #[test]
+    fn a_channel_entry_may_leave_out_what_it_does_not_change() {
+        let directory = test_directory("channels-short");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"channels":[{"name":"Kick"},{}]}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.channels(),
+            vec![
+                channel("Kick", "other", false, false),
+                channel("", "other", false, false)
+            ]
+        );
+        assert_eq!(session.notice(), None);
+    }
+
+    #[test]
+    fn a_misshapen_channel_entry_sets_the_section_aside_and_the_labels_are_kept() {
+        let directory = test_directory("channels-misshapen");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "channels":[{"name":5}],"groups":[{"id":"kit","name":"Drums","channels":[1]}]}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(session.groups().len(), 1, "the readable sections are kept");
+        assert_eq!(session.channels(), Vec::new(), "the details start empty");
+        let aside = files_in(&directory)
+            .into_iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.channels-damaged-")))
+            .expect("the damaged section is kept for recovery");
+        assert_eq!(
+            read_json(&directory.join(aside)),
+            serde_json::json!([{ "name": 5 }])
+        );
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["channels"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn saving_channels_is_refused_over_a_newer_session_and_a_failed_save_changes_nothing() {
+        let newer_directory = test_directory("channels-newer");
+        fs::write(newer_directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let newer = SessionStore::open(&newer_directory);
+        assert!(newer
+            .set_channels(vec![channel("Kick", "drums", false, false)])
+            .expect_err("refused")
+            .contains("newer"));
+        assert_eq!(newer.channels(), Vec::new());
+
+        let directory = test_directory("channels-failed-save");
+        let session = SessionStore::open(&directory);
+        let kept = vec![channel("Kick", "drums", false, false)];
+        session.set_channels(kept.clone()).expect("saved");
+        fs::create_dir(directory.join(format!("{SESSION_FILE}.tmp"))).expect("blocker");
+        session
+            .set_channels(Vec::new())
+            .expect_err("the write cannot happen");
+        assert_eq!(session.channels(), kept);
     }
 
     #[test]

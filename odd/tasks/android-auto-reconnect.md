@@ -100,12 +100,24 @@ Three facts from the code make it worse:
   stable client id announced in `register`. Commits: `bbe4070`, then this commit.
   - [x] T3a (server): optional `client_id` parsed leniently; a known id from a new IP moves the
     entry; the old IP's leftover connection leaves the moved entry alone. Commit: `bbe4070`.
-  - [x] T3b (android): generate and keep the client id, send it in every `register`. Commit: this
-    commit.
-- [ ] T4 (live): on the S23, a Wi-Fi blip that changes the phone's IP leaves one row on the
-  desktop, with its mix, and the server logs `..., moved from <old address>`.
+  - [x] T3b (android): generate and keep the client id, send it in every `register`. Commit:
+    `00ef6bf` (T3a: `bbe4070`).
+- [x] T4 (live): rechecked on the S23 with the rebuilt desktop and app. A Wi-Fi blip reconnected
+  on its own (`control registration from 192.168.1.3:51178`, then `closed: nothing received for
+  10s, heartbeat missed`, then `control registration from 192.168.1.3:59202`), one row throughout,
+  ending connected and good. The router kept the same IP this time, so the address move
+  (`moved from`) was not exercised live; it is covered by the registry tests and the socket-level
+  test with a real connection.
+
+Review of T3 (lineage `review-e2e25b314dbf079b`, range `810ec6d..00ef6bf`): approved and
+acknowledged, one suggestion kept as a follow-up below.
 
 ## Follow-ups
+
+- From review `review-e2e25b314dbf079b`: a move onto an IP still held by a manually configured
+  target ("add a musician by address") drops that configured entry and its mix instead of adopting
+  it, as the non-move path does; nothing tests that case. Decide the intended behaviour and pin it
+  with a test.
 
 - From review `review-f90e423bce7de49c` (test gaps, not defects; Android, not scheduled):
   - The 5 s ping value is only asserted as a constant; nothing checks it reaches the OkHttp client.

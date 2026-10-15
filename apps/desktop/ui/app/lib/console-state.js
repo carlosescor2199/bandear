@@ -14,6 +14,10 @@
 //   pending    { address: { editKey: value } }: local edits still waiting for the engine.
 //   mixError   { address, message } of the last refused change, cleared by the next answer.
 //   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
+//   connection { status, error }: "connecting", "ready" (the engine answered, or a status came)
+//              or "failed" with the reason the console cannot hear the engine.
+//   commandError { action, message }: a stop (or start) the engine refused while its run went
+//              on; cleared by the next start or stop.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
 // never jumps back to an older value while its change is on the way. Each copy of a musician's mix
@@ -21,9 +25,10 @@
 // can arrive in any order: the store keeps the copy with the highest revision from any of them and
 // never goes back to a lower one. An answer also settles the edits it carried.
 //
-// Every engine payload names its run. Starting, a failed start and a stop end the current run, and
-// a payload of an ended or older run is ignored, so a late event can never bring back an engine
-// that has stopped.
+// Every engine payload names its run. Starting, a failed start and a confirmed stop end the
+// current run, and a payload of an ended or older run is ignored, so a late event can never bring
+// back an engine that has stopped. A stop the engine refused ends nothing: the engine may still
+// run, so its run stays live and the refusal is shown (`commandFailed`).
 
 import { DEFAULT_AUDIO, audioChoice } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
@@ -45,7 +50,11 @@ export const initialState = Object.freeze({
   pending: NO_EDITS,
   mixError: null,
   audio: DEFAULT_AUDIO,
+  connection: Object.freeze({ status: "connecting", error: null }),
+  commandError: null,
 });
+
+const READY = Object.freeze({ status: "ready", error: null });
 
 /** Action creators, so a screen never spells an action by hand. */
 export const actions = Object.freeze({
@@ -67,6 +76,19 @@ export const actions = Object.freeze({
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
   /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
   audio: (change) => ({ type: "audio", change }),
+  /**
+   * The engine refused `action` ("stop" or "start") but its run goes on: the phase goes back to
+   * what the last status said, and the refusal is kept to be shown.
+   */
+  commandFailed: (action, message) => ({ type: "command-failed", action, message }),
+  /** The console is (re)connecting to the engine's events and status. */
+  connecting: () => ({ type: "connection", connection: { status: "connecting", error: null } }),
+  connected: () => ({ type: "connection", connection: READY }),
+  /** The console cannot hear the engine, for `message`. */
+  connectionFailed: (message) => ({
+    type: "connection",
+    connection: { status: "failed", error: message },
+  }),
 });
 
 /**
@@ -140,6 +162,8 @@ function receiveStatus(state, status) {
     departed,
     pending: onlyListed(state.pending, addresses),
     mixError: state.mixError && addresses.has(state.mixError.address) ? state.mixError : null,
+    // A status proves the console hears the engine.
+    connection: READY,
   };
 }
 
@@ -158,9 +182,24 @@ function setPhase(state, { phase, error }) {
       departed: null,
       pending: NO_EDITS,
       mixError: null,
+      commandError: null,
     };
   }
-  return { ...state, engine: { ...state.engine, phase, error } };
+  return { ...state, engine: { ...state.engine, phase, error }, commandError: null };
+}
+
+// The engine refused a command but its run goes on: back to the phase the last status showed.
+function commandFailed(state, { action, message }) {
+  const { status } = state.engine;
+  let phase = "idle";
+  if (status) {
+    phase = status.stopped ? "stopped" : "running";
+  }
+  return {
+    ...state,
+    engine: { ...state.engine, phase },
+    commandError: { action, message },
+  };
 }
 
 function isListed(state, address) {
@@ -255,6 +294,10 @@ export function consoleReducer(state, action) {
       return refused(state, action);
     case "audio":
       return { ...state, audio: audioChoice(state.audio, action.change) };
+    case "command-failed":
+      return commandFailed(state, action);
+    case "connection":
+      return { ...state, connection: action.connection };
     default:
       return state;
   }

@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { EVENTS, createEngineApi, createTauriBridge } from "../app/lib/bridge.js";
+import {
+  ENGINE_NOT_RUNNING,
+  EVENTS,
+  createEngineApi,
+  createTauriBridge,
+  isEngineNotRunning,
+} from "../app/lib/bridge.js";
 import { createFakeBridge, sampleStatus, syntheticMeters } from "../app/lib/fake-bridge.js";
 import { applyEdits, buildMixRequest, mixFromDto } from "../app/lib/mix.js";
 
@@ -108,6 +114,26 @@ test("the engine API listens for the three engine events", async () => {
 
   assert.deepEqual(bridge.listens, ["meters", "status", "mix-changed"]);
   assert.deepEqual(EVENTS, { meters: "meters", status: "status", mixChanged: "mix-changed" });
+});
+
+test("only the desktop's own words mean that no engine runs", () => {
+  assert.equal(ENGINE_NOT_RUNNING, "the engine is not running");
+  assert.equal(isEngineNotRunning("the engine is not running"), true);
+  assert.equal(isEngineNotRunning(new Error("the engine is not running")), true);
+  assert.equal(isEngineNotRunning("engine state lock was poisoned"), false);
+  assert.equal(isEngineNotRunning(undefined), false);
+});
+
+test("the fake engine can fail a command once, before or after it takes effect", async () => {
+  const fake = createFakeBridge({ running: true });
+
+  fake.failNext("stop_engine", "could not stop the capture");
+  await assert.rejects(fake.invoke("stop_engine"), /could not stop the capture/);
+  assert.equal((await fake.invoke("engine_status")).run, 1, "the engine still runs");
+
+  fake.failNext("stop_engine", "stopped, but late", { afterEffect: true });
+  await assert.rejects(fake.invoke("stop_engine"), /stopped, but late/);
+  await assert.rejects(fake.invoke("engine_status"), /not running/, "this time it did stop");
 });
 
 test("the fake engine answers engine_status only while it runs, as the real one does", async () => {

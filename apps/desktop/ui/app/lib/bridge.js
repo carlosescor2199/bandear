@@ -19,6 +19,18 @@ export const EVENTS = Object.freeze({
   mixChanged: "mix-changed",
 });
 
+/**
+ * The error text every engine command answers with while no engine runs (commands.rs). Only this
+ * answer means "not running"; any other failure of `engine_status` is a real problem.
+ */
+export const ENGINE_NOT_RUNNING = "the engine is not running";
+
+/** True when a command failed only because no engine runs. */
+export function isEngineNotRunning(error) {
+  const text = error instanceof Error ? error.message : error;
+  return text === ENGINE_NOT_RUNNING;
+}
+
 /** The bridge over `window.__TAURI__`, which `withGlobalTauri` provides. */
 export function createTauriBridge(tauri = globalThis.__TAURI__) {
   const invoke = tauri?.core?.invoke;

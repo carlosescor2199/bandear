@@ -134,7 +134,12 @@ test("the mix area says why it is empty", () => {
   const nobody = sampleStatus();
   nobody.musicians = [];
 
-  assert.deepEqual(mixNotice(initialState), { kind: "stopped" });
+  assert.deepEqual(mixNotice(initialState), { kind: "connecting" });
+  assert.deepEqual(mixNotice(reduce([actions.connected()])), { kind: "stopped" });
+  assert.deepEqual(mixNotice(reduce([actions.connectionFailed("no events")], running)), {
+    kind: "disconnected",
+    message: "no events",
+  });
   assert.deepEqual(mixNotice(reduce([actions.engine("starting")])), { kind: "starting" });
   assert.deepEqual(mixNotice(reduce([actions.engine("stopping")], running)), { kind: "stopping" });
   assert.deepEqual(mixNotice(reduce([actions.engine("error", "No input device.")])), {
@@ -156,6 +161,7 @@ test("the console says who was removed, and which musician's change was refused"
   assert.deepEqual(mixMessages(removed), {
     departed: "Bass was removed; showing Lead vocal's mix.",
     error: null,
+    command: null,
   });
 
   const refused = reduce(
@@ -168,5 +174,15 @@ test("the console says who was removed, and which musician's change was refused"
   assert.deepEqual(mixMessages(refused), {
     departed: null,
     error: "A change to Lead vocal's mix was not applied: the engine is not running.",
+    command: null,
   });
+
+  const unstopped = reduce(
+    [actions.engine("stopping"), actions.commandFailed("stop", "could not stop the capture")],
+    running,
+  );
+  assert.equal(
+    mixMessages(unstopped).command,
+    "The engine could not be stopped: could not stop the capture.",
+  );
 });

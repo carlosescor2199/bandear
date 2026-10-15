@@ -118,11 +118,19 @@ export function masterStrip(state, address) {
 }
 
 /**
- * Why the mix area has no strips, or null when it has some: `{ kind }` with kind "stopped",
- * "starting", "stopping", "error" (with `message`) or "no-musicians".
+ * Why the mix area has no strips, or null when it has some: `{ kind }` with kind "disconnected"
+ * (with `message`; the console cannot hear the engine), "connecting", "stopped", "starting",
+ * "stopping", "error" (with `message`) or "no-musicians".
  */
 export function mixNotice(state) {
   const { phase, error } = state.engine;
+  const { connection } = state;
+  if (connection.status === "failed") {
+    return { kind: "disconnected", message: connection.error };
+  }
+  if (connection.status === "connecting" && phase === "idle") {
+    return { kind: "connecting" };
+  }
   if (phase === "idle" || phase === "stopped") {
     return { kind: "stopped" };
   }
@@ -135,11 +143,23 @@ export function mixNotice(state) {
   return state.musicians.length === 0 ? { kind: "no-musicians" } : null;
 }
 
+const COMMAND_WORDS = Object.freeze({ stop: "stopped", start: "started" });
+
 /**
  * The sentences above the strips: `departed` when the open musician was removed and another one
- * opened, `error` when a change was refused. Each is null when there is nothing to say.
+ * opened, `error` when a change was refused, `command` when the engine refused a stop while it
+ * went on running. Each is null when there is nothing to say.
  */
 export function mixMessages(state) {
+  let command = null;
+  if (state.commandError) {
+    const { action, message } = state.commandError;
+    command = `The engine could not be ${COMMAND_WORDS[action] ?? action}: ${message}.`;
+  }
+  return { ...musicianMessages(state), command };
+}
+
+function musicianMessages(state) {
   let departed = null;
   const shown = musicianByAddress(state, state.selected);
   if (state.departed && shown) {

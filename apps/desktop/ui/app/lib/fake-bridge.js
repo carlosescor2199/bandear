@@ -166,8 +166,8 @@ function withPort(address) {
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
  * (timers until the returned stop function is called), `holdAnswers(command)` and
- * `releaseAnswers()` (answers that arrive late), `failStart(message)` and `calls`, every
- * `{ command, args }` invoked.
+ * `releaseAnswers()` (answers that arrive late), `failNext(command, message)` (one failed call),
+ * `failStart(message)` and `calls`, every `{ command, args }` invoked.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -315,6 +315,8 @@ export function createFakeBridge({
   // Commands whose answers wait for `releaseAnswers`, and the answers waiting.
   const held = new Set();
   const waiting = [];
+  // Commands whose next call fails: { message, afterEffect }.
+  const failing = new Map();
 
   return {
     calls,
@@ -322,8 +324,19 @@ export function createFakeBridge({
       calls.push({ command, args });
       // The command takes effect at once, events included; only its answer may be held back.
       const handler = commands[command];
+      const failure = failing.get(command);
+      failing.delete(command);
       let outcome;
-      if (handler) {
+      if (failure) {
+        if (failure.afterEffect) {
+          try {
+            handler?.(args ?? {});
+          } catch {
+            // The failure below is the answer either way.
+          }
+        }
+        outcome = { ok: false, value: failure.message };
+      } else if (handler) {
         try {
           outcome = { ok: true, value: handler(args ?? {}) };
         } catch (error) {
@@ -356,6 +369,14 @@ export function createFakeBridge({
     /** From now on the answers to `command` wait for `releaseAnswers`, as a slow link would. */
     holdAnswers(command) {
       held.add(command);
+    },
+    /**
+     * Makes the next call of `command` fail with `message`: before it does anything, or, with
+     * `afterEffect`, after it took effect, as a command whose answer is an error but whose work
+     * was done.
+     */
+    failNext(command, message, { afterEffect = false } = {}) {
+      failing.set(command, { message, afterEffect });
     },
     /** Delivers every answer waiting now, in the order the commands were invoked. */
     releaseAnswers() {

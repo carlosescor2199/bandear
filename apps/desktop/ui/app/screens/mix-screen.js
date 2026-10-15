@@ -18,6 +18,8 @@ import {
 } from "../lib/mix-view.js";
 
 const NOTICES = Object.freeze({
+  connecting: { title: "Connecting to the engine…", text: "" },
+  disconnected: { title: "The console cannot reach the engine", action: "Try again" },
   stopped: {
     title: "The engine is stopped",
     text: "Start it to send each musician their mix.",
@@ -41,6 +43,7 @@ const LAYOUT = `
   <div class="mix-tabs"><ml-musician-tabs></ml-musician-tabs></div>
   <p class="mix-message" role="status" data-departed hidden></p>
   <p class="mix-message mix-message--error" role="alert" data-error hidden></p>
+  <p class="mix-message mix-message--error" role="alert" data-command hidden></p>
   <div class="mix-notice" data-notice hidden>
     <h2 data-notice-title></h2>
     <p data-notice-text></p>
@@ -77,6 +80,7 @@ export function mountMixScreen(main, app) {
     tabs: screen.querySelector("ml-musician-tabs"),
     departed: screen.querySelector("[data-departed]"),
     error: screen.querySelector("[data-error]"),
+    command: screen.querySelector("[data-command]"),
     notice: screen.querySelector("[data-notice]"),
     noticeTitle: screen.querySelector("[data-notice-title]"),
     noticeText: screen.querySelector("[data-notice-text]"),
@@ -94,7 +98,9 @@ export function mountMixScreen(main, app) {
     }
     const copy = NOTICES[notice.kind];
     parts.noticeTitle.textContent = copy.title;
-    parts.noticeText.textContent = notice.kind === "error" ? notice.message : copy.text;
+    parts.noticeText.textContent = notice.message ?? copy.text;
+    parts.noticeText.hidden = parts.noticeText.textContent === "";
+    parts.noticeAction.dataset.kind = notice.kind;
     if (copy.link) {
       const link = document.createElement("a");
       link.href = copy.link.href;
@@ -111,11 +117,11 @@ export function mountMixScreen(main, app) {
     parts.topBar.data = topBarView(state);
     parts.tabs.data = musicianTabs(state);
 
-    const { departed, error } = mixMessages(state);
-    parts.departed.hidden = departed === null;
-    parts.departed.textContent = departed ?? "";
-    parts.error.hidden = error === null;
-    parts.error.textContent = error ?? "";
+    const messages = mixMessages(state);
+    for (const name of ["departed", "error", "command"]) {
+      parts[name].hidden = messages[name] === null;
+      parts[name].textContent = messages[name] ?? "";
+    }
 
     const notice = mixNotice(state);
     renderNotice(notice);
@@ -174,7 +180,14 @@ export function mountMixScreen(main, app) {
   screen.addEventListener("engine-stop", () => app.stop());
   screen.addEventListener("musician-select", (event) => app.select(event.detail.address));
   screen.addEventListener("mix-edit", onMixEdit);
-  parts.noticeAction.addEventListener("click", () => app.start());
+  // "Try again" after a lost connection connects again; every other notice's action starts.
+  parts.noticeAction.addEventListener("click", () => {
+    if (parts.noticeAction.dataset.kind === "disconnected") {
+      app.reconnect();
+    } else {
+      app.start();
+    }
+  });
   const unsubscribe = app.store.subscribe(scheduleRender);
   const stopMeters = app.onMeters(onMeters);
   render();

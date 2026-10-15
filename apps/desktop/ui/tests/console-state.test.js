@@ -469,6 +469,40 @@ test("the audio choices start on the system's own driver at 256 frames, and ASIO
   assert.deepEqual(odd.audio, { host: "auto", bufferFrames: null });
 });
 
+test("a failed stop keeps the run and its musicians, and says what failed", () => {
+  const state = reduce([
+    twoMusicians,
+    actions.engine("stopping"),
+    actions.commandFailed("stop", "could not stop the capture"),
+  ]);
+
+  assert.equal(state.engine.phase, "running", "the engine may well still run");
+  assert.equal(state.engine.run, 1);
+  assert.equal(state.musicians.length, 2);
+  assert.deepEqual(state.commandError, { action: "stop", message: "could not stop the capture" });
+
+  const later = reduce([change(BO, "phone", mixWith({ volumePercent: 9 }))], state);
+  assert.equal(viewMix(later, BO).volumePercent, 9, "its events still count");
+
+  const retried = reduce([actions.engine("stopping")], state);
+  assert.equal(retried.commandError, null, "the next start or stop clears it");
+});
+
+test("the console is connecting until it hears the engine, and says when it cannot", () => {
+  assert.deepEqual(initialState.connection, { status: "connecting", error: null });
+
+  const failed = reduce([actions.connectionFailed("the event channel is closed")]);
+  assert.deepEqual(failed.connection, { status: "failed", error: "the event channel is closed" });
+
+  const again = reduce([actions.connecting()], failed);
+  assert.deepEqual(again.connection, { status: "connecting", error: null });
+  assert.deepEqual(reduce([actions.connected()], again).connection, {
+    status: "ready",
+    error: null,
+  });
+  assert.equal(reduce([twoMusicians], again).connection.status, "ready", "a status proves it");
+});
+
 test("an action the console does not know leaves the state as it was", () => {
   const state = reduce([twoMusicians]);
 

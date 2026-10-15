@@ -183,6 +183,98 @@ test("a refused change says so and the strip falls back to the engine's value", 
   app.dispose();
 });
 
+test("a failed stop keeps the engine's run, shows the error, and its events still count", async () => {
+  const { fake, app } = await connected();
+  fake.failNext("stop_engine", "could not stop the capture");
+
+  await app.stop();
+  fake.changeFromPhone(LEAD, { volumePercent: 5 });
+
+  const state = app.store.getState();
+  assert.equal(state.engine.phase, "running", "engine_status says it still runs");
+  assert.equal(state.musicians.length, sampleStatus().musicians.length);
+  assert.deepEqual(state.commandError, { action: "stop", message: "could not stop the capture" });
+  assert.equal(viewMix(state, LEAD).volumePercent, 5);
+  app.dispose();
+});
+
+test("a stop that reports a failure but did stop the engine ends the run", async () => {
+  const { fake, app } = await connected();
+  fake.failNext("stop_engine", "stopped, but late", { afterEffect: true });
+
+  await app.stop();
+
+  assert.equal(app.store.getState().engine.phase, "idle");
+  app.dispose();
+});
+
+test("when a start works but reading its status fails, the new run stays live", async () => {
+  const { fake, app } = await connected();
+  fake.failNext("engine_status", "the status could not be read");
+
+  await app.start();
+  fake.changeFromPhone(LEAD, { volumePercent: 7 });
+
+  const state = app.store.getState();
+  assert.equal(state.engine.phase, "running");
+  assert.equal(state.engine.error, null);
+  assert.equal(viewMix(state, LEAD).volumePercent, 7, "the new run's events still count");
+  app.dispose();
+});
+
+test("only an engine that is not running is started; any other failure is shown", async () => {
+  const fake = createFakeBridge();
+  fake.failNext("engine_status", "engine state lock was poisoned");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  assert.equal(commands(fake, "start_engine").length, 0);
+  assert.deepEqual(app.store.getState().connection, {
+    status: "failed",
+    error: "engine state lock was poisoned",
+  });
+
+  await app.reconnect();
+  assert.equal(commands(fake, "start_engine").length, 1, "now it is just not running");
+  assert.equal(app.store.getState().connection.status, "ready");
+  assert.equal(app.store.getState().engine.phase, "running");
+  app.dispose();
+});
+
+test("a failed event registration is shown, and connecting again listens once", async () => {
+  const fake = createFakeBridge({ running: true });
+  let refuse = true;
+  const bridge = {
+    invoke: (command, args) => fake.invoke(command, args),
+    listen: (event, handler) =>
+      refuse && event === "meters"
+        ? Promise.reject("the event channel is closed")
+        : fake.listen(event, handler),
+  };
+  const app = createConsoleApp({ bridge });
+  await app.ready;
+
+  const { connection } = app.store.getState();
+  assert.equal(connection.status, "failed");
+  assert.match(connection.error, /the event channel is closed/);
+  const before = app.store.getState();
+  fake.changeFromPhone(LEAD, { volumePercent: 3 });
+  assert.equal(app.store.getState(), before, "no half-connected listeners are left behind");
+
+  refuse = false;
+  await app.reconnect();
+  let updates = 0;
+  app.store.subscribe(() => {
+    updates += 1;
+  });
+  fake.changeFromPhone(LEAD, { volumePercent: 4 });
+
+  assert.equal(app.store.getState().connection.status, "ready");
+  assert.equal(viewMix(app.store.getState(), LEAD).volumePercent, 4);
+  assert.equal(updates, 1, "each event is heard once");
+  app.dispose();
+});
+
 test("picking a musician opens their mix", async () => {
   const { app } = await connected();
 

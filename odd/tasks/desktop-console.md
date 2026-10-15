@@ -349,6 +349,36 @@ user's decision.
   model, five organisms, the screen and the demo engine together to show anything; the
   review fixes came first as their own commits.
   Commit: this commit.
+- [x] T6b (review R3-001 to R3-003 of T6). Route: delegated writer. Two commits:
+  - Mix revisions (08fe631, R3-001). Every stored mix has a revision: a process-wide counter
+    hands one out under the mix's writer lock on every change (phone or desk), so each change
+    is higher than the one before, none is shared, and a mix created later (a musician added
+    again) starts above every earlier one. `MixState::current` reads the mix and its revision
+    together (status and the mix join use it); the audio path keeps the lock-free `snapshot`.
+    The phone protocol is unchanged. `MixDto.revision` reaches status rows, `mix-changed` and
+    the `set_mix` answer. The store keeps, per musician, the copy with the highest revision
+    from any source and never goes back; an answer settles its edits and offers its mix. The
+    fake engine numbers its changes and can answer before it announces (`answersFirst`).
+  - Engine lifecycle (this commit, R3-002 and R3-003). Only a confirmed stop ends the run: a
+    refused stop keeps it, shows "The engine could not be stopped: ..." and reads the status
+    again ("not running" then means it did stop). A start whose status read fails keeps the new
+    run and asks again up to 3 times while the status events have not filled the view. Only
+    `engine_status`'s "the engine is not running" (`ENGINE_NOT_RUNNING`) triggers the
+    auto-start; any other failure, and a failed or partial event registration (taken down
+    again), becomes the console's connection error, shown as "The console cannot reach the
+    engine" with Try again (`reconnect`). The store has `connection` and `commandError`; the
+    fake engine can fail one call (`failNext`, before or after it takes effect).
+  RED observed: server 16 compile errors (`MixState::read`, `MixValues::revision`), desktop 1;
+  node 6 failures, then with the fake answering first the end-to-end test showed the fader at
+  40, 55, 40 (the jump back); for the lifecycle, 9 failures with `failNext` in place (a refused
+  stop ending the run, a failed status read ending a new run, a poisoned lock auto-starting,
+  a failed registration rejecting `ready`, the new notices and messages). GREEN:
+  `cargo fmt` clean; `cargo test -p personal-monitoring` 208 passed (4 new);
+  `cargo test -p mixlink-desktop` 45 passed (1 new); `cargo build -p mixlink-desktop` ok after
+  `cargo clean -p mixlink-desktop`; `fnm exec --using=default node --test apps/desktop/ui/tests`
+  152 passed (143 after the first commit); `console.html?fake` with no console errors. No new
+  clippy warnings. About 426 + 421 authored changed lines.
+  Commit: this commit.
 - [ ] T7 (Network and system, switch): musicians table and audio setup moved from the old UI;
   switch `index.html` to the new shell; delete the old `main.js` and styles; docs. Route:
   delegated writer.
@@ -407,6 +437,15 @@ user's decision.
     should only settle pending edits; `mix-changed` events (server order) carry the truth.
   - SUGGESTION R3-003: the shared slider logic (drag hold, one `change` at drag end, grab
     offset, double-click reset) has no automated tests; move it into a pure module and test it.
+- T6 0c6da0f + ffec1e5 + a31d96c: lineage `review-4f22c9c9e2296c71` over 43304a7..a31d96c
+  approved and acknowledged. Next review base: a31d96c. Its notes, all fixed by T6b:
+  - WARNING R3-001: a `set_mix` answer arriving before its `mix-changed` event left the fader
+    on the older stored mix until the event. Fixed by numbering every mix change (revisions).
+  - WARNING R3-002: a refused stop, or a failed status read after a good start, ended a run
+    that may still be live, so its events were dropped. Fixed: only a confirmed stop ends it.
+  - SUGGESTION R3-003: any `engine_status` failure auto-started, and a failed event
+    registration rejected `ready` unseen. Fixed: only "not running" starts; failures show with
+    Try again.
 - Local preview: `.claude/launch.json` (excluded through `.git/info/exclude`) runs
   `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`.
 

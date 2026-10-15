@@ -296,6 +296,13 @@ slice. Push and PRs are the user's decision.
   base 8ef33ad. Its three WARNINGs (R3-set-groups-save-apply-not-atomic,
   R3-set-groups-error-after-persist, R3-misshapen-group-discards-labels) are fixed by T2b. The
   window shows `formatGroupsSet` once T4's group editor calls `setGroups`.
+- Review `review-150044cc10868604` over 8ef33ad..85e4409 (T2b) approved and acknowledged; next
+  review base 85e4409. Two SUGGESTIONs folded into T4:
+  - R3-concurrency-test-not-discriminating: the two-edits test also passed against the old
+    order (Windows hands the lock over in arrival order); force the interleaving with a hook
+    that parks one edit between apply and save.
+  - R3-format-groups-set-unguarded-save-error: `formatGroupsSet` can print a double period or
+    "not saved: null."; guard both.
 
 ## Next step
 

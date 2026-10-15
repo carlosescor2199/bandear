@@ -14,10 +14,12 @@ use crate::capture::{
     select_input_config, AudioHost, TARGET_SAMPLE_RATE,
 };
 use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, GroupDefinition};
-use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
+use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
-use crate::mix::{group_sources, Group, GroupLayout, MixUpdate, MixValues, MAX_MIX_CHANNELS};
+use crate::mix::{
+    group_sources, ChannelFlags, Group, GroupLayout, MixUpdate, MixValues, MAX_MIX_CHANNELS,
+};
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
 use crate::targets::{TargetEntry, TargetRegistry};
@@ -55,6 +57,10 @@ pub enum EngineEvent {
     /// group levels moved with an edit, so a consumer can show the new groups before levels placed
     /// for them.
     GroupsChanged,
+    /// The channel details the status reports changed: the engineer named, hid or linked inputs
+    /// ([EngineHandle::set_channels]), or a device switch dropped the details of inputs it lacks. It
+    /// comes before the [Self::MixChanged] of every mix a new stereo pair panned apart.
+    ChannelsChanged,
 }
 
 /// Where a mix change came from.
@@ -139,6 +145,169 @@ pub struct GroupStatus {
     pub invalid: bool,
 }
 
+/// What a source channel carries, as the engineer labels it, from a fixed set every client knows.
+///
+/// The set is closed on purpose: a phone picks the icon for each kind, so a kind it does not know
+/// would have none. [ChannelKind::name] is the name the `config` message and the desktop use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ChannelKind {
+    Voice,
+    Guitar,
+    Bass,
+    Keys,
+    Drums,
+    Percussion,
+    Horns,
+    Strings,
+    /// Tracks or samples played from a computer.
+    Playback,
+    /// The click track or a metronome.
+    Click,
+    /// Anything else, and every input the engineer has not labelled.
+    #[default]
+    Other,
+}
+
+impl ChannelKind {
+    /// Every kind, in the order a UI offers them.
+    pub const ALL: [ChannelKind; 11] = [
+        ChannelKind::Voice,
+        ChannelKind::Guitar,
+        ChannelKind::Bass,
+        ChannelKind::Keys,
+        ChannelKind::Drums,
+        ChannelKind::Percussion,
+        ChannelKind::Horns,
+        ChannelKind::Strings,
+        ChannelKind::Playback,
+        ChannelKind::Click,
+        ChannelKind::Other,
+    ];
+
+    /// The kind's name on the wire and in the desktop: lowercase, one word.
+    pub fn name(self) -> &'static str {
+        match self {
+            ChannelKind::Voice => "voice",
+            ChannelKind::Guitar => "guitar",
+            ChannelKind::Bass => "bass",
+            ChannelKind::Keys => "keys",
+            ChannelKind::Drums => "drums",
+            ChannelKind::Percussion => "percussion",
+            ChannelKind::Horns => "horns",
+            ChannelKind::Strings => "strings",
+            ChannelKind::Playback => "playback",
+            ChannelKind::Click => "click",
+            ChannelKind::Other => "other",
+        }
+    }
+
+    /// The kind with this [ChannelKind::name], or `None` for a name that is no kind.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+/// The longest channel name the engine takes, in characters.
+pub const MAX_CHANNEL_NAME_LENGTH: usize = 32;
+
+/// What the engineer says about one source channel.
+///
+/// The default is an unnamed input of kind [ChannelKind::Other], shown and on its own: a client
+/// labels an unnamed channel by its number ("CH 3").
+///
+/// - A hidden channel is not heard in any mix (a spare input must not leak noise into anyone's
+///   ears) and clients do not show it.
+/// - `linked_to_next` makes this channel and the next one a stereo pair, set on the pair's first
+///   channel only. A client shows a pair as one strip whose level, mute and solo write both
+///   channels and whose pan is a balance over the two pans; the server keeps the pair's level, mute
+///   and solo equal whoever writes them (see [EngineHandle::set_channels]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelMeta {
+    pub name: String,
+    pub kind: ChannelKind,
+    pub hidden: bool,
+    pub linked_to_next: bool,
+}
+
+/// Checks the engineer's channel details, in channel order (the first entry is CH 1), before any of
+/// them is applied or kept.
+///
+/// At most 32 entries (the mixer's channels); names of at most [MAX_CHANNEL_NAME_LENGTH]
+/// characters; a stereo pair only between two entries of the list, never overlapping another pair;
+/// and both sides of a pair hidden or both shown, since a client shows a pair as one strip. Errors
+/// name the channel by its 1-based number.
+pub fn check_channels(channels: &[ChannelMeta]) -> Result<(), String> {
+    if channels.len() > MAX_MIX_CHANNELS {
+        return Err(format!(
+            "channel details are supported for at most {MAX_MIX_CHANNELS} channels, received {}",
+            channels.len()
+        ));
+    }
+    for (index, channel) in channels.iter().enumerate() {
+        let number = index + 1;
+        if channel.name.chars().count() > MAX_CHANNEL_NAME_LENGTH {
+            return Err(format!(
+                "the name of CH {number} is longer than {MAX_CHANNEL_NAME_LENGTH} characters"
+            ));
+        }
+        if !channel.linked_to_next {
+            continue;
+        }
+        let Some(next) = channels.get(index + 1) else {
+            return Err(format!(
+                "CH {number} is linked to the next channel, but it is the last one"
+            ));
+        };
+        if next.linked_to_next {
+            return Err(format!(
+                "CH {} cannot be in two stereo pairs (CH {number}-{} and CH {}-{})",
+                number + 1,
+                number + 1,
+                number + 1,
+                number + 2
+            ));
+        }
+        if next.hidden != channel.hidden {
+            return Err(format!(
+                "CH {number} and CH {} are one stereo pair: hide or show both",
+                number + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The channel details for a device with `source_channels` inputs: one entry per input, in order.
+///
+/// Details of inputs the device has are kept, inputs with none get the defaults, and details past
+/// the last input are dropped, along with a pair whose second side is gone: a device switch keeps
+/// what the inputs that remain were called and drops the rest.
+pub(crate) fn fit_channels(channels: &[ChannelMeta], source_channels: u8) -> Vec<ChannelMeta> {
+    let count = usize::from(source_channels);
+    let mut fitted: Vec<ChannelMeta> = channels.iter().take(count).cloned().collect();
+    fitted.resize(count, ChannelMeta::default());
+    // The last input has no next one to be paired with.
+    if let Some(last) = fitted.last_mut() {
+        last.linked_to_next = false;
+    }
+    fitted
+}
+
+/// The mixer's flags for fitted channel details (see [crate::mix::ChannelFlags]). Details past the
+/// mixer's channels carry no flag: the mixer does not hear those inputs.
+pub(crate) fn channel_flags(channels: &[ChannelMeta]) -> ChannelFlags {
+    let mut flags = ChannelFlags::default();
+    for (index, channel) in channels.iter().enumerate().take(MAX_MIX_CHANNELS) {
+        if channel.hidden {
+            flags.hidden |= 1 << index;
+        }
+        if channel.linked_to_next && index + 1 < MAX_MIX_CHANNELS {
+            flags.linked |= 1 << index;
+        }
+    }
+    flags
+}
+
 /// A snapshot of everything the engine can report without blocking the audio path.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineStatus {
@@ -151,6 +320,9 @@ pub struct EngineStatus {
     pub source_channels: u8,
     /// The configured group layout, in the order the engineer defined it.
     pub groups: Vec<GroupStatus>,
+    /// The engineer's details of every source channel, one entry per channel in channel order
+    /// (see [ChannelMeta]); an input the engineer said nothing about has the defaults.
+    pub channels: Vec<ChannelMeta>,
     /// One 0-100 source-channel peak per channel, index-aligned with the source channels.
     ///
     /// The value is measured before mixing, so it describes the input rather than any one
@@ -700,6 +872,10 @@ pub(crate) fn plan_switch_from_attempt(
 /// moment therefore either exists already and is moved here, or comes after the publish and starts
 /// with the new membership; none is left on the old one.
 ///
+/// The channel details are kept for the inputs the new channel count has and dropped for the rest
+/// (see [fit_channels]); every mix takes the flags that remain, and [EngineEvent::ChannelsChanged]
+/// follows [EngineEvent::GroupsChanged] when the details changed.
+///
 /// [MixState::regroup]: crate::mix::MixState::regroup
 pub(crate) fn apply_groups(
     targets: &TargetRegistry,
@@ -709,30 +885,39 @@ pub(crate) fn apply_groups(
     groups: GroupRevalidation,
 ) -> bool {
     let entries = targets.read();
-    let layout = groups.mixer_layout.clone();
-    let Some(previous) = config.publish(source_channels, groups.statuses, groups.mixer_layout)
+    let Some((previous, live)) =
+        config.publish(source_channels, groups.statuses, groups.mixer_layout)
     else {
         return false;
     };
-    let moved: Vec<SocketAddr> = if previous.layout.same_positions(&layout) {
+    let layout = &live.layout;
+    let mut moved: Vec<SocketAddr> = if previous.layout.same_positions(layout) {
         for entry in entries.iter() {
-            entry.mix_state.set_group_layout(&layout);
+            entry.mix_state.set_group_layout(layout);
         }
         Vec::new()
     } else {
-        let sources = group_sources(&previous.layout, &layout);
+        let sources = group_sources(&previous.layout, layout);
         entries
             .iter()
             .map(|entry| {
-                entry.mix_state.regroup(&layout, &sources);
+                entry.mix_state.regroup(layout, &sources);
                 entry.address
             })
             .collect()
     };
+    for address in follow_channels(&entries, &live) {
+        if !moved.contains(&address) {
+            moved.push(address);
+        }
+    }
     // Announced once the registry is released, since a listener may read it at once: the new
-    // groups first, then every mix whose levels moved.
+    // configuration first, then every mix whose levels moved.
     drop(entries);
     events.emit(EngineEvent::GroupsChanged);
+    if previous.channels != live.channels {
+        events.emit(EngineEvent::ChannelsChanged);
+    }
     for address in moved {
         events.emit(EngineEvent::MixChanged {
             address,
@@ -740,6 +925,69 @@ pub(crate) fn apply_groups(
         });
     }
     true
+}
+
+/// Gives every mix the channel flags of the configuration `live` (see
+/// [crate::mix::MixState::set_channel_flags]) and returns the musicians whose stored mix changed:
+/// those a newly linked pair panned apart.
+fn follow_channels(entries: &[TargetEntry], live: &ConfigSnapshot) -> Vec<SocketAddr> {
+    let flags = channel_flags(&live.channels);
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .mix_state
+                .set_channel_flags(flags)
+                .map(|_| entry.address)
+        })
+        .collect()
+}
+
+/// Publishes the engineer's channel details `channels`, fitted to the live channel count, and moves
+/// every musician's mix onto them, as [EngineHandle::set_channels] does. Returns whether anything
+/// changed; the details in force again touch nothing and make no connection re-send `config`.
+///
+/// The order is the one [apply_groups] keeps: the new `config` is published before any pan moves,
+/// so a phone is sent the pair before the pans its link set, and the desktop is told
+/// ([EngineEvent::ChannelsChanged]) before each moved mix ([EngineEvent::MixChanged] from
+/// [MixOrigin::Engine]). The registry is held for reading throughout, so a musician registering at
+/// the same moment is either moved here or starts from the new details.
+pub(crate) fn apply_channels(
+    targets: &TargetRegistry,
+    config: &ConfigState,
+    events: &EventBus,
+    channels: &[ChannelMeta],
+) -> bool {
+    let entries = targets.read();
+    let Some((_, live)) = config.publish_channels(channels) else {
+        return false;
+    };
+    let moved = follow_channels(&entries, &live);
+    drop(entries);
+    events.emit(EngineEvent::ChannelsChanged);
+    for address in moved {
+        events.emit(EngineEvent::MixChanged {
+            address,
+            origin: MixOrigin::Engine,
+        });
+    }
+    true
+}
+
+/// Replaces the engineer's channel details with `channels` (channel order, the first is CH 1), as
+/// [EngineHandle::set_channels] does, and returns the details now in force: one entry per input.
+///
+/// The details are checked first ([check_channels]); details that fail the check are an error
+/// naming the problem, and nothing changes.
+pub(crate) fn edit_channels(
+    targets: &TargetRegistry,
+    config: &ConfigState,
+    events: &EventBus,
+    channels: &[ChannelMeta],
+) -> Result<Vec<ChannelMeta>, String> {
+    check_channels(channels)?;
+    apply_channels(targets, config, events, channels);
+    Ok(config.snapshot().channels.clone())
 }
 
 /// Replaces the engineer's groups with `definitions` on a device with `source_channels` inputs, as
@@ -854,13 +1102,15 @@ impl EngineHandle {
             .collect();
         let announced = announced_identities(&entries);
         let links = link_statuses(&entries, &connected, Instant::now());
+        let config = self.config_state.snapshot();
         EngineStatus {
             device_name: self.device_name.clone(),
             capture_format: self.capture_format.clone(),
             control_port: self.control_port,
             sample_rate: TARGET_SAMPLE_RATE,
             source_channels: self.source_channels,
-            groups: self.config_state.snapshot().groups.clone(),
+            groups: config.groups.clone(),
+            channels: config.channels.clone(),
             channel_levels: self.levels.read(usize::from(self.source_channels)),
             stopped: self.is_stopped(),
             samples_received: self.samples_seen.load(Ordering::Relaxed),
@@ -896,8 +1146,9 @@ impl EngineHandle {
     /// the discovery beacon are untouched, and the packet sequence continues from where it was. The
     /// new stream is built and started before the old one is dropped, so a device that has vanished
     /// or a format that cannot be opened leaves the previous capture exactly as it was and returns
-    /// the error. On success, groups are re-validated (never rewritten) and connected clients are
-    /// told to rebuild when the channel count changed.
+    /// the error. On success, groups are re-validated (never rewritten), the channel details of the
+    /// inputs the new device has are kept and the rest dropped ([ChannelMeta]), and connected
+    /// clients are sent the new `config` when any of it changed.
     pub fn switch_device(&mut self, filter: Option<&str>) -> Result<CaptureFormat, Box<dyn Error>> {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
@@ -991,6 +1242,43 @@ impl EngineHandle {
         )?;
         self.group_definitions = definitions;
         Ok(groups)
+    }
+
+    /// Replaces the engineer's channel details while the engine runs, and returns the details now
+    /// in force: one entry per input of the current device, in channel order.
+    ///
+    /// `channels` is in channel order (the first entry is CH 1) and is checked first
+    /// ([check_channels]): at most 32 entries, names of at most [MAX_CHANNEL_NAME_LENGTH]
+    /// characters, stereo pairs only between two listed channels and never overlapping, and both
+    /// sides of a pair hidden or both shown. Entries past the device's last input are dropped and
+    /// inputs past the list get the defaults ([ChannelMeta::default]). A device switch later keeps
+    /// the details of the inputs the new device has and drops the rest.
+    ///
+    /// Every phone is sent the details at once in `config`. A hidden channel is silent in every
+    /// musician's mix from the next packet on; showing it again restores it, since hiding changes
+    /// no stored level. Linking a pair pans it apart in every musician's mix (the first channel 0,
+    /// the second 100) and gives its second side the first side's level, mute and solo; each such
+    /// mix takes a new revision, is sent to its phone as `mix_state` after the new `config`, and is
+    /// announced as [EngineEvent::MixChanged] after [EngineEvent::ChannelsChanged]. From then on,
+    /// whoever changes a pair's level, mute or solo (a phone or [Self::set_mix]) changes both
+    /// sides: a change to one side moves the other, and when one update changes both sides to
+    /// different values the first channel's value wins. A pair's pans stay as written: its balance
+    /// is the client's, which writes both pans.
+    ///
+    /// Details that fail the check are an error naming the problem, and nothing changes.
+    pub fn set_channels(
+        &mut self,
+        channels: Vec<ChannelMeta>,
+    ) -> Result<Vec<ChannelMeta>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(edit_channels(
+            &self.targets,
+            &self.config_state,
+            &self.events,
+            &channels,
+        )?)
     }
 
     /// Adds a UDP target while the engine runs.
@@ -2145,5 +2433,360 @@ mod tests {
             assert_eq!(config.snapshot(), before, "nothing changed");
             assert_eq!(group_levels(&registry, "192.168.1.3"), levels);
         }
+    }
+
+    fn channel(name: &str, kind: ChannelKind) -> ChannelMeta {
+        ChannelMeta {
+            name: name.to_owned(),
+            kind,
+            ..ChannelMeta::default()
+        }
+    }
+
+    fn hidden(channel: ChannelMeta) -> ChannelMeta {
+        ChannelMeta {
+            hidden: true,
+            ..channel
+        }
+    }
+
+    fn linked(channel: ChannelMeta) -> ChannelMeta {
+        ChannelMeta {
+            linked_to_next: true,
+            ..channel
+        }
+    }
+
+    #[test]
+    fn instrument_kinds_have_fixed_names_that_read_back() {
+        let names: Vec<&str> = ChannelKind::ALL.iter().map(|kind| kind.name()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "voice",
+                "guitar",
+                "bass",
+                "keys",
+                "drums",
+                "percussion",
+                "horns",
+                "strings",
+                "playback",
+                "click",
+                "other"
+            ]
+        );
+        for kind in ChannelKind::ALL {
+            assert_eq!(ChannelKind::from_name(kind.name()), Some(kind));
+        }
+        assert_eq!(ChannelKind::from_name("kazoo"), None);
+        assert_eq!(ChannelKind::default(), ChannelKind::Other);
+        assert_eq!(
+            ChannelMeta::default(),
+            channel("", ChannelKind::Other),
+            "unnamed, other, shown and on its own"
+        );
+    }
+
+    #[test]
+    fn channel_details_are_checked_before_anything_changes() {
+        use ChannelKind::{Drums, Keys, Other};
+        let accepted = vec![
+            channel("Kick", Drums),
+            linked(channel("Keys L", Keys)),
+            channel("Keys R", Keys),
+            hidden(linked(channel("Spare L", Other))),
+            hidden(channel("Spare R", Other)),
+        ];
+        assert_eq!(check_channels(&accepted), Ok(()));
+
+        for (refused, named) in [
+            (vec![ChannelMeta::default(); MAX_MIX_CHANNELS + 1], "33"),
+            (
+                vec![channel(&"x".repeat(MAX_CHANNEL_NAME_LENGTH + 1), Other)],
+                "CH 1",
+            ),
+            (
+                vec![channel("Kick", Drums), linked(channel("Pad", Keys))],
+                "CH 2",
+            ),
+            (
+                vec![
+                    linked(channel("A", Keys)),
+                    linked(channel("B", Keys)),
+                    channel("C", Keys),
+                ],
+                "CH 2",
+            ),
+            (
+                vec![linked(channel("L", Keys)), hidden(channel("R", Keys))],
+                "CH 1",
+            ),
+        ] {
+            let error = check_channels(&refused).expect_err("refused");
+            assert!(error.contains(named), "names {named}: {error}");
+        }
+        assert_eq!(
+            check_channels(&[channel(&"é".repeat(MAX_CHANNEL_NAME_LENGTH), Other)]),
+            Ok(()),
+            "a name is measured in characters, not bytes"
+        );
+    }
+
+    #[test]
+    fn channel_details_fit_the_device_keeping_what_exists_and_dropping_the_rest() {
+        use ChannelKind::{Drums, Keys, Other};
+        let details = vec![
+            channel("Kick", Drums),
+            hidden(channel("Spare", Other)),
+            linked(channel("Keys L", Keys)),
+            channel("Keys R", Keys),
+        ];
+
+        assert_eq!(fit_channels(&details, 4), details);
+        assert_eq!(
+            fit_channels(&details, 3),
+            vec![
+                channel("Kick", Drums),
+                hidden(channel("Spare", Other)),
+                channel("Keys L", Keys),
+            ],
+            "a pair whose second side is gone is no pair"
+        );
+        assert_eq!(
+            fit_channels(&details[..1], 3),
+            vec![
+                channel("Kick", Drums),
+                ChannelMeta::default(),
+                ChannelMeta::default()
+            ],
+            "an input with no details gets the defaults"
+        );
+    }
+
+    const DUO: [&str; 2] = ["192.168.1.3:50000", "192.168.1.4:50000"];
+
+    /// Two musicians on a four-channel engine with no groups.
+    fn duo() -> (TargetRegistry, ConfigState) {
+        let config = config_for(&[], 4);
+        let registry = TargetRegistry::new(
+            &DUO.map(|address| address.parse().unwrap()),
+            &config.snapshot().layout,
+        )
+        .expect("registry should build");
+        (registry, config)
+    }
+
+    /// What `musician` is sent for one four-channel frame, as the send loop mixes it.
+    fn heard(registry: &TargetRegistry, musician: &str, frame: [i16; 4]) -> Vec<i16> {
+        let address: SocketAddr = musician.parse().unwrap();
+        let mix = registry
+            .mix_state(address.ip())
+            .expect("configured")
+            .snapshot();
+        crate::mix::mix_channels(&frame, 4, mix)
+    }
+
+    #[test]
+    fn a_hidden_channel_is_silent_in_every_mix_and_showing_it_restores_it() {
+        let (registry, config) = duo();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        // Only CH 2 carries signal; its default pan is hard right.
+        let frame = [0, 10_000, 0, 0];
+        for musician in DUO {
+            assert_eq!(heard(&registry, musician, frame), [0, 10_000]);
+        }
+
+        let channels = edit_channels(
+            &registry,
+            &config,
+            &events,
+            &[
+                ChannelMeta::default(),
+                hidden(channel("Spare", ChannelKind::Other)),
+            ],
+        )
+        .expect("the details are valid");
+
+        assert_eq!(channels.len(), 4, "one entry per input");
+        assert!(channels[1].hidden);
+        assert_eq!(config.snapshot().channels, channels);
+        for musician in DUO {
+            assert_eq!(
+                heard(&registry, musician, frame),
+                [0, 0],
+                "{musician} hears nothing of it"
+            );
+        }
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [EngineEvent::ChannelsChanged],
+            "no stored mix changed"
+        );
+
+        edit_channels(&registry, &config, &events, &[]).expect("the details are valid");
+        for musician in DUO {
+            assert_eq!(heard(&registry, musician, frame), [0, 10_000]);
+        }
+    }
+
+    #[test]
+    fn linking_a_pair_pans_it_apart_for_every_musician_and_keeps_its_sides_equal() {
+        let (registry, config) = duo();
+        registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![100, 60, 30]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let generation = config.generation();
+
+        edit_channels(
+            &registry,
+            &config,
+            &events,
+            &[
+                channel("Kick", ChannelKind::Drums),
+                linked(channel("Keys L", ChannelKind::Keys)),
+                channel("Keys R", ChannelKind::Keys),
+            ],
+        )
+        .expect("the details are valid");
+
+        assert!(config.generation() > generation, "every phone is sent them");
+        assert!(config.snapshot().channels[1].linked_to_next);
+        for (musician, levels) in [("192.168.1.3", [60, 60]), ("192.168.1.4", [100, 100])] {
+            let mix = registry
+                .mix_state(ip(musician))
+                .expect("configured")
+                .current();
+            assert_eq!(&mix.pans[1..3], &[0, 100], "{musician}");
+            assert_eq!(&mix.channel_gains[1..3], &levels, "{musician}");
+        }
+        let mut expected = vec![EngineEvent::ChannelsChanged];
+        expected.extend(DUO.map(|address| EngineEvent::MixChanged {
+            address: address.parse().unwrap(),
+            origin: MixOrigin::Engine,
+        }));
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            expected,
+            "the new details are announced before the pans placed for them"
+        );
+
+        // A phone moves one side: the other follows.
+        let phone = registry
+            .mix_state(ip("192.168.1.4"))
+            .expect("configured")
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![100, 100, 45]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        assert_eq!(&phone.channel_gains[1..3], &[45, 45]);
+
+        // A musician who joins later starts with the pair panned apart.
+        registry
+            .add("192.168.1.5:50000", &config)
+            .expect("a fresh address is accepted");
+        let joined = registry
+            .mix_state(ip("192.168.1.5"))
+            .expect("added")
+            .current();
+        assert_eq!(&joined.pans[1..3], &[0, 100]);
+    }
+
+    #[test]
+    fn a_device_switch_keeps_the_details_of_the_inputs_that_remain_and_drops_the_rest() {
+        let (registry, config) = duo();
+        let events = EventBus::default();
+        edit_channels(
+            &registry,
+            &config,
+            &events,
+            &[
+                channel("Kick", ChannelKind::Drums),
+                hidden(channel("Spare", ChannelKind::Other)),
+                linked(channel("Keys L", ChannelKind::Keys)),
+                channel("Keys R", ChannelKind::Keys),
+            ],
+        )
+        .expect("the details are valid");
+        let observed = events.subscribe();
+
+        let smaller = plan_device_switch(&[], 3);
+        assert!(apply_groups(
+            &registry,
+            &config,
+            &events,
+            smaller.source_channels,
+            smaller.groups
+        ));
+
+        assert_eq!(
+            config.snapshot().channels,
+            vec![
+                channel("Kick", ChannelKind::Drums),
+                hidden(channel("Spare", ChannelKind::Other)),
+                channel("Keys L", ChannelKind::Keys),
+            ]
+        );
+        assert!(observed
+            .try_iter()
+            .any(|event| event == EngineEvent::ChannelsChanged));
+        let mix = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![100, 100, 50]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        assert_eq!(mix.hidden_channels, 0b10, "the spare input stays silent");
+        assert_eq!(
+            &mix.channel_gains[2..4],
+            &[50, 100],
+            "CH 3 is on its own now"
+        );
+
+        let back = plan_device_switch(&[], 4);
+        apply_groups(
+            &registry,
+            &config,
+            &events,
+            back.source_channels,
+            back.groups,
+        );
+        assert_eq!(
+            config.snapshot().channels[3],
+            ChannelMeta::default(),
+            "a dropped detail does not come back"
+        );
+    }
+
+    #[test]
+    fn refused_channel_details_change_nothing() {
+        let (registry, config) = duo();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let before = config.snapshot();
+
+        let error = edit_channels(
+            &registry,
+            &config,
+            &events,
+            &[linked(channel("Pad", ChannelKind::Keys))],
+        )
+        .expect_err("a pair cannot run past the last channel");
+
+        assert!(error.contains("CH 1"), "{error}");
+        assert_eq!(config.snapshot(), before);
+        assert!(observed.try_recv().is_err(), "nothing is announced");
     }
 }

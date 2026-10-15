@@ -12,8 +12,9 @@ mod targets;
 pub use capture::{list_input_devices, list_input_devices_for, AudioHost, InputDevice};
 pub use cli::{check_groups, parse_arguments, EngineConfig, GroupDefinition};
 pub use engine::{
-    start, CaptureFormat, EngineEvent, EngineHandle, EngineMeters, EngineStatus, GroupStatus,
-    MixOrigin, MusicianCounters, MusicianMeters, MusicianStatus,
+    check_channels, start, CaptureFormat, ChannelKind, ChannelMeta, EngineEvent, EngineHandle,
+    EngineMeters, EngineStatus, GroupStatus, MixOrigin, MusicianCounters, MusicianMeters,
+    MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
 };
 pub use health::{LinkHealth, LinkStatus};
 pub use mix::{MixUpdate, MixValues};

@@ -486,6 +486,7 @@ mod tests {
             sample_rate: 48_000,
             source_channels: 2,
             groups,
+            channels: Vec::new(),
             channel_levels,
             stopped: false,
             samples_received: 0,

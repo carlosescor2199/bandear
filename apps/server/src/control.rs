@@ -12,13 +12,15 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
-use crate::engine::{EngineEvent, EventBus, GroupStatus, MixOrigin};
+use crate::engine::{
+    channel_flags, fit_channels, ChannelMeta, EngineEvent, EventBus, GroupStatus, MixOrigin,
+};
 use crate::health::LinkReport;
 use crate::mix::{GroupLayout, Membership, MixState};
 use crate::protocol::{
     control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
-    parse_mix_update, parse_register_command, parse_stats_command, registered_name, ControlConfig,
-    GroupConfig,
+    parse_mix_update, parse_register_command, parse_stats_command, registered_name, ChannelConfig,
+    ControlConfig, GroupConfig,
 };
 use crate::targets::TargetRegistry;
 
@@ -65,7 +67,8 @@ impl Default for Heartbeat {
     }
 }
 
-/// What `config` tells a phone, as one immutable value: the captured channel count and the groups.
+/// What `config` tells a phone, as one immutable value: the captured channel count, the groups and
+/// the channel details.
 ///
 /// A change publishes a whole new snapshot with a higher generation (see [ConfigState::publish]),
 /// so a reader never sees a channel count paired with the groups of another configuration.
@@ -81,12 +84,26 @@ pub(crate) struct ConfigSnapshot {
     /// The membership the mixer applies: an invalid group keeps its position, so group levels stay
     /// aligned with the list, but maps no channel.
     pub(crate) layout: GroupLayout,
+    /// The engineer's channel details, exactly one entry per source channel (see [fit_channels]).
+    pub(crate) channels: Vec<ChannelMeta>,
 }
+
+/// Every snapshot field but the generation, which [ConfigState] assigns.
+struct ConfigParts {
+    source_channels: u8,
+    groups: Vec<GroupStatus>,
+    layout: GroupLayout,
+    channels: Vec<ChannelMeta>,
+}
+
+/// A published change: the configuration it replaced and the one now in force.
+pub(crate) type Published = (Arc<ConfigSnapshot>, Arc<ConfigSnapshot>);
 
 /// The live control configuration, shared by the engine and every connection.
 ///
 /// The engine publishes a new snapshot whenever what `config` says changes: the engineer edits the
-/// groups, or a device switch changes the channel count (and with it which groups are valid). Each
+/// groups or the channel details, or a device switch changes the channel count (and with it which
+/// groups are valid and which channel details remain). Each
 /// connection notices the higher generation and re-sends `config` on the same socket, so a client
 /// rebuilds its controls without losing the control channel, and a phone that registers takes the
 /// live membership for its mix. The generation is an atomic, so a connection's poll is one load; the
@@ -97,12 +114,15 @@ pub(crate) struct ConfigState {
 }
 
 impl ConfigState {
+    /// The configuration an engine starts with: its channel count and groups, and no channel
+    /// details yet (every input has the defaults).
     pub(crate) fn new(source_channels: u8, groups: Vec<GroupStatus>, layout: GroupLayout) -> Self {
         let first = ConfigSnapshot {
             generation: 1,
             source_channels,
             groups,
             layout,
+            channels: fit_channels(&[], source_channels),
         };
         Self {
             current: RwLock::new(Arc::new(first)),
@@ -125,47 +145,72 @@ impl ConfigState {
         )
     }
 
-    /// Publishes a configuration and returns the one it replaced, or `None` when it is the one in
-    /// force: an unchanged configuration keeps its generation, so no connection re-sends `config`
-    /// for nothing.
-    ///
-    /// The generation is raised while the new snapshot is held under the write lock, so a reader
-    /// that sees the new generation always reads the new snapshot.
+    /// Publishes a channel count and groups, keeping the channel details of the inputs the count
+    /// has (see [fit_channels]). Returns the configuration it replaced and the one now in force, or
+    /// `None` when nothing changed: an unchanged configuration keeps its generation, so no
+    /// connection re-sends `config` for nothing.
     pub(crate) fn publish(
         &self,
         source_channels: u8,
         groups: Vec<GroupStatus>,
         layout: GroupLayout,
-    ) -> Option<Arc<ConfigSnapshot>> {
+    ) -> Option<Published> {
+        self.publish_with(|current| ConfigParts {
+            source_channels,
+            groups,
+            layout,
+            channels: fit_channels(&current.channels, source_channels),
+        })
+    }
+
+    /// Publishes the engineer's channel details, fitted to the channel count in force (see
+    /// [fit_channels]), as [Self::publish] publishes groups.
+    pub(crate) fn publish_channels(&self, channels: &[ChannelMeta]) -> Option<Published> {
+        self.publish_with(|current| ConfigParts {
+            source_channels: current.source_channels,
+            groups: current.groups.clone(),
+            layout: current.layout.clone(),
+            channels: fit_channels(channels, current.source_channels),
+        })
+    }
+
+    /// Builds the next configuration from the one in force and publishes it unless it is the same.
+    ///
+    /// The whole step runs under the write lock, and the generation is raised while the new
+    /// snapshot is held there, so a reader that sees the new generation always reads the new
+    /// snapshot and two publishes never build on the same old one.
+    fn publish_with(&self, next: impl FnOnce(&ConfigSnapshot) -> ConfigParts) -> Option<Published> {
         let mut current = self
             .current
             .write()
             .expect("control configuration lock poisoned");
-        if current.source_channels == source_channels
-            && current.groups == groups
-            && current.layout == layout
+        let parts = next(&current);
+        if current.source_channels == parts.source_channels
+            && current.groups == parts.groups
+            && current.layout == parts.layout
+            && current.channels == parts.channels
         {
             return None;
         }
-        let generation = current.generation + 1;
-        let previous = std::mem::replace(
-            &mut *current,
-            Arc::new(ConfigSnapshot {
-                generation,
-                source_channels,
-                groups,
-                layout,
-            }),
-        );
-        self.generation.store(generation, Ordering::SeqCst);
-        Some(previous)
+        let live = Arc::new(ConfigSnapshot {
+            generation: current.generation + 1,
+            source_channels: parts.source_channels,
+            groups: parts.groups,
+            layout: parts.layout,
+            channels: parts.channels,
+        });
+        let previous = std::mem::replace(&mut *current, Arc::clone(&live));
+        self.generation.store(live.generation, Ordering::SeqCst);
+        Some((previous, live))
     }
 }
 
-/// A phone registering, or a target added by address, gets the membership in force at that moment.
+/// A phone registering, or a target added by address, gets the membership and the channel flags in
+/// force at that moment.
 impl Membership for ConfigState {
     fn new_mix(&self) -> MixState {
-        MixState::new(&self.snapshot().layout)
+        let config = self.snapshot();
+        MixState::configured(&config.layout, channel_flags(&config.channels))
     }
 }
 
@@ -174,7 +219,8 @@ impl Membership for ConfigState {
 /// Free of connection state so it can be sent on connect and re-sent on a change from the same
 /// code, which is what keeps the two messages identical in shape. The groups are the mixer's: an
 /// invalid group is announced in its position with no channel, so the phone's group levels, which
-/// are positional, stay aligned with the server's.
+/// are positional, stay aligned with the server's. The channel details hold one entry per source
+/// channel (see [ChannelConfig]).
 fn config_message(config: &ConfigSnapshot) -> Result<String, serde_json::Error> {
     serde_json::to_string(&ControlConfig {
         message_type: "config",
@@ -188,6 +234,16 @@ fn config_message(config: &ConfigSnapshot) -> Result<String, serde_json::Error> 
                 id: group.id.clone(),
                 name: group.name.clone(),
                 channels: group.channels.clone(),
+            })
+            .collect(),
+        channels: config
+            .channels
+            .iter()
+            .map(|channel| ChannelConfig {
+                name: channel.name.clone(),
+                kind: channel.kind.name(),
+                hidden: channel.hidden,
+                link: channel.linked_to_next,
             })
             .collect(),
     })
@@ -755,7 +811,7 @@ fn log_missed_heartbeat(peer: SocketAddr, dead_after: Duration) {
 mod tests {
     use super::*;
     use crate::cli::GroupDefinition;
-    use crate::engine::revalidate_groups;
+    use crate::engine::{revalidate_groups, ChannelKind};
 
     fn definition(id: &str, name: &str, channels: &[usize]) -> GroupDefinition {
         GroupDefinition {
@@ -1303,6 +1359,117 @@ mod tests {
         assert_eq!(new_config["groups"][0]["id"], "vox");
         let levels: Vec<u8> = serde_json::from_value(moved["group_levels"].clone()).unwrap();
         assert_eq!(&levels[..2], &[70, 30], "each level moved with its group");
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// No details, then Keys L and Keys R linked on CH 2 and CH 3 of a four-channel device.
+    fn linked_keys() -> Vec<ChannelMeta> {
+        vec![
+            ChannelMeta::default(),
+            ChannelMeta {
+                name: "Keys L".to_owned(),
+                kind: ChannelKind::Keys,
+                hidden: false,
+                linked_to_next: true,
+            },
+            ChannelMeta {
+                name: "Keys R".to_owned(),
+                kind: ChannelKind::Keys,
+                hidden: false,
+                linked_to_next: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn config_carries_one_channel_entry_per_input_with_its_details() {
+        let config = live_config(&drums(), 4);
+        let read = |config: &ConfigState| -> serde_json::Value {
+            serde_json::from_str(&config_message(&config.snapshot()).expect("serializes"))
+                .expect("config is JSON")
+        };
+        let unnamed =
+            serde_json::json!({ "name": "", "kind": "other", "hidden": false, "link": false });
+
+        assert_eq!(
+            read(&config)["channels"],
+            serde_json::Value::Array(vec![unnamed.clone(); 4])
+        );
+
+        assert!(config.publish_channels(&linked_keys()).is_some());
+        let channels = read(&config)["channels"].clone();
+        assert_eq!(channels.as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            channels[1],
+            serde_json::json!({ "name": "Keys L", "kind": "keys", "hidden": false, "link": true })
+        );
+        assert_eq!(
+            channels[2],
+            serde_json::json!({ "name": "Keys R", "kind": "keys", "hidden": false, "link": false })
+        );
+        assert_eq!(channels[3], unnamed);
+        assert!(
+            config.publish_channels(&linked_keys()).is_none(),
+            "the same details are no change"
+        );
+    }
+
+    /// The order a phone needs when the engineer links a pair while it is connected: the `config`
+    /// that says CH 2 and CH 3 are one pair first, then the `mix_state` with the pans the link set,
+    /// so the phone never shows a pair's pans before it knows the pair.
+    #[tokio::test]
+    async fn after_linking_a_pair_the_phone_gets_the_channel_details_before_its_moved_pans() {
+        let config = live_config(&[], 4);
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &config.snapshot().layout,
+            )
+            .expect("registry should build"),
+        );
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_on(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+            Arc::clone(&config),
+        );
+        let mut client = connect_client(address).await;
+
+        crate::engine::edit_channels(&targets, &config, &events, &linked_keys())
+            .expect("the details are valid");
+
+        let mut new_config = None;
+        let moved = loop {
+            let message = read_next_message(&mut client)
+                .await
+                .expect("the link reaches the phone");
+            match message["type"].as_str() {
+                Some("config") => new_config = Some(message),
+                Some("mix_state") => break message,
+                _ => {}
+            }
+        };
+        let new_config = new_config
+            .unwrap_or_else(|| panic!("the moved pans {moved} arrived before the channel details"));
+        assert_eq!(new_config["channels"][1]["link"], true);
+        assert_eq!(new_config["channels"][1]["name"], "Keys L");
+        let pans: Vec<u8> = serde_json::from_value(moved["pans"].clone()).unwrap();
+        assert_eq!(&pans[1..3], &[0, 100], "CH 2 hard left, CH 3 hard right");
+
+        // The phone moves one side of the pair; the server keeps the other with it.
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"channels":[100,100,40]}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+        let levels: Vec<u8> = serde_json::from_value(ack["channels"].clone()).unwrap();
+        assert_eq!(&levels[..4], &[100, 40, 40, 100]);
 
         stop_server(address, &stopped, server).await;
     }

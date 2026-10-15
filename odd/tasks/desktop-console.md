@@ -250,7 +250,26 @@ user's decision.
     `apply`; today only tests call it, but route remaining writers through `apply` (or lock in
     `update`) and add a two-thread test with disjoint fields.
   - Both resolved in T2b.
+- T3 98591c3: assessed medium, `slice_budget_reached`; lineage `review-ce50c64b6cdc565f` over
+  0c4b94e..98591c3 approved and acknowledged. Its WARNING (a stale push can desync the phone
+  screen) was fixed by T3b.
+- T3b a370a41, T2b db3e52a, T4 0f24924: lineage `review-1eaa1107d35a2b32` over 98591c3..0f24924
+  approved and acknowledged. Its two WARNINGs on T3b's counting (an ack arriving before a queued
+  send could undo the last fader step; any `error` lowered the count) were fixed by T3c.
+- T3c f272010: lineage `review-7609fdd2a1f59631` over 0f24924..f272010 approved and acknowledged.
+  Next review base: f272010. Non-blocking notes:
+  - WARNING R3-001 (not actionable): a server that sends `mix_state` but does not echo `seq`
+    would leave the phone unsettled; that server exists only at 0f24924 on this unmerged
+    branch (released servers never send `mix_state`, and from T3c on they always echo `seq`).
+  - SUGGESTION R3-002: Android has no test for a negative or non-numeric `seq` being ignored.
+- Follow-up T4b (before T6): engine meter peaks decay on every read (7/8), so the 30 Hz meter
+  stream, the 4 Hz status events and the old UI's polling together make the falloff depend on
+  how many readers there are. The falloff must depend on time, and status reads must not decay
+  the meters.
+- Follow-up (T3c report): on the first connect the phone sends its mix before `config` arrives,
+  with empty channel lists; the server keeps its earlier levels while the phone shows neutral
+  strips. Adopt the server's answer after `config`.
 
 ## Next step
 
-T5.
+T4b, then T5.

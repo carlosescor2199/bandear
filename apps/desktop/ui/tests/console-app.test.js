@@ -365,13 +365,70 @@ test("ASIO starts only on a driver the engineer picked", async () => {
   const { fake, app } = await connected();
 
   const refused = await app.applyAudio({ host: "asio" });
-  assert.deepEqual(refused, { ok: false, message: "Pick an ASIO driver first." });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /Network and system/);
   assert.equal(commands(fake, "start_engine").length, 0, "nothing loaded a driver");
 
   await app.applyAudio({ host: "asio" }, { deviceFilter: "Volt ASIO" });
   assert.deepEqual(startConfigs(fake).map(({ host, deviceFilter }) => [host, deviceFilter]), [
     ["asio", "Volt ASIO"],
   ]);
+  app.dispose();
+});
+
+const ASIO = "Demo ASIO driver";
+
+function lastStart(fake) {
+  const { host, deviceFilter } = startConfigs(fake).at(-1);
+  return [host, deviceFilter];
+}
+
+test("after ASIO was applied, a plain start and a start after a stop use the picked driver", async () => {
+  const { fake, app } = await connected();
+  await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO });
+
+  await app.stop();
+  await app.start();
+
+  assert.deepEqual(lastStart(fake), ["asio", ASIO]);
+  app.dispose();
+});
+
+test("the automatic start after a reconnect uses the picked ASIO driver", async () => {
+  const { fake, app } = await connected();
+  await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO });
+  await fake.invoke("stop_engine");
+
+  await app.reconnect();
+
+  assert.deepEqual(lastStart(fake), ["asio", ASIO]);
+  app.dispose();
+});
+
+test("ASIO without a picked driver never reaches the engine, and says where to pick one", async () => {
+  const { fake, app } = await connected();
+  await app.stop();
+  app.setAudio({ host: "asio" });
+
+  await app.start();
+
+  assert.equal(commands(fake, "start_engine").length, 0);
+  assert.equal(app.store.getState().engine.phase, "error");
+  assert.match(app.store.getState().engine.error, /Network and system/);
+  app.dispose();
+});
+
+test("a failed ASIO start keeps the settings that were applied; a successful one applies it", async () => {
+  const { fake, app } = await connected();
+  fake.failStart("the driver did not load");
+
+  const failed = await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO });
+
+  assert.deepEqual(failed, { ok: false, error: "the driver did not load" });
+  assert.deepEqual(app.store.getState().audio, { host: "auto", bufferFrames: 256, asioDriver: null });
+  fake.failStart(null);
+  assert.deepEqual(await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO }), { ok: true });
+  assert.deepEqual(app.store.getState().audio, { host: "asio", bufferFrames: 256, asioDriver: ASIO });
   app.dispose();
 });
 

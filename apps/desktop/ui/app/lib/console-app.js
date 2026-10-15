@@ -29,7 +29,7 @@ import {
   musicianByAddress,
   pendingEdits,
 } from "./console-state.js";
-import { audioChoice, startRequest } from "./engine-config.js";
+import { ASIO_NEEDS_DRIVER, audioChoice, startRequest } from "./engine-config.js";
 import { buildMixRequest } from "./mix.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { createStore } from "./store.js";
@@ -119,21 +119,35 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     timer.unref?.();
   }
 
-  // Starts (or restarts) the engine with the applied audio choices, on `deviceFilter` when named.
-  async function start({ deviceFilter = null } = {}) {
+  // Starts (or restarts) the engine with `audio`, the applied choices unless given, on
+  // `deviceFilter` when named. Every start is built by startRequest, which never builds an ASIO
+  // start without a picked driver. Answers `{ ok: true }` or `{ ok: false, error }`.
+  async function start({ deviceFilter = null, audio = store.getState().audio } = {}) {
+    const request = startRequest(audio, { deviceFilter });
+    if (!request) {
+      // Nothing reaches the engine, so an engine that runs keeps running.
+      const running = store.getState().engine.status !== null;
+      store.dispatch(
+        running
+          ? actions.commandFailed("start", ASIO_NEEDS_DRIVER)
+          : actions.engine("error", ASIO_NEEDS_DRIVER),
+      );
+      return { ok: false, error: ASIO_NEEDS_DRIVER };
+    }
     store.dispatch(actions.engine("starting"));
     try {
-      await api.start(startRequest(store.getState().audio, { deviceFilter }));
+      await api.start(request);
     } catch (error) {
       // A failed start has stopped the engine it replaced and started none.
       store.dispatch(actions.engine("error", message(error)));
-      return;
+      return { ok: false, error: message(error) };
     }
     // The engine runs now: failing to read its status must not end its run.
     const error = await readStatus();
     if (error) {
       fillAfterStart(error);
     }
+    return { ok: true };
   }
 
   async function stop() {
@@ -224,22 +238,28 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
 
   // Applies a driver or buffer change by restarting the engine, as a DAW does: on the device in
   // use with `keepDevice`, on `deviceFilter` when named, else on the driver's first device. ASIO
-  // loads a kernel-mode driver, so it is only ever started on a driver the engineer picked.
+  // loads a kernel-mode driver, so it only ever starts on a driver the engineer picked, which
+  // stays the applied driver for every later start. The choices are applied only once the engine
+  // started with them: a failed start keeps the previous ones. Answers like `start`.
   async function applyAudio(change, { deviceFilter = null, keepDevice = false } = {}) {
     const state = store.getState();
     const device = keepDevice ? (state.engine.status?.deviceName ?? null) : deviceFilter;
-    if (audioChoice(state.audio, change).host === "asio" && !device) {
-      return { ok: false, message: "Pick an ASIO driver first." };
+    let next = audioChoice(state.audio, change);
+    if (next.host === "asio" && device) {
+      next = { ...next, asioDriver: device };
     }
-    store.dispatch(actions.audio(change));
-    await start({ deviceFilter: device });
-    return { ok: true };
+    const result = await start({ deviceFilter: device, audio: next });
+    if (result.ok) {
+      store.dispatch(actions.audio(next));
+    }
+    return result;
   }
 
-  // Switches the input device: live under WASAPI, by a restart on that device otherwise.
+  // Switches the input device: live under WASAPI, by a restart on that device otherwise (under
+  // ASIO the device picked becomes the applied driver).
   async function switchDevice(name) {
     if (switchMethod(store.getState().audio) === "restart") {
-      await start({ deviceFilter: name });
+      await applyAudio({}, { deviceFilter: name });
       return;
     }
     try {

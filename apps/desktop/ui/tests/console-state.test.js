@@ -460,13 +460,13 @@ test("a musician who was not open leaving says nothing", () => {
 });
 
 test("the audio choices start on the system's own driver at 256 frames, and ASIO only when chosen", () => {
-  assert.deepEqual(initialState.audio, { host: "auto", bufferFrames: 256 });
+  assert.deepEqual(initialState.audio, { host: "auto", bufferFrames: 256, asioDriver: null });
 
-  const asio = reduce([actions.audio({ host: "asio" })]);
-  assert.deepEqual(asio.audio, { host: "asio", bufferFrames: 256 });
+  const asio = reduce([actions.audio({ host: "asio", asioDriver: "Volt ASIO" })]);
+  assert.deepEqual(asio.audio, { host: "asio", bufferFrames: 256, asioDriver: "Volt ASIO" });
 
   const odd = reduce([actions.audio({ host: "kernel", bufferFrames: 0 })]);
-  assert.deepEqual(odd.audio, { host: "auto", bufferFrames: null });
+  assert.deepEqual(odd.audio, { host: "auto", bufferFrames: null, asioDriver: null });
 });
 
 test("a failed stop keeps the run and its musicians, and says what failed", () => {

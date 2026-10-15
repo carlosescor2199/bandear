@@ -436,6 +436,18 @@ user's decision.
   needs its view model, controller commands, two organisms and the container to replace the
   old window's features, which are deleted in the same series.
   Commit: this commit.
+- [x] T7b (review correction, lineage `review-1b73ee8c1982ea16` R3-001 CRITICAL): ASIO started
+  only on a picked driver inside `applyAudio`; later plain starts (Start, the auto start after a
+  reconnect, a start after a stop) asked for host "asio" with no device, so the engine would load
+  the first ASIO driver. Now the applied audio keeps `asioDriver`, and `startRequest`, which
+  every start goes through, names it or builds no request (`ASIO_NEEDS_DRIVER`, pointing to
+  Network and system; a running engine keeps running). `applyAudio` applies the choices only
+  after the start succeeded and answers `{ ok: false, error }` otherwise, so the old settings
+  and the screen's ASIO draft stay. Route: delegated writer. RED observed: 9 of 179 node tests
+  failed (a start after a stop and the reconnect auto start without the driver, an ASIO start
+  without one reaching the engine, a failed apply leaving "asio" applied, the settings shape).
+  GREEN: `fnm exec --using=default node --test apps/desktop/ui/tests` 179 passed (4 new).
+  Commit: this commit.
 
 ## Progress
 

@@ -316,8 +316,11 @@ boundaries if a smaller review is wanted.
 
 ## Status and next steps
 
-- Code complete: T1 to T4 are done. Every slice range up to `9fbbd13` has an approved native
-  review; `0fc844c` (T4) is reviewed together with this documentation commit.
+- Code complete: T1 to T4 are done, and every slice range has an approved native review. Review 5
+  (lineage `review-4092210b379c3d3f`, range `9fbbd13..b94d55a`, T4 and its live notes) was
+  approved and acknowledged with two suggestions kept as follow-ups: a test for a ping write that
+  stalls past the deadline (R3-001), and inbound frames are not read while a ping waits for the
+  writer lock, so the deadline can be judged on stale input in that rare case (R3-002).
 - Final checks: `cargo test -p personal-monitoring` 159 passed, `cargo test -p mixlink-desktop` 21
   passed, Android JVM tests 81 passed with the debug APK assembled (no Android change since).
 - Verified live on the S23 with the desktop: green on clean Wi-Fi, red ("lost") with Wi-Fi off,

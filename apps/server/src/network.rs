@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use crate::engine::{LevelMeter, METER_IDLE_FRAMES, METER_IDLE_WAIT};
 use crate::mix::{mix_channels, OUTPUT_CHANNELS};
 use crate::protocol::{serialize_packet, AudioPacket};
 use crate::targets::TargetRegistry;
@@ -31,14 +32,30 @@ pub(crate) struct TargetCounters {
 /// engine can add and remove targets at runtime without restarting this thread, the capture stream
 /// or the control server. Each entry carries its own mix state and counters, so one packet's send
 /// loop never looks anything up by IP and can never fail on a missing entry.
+///
+/// The meters fall with the audio, so when no packet arrives for [METER_IDLE_WAIT] the thread lets
+/// the input meters (`levels`) and every musician's output meter fall by that much silence: a
+/// capture that stopped delivering then reads as silence instead of freezing on its last level.
 pub(crate) fn spawn_network_thread(
     packet_receiver: Receiver<AudioPacket>,
     targets: Arc<TargetRegistry>,
     packet_stats: Arc<PacketStats>,
+    levels: Arc<LevelMeter>,
 ) -> Result<JoinHandle<()>, Box<dyn Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    Ok(thread::spawn(move || {
-        for packet in packet_receiver {
+    Ok(thread::spawn(move || loop {
+        let packet = match packet_receiver.recv_timeout(METER_IDLE_WAIT) {
+            Ok(packet) => packet,
+            Err(RecvTimeoutError::Timeout) => {
+                levels.fall(METER_IDLE_FRAMES);
+                for entry in targets.read().iter() {
+                    entry.output_meter.fall(METER_IDLE_FRAMES);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        {
             let entries = targets.read();
             for entry in entries.iter() {
                 let samples = mix_channels(
@@ -46,7 +63,7 @@ pub(crate) fn spawn_network_thread(
                     usize::from(packet.channels),
                     entry.mix_state.snapshot(),
                 );
-                // Two atomic maxima on the buffer just mixed: no allocation, lock or clock.
+                // Two atomic updates on the buffer just mixed: no allocation, lock or clock.
                 entry.output_meter.observe(&samples);
                 let target_packet = AudioPacket {
                     channels: OUTPUT_CHANNELS,
@@ -111,6 +128,10 @@ mod tests {
         })
     }
 
+    fn inputs() -> Arc<LevelMeter> {
+        Arc::new(LevelMeter::new())
+    }
+
     /// Removal happens under the registry's write lock, before the next packet is queued, so the
     /// send thread must see the shorter table on the next packet: the removed target gets nothing,
     /// the kept one keeps streaming, and the thread is never restarted.
@@ -123,7 +144,7 @@ mod tests {
             kept.local_addr().expect("kept address"),
         ]);
         let (sender, receiver) = sync_channel(4);
-        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats())
+        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats(), inputs())
             .expect("network thread should spawn");
 
         sender.send(packet()).expect("packet should queue");
@@ -159,7 +180,7 @@ mod tests {
             })
             .expect("a valid update applies");
         let (sender, receiver) = sync_channel(4);
-        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats())
+        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats(), inputs())
             .expect("network thread should spawn");
 
         sender
@@ -168,9 +189,45 @@ mod tests {
                 ..packet()
             })
             .expect("packet should queue");
+        // Closing the queue right away ends the thread after this packet, before any wait could
+        // count as silence, so the level read below is exactly the packet's.
+        drop(sender);
+        thread
+            .join()
+            .expect("thread should exit when the sender drops");
         assert!(receive(&phone, Duration::from_secs(2)).is_some());
 
-        assert_eq!(targets.read()[0].output_meter.decayed(), [45, 30]);
+        assert_eq!(targets.read()[0].output_meter.read(), [45, 30]);
+    }
+
+    /// When the capture stops delivering, no audio time passes for a meter to fall by. The send
+    /// loop counts its wait as silence, so the input and output meters fall to zero instead of
+    /// freezing on the last level.
+    #[test]
+    fn meters_fall_to_zero_when_the_audio_stops() {
+        let phone = bind("127.0.0.1:0");
+        let targets = registry(&[phone.local_addr().expect("phone address")]);
+        let inputs = Arc::new(LevelMeter::new());
+        let (sender, receiver) = sync_channel(4);
+        let thread =
+            spawn_network_thread(receiver, Arc::clone(&targets), stats(), Arc::clone(&inputs))
+                .expect("network thread should spawn");
+
+        // What the capture callback does with its last block before the device goes quiet.
+        inputs.observe(&[9_830, 6_554], 2);
+        sender
+            .send(AudioPacket {
+                samples: vec![9_830, 6_554],
+                ..packet()
+            })
+            .expect("packet should queue");
+        assert!(receive(&phone, Duration::from_secs(2)).is_some());
+
+        // About 30 steps of 720 frames is 0.45 s of audio; wait well past it with nothing sent.
+        std::thread::sleep(Duration::from_secs(1));
+
+        assert_eq!(targets.read()[0].output_meter.read(), [0, 0]);
+        assert_eq!(inputs.read(2), vec![0, 0]);
 
         drop(sender);
         thread
@@ -186,7 +243,7 @@ mod tests {
         let second = bind("127.0.0.2:0");
         let targets = registry(&[first.local_addr().expect("first address")]);
         let (sender, receiver) = sync_channel(4);
-        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats())
+        let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats(), inputs())
             .expect("network thread should spawn");
 
         sender.send(packet()).expect("packet should queue");

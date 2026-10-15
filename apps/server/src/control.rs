@@ -1042,6 +1042,7 @@ mod tests {
                 sent: std::sync::atomic::AtomicU64::new(0),
                 discarded: std::sync::atomic::AtomicU64::new(0),
             }),
+            Arc::new(crate::engine::LevelMeter::new()),
         )
         .expect("network thread should spawn");
         sender
@@ -1137,6 +1138,7 @@ mod tests {
                 sent: std::sync::atomic::AtomicU64::new(0),
                 discarded: std::sync::atomic::AtomicU64::new(0),
             }),
+            Arc::new(crate::engine::LevelMeter::new()),
         )
         .expect("network thread should spawn");
         sender

@@ -227,6 +227,23 @@ user's decision.
   `cargo build -p mixlink-desktop` ok, no new clippy warnings. About 1,230 changed lines, mostly
   tests and docs: over the 400-line heuristic because the pump's lifecycle is only proven with its
   thread, fakes and the command layer together. Commit: this commit.
+- [x] T4b (meters fall with audio time, follow-up of T4): reading a meter is a pure load, so the
+  meter stream, the status events and the old UI's polling see the same level however often they
+  read. The writers own the falloff: the capture callback (input) and the send loop (output) store
+  `max(peak, held - frames)`, the block's length in frames at the packaged 48 kHz rate being the
+  elapsed time (atomics only, no clock, lock or allocation). The release is set in one place,
+  `LEVEL_FALL_MS` in `engine.rs`: full scale to silence in 1.5 s, linear on the 0-100 scale, one
+  step every 720 frames; the shown level rounds up, so a peak shows at once and for a whole step.
+  A capture that stops delivering passes no audio time, so the send loop counts a 100 ms wait
+  with no packet as 100 ms of silence for every meter (it waits on the packet queue anyway), and
+  the engine clears every meter when it stops and the input meters on a device switch. Route:
+  delegated writer. RED observed: against the old code, `reading_a_meter_never_lowers_it`,
+  `a_held_level_falls_one_step_every_720_frames_of_audio`,
+  `a_new_peak_above_the_fallen_level_shows_at_once` and the send loop's stall test failed (4 of
+  204); then 26 compile errors (`read`, `clear_meters`, the send loop's input-meter parameter
+  missing). GREEN: `cargo test -p personal-monitoring` 204 passed (5 new, 1 read-decay test
+  removed; the stall test 3 of 3 runs), `cargo test -p mixlink-desktop` 41 passed,
+  `cargo build -p mixlink-desktop` ok, no new clippy warnings. Commit: this commit.
 - [ ] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the
   state store and pure helpers with `node --test` tests; the old UI still runs. Route: delegated
   writer.
@@ -265,11 +282,11 @@ user's decision.
 - Follow-up T4b (before T6): engine meter peaks decay on every read (7/8), so the 30 Hz meter
   stream, the 4 Hz status events and the old UI's polling together make the falloff depend on
   how many readers there are. The falloff must depend on time, and status reads must not decay
-  the meters.
+  the meters. Resolved in T4b.
 - Follow-up (T3c report): on the first connect the phone sends its mix before `config` arrives,
   with empty channel lists; the server keeps its earlier levels while the phone shows neutral
   strips. Adopt the server's answer after `config`.
 
 ## Next step
 
-T4b, then T5.
+T5.

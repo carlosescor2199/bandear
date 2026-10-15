@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -139,8 +139,8 @@ pub struct EngineStatus {
     /// One 0-100 source-channel peak per channel, index-aligned with the source channels.
     ///
     /// The value is measured before mixing, so it describes the input rather than any one
-    /// musician's output, and it carries a decay from one read to the next so a poller at a few
-    /// hertz sees a level that rises immediately and falls smoothly.
+    /// musician's output. It rises at once and falls with the audio (full scale to silence in
+    /// 1.5 s), whoever reads it and however often: reading never changes it.
     pub channel_levels: Vec<u8>,
     pub stopped: bool,
     pub samples_received: u64,
@@ -288,33 +288,53 @@ pub(crate) fn link_statuses(
         .collect()
 }
 
-/// The fixed decay applied to a held peak each time the level is read.
+/// How long a held full-scale peak takes to fall to silence, in milliseconds of audio.
 ///
-/// The desktop's meter stream reads about 30 times a second, so an integer multiply by 7/8 per
-/// read halves a peak in about 150 ms (roughly 35 dB a second, a usual digital meter release); a
-/// status read at a few hertz adds one more step. It is deliberately not a time source: the audio
-/// callback must stay free of clock reads, and a read-rate-relative falloff is enough for a level
-/// that only has to look alive.
-const LEVEL_DECAY_NUMERATOR: u8 = 7;
-const LEVEL_DECAY_DENOMINATOR: u8 = 8;
+/// The one place the meters' release is set. The fall is linear on the 0-100 scale and is
+/// measured in audio, not in reads: the writer that raises a level also lowers it by the length of
+/// each block, so every reader (the meter stream, the status, a poller) sees the same level however
+/// often it reads, and reading never changes a meter.
+const LEVEL_FALL_MS: u32 = 1_500;
 
-/// One read's decay of a held peak.
-fn decay_level(value: u8) -> u8 {
-    // Widened so a full-scale 100 times the numerator cannot overflow a u8.
-    (u16::from(value) * u16::from(LEVEL_DECAY_NUMERATOR) / u16::from(LEVEL_DECAY_DENOMINATOR)) as u8
+/// Audio frames at the packaged rate per one-step fall on the 0-100 scale: 720 at 48 kHz.
+///
+/// Both meters see audio at the packaged rate (the capture decimates before measuring, and every
+/// packet carries that rate), so a block's length in frames is its length in time.
+const FRAMES_PER_LEVEL: u32 = TARGET_SAMPLE_RATE / 1_000 * LEVEL_FALL_MS / 100;
+
+/// Lowers a held level by `frames` of audio and raises it to this block's `peak`:
+/// `max(peak, held - frames)`, so a new peak shows at once and a quieter block lets it fall.
+///
+/// A held level is stored in frames, one unit per frame of fall, so the arithmetic is exact. Only
+/// atomics are touched (no lock, clock or allocation), and `fetch_update` keeps a concurrent
+/// writer's raise (the outgoing and incoming streams overlap for a moment during a device switch).
+fn hold_peak(held: &AtomicU32, peak: u8, frames: usize) {
+    let peak = u32::from(peak) * FRAMES_PER_LEVEL;
+    let fall = u32::try_from(frames).unwrap_or(u32::MAX);
+    // The closure always returns `Some`, so the update cannot fail.
+    let _ = held.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(peak.max(value.saturating_sub(fall)))
+    });
 }
 
-/// Reads a held peak and decays it for the next read.
-///
-/// `fetch_update` retries against a concurrent raise instead of clobbering a peak the audio or
-/// network thread raised in between, so a busy reader never eats a transient.
-fn take_decayed(level: &AtomicU8) -> u8 {
-    level
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(decay_level(value))
-        })
-        .unwrap_or(0)
+/// The 0-100 level a held value shows: a pure load. Rounded up, so a peak shows for a whole step
+/// before it starts to fall, and only a level that has fallen all the way reads zero.
+fn shown_level(held: &AtomicU32) -> u8 {
+    held.load(Ordering::Relaxed)
+        .div_ceil(FRAMES_PER_LEVEL)
+        .min(100) as u8
 }
+
+/// How long the send loop waits for a packet before it counts the wait as silence for the meters.
+///
+/// A capture that stops delivering (a device that vanished, a stopped stream) passes no audio time,
+/// so an audio-time fall alone would freeze the last level. The send loop waits on the packet queue
+/// anyway; when nothing arrives for this long, it lowers every meter by this much audio.
+pub(crate) const METER_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [METER_IDLE_WAIT] in frames at the packaged rate.
+pub(crate) const METER_IDLE_FRAMES: usize =
+    (TARGET_SAMPLE_RATE as usize) * (METER_IDLE_WAIT.as_millis() as usize) / 1_000;
 
 /// Converts a full-scale-relative sample magnitude into a 0-100 peak.
 ///
@@ -325,23 +345,24 @@ fn peak_to_level(peak: u16) -> u8 {
     ((u32::from(peak) * 100) / 32767).min(100) as u8
 }
 
-/// Per-source-channel peak levels, measured on the audio thread and held for the UI to poll.
+/// Per-source-channel peak levels, measured on the audio thread and held for the UI to read.
 ///
-/// The audio callback raises each channel's held peak with [observe], which is allocation-free and
-/// does one max-scan over the already-decimated samples. Reading with [decayed] applies the decay,
-/// so the cost of decaying sits on the polling path, never on the audio thread.
+/// The audio callback raises and lowers each channel's held level with [observe], which is
+/// allocation-free and does one max-scan over the already-decimated samples. Reading is a pure
+/// load, so any number of readers see the same level.
 pub(crate) struct LevelMeter {
-    levels: [AtomicU8; MAX_MIX_CHANNELS],
+    levels: [AtomicU32; MAX_MIX_CHANNELS],
 }
 
 impl LevelMeter {
     pub(crate) fn new() -> Self {
         Self {
-            levels: std::array::from_fn(|_| AtomicU8::new(0)),
+            levels: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
 
-    /// Raises each channel's held peak to this block's peak. Called from the audio callback.
+    /// Lets each channel's held level fall by this block's length and raises it to the block's
+    /// peak (see [hold_peak]). Called from the audio callback.
     ///
     /// Memory order is `Relaxed` on both sides: a meter reading that lags one callback is
     /// irrelevant, and the value carries no other state, so no synchronisation is warranted. The
@@ -359,18 +380,31 @@ impl LevelMeter {
                     peak = magnitude;
                 }
             }
-            level.fetch_max(peak_to_level(peak), Ordering::Relaxed);
+            hold_peak(level, peak_to_level(peak), frames);
         }
     }
 
-    /// Reads the held peaks and decays them for the next read.
+    /// Lets every channel fall by `frames` of silence, for a wait in which no audio arrived.
+    pub(crate) fn fall(&self, frames: usize) {
+        for level in &self.levels {
+            hold_peak(level, 0, frames);
+        }
+    }
+
+    /// Returns every channel to zero, for a capture that stopped or was replaced.
+    pub(crate) fn clear(&self) {
+        for level in &self.levels {
+            level.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// One level per source channel, in channel order; a pure load that changes nothing.
     ///
-    /// Returns one level per source channel, in channel order. A concurrent [observe] is never
-    /// clobbered (see [take_decayed]). Channels beyond the metered maximum read as zero, matching
-    /// the mixer, which also ignores them.
-    pub(crate) fn decayed(&self, channels: usize) -> Vec<u8> {
+    /// Channels beyond the metered maximum read as zero, matching the mixer, which also ignores
+    /// them.
+    pub(crate) fn read(&self, channels: usize) -> Vec<u8> {
         (0..channels)
-            .map(|channel| self.levels.get(channel).map_or(0, take_decayed))
+            .map(|channel| self.levels.get(channel).map_or(0, shown_level))
             .collect()
     }
 }
@@ -391,30 +425,46 @@ fn stereo_peak(stereo: &[i16]) -> [u8; 2] {
 
 /// The left and right peak of one musician's mixed output, held for the meter read.
 ///
-/// The send loop raises it right after mixing, so it reads what that musician's phone is sent:
-/// after their gains, pans, solos, mutes, master and level cap. Like [LevelMeter], raising costs
-/// one pass over the block and two `Relaxed` atomic maxima, with no allocation, lock or clock, and
-/// reading decays.
+/// The send loop updates it right after mixing, so it reads what that musician's phone is sent:
+/// after their gains, pans, solos, mutes, master and level cap. Like [LevelMeter], an update costs
+/// one pass over the block and two atomic updates, with no allocation, lock or clock, the level
+/// falls with the audio, and reading is a pure load.
 #[derive(Default)]
 pub(crate) struct OutputMeter {
-    levels: [AtomicU8; 2],
+    levels: [AtomicU32; 2],
 }
 
 impl OutputMeter {
-    /// Raises the held peaks to this block's. A buffer that is not whole stereo frames is not a
-    /// mixed output and is ignored, as [LevelMeter::observe] ignores incomplete frames.
+    /// Lets the held levels fall by this block's length and raises them to its peaks (see
+    /// [hold_peak]). A buffer that is not whole stereo frames is not a mixed output and is ignored,
+    /// as [LevelMeter::observe] ignores incomplete frames.
     pub(crate) fn observe(&self, stereo: &[i16]) {
         if !stereo.len().is_multiple_of(2) {
             return;
         }
+        let frames = stereo.len() / 2;
         for (level, peak) in self.levels.iter().zip(stereo_peak(stereo)) {
-            level.fetch_max(peak, Ordering::Relaxed);
+            hold_peak(level, peak, frames);
         }
     }
 
-    /// Reads the held left and right peaks and decays them for the next read.
-    pub(crate) fn decayed(&self) -> [u8; 2] {
-        [take_decayed(&self.levels[0]), take_decayed(&self.levels[1])]
+    /// Lets both sides fall by `frames` of silence, for a wait in which no audio arrived.
+    pub(crate) fn fall(&self, frames: usize) {
+        for level in &self.levels {
+            hold_peak(level, 0, frames);
+        }
+    }
+
+    /// Returns both sides to zero, for a capture that stopped.
+    pub(crate) fn clear(&self) {
+        for level in &self.levels {
+            level.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The left and right levels; a pure load that changes nothing.
+    pub(crate) fn read(&self) -> [u8; 2] {
+        [shown_level(&self.levels[0]), shown_level(&self.levels[1])]
     }
 }
 
@@ -439,21 +489,34 @@ pub struct MusicianMeters {
     pub output_levels: [u8; 2],
 }
 
-/// Reads and decays the input peaks of `channels` source channels and every musician's output peak.
+/// Reads the input levels of `channels` source channels and every musician's output level. A pure
+/// read: it changes no meter.
 pub(crate) fn read_meters(
     levels: &LevelMeter,
     channels: usize,
     entries: &[TargetEntry],
 ) -> EngineMeters {
     EngineMeters {
-        channel_levels: levels.decayed(channels),
+        channel_levels: levels.read(channels),
         musicians: entries
             .iter()
             .map(|entry| MusicianMeters {
                 address: entry.address,
-                output_levels: entry.output_meter.decayed(),
+                output_levels: entry.output_meter.read(),
             })
             .collect(),
+    }
+}
+
+/// Returns every input and output meter to zero.
+///
+/// A stopped capture delivers no more audio, so no audio time passes for the levels to fall by,
+/// and the send loop that would count the silence has ended too; the engine clears the meters
+/// instead, so a reader never sees the last level frozen.
+pub(crate) fn clear_meters(levels: &LevelMeter, entries: &[TargetEntry]) {
+    levels.clear();
+    for entry in entries {
+        entry.output_meter.clear();
     }
 }
 
@@ -692,7 +755,7 @@ impl EngineHandle {
             sample_rate: TARGET_SAMPLE_RATE,
             source_channels: self.source_channels,
             groups: self.groups.clone(),
-            channel_levels: self.levels.decayed(usize::from(self.source_channels)),
+            channel_levels: self.levels.read(usize::from(self.source_channels)),
             stopped: self.is_stopped(),
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
@@ -703,8 +766,8 @@ impl EngineHandle {
 
     /// The live input and output levels, without building the rest of the status.
     ///
-    /// Each read decays the held peaks (see [EngineStatus::channel_levels]), so this is meant for
-    /// one steady reader, the desktop's meter stream; the status reads add a step each.
+    /// A pure read, like the status: any number of readers can poll it at any rate without
+    /// changing the levels (see [EngineStatus::channel_levels]).
     pub fn meters(&self) -> EngineMeters {
         read_meters(
             &self.levels,
@@ -787,6 +850,9 @@ impl EngineHandle {
         if plan.resend_config {
             self.config_state.set_channels(plan.source_channels);
         }
+        // The old device's levels describe a stream that is gone, and channels the new device lacks
+        // would keep theirs frozen until a switch back; the new stream raises its own at once.
+        self.levels.clear();
         Ok(self.capture_format.clone())
     }
 
@@ -858,6 +924,8 @@ impl EngineHandle {
         if let Some(thread) = self.network_thread.take() {
             thread.join().map_err(|_| "UDP network thread panicked")?;
         }
+        // Capture and the send loop have ended, so nothing would ever lower the last levels.
+        clear_meters(&self.levels, &self.targets.read());
         if let Some(thread) = self.control_thread.take() {
             thread
                 .join()
@@ -953,13 +1021,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         sent: AtomicU64::new(0),
         discarded: AtomicU64::new(0),
     });
+    let levels = Arc::new(LevelMeter::new());
     let network_thread = spawn_network_thread(
         packet_receiver,
         Arc::clone(&target_registry),
         Arc::clone(&packet_stats),
+        Arc::clone(&levels),
     )?;
     let samples_seen = Arc::new(AtomicU64::new(0));
-    let levels = Arc::new(LevelMeter::new());
     let sequence = Arc::new(AtomicU64::new(0));
     let (stream, effective_buffer) = build_input_stream(
         &device,
@@ -1305,20 +1374,67 @@ mod tests {
         // Two frames, two channels: channel 0 peaks at half scale, channel 1 at full scale.
         meter.observe(&[16_384, 32_767, -16_384, -1], 2);
 
-        assert_eq!(meter.decayed(2), vec![50, 100]);
+        assert_eq!(meter.read(2), vec![50, 100]);
     }
 
+    /// Readers only look: the meter stream, the status events and any poller can read as often as
+    /// they like without changing what the others see.
     #[test]
-    fn a_held_peak_decays_between_reads_and_a_new_block_re_raises_it() {
-        let meter = LevelMeter::new();
+    fn reading_a_meter_never_lowers_it() {
+        let inputs = LevelMeter::new();
+        inputs.observe(&[16_384, 32_767], 2);
+        let output = OutputMeter::default();
+        output.observe(&[32_767, 16_384]);
 
-        meter.observe(&[32_767, 32_767], 2);
-        assert_eq!(meter.decayed(2), vec![100, 100]);
-        // No new audio: the held peak falls on the next read.
-        assert_eq!(meter.decayed(2), vec![87, 87]);
-        // A fresh block raises it straight back to the block peak.
-        meter.observe(&[32_767, 32_767], 2);
-        assert_eq!(meter.decayed(2), vec![100, 100]);
+        for _ in 0..50 {
+            assert_eq!(inputs.read(2), vec![50, 100]);
+            assert_eq!(output.read(), [100, 50]);
+        }
+    }
+
+    /// Full scale falls to silence in 1.5 s of audio: at 48 kHz, one step of the 0-100 scale every
+    /// 720 frames, however often the level is read.
+    #[test]
+    fn a_held_level_falls_one_step_every_720_frames_of_audio() {
+        let inputs = LevelMeter::new();
+        let output = OutputMeter::default();
+        inputs.observe(&[32_767], 1);
+        output.observe(&[32_767, 32_767]);
+
+        inputs.observe(&vec![0; 7_200], 1);
+        output.observe(&vec![0; 2 * 7_200]);
+        assert_eq!(inputs.read(1), vec![90], "0.15 s after a full-scale peak");
+        assert_eq!(output.read(), [90, 90]);
+
+        inputs.observe(&vec![0; 64_080], 1);
+        output.observe(&vec![0; 2 * 64_080]);
+        assert_eq!(inputs.read(1), vec![1], "one step short of 1.5 s");
+        assert_eq!(output.read(), [1, 1]);
+
+        inputs.observe(&vec![0; 720], 1);
+        output.observe(&vec![0; 2 * 720]);
+        assert_eq!(inputs.read(1), vec![0], "1.5 s after the peak");
+        assert_eq!(output.read(), [0, 0]);
+    }
+
+    /// A louder block shows at once; a quieter one does not pull the level below its fall.
+    #[test]
+    fn a_new_peak_above_the_fallen_level_shows_at_once() {
+        let inputs = LevelMeter::new();
+        let output = OutputMeter::default();
+        inputs.observe(&[32_767, 32_767], 2);
+        output.observe(&[32_767, 32_767]);
+        inputs.observe(&vec![0; 2 * 36_000], 2);
+        output.observe(&vec![0; 2 * 36_000]);
+        assert_eq!(inputs.read(2), vec![50, 50], "half way down after 0.75 s");
+        assert_eq!(output.read(), [50, 50]);
+
+        // One frame: 80 on the first side, 30 on the second.
+        inputs.observe(&[26_214, 9_830], 2);
+        output.observe(&[26_214, 9_830]);
+
+        assert_eq!(inputs.read(2), vec![80, 50]);
+        assert_eq!(output.read(), [80, 50]);
     }
 
     #[test]
@@ -1330,18 +1446,41 @@ mod tests {
     }
 
     #[test]
-    fn an_output_meter_holds_each_sides_peak_until_read_and_then_decays() {
+    fn an_output_meter_holds_each_sides_peak() {
         let meter = OutputMeter::default();
 
         meter.observe(&[16_384, 32_767]);
-        // A quieter block does not lower the held peak.
+        // A quieter block does not pull the held peak below its fall.
         meter.observe(&[100, 100]);
-        assert_eq!(meter.decayed(), [50, 100]);
-        // No new audio: both sides fall on the next read, like the input meters.
-        assert_eq!(meter.decayed(), [43, 87]);
+        assert_eq!(meter.read(), [50, 100]);
         // A buffer that is not whole stereo frames is ignored.
         meter.observe(&[32_767, 32_767, 32_767]);
-        assert_eq!(meter.decayed(), [37, 76]);
+        assert_eq!(meter.read(), [50, 100]);
+    }
+
+    /// A stopped stream delivers no more audio, so no audio time passes for the meters to fall by:
+    /// the engine clears them when it stops capturing.
+    #[test]
+    fn clearing_the_meters_returns_every_level_to_zero() {
+        let address: SocketAddr = "192.168.1.3:50000".parse().unwrap();
+        let registry = TargetRegistry::new(&[address], &GroupLayout::default())
+            .expect("registry should build");
+        registry.read()[0].output_meter.observe(&[32_767, 16_384]);
+        let inputs = LevelMeter::new();
+        inputs.observe(&[32_767, 16_384], 2);
+
+        clear_meters(&inputs, &registry.read());
+
+        assert_eq!(
+            read_meters(&inputs, 2, &registry.read()),
+            EngineMeters {
+                channel_levels: vec![0, 0],
+                musicians: vec![MusicianMeters {
+                    address,
+                    output_levels: [0, 0],
+                }],
+            }
+        );
     }
 
     #[test]
@@ -1372,10 +1511,10 @@ mod tests {
                 ],
             }
         );
-        // It is the meters' own read: the held peaks decay for the next one.
         assert_eq!(
-            read_meters(&inputs, 2, &registry.read()).musicians[0].output_levels,
-            [87, 43]
+            read_meters(&inputs, 2, &registry.read()),
+            meters,
+            "a read changes nothing"
         );
     }
 
@@ -1416,7 +1555,7 @@ mod tests {
         meter.observe(&[1, 2, 3], 2);
         meter.observe(&[], 0);
 
-        assert_eq!(meter.decayed(2), vec![0, 0]);
+        assert_eq!(meter.read(2), vec![0, 0]);
     }
 
     #[test]

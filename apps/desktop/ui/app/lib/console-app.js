@@ -1,10 +1,11 @@
 // The console's controller: the one place that talks to the engine through a bridge and keeps
 // the store. It lives as long as the window; screens come and go and use it. No DOM.
 //
-// - On creation it listens to the engine's events, then asks for the engine's status. Only when
-//   the engine answers that it is not running does it start one, with the start request the old
-//   window sent (see engine-config.js), unless `autoStart` is false. Any other failure, and a
-//   failed listen, is the console's connection error; `reconnect` tries again.
+// - On creation it listens to the engine's events, then asks for the engine's state. When the
+//   answer is that no engine runs (`state: "notRunning"`, an answer and not an error) it starts
+//   one with the start request the old window sent (see engine-config.js), unless `autoStart` is
+//   false. A failed read, and a failed listen, is the console's connection error; `reconnect`
+//   tries again, one attempt at a time.
 // - `start` and `stop` drive the engine and its phase. A start, a failed start and a confirmed
 //   stop end the current run, so late events of an ended engine are ignored (see
 //   console-state.js). A refused stop or an unreadable status after a start ends nothing: the
@@ -15,7 +16,7 @@
 //   settling the edits it carried and offering its mix by revision.
 // - Meters skip the store: `onMeters` listeners get each `meters` payload of the live run.
 
-import { createEngineApi, isEngineNotRunning } from "./bridge.js";
+import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
 import {
   actions,
@@ -37,7 +38,11 @@ function message(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function createConsoleApp({ bridge, autoStart = true }) {
+/**
+ * The controller over `bridge`. `autoStart` starts an engine when none runs; `statusRetryMs` is the
+ * wait between status reads after a start whose status could not be read.
+ */
+export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STATUS_RETRY_MS }) {
   const api = createEngineApi(bridge);
   const store = createStore(consoleReducer, initialState);
   const meterListeners = new Set();
@@ -63,31 +68,50 @@ export function createConsoleApp({ bridge, autoStart = true }) {
 
   const sender = createCoalescer(sendMix);
 
-  // Reads the engine's status into the store. Resolves to false when it could not be read; a
-  // "not running" answer then means the engine has stopped, any other failure tells nothing.
+  // Puts the engine's answer to `engine_status` in the store: its status when it runs, idle when
+  // it says no engine runs.
+  function takeEngineState(answer) {
+    if (answer.state === "notRunning") {
+      store.dispatch(actions.engine("idle"));
+    } else {
+      store.dispatch(actions.status(answer));
+    }
+  }
+
+  // Reads the engine's state into the store. Resolves to null, or to the error when it could
+  // not be read, which tells nothing about the engine.
   async function readStatus() {
     try {
-      store.dispatch(actions.status(await api.status()));
-      return true;
+      takeEngineState(await api.status());
+      return null;
     } catch (error) {
-      if (isEngineNotRunning(error)) {
-        store.dispatch(actions.engine("idle"));
-      }
-      return false;
+      return error;
     }
   }
 
   // After a start, the status the pump sends fills the view; when none has come yet, ask again a
-  // few times rather than leave the screen on "starting".
-  function fillAfterStart(attempt = 1) {
+  // few times. When it never comes, say so, with Try again, rather than stay on "starting".
+  function fillAfterStart(lastError, attempt = 1) {
+    if (disposed || store.getState().engine.phase !== "starting") {
+      return;
+    }
     if (attempt > STATUS_RETRIES) {
+      store.dispatch(
+        actions.connectionFailed(
+          `The engine started, but its status could not be read: ${message(lastError)}`,
+        ),
+      );
       return;
     }
     const timer = setTimeout(async () => {
-      if (!disposed && store.getState().engine.phase === "starting" && !(await readStatus())) {
-        fillAfterStart(attempt + 1);
+      if (disposed || store.getState().engine.phase !== "starting") {
+        return;
       }
-    }, STATUS_RETRY_MS);
+      const error = await readStatus();
+      if (error) {
+        fillAfterStart(error, attempt + 1);
+      }
+    }, statusRetryMs);
     timer.unref?.();
   }
 
@@ -101,8 +125,9 @@ export function createConsoleApp({ bridge, autoStart = true }) {
       return;
     }
     // The engine runs now: failing to read its status must not end its run.
-    if (!(await readStatus()) && store.getState().engine.phase === "starting") {
-      fillAfterStart();
+    const error = await readStatus();
+    if (error) {
+      fillAfterStart(error);
     }
   }
 
@@ -154,9 +179,9 @@ export function createConsoleApp({ bridge, autoStart = true }) {
     unlisteners.push(...registered.map(({ value }) => value));
   }
 
-  // Listens to the engine (once) and loads its status. Never rejects: a failure is shown as the
+  // Listens to the engine (once) and loads its state. Never rejects: a failure is shown as the
   // console's connection error, and `reconnect` tries again.
-  async function connect() {
+  async function runConnect() {
     store.dispatch(actions.connecting());
     try {
       if (unlisteners.length === 0) {
@@ -169,25 +194,29 @@ export function createConsoleApp({ bridge, autoStart = true }) {
     if (disposed) {
       return;
     }
-    let status;
+    let answer;
     try {
-      status = await api.status();
+      answer = await api.status();
     } catch (error) {
-      if (!isEngineNotRunning(error)) {
-        store.dispatch(actions.connectionFailed(message(error)));
-        return;
-      }
-      // No engine runs yet, which is the one failure that means exactly that.
-      store.dispatch(actions.connected());
-      if (autoStart) {
-        await start();
-      } else {
-        store.dispatch(actions.engine("idle"));
-      }
+      store.dispatch(actions.connectionFailed(message(error)));
       return;
     }
     store.dispatch(actions.connected());
-    store.dispatch(actions.status(status));
+    if (answer.state === "notRunning" && autoStart) {
+      await start();
+    } else {
+      takeEngineState(answer);
+    }
+  }
+
+  // One connection attempt at a time: a second call while one is on its way joins it, so two
+  // quick Try again presses can never listen twice.
+  let connecting = null;
+  function connect() {
+    connecting ??= runConnect().finally(() => {
+      connecting = null;
+    });
+    return connecting;
   }
 
   const ready = connect();

@@ -14,8 +14,8 @@ use personal_monitoring::{
 };
 
 use crate::dto::{
-    CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, MetersDto, MixDto,
-    MixUpdateRequest, StartRequest, StartSummary,
+    CaptureFormatDto, EngineStateDto, EngineStatusDto, GroupRequest, InputDeviceDto, MetersDto,
+    MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
 use crate::names::MusicianNames;
@@ -169,8 +169,22 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     }
 }
 
+/// Whether an engine runs and, if so, its status: what the window's `engine_status` command
+/// answers. No engine running is an answer, not an error; only a poisoned lock fails.
+pub fn engine_state(state: &DesktopState) -> Result<EngineStateDto, String> {
+    // One lock for the check and the read, so the answer is about one engine.
+    let guard = state
+        .engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    Ok(match guard.as_ref() {
+        Some(handle) => EngineStateDto::Running(status_of(state, handle)),
+        None => EngineStateDto::NotRunning { run: state.run() },
+    })
+}
+
 /// Returns the engine's current status, naming its run, with each musician row's displayed name
-/// resolved by [apply_names].
+/// resolved by [apply_names]. Fails while no engine runs.
 pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     let guard = state
         .engine
@@ -179,10 +193,15 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     let handle = guard
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
+    Ok(status_of(state, handle))
+}
+
+/// The status of `handle`, the engine in `state`, read while the caller holds the engine lock.
+fn status_of(state: &DesktopState, handle: &EngineHandle) -> EngineStatusDto {
     let mut status = EngineStatusDto::from(&handle.status());
     status.run = state.run();
     apply_names(&mut status, &state.names);
-    Ok(status)
+    status
 }
 
 /// Returns the live input and output levels, for the `meters` event.
@@ -572,6 +591,34 @@ mod tests {
             1,
             "the previous pump's thread has ended"
         );
+    }
+
+    #[test]
+    fn with_no_engine_the_state_says_so_instead_of_failing() {
+        let state = DesktopState::new(MusicianNames::load(names_path("state-idle")));
+
+        let idle = engine_state(&state).expect("the state is always readable");
+        let json = serde_json::to_value(&idle).expect("the state serializes");
+
+        assert_eq!(json, serde_json::json!({ "state": "notRunning", "run": 0 }));
+    }
+
+    #[test]
+    fn after_a_failed_start_the_state_names_the_run_that_ended() {
+        let state = DesktopState::new(MusicianNames::load(names_path("state-failed")));
+        start_engine(
+            &state,
+            StartRequest {
+                targets: vec!["not a target".to_owned()],
+                ..StartRequest::default()
+            },
+        )
+        .expect_err("the engine cannot start");
+
+        let json = serde_json::to_value(engine_state(&state).expect("readable"))
+            .expect("the state serializes");
+
+        assert_eq!(json, serde_json::json!({ "state": "notRunning", "run": 1 }));
     }
 
     #[test]

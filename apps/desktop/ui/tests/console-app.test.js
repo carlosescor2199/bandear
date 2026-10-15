@@ -275,6 +275,55 @@ test("a failed event registration is shown, and connecting again listens once", 
   app.dispose();
 });
 
+test("a start whose status never comes says so and offers to try again", async () => {
+  const fake = createFakeBridge({ running: true, statusOnStart: false });
+  const app = createConsoleApp({ bridge: fake, statusRetryMs: 1 });
+  await app.ready;
+  fake.failNext("engine_status", "the status could not be read", { times: 4 });
+
+  await app.start();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  const { connection } = app.store.getState();
+  assert.equal(connection.status, "failed", "not left on starting with nothing to press");
+  assert.match(connection.error, /could not be read/);
+
+  await app.reconnect();
+  assert.equal(app.store.getState().connection.status, "ready");
+  assert.equal(app.store.getState().engine.phase, "running");
+  assert.equal(app.store.getState().engine.run, 2, "the started run, never ended");
+  app.dispose();
+});
+
+test("two quick reconnects listen to the engine only once", async () => {
+  const fake = createFakeBridge({ running: true });
+  let refuse = true;
+  const active = new Map();
+  const bridge = {
+    invoke: (command, args) => fake.invoke(command, args),
+    async listen(event, handler) {
+      if (refuse && event === "meters") {
+        throw "the event channel is closed";
+      }
+      const unlisten = await fake.listen(event, handler);
+      active.set(event, (active.get(event) ?? 0) + 1);
+      return () => {
+        active.set(event, active.get(event) - 1);
+        unlisten();
+      };
+    },
+  };
+  const app = createConsoleApp({ bridge });
+  await app.ready;
+  refuse = false;
+
+  await Promise.all([app.reconnect(), app.reconnect()]);
+
+  assert.deepEqual(Object.fromEntries(active), { status: 1, "mix-changed": 1, meters: 1 });
+  assert.equal(app.store.getState().connection.status, "ready");
+  app.dispose();
+});
+
 test("picking a musician opens their mix", async () => {
   const { app } = await connected();
 

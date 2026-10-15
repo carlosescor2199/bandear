@@ -161,7 +161,8 @@ function withPort(address) {
  * The fake bridge. `running` starts the engine already running, as run `status.run`; `failStart`
  * is the error every start fails with (none by default); `answersFirst` delivers a `set_mix`
  * answer before its `mix-changed` event, an order the desktop's two channels allow (by default
- * the event comes first). Every stored mix change takes a higher `revision`, as in the engine.
+ * the event comes first); `statusOnStart: false` starts without announcing a status, as a window
+ * without an event pump. Every stored mix change takes a higher `revision`, as in the engine.
  * Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
@@ -175,6 +176,7 @@ export function createFakeBridge({
   running = false,
   failStart = null,
   answersFirst = false,
+  statusOnStart = true,
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
@@ -233,8 +235,8 @@ export function createFakeBridge({
 
   const commands = {
     engine_status() {
-      requireRunning();
-      return clone(engine);
+      // As the desktop answers: no engine running is an answer, not an error.
+      return isRunning ? { state: "running", ...clone(engine) } : { state: "notRunning", run };
     },
     start_engine() {
       // As in the desktop, a start ends the previous engine and takes a run even when it fails.
@@ -246,7 +248,9 @@ export function createFakeBridge({
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
-      emit("status", clone(engine));
+      if (statusOnStart) {
+        emit("status", clone(engine));
+      }
       return summary();
     },
     stop_engine() {
@@ -325,7 +329,12 @@ export function createFakeBridge({
       // The command takes effect at once, events included; only its answer may be held back.
       const handler = commands[command];
       const failure = failing.get(command);
-      failing.delete(command);
+      if (failure) {
+        failure.times -= 1;
+        if (failure.times <= 0) {
+          failing.delete(command);
+        }
+      }
       let outcome;
       if (failure) {
         if (failure.afterEffect) {
@@ -371,12 +380,12 @@ export function createFakeBridge({
       held.add(command);
     },
     /**
-     * Makes the next call of `command` fail with `message`: before it does anything, or, with
-     * `afterEffect`, after it took effect, as a command whose answer is an error but whose work
-     * was done.
+     * Makes the next call (or `times` calls) of `command` fail with `message`: before it does
+     * anything, or, with `afterEffect`, after it took effect, as a command whose answer is an
+     * error but whose work was done.
      */
-    failNext(command, message, { afterEffect = false } = {}) {
-      failing.set(command, { message, afterEffect });
+    failNext(command, message, { afterEffect = false, times = 1 } = {}) {
+      failing.set(command, { message, afterEffect, times });
     },
     /** Delivers every answer waiting now, in the order the commands were invoked. */
     releaseAnswers() {

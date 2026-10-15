@@ -96,11 +96,14 @@ Three facts from the code make it worse:
   musician turns green again with their mix; Stop during reconnection stops retrying. Done: a
   Wi-Fi blip and a desktop engine restart both reconnected on their own. The Wi-Fi return came
   with a new DHCP address, which produced a duplicate row (see T3).
-- [ ] T3 (server + android): a phone that returns from a new IP keeps its musician row, through a
-  stable client id announced in `register`.
+- [x] T3 (server + android): a phone that returns from a new IP keeps its musician row, through a
+  stable client id announced in `register`. Commits: `bbe4070`, then this commit.
   - [x] T3a (server): optional `client_id` parsed leniently; a known id from a new IP moves the
-    entry; the old IP's leftover connection leaves the moved entry alone. Commit: this commit.
-  - [ ] T3b (android): generate and keep the client id, send it in every `register`.
+    entry; the old IP's leftover connection leaves the moved entry alone. Commit: `bbe4070`.
+  - [x] T3b (android): generate and keep the client id, send it in every `register`. Commit: this
+    commit.
+- [ ] T4 (live): on the S23, a Wi-Fi blip that changes the phone's IP leaves one row on the
+  desktop, with its mix, and the server logs `..., moved from <old address>`.
 
 ## Follow-ups
 
@@ -218,6 +221,19 @@ strategy for it is still to be chosen.
     the peer's IP; the old IP's `PeerGuard` finds no entry at its IP, so its later close neither
     marks the moved entry disconnected nor removes it.
   - About 520 authored changed lines, over the ~400 heuristic: about 400 of them are tests.
+- T3b done (route: delegated direct, the same writer). What landed:
+  - `ClientIdentity.kt` (new): `validClientId` (the server's rule: 1 to 64 ASCII letters, digits
+    and hyphens), `newClientId` (`UUID.randomUUID()`), `resolveClientId` (keeps a valid stored id,
+    otherwise generates one and saves it, which also replaces a damaged value), and
+    `ClientIdentity`, which reads and writes the id in its own `SharedPreferences` file
+    (`mixlink_identity`), so `MixBankStore` is untouched.
+  - `ControlChannel`: `buildRegisterMessage` takes an optional client id and adds `client_id` only
+    when there is one; `connect` takes an optional `clientId` (default null, so existing callers
+    and tests are unchanged), keeps it for the session and uses it for every registration: each
+    open, each reconnect, and a rename.
+  - `MainActivity`: creates the `ClientIdentity` in `onCreate` and passes its id to `connect` on
+    Start.
+- T3 commits: `bbe4070` (server), then this commit (Android).
 
 ## Verification
 
@@ -249,3 +265,16 @@ strategy for it is still to be chosen.
 - T3a GREEN: `cargo test -p personal-monitoring`: 170 passed (159 before, 11 new), 0 failed;
   `cargo test -p mixlink-desktop`: 21 passed; `cargo fmt --all -- --check`: clean;
   `cargo check --workspace --all-targets`: no warnings.
+- T3b RED (tests first; stubs that compile: `validClientId` always null, `newClientId` empty,
+  `resolveClientId` returning the stored value without saving, `client_id` never put in the
+  message, the channel not keeping the id): `gradle -p apps/android :app:testDebugUnitTest`: 115
+  tests, 6 failed: the message keys (`expected:<[type, name, udp_port, client_id]> but
+  was:<[name, udp_port, type]>`), the channel test (every registration of the session carries the
+  id: open, reconnect, rename), the valid-id rule (`expected:<a> but was:<null>`), the UUID
+  (`Invalid UUID string`), and both generate-and-save cases. The other 3 new tests passed already:
+  invalid ids rejected, a valid stored id kept without saving, and no `client_id` when there is no
+  id.
+- T3b GREEN: `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 115
+  tests (106 before, 9 new), 0 failures, 0 errors; no Kotlin warnings. Rust unchanged since
+  `bbe4070`: `cargo fmt --all -- --check` clean, `cargo test -p personal-monitoring` 170 passed,
+  `cargo test -p mixlink-desktop` 21 passed, `cargo check --workspace --all-targets` no warnings.

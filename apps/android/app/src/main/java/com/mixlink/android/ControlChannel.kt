@@ -51,6 +51,7 @@ internal class ControlChannel(
     @Volatile private var controlWebSocket: ControlSocket? = null
     @Volatile private var registrationMessage: String? = null
     @Volatile private var announcedUdpPort: Int? = null
+    @Volatile private var announcedClientId: String? = null
     private var pendingNameResend: ScheduledTask? = null
     @Volatile var controlState = ControlState.IDLE
     @Volatile var mixAcknowledged = false
@@ -140,11 +141,14 @@ internal class ControlChannel(
      * answers with an error or ignores it, and the rest of the session behaves as before.
      *
      * The host and control port are kept for the whole session, so a lost connection can be
-     * reopened to the same server without the musician pressing anything.
+     * reopened to the same server without the musician pressing anything. The [clientId], when
+     * given, travels in every registration of the session, so a phone that reconnects from a new
+     * IP keeps its row on the server.
      */
-    fun connect(host: String, port: Int, udpPort: Int, musicianName: String) {
+    fun connect(host: String, port: Int, udpPort: Int, musicianName: String, clientId: String? = null) {
         announcedUdpPort = udpPort
-        registrationMessage = buildRegisterMessage(musicianName, udpPort)
+        announcedClientId = clientId
+        registrationMessage = buildRegisterMessage(musicianName, udpPort, clientId)
         synchronized(connectionLock) {
             serverHost = host
             serverControlPort = port
@@ -273,7 +277,7 @@ internal class ControlChannel(
     fun updateRegistrationName(name: String) {
         if (!running.get()) return
         val udpPort = announcedUdpPort ?: return
-        val message = buildRegisterMessage(name, udpPort)
+        val message = buildRegisterMessage(name, udpPort, announcedClientId)
         registrationMessage = message
         pendingNameResend?.cancel()
         pendingNameResend = scheduler.schedule(NAME_RESEND_DEBOUNCE_MS) { sendRegistrationMessage(message) }
@@ -402,15 +406,19 @@ internal class ControlChannel(
 }
 
 /**
- * Builds the registration message a client sends when the control channel opens: its name and the
- * UDP port it listens on. The server takes the address from the socket, so none is carried here.
+ * Builds the registration message a client sends when the control channel opens: its name, the
+ * UDP port it listens on and, when it has one, its stable client id (see [ClientIdentity]), which
+ * lets the server keep this musician's row when the phone returns from a new IP. The server takes
+ * the address from the socket, so none is carried here.
  */
-internal fun buildRegisterMessage(name: String, udpPort: Int): String =
-    JSONObject()
+internal fun buildRegisterMessage(name: String, udpPort: Int, clientId: String? = null): String {
+    val message = JSONObject()
         .put("type", "register")
         .put("name", name.trim())
         .put("udp_port", udpPort)
-        .toString()
+    if (clientId != null) message.put("client_id", clientId)
+    return message.toString()
+}
 
 /**
  * Builds the link-stats message the client sends about once a second: the counts of one report

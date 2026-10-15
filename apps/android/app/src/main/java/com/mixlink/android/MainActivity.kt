@@ -44,6 +44,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
     private lateinit var moreOfMeCheckBox: CheckBox
     private lateinit var moreOfMeStatusText: TextView
     private lateinit var bankStore: MixBankStore
+    private lateinit var clientIdentity: ClientIdentity
 
     private val running = AtomicBoolean(false)
     private val mixState = ClientMixState()
@@ -101,6 +102,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         moreOfMeStatusText = findViewById(R.id.moreOfMeStatusText)
 
         bankStore = MixBankStore(this)
+        clientIdentity = ClientIdentity(this)
         musicianChannel = bankStore.musicianChannel()
         // The name is remembered the same way the musician channel is: restored here and saved as
         // it is typed. It travels in the registration when the control channel opens, and a change
@@ -213,8 +215,9 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         control.clearMixOwnership()
         renderControlStatus()
         // The name and the UDP port this client listens on travel in the registration, so the
-        // server can add this musician as a target without anyone typing an address.
-        control.connect(host, controlPort, port, musicianNameInput.text.toString())
+        // server can add this musician as a target without anyone typing an address. The client id
+        // travels too, so a reconnect from a new IP keeps this musician's row on the server.
+        control.connect(host, controlPort, port, musicianNameInput.text.toString(), clientIdentity.clientId)
 
         player.launch(host, port)
     }

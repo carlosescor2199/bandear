@@ -111,6 +111,7 @@ private fun ScreenContent(
             onMoreOfMe = { actions.setMoreOfMe(it) },
             onMusicianChannel = { actions.setMusicianChannel(it) },
             onChannelLevel = { channel, level -> actions.setChannelLevel(channel, level) },
+            onChannelPan = { channel, pan -> actions.setChannelPan(channel, pan) },
             onChannelMuted = { channel, muted -> actions.setChannelMuted(channel, muted) },
             onChannelSoloed = { channel, soloed -> actions.setChannelSoloed(channel, soloed) },
             onGroupLevel = { group, level -> actions.setGroupLevel(group, level) },

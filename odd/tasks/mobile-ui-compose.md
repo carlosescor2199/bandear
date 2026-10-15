@@ -85,10 +85,14 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
   state fixed; live check on the S23.
   - [x] Code: T3 review follow-ups (`69f613d`), receiver stop ordering (`538f990`), the switch to
     Compose (`0f51cb2`), R8 for release (see Progress). Checks per commit in Progress.
-  - [ ] Live check on the S23 (parent), on the debug and the minified release build.
-  - [ ] Pan: the old screen had a pan slider per channel; the new screens have none, so after the
-    switch pan cannot be changed (it is still kept, sent, saved and recalled). Needs a decision on
-    where pan lives in the redesign. Reopens the acceptance criterion "every existing control".
+  - [ ] Live check on the S23 (parent), on the debug and the minified release build, including
+    the channel sheet (pan detent, TalkBack) and the strip height from T4b.
+  - [x] Pan: the old screen had a pan slider per channel; the new screens had none, so after the
+    switch pan could not be changed (it was still kept, sent, saved and recalled). The user chose:
+    a strip's label opens a sheet for that channel with a large L–C–R pan control, its level, Mute
+    and Solo, and each strip shows its pan under the label; the Mix screen must not grow. Done in
+    T4b (`f86414e`; see Progress), which closes the acceptance criterion "every existing control"
+    again.
 - [ ] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
   download.
 
@@ -110,6 +114,8 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
 ## Route
 
 - T1 to T4: delegated direct, one writer per task (2+ non-trivial files each).
+- T4b (pan sheet and the T4 review follow-ups): delegated direct, one writer (2+ non-trivial
+  files per work unit).
 - T5: parent, after the download permission.
 
 ## Delivery forecast
@@ -400,3 +406,97 @@ features.
       SUCCESSFUL, 41 tasks executed; 302 tests, 0 failures, 0 errors. Debug APK 26,248,536 bytes
       (debug is not minified). `cargo fmt --all -- --check`: clean.
     - The minified release build has not run on a phone yet: the S23 check should use it too.
+  - `3a27e61` is the commit above.
+- T4b (route: delegated direct, one writer; trigger: 2+ non-trivial files per work unit). The pan
+  decision and the follow-ups of T4's native review (lineage `review-22d833ad2e134030`).
+  Work-unit commits, in order:
+  - The channel sheet with pan (WARNING R3-pan-control-unreachable-after-switch), `f86414e`:
+    - A strip's label is now a 44 dp button as wide as the strip ("Channel 3 settings" for a
+      screen reader, which also hears "Pan left 30") showing the label and, under it, the pan:
+      "C" at the centre, "L30" / "R20" for the share toward a side (L100 hard left, R100 hard
+      right; the stored pan is 0..100 with 50 the centre, as the server reads it). It opens a
+      bottom sheet (`ChannelSheet`, Material 3 `ModalBottomSheet`, skipping the half-open state)
+      for that channel: a header with the channel, its group and "Your channel" when it is the
+      musician's, the pan, the level (a `HorizontalFader`), wide Mute and Solo keys that read
+      "Muted" / "Soloed" while on, and Done. It closes with Done, a swipe down, a tap outside it or
+      back, and it closes if the server stops announcing the channel. Which sheet is open is the
+      Mix screen's own state (`rememberSaveable`).
+    - `PanControl` (new atom): 52 dp tall touch area across the sheet, a centre mark, the fill from
+      the centre to a 32 dp thumb, and L, C and R marks under it; a slider for a screen reader
+      whose value is spoken as "Left 30", "Centre" or "Right 20". It runs on
+      `HorizontalFaderGesture`, which (with `FaderGesture`) now takes a `FaderScale`: `LevelScale`
+      (the existing even mapping, the default) or `PanScale`, whose pure `panValueAt` /
+      `panPositionOf` hold the middle tenth of the travel at the centre (the detent) and spread
+      the rest evenly, so every pan is still reachable and the ends are hard left and hard right.
+      Screen-reader steps ignore the detent.
+    - `MonitorActions.setChannelPan` added and bound (the ViewModel already had the intent);
+      `MixScreen` takes `onChannelPan`.
+    - The Mix screen does not grow: the label button is 44 dp where the label was one line of
+      about 17 dp, and the strip's top inset drops from 10 to 6 dp, so a channel strip's fader is
+      212 dp instead of 236 (`VerticalFader` takes a `height`; group strips keep 236). The strip
+      comes out the same height or up to a few dp shorter, depending on the monospace font.
+    - Previews: the sheet at the centre (your channel), hard left and hard right (muted); the pan
+      control; the sample mix now has varied pans, so the Mix previews show them on the strips.
+    - RED: the 21 new pure tests (17 `PanScaleTest`, 4 `ChannelSheetTextTest`) against `TODO`
+      stubs: 21 run, 20 failed with `NotImplementedError`; the one pass,
+      `aScreenReaderStepIgnoresTheDetent`, never consults the scale. The new ViewModel test
+      `aPanFromTheScreensIsKeptAndSentAsAMix` binds through `MonitorActions` and passed once the
+      interface had the intent (it guards the binding). The existing `FaderGestureTest` and
+      `HorizontalFaderGestureTest` stayed green on `LevelScale`. GREEN: all pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 34 result files, 324 tests (302 plus 22), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,346,840 bytes. `cargo fmt --all -- --check`: clean.
+    - About 920 authored added lines, over the ~400 heuristic: a new atom and a new sheet with
+      their previews, the pure mapping and 22 tests, which only make sense together.
+    - No Compose UI tests (they need instrumentation): the sheet, the label button and the strip
+      height need the live check.
+  - Paste truncation in name fields (WARNING R3-keptedit-truncates-existing-text-on-mid-insert),
+    `cc65cef`:
+    - `keptEdit` kept the first `maxLength` characters of the whole new text, so a paste at the
+      start or in the middle of a name that passed the limit cut off the end of the name (limit
+      10, "Carlos", "Escudero " pasted at the start gave "Escudero C"). It now works like the old
+      `InputFilter.LengthFilter`: it finds the edit (the selection, or nothing at the cursor,
+      replaced by the pasted text; or, when the selection does not explain it, what lies between
+      the start and the end both texts share, never splitting a two-unit character), keeps the
+      text already there, cuts only the inserted part to the room left (one unit shorter rather
+      than split an emoji), and puts the cursor after the kept part. The pure rule takes a new
+      `FieldText` (text and selection); the plain-text form stays for callers without a cursor.
+      Unchanged: an edit that fits or does not lengthen the text is kept whole, and at the limit
+      a key or paste does nothing.
+    - RED: 9 new `MixLinkTextFieldTest` tests (pastes that fit at the start, middle and end;
+      overflowing pastes at the start, middle and end; over a selection; at the limit; an emoji
+      at the cut; and the plain-text form found by comparison, twice) against a `TODO` stub for
+      the `FieldText` rule and the unchanged plain-text rule: 18 run, 9 failed (7
+      `NotImplementedError`; 2 assertions on the old rule, one of them "Escudero C" for
+      "EscuCarlos"). GREEN: all 18 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 34 result files, 333 tests (324 plus 9), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,363,224 bytes. `cargo fmt --all -- --check`: clean.
+  - The fake receiver follows the real launch gating (SUGGESTION
+    R3-fake-receiver-drops-flag-unconditionally), this commit; tests only:
+    - `FakeReceiver` lowered the shared session flag on every stop and never counted as alive,
+      while the real receiver (since `538f990`) lowers it only while its launch is the latest and
+      counts as alive until its stop report has been handled. The fake now runs the real
+      `ReceiverLaunches`: each launch is a loop that is alive until its report, a loop ends
+      through `ReceiverLaunches.finished`, and `endOnItsOwn` / `finishStopping` take a
+      `beforeReport` hook that runs between the flag drop and the report, where the main thread
+      can still act. The `alive` switch is gone.
+    - `theLastSessionsLateStopReportCannotEndTheNextSession` no longer starts a session before the
+      last one's report, which the real receiver now prevents; it tests the race that is left: a
+      Connect right after Stop is refused until the stopped loop has reported, and the session
+      started afterwards ends only with its own loop. `connectWaitsForThePreviousReceiverToEnd`
+      reaches the refusal the real way (Stop, then Connect before the report), and
+      `aReceiverThatEndedOnItsOwnBeforeClearingAndReportsAfterTouchesNothing` clears the
+      ViewModel through the hook instead of lowering the flag by hand.
+    - New `aLoopEndingWhileTheMusicianStopsAndReconnectsEndsOnlyItsOwnSession` combines the real
+      gating with the ViewModel's stop counting: a loop that ends on its own drops the flag, Stop
+      and Connect land before its report (Stop does nothing, Connect is refused), the report ends
+      its session once, and the next session's report, after Stop, ends nothing again.
+    - RED: a probe fake with the old contract (flag dropped unconditionally, never alive; only the
+      hook added so the tests compile; not committed): 92 `ui.state` tests run, 3 failed (the new
+      test, the adjusted race test and the rewritten refusal test). GREEN with the real gating:
+      all 92 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 34 result files, 334 tests (333 plus 1), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,363,224 bytes (tests only). `cargo fmt --all --
+      --check`: clean.

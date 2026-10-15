@@ -34,6 +34,7 @@ import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.mixlink.android.ui.theme.MixLinkColors
 import com.mixlink.android.ui.theme.MixLinkTheme
@@ -57,7 +58,8 @@ private const val DisabledAlpha = 0.4f
  * Stateless: it shows [value] and reports a new level through [onValueChange], only when the level
  * actually changes. A fader laid out no taller than its thumb ignores input rather than report
  * silence (see [FaderGesture]). The fill uses [accent], so the caller decides what the colour
- * means (the musician's own channel, a muted one).
+ * means (the musician's own channel, a muted one). It is [height] tall, 236 dp unless the caller
+ * needs room for something else in the same column.
  */
 @Composable
 fun VerticalFader(
@@ -67,6 +69,7 @@ fun VerticalFader(
     contentDescription: String,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    height: Dp = FaderHeight,
 ) {
     val colors = MixLinkTheme.colors
     val currentValue by rememberUpdatedState(value)
@@ -85,7 +88,7 @@ fun VerticalFader(
     Box(
         modifier = modifier
             .width(FaderWidth)
-            .height(FaderHeight)
+            .height(height)
             .alpha(if (enabled) 1f else DisabledAlpha)
             .onSizeChanged { gesture.lengthPx = it.height.toFloat() }
             .progressSemantics(value.toFloat(), 0f..FADER_MAX.toFloat())

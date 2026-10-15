@@ -287,7 +287,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
 
     override fun setChannelLevel(channel: Int, level: Int) = changeMix(ChannelLevelChanged(channel, level))
 
-    fun setChannelPan(channel: Int, pan: Int) = changeMix(ChannelPanChanged(channel, pan))
+    override fun setChannelPan(channel: Int, pan: Int) = changeMix(ChannelPanChanged(channel, pan))
 
     override fun setChannelMuted(channel: Int, muted: Boolean) = changeMix(ChannelMuteChanged(channel, muted))
 

@@ -7,9 +7,11 @@ package com.mixlink.android.ui.components
  * delta. [FaderGesture] measures from the loud end, with a positive delta toward the quiet end, so
  * both are flipped here, in one place: a tap is measured from the right edge and a drag delta is
  * negated. A rightward drag and a tap near the right end therefore raise the level.
+ *
+ * With [PanScale] it drives the pan control: hard left at the left end, hard right at the right.
  */
-internal class HorizontalFaderGesture(thumbWidthPx: Float) {
-    private val gesture = FaderGesture(thumbWidthPx)
+internal class HorizontalFaderGesture(thumbWidthPx: Float, scale: FaderScale = LevelScale) {
+    private val gesture = FaderGesture(thumbWidthPx, scale)
 
     /** The fader's laid-out width; 0 until it is laid out. */
     var widthPx: Float

@@ -27,6 +27,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -73,6 +74,9 @@ private val PickerWidth = 104.dp
  * a banner shows. Whether the row shows channels or groups is this screen's own choice; it starts
  * at [initialView].
  *
+ * A strip's label opens that channel's sheet, with its pan, level, Mute and Solo; which channel's
+ * sheet is open is this screen's own state too, and the sheet closes if the channel goes away.
+ *
  * It reads only the sub-states it shows, so the receiver's statistics, which change about a
  * hundred times a second, never recompose it.
  */
@@ -85,6 +89,7 @@ fun MixScreen(
     onMoreOfMe: (Boolean) -> Unit,
     onMusicianChannel: (Int?) -> Unit,
     onChannelLevel: (channel: Int, level: Int) -> Unit,
+    onChannelPan: (channel: Int, pan: Int) -> Unit,
     onChannelMuted: (channel: Int, muted: Boolean) -> Unit,
     onChannelSoloed: (channel: Int, soloed: Boolean) -> Unit,
     onGroupLevel: (group: Int, level: Int) -> Unit,
@@ -96,9 +101,15 @@ fun MixScreen(
 ) {
     val colors = MixLinkTheme.colors
     var view by rememberSaveable { mutableStateOf(initialView) }
+    var openChannel by rememberSaveable { mutableStateOf<Int?>(null) }
     val channels = remember(mix) { mix.channels }
     val groups = remember(mix) { mix.groups }
     val banner = connectionBanner(connection)
+    val sheetChannel = openChannel?.let { channels.getOrNull(it) }
+    // A channel the server no longer announces has no sheet; it does not reopen if it comes back.
+    LaunchedEffect(openChannel, sheetChannel == null) {
+        if (sheetChannel == null) openChannel = null
+    }
 
     Column(
         modifier = modifier
@@ -131,6 +142,7 @@ fun MixScreen(
                 onLevel = onChannelLevel,
                 onMuted = onChannelMuted,
                 onSoloed = onChannelSoloed,
+                onOpen = { openChannel = it },
             )
             MixView.GROUPS -> GroupRow(groups = groups, onLevel = onGroupLevel)
         }
@@ -142,6 +154,20 @@ fun MixScreen(
             modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp),
         )
         Spacer(Modifier.height(16.dp))
+    }
+
+    if (sheetChannel != null) {
+        val index = sheetChannel.index
+        ChannelSheet(
+            channel = sheetChannel,
+            mine = index == moreOfMe.musicianChannel,
+            moreOfMeOn = moreOfMe.enabled,
+            onDismiss = { openChannel = null },
+            onPan = { onChannelPan(index, it) },
+            onLevel = { onChannelLevel(index, it) },
+            onMuted = { onChannelMuted(index, it) },
+            onSoloed = { onChannelSoloed(index, it) },
+        )
     }
 }
 
@@ -345,6 +371,7 @@ private fun MixPreview(state: MonitorUiState, initialView: MixView = MixView.CHA
             onMoreOfMe = {},
             onMusicianChannel = {},
             onChannelLevel = { _, _ -> },
+            onChannelPan = { _, _ -> },
             onChannelMuted = { _, _ -> },
             onChannelSoloed = { _, _ -> },
             onGroupLevel = { _, _ -> },

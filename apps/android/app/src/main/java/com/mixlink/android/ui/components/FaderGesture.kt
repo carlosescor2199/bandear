@@ -14,8 +14,10 @@ import kotlin.math.roundToInt
  * would not change, or the fader has no travel. A fader laid out no taller than its thumb (or not
  * laid out yet) has nowhere to move the thumb, so it ignores input instead of reading it as the
  * bottom: an input can never silently drop a level to silence.
+ *
+ * [scale] turns the thumb's place into a value: even for a level, with a centre detent for the pan.
  */
-internal class FaderGesture(private val thumbLengthPx: Float) {
+internal class FaderGesture(private val thumbLengthPx: Float, private val scale: FaderScale = LevelScale) {
     /** The fader's laid-out length along its axis; 0 until it is laid out. */
     var lengthPx: Float = 0f
 
@@ -40,7 +42,7 @@ internal class FaderGesture(private val thumbLengthPx: Float) {
      * landed, so touching the fader never makes the level jump.
      */
     fun startDrag(current: Int) {
-        dragCentrePx = faderOffsetOf(current, travelPx) + thumbLengthPx / 2f
+        dragCentrePx = scale.offsetOf(current, travelPx) + thumbLengthPx / 2f
     }
 
     /**
@@ -60,7 +62,7 @@ internal class FaderGesture(private val thumbLengthPx: Float) {
     }
 
     private fun levelWithCentreAt(centrePx: Float): Int =
-        faderValueAt(centrePx - thumbLengthPx / 2f, travelPx)
+        scale.valueAt(centrePx - thumbLengthPx / 2f, travelPx)
 
     /** Reports are de-duplicated: a level equal to the one shown is not reported again. */
     private fun changed(next: Int, current: Int): Int? = next.takeIf { it != current }

@@ -309,3 +309,20 @@ features.
   41 tasks executed; 30 result files, 278 tests (271 plus 7), 0 failures, 0 errors; no Kotlin
   warnings.
 - T2b `cargo fmt --all -- --check`: clean (no Rust changes).
+- T4 (route: delegated direct, one writer; trigger: 2+ non-trivial files per work unit). Work-unit
+  commits, in order:
+  - T3 review follow-ups (lineage `review-3a5eba80821594c9`, approved), this commit:
+    - WARNING `SaveCard` cleared the typed name whatever the save did. `saveMix` (ViewModel and
+      `MonitorActions`) now returns whether the mix was saved, and the field is cleared only then,
+      through the pure `nameAfterSave`. The only refusal is a blank name: saving under a name
+      already used updates that mix, as the old screen did (now pinned by a test).
+    - SUGGESTION the horizontal fader's flip (tap measured from the right edge, drag delta negated)
+      moved into the pure `HorizontalFaderGesture`, which `HorizontalFader` now uses.
+    - SUGGESTION `RenameDialog` passes the trimmed name (`renameTarget`); `canRename` reads it.
+    - RED: 13 new tests (8 `HorizontalFaderGestureTest`, 4 `SavedMixesTextTest`, 1 ViewModel) and
+      a new assertion in `savingAndRecallingAMix`, against `TODO` stubs and a `saveMix` that
+      always returned false: 48 run, 14 failed (12 `NotImplementedError`, 2 assertions). GREEN:
+      all pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 31 result files, 291 tests (278 plus 13), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,300,706 bytes. `cargo fmt --all -- --check`: clean.

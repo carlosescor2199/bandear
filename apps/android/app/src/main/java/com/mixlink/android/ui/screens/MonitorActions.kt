@@ -37,7 +37,8 @@ interface MonitorActions {
 
     fun setMusicianChannel(channel: Int?)
 
-    fun saveMix(name: String)
+    /** Saves the current mix as [name]; false when the name was refused (a notice says why). */
+    fun saveMix(name: String): Boolean
 
     fun recallMix(name: String)
 

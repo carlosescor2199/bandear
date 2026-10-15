@@ -337,14 +337,19 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
 
     // Saved mixes. They hold the stored mix, never the More of me derivation.
 
-    fun saveMix(name: String) {
+    /**
+     * Saves the current mix as [name], trimmed; a name already used is updated. Returns whether it
+     * was saved: a blank name is refused with a notice, and the screen keeps what was typed.
+     */
+    fun saveMix(name: String): Boolean {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) {
             dispatch(MixNotice(NAME_NEEDED))
-            return
+            return false
         }
         store.saveBank(trimmed, _state.value.mix.toSnapshot())
         dispatch(MixSaved(trimmed, savedNames()))
+        return true
     }
 
     /** Applies a saved mix and sends it, exactly as if the musician had moved every control. */

@@ -25,4 +25,27 @@ class SavedMixesTextTest {
         assertFalse(canRename(from = "Soundcheck", to = "   "))
         assertFalse(canRename(from = "Soundcheck", to = " Soundcheck "))
     }
+
+    @Test
+    fun aSavedMixClearsTheField() {
+        assertEquals("", nameAfterSave(typed = "Ballads", saved = true))
+    }
+
+    @Test
+    fun aRefusedSaveKeepsWhatWasTyped() {
+        assertEquals("Ballads", nameAfterSave(typed = "Ballads", saved = false))
+        assertEquals("   ", nameAfterSave(typed = "   ", saved = false))
+    }
+
+    @Test
+    fun aRenameConfirmsTheTrimmedName() {
+        assertEquals("Main set", renameTarget(from = "Soundcheck", to = "  Main set "))
+        assertEquals("Main set", renameTarget(from = "Soundcheck", to = "Main set"))
+    }
+
+    @Test
+    fun aBlankOrUnchangedRenameConfirmsNothing() {
+        assertNull(renameTarget(from = "Soundcheck", to = "   "))
+        assertNull(renameTarget(from = "Soundcheck", to = " Soundcheck "))
+    }
 }

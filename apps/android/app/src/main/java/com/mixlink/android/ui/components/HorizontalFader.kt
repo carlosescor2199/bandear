@@ -49,7 +49,8 @@ private const val DisabledLevelAlpha = 0.4f
  * It behaves like [VerticalFader]: a drag moves the thumb from wherever it is, a tap moves it to the
  * tapped point, a screen reader hears a slider, and it reports a new level through [onValueChange]
  * only when the level changes. A fader no wider than its thumb ignores input (see [FaderGesture]).
- * A vertical swipe is left to the parent, so a page that scrolls still scrolls over it.
+ * A vertical swipe is left to the parent, so a page that scrolls still scrolls over it. The
+ * left-to-right conversion lives in [HorizontalFaderGesture].
  */
 @Composable
 fun HorizontalFader(
@@ -64,21 +65,19 @@ fun HorizontalFader(
     val currentValue by rememberUpdatedState(value)
     val currentOnValueChange by rememberUpdatedState(onValueChange)
     val thumbPx = with(LocalDensity.current) { LevelThumbSize.toPx() }
-    // The gesture measures from the loud end, which is the right end here: positions and deltas
-    // are flipped on the way in.
-    val gesture = remember(thumbPx) { FaderGesture(thumbPx) }
+    val gesture = remember(thumbPx) { HorizontalFaderGesture(thumbPx) }
 
     fun report(next: Int?) {
         if (next != null) currentOnValueChange(next)
     }
 
-    val dragState = rememberDraggableState { delta -> report(gesture.drag(-delta, currentValue)) }
+    val dragState = rememberDraggableState { delta -> report(gesture.drag(delta, currentValue)) }
 
     Box(
         modifier = modifier
             .height(LevelFaderHeight)
             .alpha(if (enabled) 1f else DisabledLevelAlpha)
-            .onSizeChanged { gesture.lengthPx = it.width.toFloat() }
+            .onSizeChanged { gesture.widthPx = it.width.toFloat() }
             .progressSemantics(value.toFloat(), 0f..FADER_MAX.toFloat())
             .semantics {
                 this.contentDescription = contentDescription
@@ -93,7 +92,7 @@ fun HorizontalFader(
             }
             .pointerInput(enabled, gesture) {
                 if (enabled) {
-                    detectTapGestures(onTap = { report(gesture.tap(size.width - it.x, currentValue)) })
+                    detectTapGestures(onTap = { report(gesture.tap(it.x, currentValue)) })
                 }
             }
             .draggable(

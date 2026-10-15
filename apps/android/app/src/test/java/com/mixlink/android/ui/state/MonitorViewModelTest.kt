@@ -426,7 +426,7 @@ class MonitorViewModelTest {
         connected(channels = 2)
         viewModel.setChannelLevel(0, 30)
 
-        viewModel.saveMix(" Verse ")
+        assertTrue(viewModel.saveMix(" Verse "))
 
         assertEquals(listOf("Verse"), store.banks.map { it.name })
         assertEquals(listOf(SavedMixUiState("Verse", true)), state.savedMixes.mixes)
@@ -442,8 +442,22 @@ class MonitorViewModelTest {
     }
 
     @Test
+    fun savingUnderAnExistingNameReplacesThatMix() {
+        connected(channels = 2)
+        viewModel.setChannelLevel(0, 30)
+        viewModel.saveMix("Verse")
+        viewModel.setChannelLevel(0, 70)
+
+        // As on the old screen, saving under a name already used updates that mix; it is not refused.
+        assertTrue(viewModel.saveMix("Verse"))
+
+        assertEquals(listOf("Verse"), store.banks.map { it.name })
+        assertEquals(listOf(70, 100), store.banks.single().snapshot.channelGains.toList())
+    }
+
+    @Test
     fun savingNeedsAName() {
-        viewModel.saveMix("   ")
+        assertFalse(viewModel.saveMix("   "))
 
         assertTrue(store.banks.isEmpty())
         assertEquals("Enter a name for the mix", state.savedMixes.notice)

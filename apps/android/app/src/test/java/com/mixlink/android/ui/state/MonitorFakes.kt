@@ -52,7 +52,13 @@ internal class FakeStore(
     }
 }
 
-/** Records what the session asked of the receiver, and keeps what it was built with. */
+/**
+ * Records what the session asked of the receiver, and keeps what it was built with.
+ *
+ * Like the real receiver, [stop] only asks the receive loop to end: the loop reports `onStopped`
+ * later, from its own thread, once the session's lock is free. [finishStopping] delivers that late
+ * report, so a test decides when it arrives.
+ */
 internal class FakeReceiver(
     val listener: PmonPlayer.Listener,
     val running: AtomicBoolean,
@@ -62,6 +68,10 @@ internal class FakeReceiver(
     var stops = 0
     var alive = false
 
+    /** True after a [stop] whose report [finishStopping] has not delivered yet. */
+    var stopping = false
+        private set
+
     override fun isAlive(): Boolean = alive
 
     override fun launch(host: String, port: Int) {
@@ -70,6 +80,14 @@ internal class FakeReceiver(
 
     override fun stop() {
         stops++
+        stopping = true
+    }
+
+    /** The receive loop asked to stop ends now and reports it, as the real one's `finally` does. */
+    fun finishStopping() {
+        check(stopping) { "stop() was not called" }
+        stopping = false
+        endOnItsOwn()
     }
 
     /** Ends the receive loop the way the real one does: the session flag drops, then onStopped. */
@@ -84,7 +102,9 @@ internal class FakeScanner(val listener: ServerDiscovery.Listener) : ServerScann
     var stops = 0
     var shutdowns = 0
 
+    /** Fails after [shutdown], as the real discovery's executor rejects new work once shut down. */
     override fun start() {
+        check(shutdowns == 0) { "start() after shutdown()" }
         starts++
     }
 

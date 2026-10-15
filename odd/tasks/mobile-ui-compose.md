@@ -74,6 +74,10 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
 - [x] T2 (state): `MonitorViewModel` holding connection, discovered servers, mix, saved mixes and
   diagnostics; pure reducers with JVM tests; `MainActivity` logic moved behind it (the Activity
   itself switches in T4). Commit: this commit.
+- [x] T2b (review follow-ups): T2's native review (lineage `review-ead3157fe7a55d5c`) approved and
+  acknowledged with two warnings, both fixed here: the receiver's stop report ends only its own
+  session, once, and nothing after `onCleared`; a late `mix_ack` after the session ended changes
+  nothing. Lands after T3. Commit: this commit.
 - [x] T3 (screens): Connect, Mix, Saved mixes and Settings composed from the atoms, with previews;
   `MonitorApp(state, actions)` as the root; the T1 review's fader follow-ups. The app still runs
   the XML screen. Commits: `a17522b` (fader fixes) and this commit (screens).
@@ -276,3 +280,32 @@ features.
 - T3 `cargo fmt --all -- --check`: clean (no Rust changes).
 - T3 has no Compose UI tests (they need instrumentation): the screens are checked by compiling
   their previews and by the pure tests; the live check is T4's.
+- T2b done (route: delegated direct, one writer; a correction unit for T2's review, `ui/state`
+  only). What landed:
+  - `R3-late-onstopped-after-teardown`: `MonitorViewModel` counts launched sessions and stop
+    reports under the session lock. The receiver reports exactly one stop per launch, in launch
+    order, so the n-th report belongs to the n-th session; a report ends a session only when it is
+    the latest session's and that session has not ended yet. `disconnect()` marks the session ended
+    before asking the receiver to stop, so the late report finds nothing to end; a report for a
+    session a newer one replaced does nothing; `onCleared` sets a cleared flag under the lock, so
+    no later report reaches the shut-down channel or discovery. A stray extra report counts as the
+    latest session's, so the counts cannot drift. The shared teardown is `closeSession`.
+  - `R3-late-ack-not-session-guarded`: the reducer drops `MixAcknowledged` while no session runs,
+    as it already dropped a late `ControlChanged`.
+  - Fakes: `FakeReceiver.stop()` now only asks the loop to end; `finishStopping()` delivers the
+    late report (flag down, then `onStopped`), as the real `finally` does. `FakeScanner.start()`
+    fails after `shutdown()`, as the real discovery's executor rejects work.
+- T2b note (not fixed, outside `ui/state`): `PmonPlayer`'s `finally` clears `receiverThread`
+  before it sets the shared `running` flag false, so a session started in that window has its
+  flag dropped by the previous receiver; that session then ends when its own loop sees the flag.
+  The ViewModel now attributes both reports correctly (test
+  `theLastSessionsLateStopReportCannotEndTheNextSession`), but the early end itself is
+  `PmonPlayer`'s.
+- T2b RED: the 7 new tests (5 ViewModel, 2 reducer) against the unchanged code: 89 `ui.state`
+  tests run, 6 failed (4 assertions, 2 `IllegalStateException` from `scanner.start()` after
+  shutdown); the seventh, `anAcknowledgementInTheNextSessionIsHeldByTheServer`, is a regression
+  guard that passes on both. GREEN: all 89 pass.
+- T2b `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD SUCCESSFUL,
+  41 tasks executed; 30 result files, 278 tests (271 plus 7), 0 failures, 0 errors; no Kotlin
+  warnings.
+- T2b `cargo fmt --all -- --check`: clean (no Rust changes).

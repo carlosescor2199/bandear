@@ -48,6 +48,15 @@ class MonitorViewModelTest {
     /** Builds the ViewModel now, for a test that acts on its collaborators first. */
     private fun started(): MonitorViewModel = viewModel
 
+    /** Builds the ViewModel in [owner], as an Activity would, so clearing [owner] runs `onCleared`. */
+    private fun ownedBy(owner: ViewModelStore): MonitorViewModel {
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T = newViewModel() as T
+        }
+        return ViewModelProvider(owner, factory)[MonitorViewModel::class.java]
+    }
+
     private fun socket() = transport.sockets.last()
 
     private fun lastMix(): JSONObject = socket().sentOfType("mix").last()
@@ -160,6 +169,90 @@ class MonitorViewModelTest {
         assertEquals(PillKind.NOT_CONNECTED, state.connection.pill)
         assertEquals(emptyList<Long>(), scheduler.pendingDelays())
         assertEquals(2, scanner.starts)
+    }
+
+    @Test
+    fun theReceiversLateStopReportAfterADisconnectEndsNothingAgain() {
+        connected()
+        viewModel.disconnect()
+        val ended = state
+
+        receiver.finishStopping()
+
+        assertEquals(1000 to "stopped", socket().closedWith)
+        assertEquals(2, scanner.starts)
+        assertEquals(ended, state)
+    }
+
+    @Test
+    fun aReceiverThatEndsOnItsOwnEndsTheSessionOnlyOnce() {
+        connected()
+        receiver.endOnItsOwn()
+
+        receiver.listener.onStopped()
+        viewModel.disconnect()
+
+        assertEquals(1000 to "receiver stopped", socket().closedWith)
+        assertEquals(2, scanner.starts)
+        assertEquals(0, receiver.stops)
+        assertFalse(state.connection.sessionRunning)
+    }
+
+    @Test
+    fun theLastSessionsLateStopReportCannotEndTheNextSession() {
+        connected()
+        viewModel.disconnect()
+        // The real receiver stops counting as alive just before it reports, so a new session can
+        // start in between; its report, flag drop included, still belongs to the session before.
+        viewModel.connect(SERVER)
+        val next = socket()
+
+        receiver.finishStopping()
+
+        assertNull(next.closedWith)
+        assertTrue(state.connection.sessionRunning)
+        assertEquals(2, scanner.starts)
+
+        // The next session's own receive loop then sees the flag down and ends that session.
+        receiver.endOnItsOwn()
+
+        assertEquals(1000 to "receiver stopped", next.closedWith)
+        assertFalse(state.connection.sessionRunning)
+        assertEquals(3, scanner.starts)
+    }
+
+    @Test
+    fun aStopReportArrivingAfterClearingTouchesNothing() {
+        val owner = ViewModelStore()
+        val model = ownedBy(owner)
+        model.connect(SERVER)
+        socket().open()
+        owner.clear()
+        val cleared = model.state.value
+
+        receiver.finishStopping()
+
+        assertEquals(2, scanner.starts)
+        assertEquals(1000 to "stopped", socket().closedWith)
+        assertEquals(cleared, model.state.value)
+    }
+
+    @Test
+    fun aReceiverThatEndedOnItsOwnBeforeClearingAndReportsAfterTouchesNothing() {
+        val owner = ViewModelStore()
+        val model = ownedBy(owner)
+        model.connect(SERVER)
+        socket().open()
+        // The receive loop ended and dropped the flag; its report has not arrived yet.
+        receiver.running.set(false)
+        owner.clear()
+        val cleared = model.state.value
+
+        receiver.listener.onStopped()
+
+        assertEquals(1, scanner.starts)
+        assertEquals(1000 to "destroyed", socket().closedWith)
+        assertEquals(cleared, model.state.value)
     }
 
     @Test
@@ -433,11 +526,7 @@ class MonitorViewModelTest {
     @Test
     fun clearingTheViewModelStopsEverything() {
         val owner = ViewModelStore()
-        val factory = object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T = newViewModel() as T
-        }
-        val model = ViewModelProvider(owner, factory)[MonitorViewModel::class.java]
+        val model = ownedBy(owner)
         model.connect(SERVER)
         socket().open()
 

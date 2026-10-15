@@ -66,8 +66,10 @@ private val PORTS = 1..65535
  *
  * Callbacks arrive on the receiver, control and discovery threads. The state is updated by an
  * atomic compare-and-set, so any thread may report. Starting and ending a session is serialised by
- * one lock, as the Activity's UI thread serialised it, so a receiver ending late cannot close a
- * session started after it. Intents are meant for the main thread.
+ * one lock, as the Activity's UI thread serialised it. A session ends once: the receiver's stop
+ * report only ends the session it belongs to, so a report arriving late cannot end a session twice
+ * or close a session started after it, and after [onCleared] it touches nothing. Intents are meant
+ * for the main thread.
  */
 internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel() {
     private val store = collaborators.store
@@ -80,6 +82,22 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     private val playerMix = ClientMixState()
 
     private val sessionLock = Any()
+
+    // Which session a receiver stop report belongs to. The receiver reports exactly one stop for
+    // each launch, from the launch's `finally`, in launch order, so the n-th report is the n-th
+    // session's. All three are guarded by [sessionLock].
+
+    /** Sessions launched so far; the current (or last) session is number [sessionsLaunched]. */
+    private var sessionsLaunched = 0L
+
+    /** Stop reports received so far. */
+    private var stopsReported = 0L
+
+    /** The last session torn down, by Stop or by its receiver; it is never torn down again. */
+    private var lastEndedSession = 0L
+
+    /** Set by [onCleared]: the channel and discovery are shut down, so nothing may end a session. */
+    private var cleared = false
 
     private val _state = MutableStateFlow(restoredState())
 
@@ -205,6 +223,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             // The name and the UDP port travel in the registration, so the server adds this musician
             // as a target with no address typed; the client id keeps their row when the IP changes.
             control.connect(host, controlPort, audioPort, _state.value.musicianName, clientId())
+            sessionsLaunched++
             receiver.launch(host, audioPort)
         }
     }
@@ -217,27 +236,36 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     fun disconnect() {
         synchronized(sessionLock) {
             if (!running.getAndSet(false)) return
+            // Ended before the receiver is asked to stop, so its stop report finds nothing left to end.
+            lastEndedSession = sessionsLaunched
             receiver.stop()
-            control.close(NORMAL_CLOSE, "stopped")
-            control.controlState = ControlState.IDLE
-            dispatch(SessionEnded)
-            scanner.start()
+            closeSession("stopped")
         }
     }
 
     /**
-     * The receiver ended, on request or on its own. The session is over then, so the control channel
-     * closes and stops reconnecting, and discovery listens again. A session started meanwhile is
-     * left alone.
+     * The receiver ended, on request or on its own, and reported it. Only the latest session's
+     * report ends a session, and only once: a report for a session already ended (by Stop, or one
+     * replaced by a newer session) does nothing, and after [onCleared] no report does anything.
      */
     private fun receiverStopped() {
         synchronized(sessionLock) {
-            if (running.get()) return
-            control.close(NORMAL_CLOSE, "receiver stopped")
-            control.controlState = ControlState.IDLE
-            dispatch(SessionEnded)
-            scanner.start()
+            // The real receiver never reports more stops than launches; a stray report counts as
+            // the latest session's, so the counts cannot drift apart.
+            stopsReported = minOf(stopsReported + 1, sessionsLaunched)
+            val session = stopsReported
+            if (cleared || session != sessionsLaunched || session == lastEndedSession) return
+            lastEndedSession = session
+            closeSession("receiver stopped")
         }
+    }
+
+    /** The end of a session: the control channel closes and stops reconnecting, and discovery listens again. */
+    private fun closeSession(reason: String) {
+        control.close(NORMAL_CLOSE, reason)
+        control.controlState = ControlState.IDLE
+        dispatch(SessionEnded)
+        scanner.start()
     }
 
     private fun publishControlState() {
@@ -373,7 +401,12 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     }
 
     override fun onCleared() {
-        disconnect()
+        synchronized(sessionLock) {
+            disconnect()
+            // A receiver report arriving from now on must not reach the channel or discovery,
+            // which are shut down below.
+            cleared = true
+        }
         control.close(NORMAL_CLOSE, "destroyed")
         control.shutdown()
         scanner.shutdown()

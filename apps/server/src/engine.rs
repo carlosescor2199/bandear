@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use cpal::traits::{HostTrait, StreamTrait};
 
@@ -15,10 +16,11 @@ use crate::capture::{
 use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
+use crate::health::{link_status, LinkStatus};
 use crate::mix::{Group, GroupLayout, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
-use crate::targets::TargetRegistry;
+use crate::targets::{TargetEntry, TargetRegistry};
 
 const CHANNEL_CAPACITY: usize = 8;
 
@@ -68,7 +70,9 @@ pub struct MusicianCounters {
 /// This is the row the UI shows. The engine performs the join, because the target list and the
 /// control peers are two views of the same person and letting the UI infer the relationship from
 /// two lists lets them disagree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// It is `PartialEq` but not `Eq`, because the link rates are fractional.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MusicianStatus {
     pub address: SocketAddr,
     /// The name the musician typed on their own app and announced when registering, if any.
@@ -79,6 +83,13 @@ pub struct MusicianStatus {
     pub control_connected: bool,
     pub mix: MixValues,
     pub counters: MusicianCounters,
+    /// What the musician's phone reports about the audio it receives, classified into a level.
+    ///
+    /// [LinkHealth::Unknown] with no rates when the phone never reported (including a phone that
+    /// predates stats reports) or when its reports stopped after its control channel closed.
+    /// [LinkHealth::Bad] with no rates when its reports stopped while the control channel is still
+    /// connected: the phone is there but its link is lost.
+    pub link: LinkStatus,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -97,7 +108,7 @@ pub struct GroupStatus {
 }
 
 /// A snapshot of everything the engine can report without blocking the audio path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EngineStatus {
     pub device_name: String,
     pub capture_format: CaptureFormat,
@@ -160,6 +171,7 @@ pub(crate) fn join_musicians(
     counters: &HashMap<IpAddr, MusicianCounters>,
     mixes: &HashMap<IpAddr, MixValues>,
     names: &HashMap<IpAddr, String>,
+    links: &HashMap<IpAddr, LinkStatus>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -171,7 +183,32 @@ pub(crate) fn join_musicians(
                 control_connected: connected.contains(&ip),
                 mix: mixes.get(&ip).copied().unwrap_or_default(),
                 counters: counters.get(&ip).copied().unwrap_or_default(),
+                link: links.get(&ip).copied().unwrap_or_default(),
             }
+        })
+        .collect()
+}
+
+/// Classifies every target's latest link report at `now`.
+///
+/// A stale report is judged by whether the musician's control channel is still connected: the
+/// reports travel over the same Wi-Fi as the audio, so a phone that lost its link is still connected
+/// but can no longer report it. Each report is copied out under its own short lock and every
+/// musician is judged against the same clock read.
+pub(crate) fn link_statuses(
+    entries: &[TargetEntry],
+    connected: &HashSet<IpAddr>,
+    now: Instant,
+) -> HashMap<IpAddr, LinkStatus> {
+    entries
+        .iter()
+        .map(|entry| {
+            let ip = entry.address.ip();
+            let report = *entry.link_report.lock().expect("link report lock poisoned");
+            (
+                ip,
+                link_status(report.as_ref(), connected.contains(&ip), now),
+            )
         })
         .collect()
 }
@@ -468,6 +505,7 @@ impl EngineHandle {
                     .map(|name| (entry.address.ip(), name.to_owned()))
             })
             .collect();
+        let links = link_statuses(&entries, &connected, Instant::now());
         EngineStatus {
             device_name: self.device_name.clone(),
             capture_format: self.capture_format.clone(),
@@ -480,7 +518,7 @@ impl EngineHandle {
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
-            musicians: join_musicians(&targets, &connected, &counters, &mixes, &names),
+            musicians: join_musicians(&targets, &connected, &counters, &mixes, &names, &links),
         }
     }
 
@@ -801,7 +839,16 @@ mod tests {
         let mut names = HashMap::new();
         names.insert(ip("192.168.1.4"), "Ana".to_owned());
 
-        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &names);
+        let reporting = LinkStatus {
+            health: crate::health::LinkHealth::Warning,
+            underruns_per_second: Some(1.0),
+            loss_percent: Some(0.0),
+            receive_timeouts_per_second: Some(0.0),
+        };
+        let mut links = HashMap::new();
+        links.insert(ip("192.168.1.3"), reporting);
+
+        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &names, &links);
 
         assert_eq!(musicians.len(), 3);
 
@@ -817,6 +864,7 @@ mod tests {
                 packets_discarded: 1,
             }
         );
+        assert_eq!(connected_with_mix.link, reporting);
 
         let disconnected = &musicians[1];
         assert_eq!(disconnected.address, targets[1]);
@@ -837,6 +885,61 @@ mod tests {
         assert!(connected_without_data.control_connected);
         assert_eq!(connected_without_data.counters, MusicianCounters::default());
         assert_eq!(connected_without_data.mix, MixValues::default());
+        // A phone that never reported (or predates reports) is unknown, with no rates to show.
+        assert_eq!(connected_without_data.link, LinkStatus::default());
+        assert_eq!(
+            connected_without_data.link.health,
+            crate::health::LinkHealth::Unknown
+        );
+    }
+
+    #[test]
+    fn a_stale_report_is_judged_by_whether_the_musicians_control_channel_is_still_connected() {
+        use crate::health::{LinkHealth, LinkReport, REPORT_STALE_AFTER};
+        use std::time::Duration;
+
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+                "192.168.1.5:50000".parse().unwrap(),
+            ],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let received_at = Instant::now();
+        for reporting in ["192.168.1.3", "192.168.1.4"] {
+            let slot = registry.link_report(ip(reporting)).expect("configured");
+            *slot.lock().expect("report lock") = Some(LinkReport {
+                interval_ms: 1_000,
+                packets_received: 200,
+                packets_lost: 0,
+                underruns: 0,
+                receive_timeouts: 0,
+                received_at,
+            });
+        }
+        let connected: HashSet<IpAddr> =
+            [ip("192.168.1.3"), ip("192.168.1.5")].into_iter().collect();
+        let later = received_at + REPORT_STALE_AFTER + Duration::from_secs(1);
+
+        let links = link_statuses(&registry.read(), &connected, later);
+
+        assert_eq!(
+            links[&ip("192.168.1.3")].health,
+            LinkHealth::Bad,
+            "still connected but its reports stopped: the link is lost"
+        );
+        assert_eq!(
+            links[&ip("192.168.1.4")].health,
+            LinkHealth::Unknown,
+            "its control channel closed: the musician stopped or left"
+        );
+        assert_eq!(
+            links[&ip("192.168.1.5")].health,
+            LinkHealth::Unknown,
+            "connected but never reported: a phone without stats reports"
+        );
     }
 
     #[test]

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use crate::protocol::StatsCommand;
 
 /// How long a report stays meaningful. A phone reports about once a second, so a report older than
-/// this means the phone stopped reporting (it left, or it predates stats support) and its last
-/// numbers no longer describe what the musician hears.
+/// this means its reports stopped arriving and its last numbers no longer describe what the
+/// musician hears. Why they stopped is told apart by the control channel: see [classify].
 pub(crate) const REPORT_STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Underruns per second at or above which the link is bad: the phone is audibly starving.
@@ -36,11 +36,13 @@ const MILLISECONDS_PER_SECOND: u64 = 1_000;
 /// The traffic-light level of one musician's link.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LinkHealth {
-    /// No report, or the last one is too old to describe the link.
+    /// No report ever, or the reports stopped once the musician's control channel closed.
     #[default]
     Unknown,
     Good,
     Warning,
+    /// The numbers cross a bad threshold, or the reports stopped while the control channel is still
+    /// connected: the link is lost.
     Bad,
 }
 
@@ -71,11 +73,23 @@ impl LinkReport {
         }
     }
 
-    /// The report when it still describes the link at `now`, or `None` once it is stale.
-    fn fresh(report: Option<&Self>, now: Instant) -> Option<&Self> {
-        report.filter(|report| {
-            now.saturating_duration_since(report.received_at) <= REPORT_STALE_AFTER
-        })
+    /// Whether the report still describes the link at `now`.
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.received_at) <= REPORT_STALE_AFTER
+    }
+
+    /// The level this report's numbers reach on the thresholds.
+    fn judge(&self) -> LinkHealth {
+        if self.receive_timeouts > 0
+            || self.rate_reaches(self.underruns, BAD_UNDERRUNS_PER_SECOND)
+            || self.loss_reaches(BAD_LOSS_BASIS_POINTS)
+        {
+            return LinkHealth::Bad;
+        }
+        if self.underruns > 0 || self.loss_reaches(WARNING_LOSS_BASIS_POINTS) {
+            return LinkHealth::Warning;
+        }
+        LinkHealth::Good
     }
 
     /// The packets the phone expected over the interval: those that arrived plus those that did not.
@@ -129,37 +143,52 @@ pub struct LinkStatus {
     pub receive_timeouts_per_second: Option<f64>,
 }
 
-/// Classifies a link from its latest report.
+/// Classifies a link from its latest report and whether the musician's control channel is still
+/// connected.
 ///
-/// Rates are normalised by the report's interval, so a phone reporting every 500 ms and one
-/// reporting every 2 s are judged on the same scale. The comparisons are done in integers so a
-/// count that lands exactly on a threshold is classified exactly, with no rounding at the boundary.
-pub(crate) fn classify(report: Option<&LinkReport>, now: Instant) -> LinkHealth {
-    let Some(report) = LinkReport::fresh(report, now) else {
-        return LinkHealth::Unknown;
-    };
-    if report.receive_timeouts > 0
-        || report.rate_reaches(report.underruns, BAD_UNDERRUNS_PER_SECOND)
-        || report.loss_reaches(BAD_LOSS_BASIS_POINTS)
-    {
-        return LinkHealth::Bad;
+/// - No report ever: unknown. A phone build that predates stats reports never sends one.
+/// - A fresh report: judged on its numbers. Rates are normalised by the report's interval, so a
+///   phone reporting every 500 ms and one reporting every 2 s are judged on the same scale. The
+///   comparisons are done in integers so a count that lands exactly on a threshold is classified
+///   exactly, with no rounding at the boundary.
+/// - A stale report while the control channel is still connected: bad. The reports travel over the
+///   same Wi-Fi as the audio, so a phone that loses its link can never send the report that would
+///   say so; the phone is still there, but nothing from it arrives.
+/// - A stale report once the control channel has closed: unknown. The musician stopped or left, so
+///   there is no link left to judge.
+pub(crate) fn classify(
+    report: Option<&LinkReport>,
+    control_connected: bool,
+    now: Instant,
+) -> LinkHealth {
+    match report {
+        None => LinkHealth::Unknown,
+        Some(report) if report.is_fresh(now) => report.judge(),
+        Some(_) if control_connected => LinkHealth::Bad,
+        Some(_) => LinkHealth::Unknown,
     }
-    if report.underruns > 0 || report.loss_reaches(WARNING_LOSS_BASIS_POINTS) {
-        return LinkHealth::Warning;
-    }
-    LinkHealth::Good
 }
 
 /// The level together with the rates it was judged on, for the status snapshot.
-pub(crate) fn link_status(report: Option<&LinkReport>, now: Instant) -> LinkStatus {
-    let Some(report) = LinkReport::fresh(report, now) else {
-        return LinkStatus::default();
-    };
-    LinkStatus {
-        health: classify(Some(report), now),
-        underruns_per_second: Some(report.per_second(report.underruns)),
-        loss_percent: Some(report.loss_percent()),
-        receive_timeouts_per_second: Some(report.per_second(report.receive_timeouts)),
+///
+/// The rates come only from a fresh report: a lost link is bad with no numbers to show.
+pub(crate) fn link_status(
+    report: Option<&LinkReport>,
+    control_connected: bool,
+    now: Instant,
+) -> LinkStatus {
+    let health = classify(report, control_connected, now);
+    match report.filter(|report| report.is_fresh(now)) {
+        Some(report) => LinkStatus {
+            health,
+            underruns_per_second: Some(report.per_second(report.underruns)),
+            loss_percent: Some(report.loss_percent()),
+            receive_timeouts_per_second: Some(report.per_second(report.receive_timeouts)),
+        },
+        None => LinkStatus {
+            health,
+            ..LinkStatus::default()
+        },
     }
 }
 
@@ -190,9 +219,21 @@ mod tests {
         report(1_000, received, lost, underruns, 0, now)
     }
 
+    /// The musician's control channel is still open.
+    const CONNECTED: bool = true;
+    /// The musician's control channel has closed: the phone stopped or left.
+    const CLOSED: bool = false;
+
     #[test]
-    fn no_report_is_unknown() {
-        assert_eq!(classify(None, Instant::now()), LinkHealth::Unknown);
+    fn no_report_is_unknown_whether_or_not_the_control_channel_is_connected() {
+        let now = Instant::now();
+
+        assert_eq!(
+            classify(None, CONNECTED, now),
+            LinkHealth::Unknown,
+            "a phone that never reports (an older build) is unknown, not bad"
+        );
+        assert_eq!(classify(None, CLOSED, now), LinkHealth::Unknown);
     }
 
     #[test]
@@ -200,38 +241,75 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            classify(Some(&one_second(200, 0, 0, now)), now),
+            classify(Some(&one_second(200, 0, 0, now)), CONNECTED, now),
             LinkHealth::Good
         );
     }
 
     #[test]
-    fn a_report_is_fresh_up_to_the_stale_limit_and_unknown_just_after_it() {
+    fn a_fresh_report_is_judged_on_its_numbers_whether_or_not_the_control_channel_is_connected() {
+        let now = Instant::now();
+        let one_underrun = one_second(200, 0, 1, now);
+
+        assert_eq!(
+            classify(Some(&one_underrun), CONNECTED, now),
+            LinkHealth::Warning
+        );
+        assert_eq!(
+            classify(Some(&one_underrun), CLOSED, now),
+            LinkHealth::Warning
+        );
+    }
+
+    #[test]
+    fn a_report_that_goes_stale_while_the_control_channel_is_connected_is_a_lost_link() {
         let received_at = Instant::now();
         let clean = one_second(200, 0, 0, received_at);
 
         assert_eq!(
-            classify(Some(&clean), received_at + REPORT_STALE_AFTER),
+            classify(Some(&clean), CONNECTED, received_at + REPORT_STALE_AFTER),
             LinkHealth::Good,
             "a report exactly at the limit still describes the link"
         );
         assert_eq!(
             classify(
                 Some(&clean),
+                CONNECTED,
                 received_at + REPORT_STALE_AFTER + Duration::from_millis(1)
             ),
-            LinkHealth::Unknown,
-            "a report older than the limit no longer describes the link"
+            LinkHealth::Bad,
+            "the phone is still connected but its reports stopped arriving: the link is lost"
         );
     }
 
     #[test]
-    fn a_stale_bad_report_is_unknown_rather_than_bad() {
+    fn a_report_that_goes_stale_after_the_control_channel_closed_is_unknown() {
+        let received_at = Instant::now();
+        let clean = one_second(200, 0, 0, received_at);
+
+        assert_eq!(
+            classify(Some(&clean), CLOSED, received_at + REPORT_STALE_AFTER),
+            LinkHealth::Good,
+            "a report exactly at the limit still describes the link"
+        );
+        assert_eq!(
+            classify(
+                Some(&clean),
+                CLOSED,
+                received_at + REPORT_STALE_AFTER + Duration::from_millis(1)
+            ),
+            LinkHealth::Unknown,
+            "the musician stopped or left, so there is no link to judge"
+        );
+    }
+
+    #[test]
+    fn a_stale_bad_report_is_unknown_once_the_musician_has_left() {
         let received_at = Instant::now();
         let bad = report(1_000, 0, 0, 0, 3, received_at);
 
         assert_eq!(
-            classify(Some(&bad), received_at + Duration::from_secs(10)),
+            classify(Some(&bad), CLOSED, received_at + Duration::from_secs(10)),
             LinkHealth::Unknown
         );
     }
@@ -241,11 +319,11 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            classify(Some(&one_second(0, 0, 0, now)), now),
+            classify(Some(&one_second(0, 0, 0, now)), CONNECTED, now),
             LinkHealth::Good
         );
         assert_eq!(
-            link_status(Some(&one_second(0, 0, 0, now)), now).loss_percent,
+            link_status(Some(&one_second(0, 0, 0, now)), CONNECTED, now).loss_percent,
             Some(0.0)
         );
     }
@@ -255,7 +333,7 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            classify(Some(&report(1_000, 200, 0, 0, 1, now)), now),
+            classify(Some(&report(1_000, 200, 0, 0, 1, now)), CONNECTED, now),
             LinkHealth::Bad
         );
     }
@@ -265,11 +343,11 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            classify(Some(&one_second(200, 0, 2, now)), now),
+            classify(Some(&one_second(200, 0, 2, now)), CONNECTED, now),
             LinkHealth::Bad
         );
         assert_eq!(
-            classify(Some(&one_second(200, 0, 1, now)), now),
+            classify(Some(&one_second(200, 0, 1, now)), CONNECTED, now),
             LinkHealth::Warning,
             "any underrun is worth a look"
         );
@@ -281,17 +359,17 @@ mod tests {
 
         // Three underruns over two seconds is 1.5 per second: below the bad rate.
         assert_eq!(
-            classify(Some(&report(2_000, 400, 0, 3, 0, now)), now),
+            classify(Some(&report(2_000, 400, 0, 3, 0, now)), CONNECTED, now),
             LinkHealth::Warning
         );
         // Four over two seconds is exactly the bad rate.
         assert_eq!(
-            classify(Some(&report(2_000, 400, 0, 4, 0, now)), now),
+            classify(Some(&report(2_000, 400, 0, 4, 0, now)), CONNECTED, now),
             LinkHealth::Bad
         );
         // Two in half a second is four per second.
         assert_eq!(
-            classify(Some(&report(500, 100, 0, 2, 0, now)), now),
+            classify(Some(&report(500, 100, 0, 2, 0, now)), CONNECTED, now),
             LinkHealth::Bad
         );
     }
@@ -302,12 +380,12 @@ mod tests {
 
         // 4 of 200 expected packets lost: exactly 2 %.
         assert_eq!(
-            classify(Some(&one_second(196, 4, 0, now)), now),
+            classify(Some(&one_second(196, 4, 0, now)), CONNECTED, now),
             LinkHealth::Bad
         );
         // 3 of 200: 1.5 %.
         assert_eq!(
-            classify(Some(&one_second(197, 3, 0, now)), now),
+            classify(Some(&one_second(197, 3, 0, now)), CONNECTED, now),
             LinkHealth::Warning
         );
     }
@@ -318,12 +396,12 @@ mod tests {
 
         // 1 of 200 expected packets lost: exactly 0.5 %.
         assert_eq!(
-            classify(Some(&one_second(199, 1, 0, now)), now),
+            classify(Some(&one_second(199, 1, 0, now)), CONNECTED, now),
             LinkHealth::Warning
         );
         // 1 of 400: 0.25 %.
         assert_eq!(
-            classify(Some(&one_second(399, 1, 0, now)), now),
+            classify(Some(&one_second(399, 1, 0, now)), CONNECTED, now),
             LinkHealth::Good
         );
     }
@@ -333,7 +411,11 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            classify(Some(&report(1, u64::MAX, u64::MAX, u64::MAX, 0, now)), now),
+            classify(
+                Some(&report(1, u64::MAX, u64::MAX, u64::MAX, 0, now)),
+                CONNECTED,
+                now
+            ),
             LinkHealth::Bad
         );
     }
@@ -342,7 +424,7 @@ mod tests {
     fn link_status_reports_the_rates_normalised_by_the_interval() {
         let now = Instant::now();
 
-        let status = link_status(Some(&report(2_000, 990, 10, 1, 0, now)), now);
+        let status = link_status(Some(&report(2_000, 990, 10, 1, 0, now)), CONNECTED, now);
 
         assert_eq!(status.health, LinkHealth::Warning);
         assert_eq!(status.underruns_per_second, Some(0.5));
@@ -355,12 +437,40 @@ mod tests {
         let received_at = Instant::now();
         let stale = one_second(200, 0, 0, received_at);
 
-        assert_eq!(link_status(None, received_at), LinkStatus::default());
         assert_eq!(
-            link_status(Some(&stale), received_at + Duration::from_secs(4)),
+            link_status(None, CONNECTED, received_at),
+            LinkStatus::default()
+        );
+        assert_eq!(
+            link_status(None, CLOSED, received_at),
+            LinkStatus::default()
+        );
+        assert_eq!(
+            link_status(Some(&stale), CLOSED, received_at + Duration::from_secs(4)),
             LinkStatus::default()
         );
         assert_eq!(LinkStatus::default().health, LinkHealth::Unknown);
+    }
+
+    #[test]
+    fn a_lost_link_is_bad_with_no_rates_to_show() {
+        let received_at = Instant::now();
+        let stale = one_second(200, 0, 0, received_at);
+
+        assert_eq!(
+            link_status(
+                Some(&stale),
+                CONNECTED,
+                received_at + Duration::from_secs(4)
+            ),
+            LinkStatus {
+                health: LinkHealth::Bad,
+                underruns_per_second: None,
+                loss_percent: None,
+                receive_timeouts_per_second: None,
+            },
+            "the last numbers no longer describe the link, so none are shown"
+        );
     }
 
     #[test]

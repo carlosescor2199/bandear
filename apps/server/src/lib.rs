@@ -3,8 +3,6 @@ mod cli;
 mod control;
 mod discovery;
 mod engine;
-// The control channel and the engine status start using the classifier in the next commit.
-#[allow(dead_code)]
 mod health;
 mod mix;
 mod network;

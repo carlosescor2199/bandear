@@ -12,12 +12,16 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::engine::{EngineEvent, EventBus};
+use crate::health::LinkReport;
 use crate::mix::GroupLayout;
 use crate::protocol::{
     control_error, control_message_type, mix_ack, parse_mix_command, parse_register_command,
-    registered_name, ControlConfig, GroupConfig,
+    parse_stats_command, registered_name, ControlConfig, GroupConfig,
 };
 use crate::targets::TargetRegistry;
+
+/// The error a peer whose IP is not a target gets, for every message that joins on the target.
+const NO_TARGET_ERROR: &str = "no UDP target configured for client IP";
 
 /// Counts the live control connections per client IP.
 ///
@@ -339,12 +343,28 @@ async fn handle_control_connection(
                         }
                         Err(error) => Some(control_error(error)?),
                     }
+                } else if message_type == "stats" {
+                    // A link report joins on the peer IP exactly like a mix, so an IP with no target
+                    // gets the same error and nothing is stored. Success is answered with nothing,
+                    // like a registration: the phone sends one every second and needs no echo. The
+                    // lock is only held for the store, never across an await.
+                    match targets.link_report(peer.ip()) {
+                        None => Some(control_error(NO_TARGET_ERROR.to_owned())?),
+                        Some(latest) => match parse_stats_command(&text) {
+                            Ok(command) => {
+                                let report = LinkReport::from_command(&command, Instant::now());
+                                *latest.lock().expect("link report lock poisoned") = Some(report);
+                                None
+                            }
+                            Err(error) => Some(control_error(error)?),
+                        },
+                    }
                 } else {
                     // The join is live: a peer whose target was removed at runtime finds no mix
                     // state here and gets the same error an IP that was never configured has always
                     // received. The control channel itself is deliberately left open.
                     Some(match targets.mix_state(peer.ip()) {
-                        None => control_error("no UDP target configured for client IP".to_owned())?,
+                        None => control_error(NO_TARGET_ERROR.to_owned())?,
                         Some(mix_state) => match parse_mix_command(&text, mix_state.snapshot()) {
                             Ok(values) => {
                                 mix_state.update(values);
@@ -973,6 +993,165 @@ mod tests {
         .await
         .expect("audio should arrive within 5s")
         .expect("recv task should finish")
+    }
+
+    /// Reads the next reply that is not a `config` push, so a test can tell which message answered.
+    /// Bounded by a deadline so a missing answer fails the test instead of hanging it.
+    async fn read_next_reply(client: &mut ClientStream) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, client.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+                    if value.get("type").and_then(|kind| kind.as_str()) != Some("config") {
+                        return Some(value);
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    async fn connect_client(address: SocketAddr) -> ClientStream {
+        let (mut client, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_async(format!("ws://{address}")),
+        )
+        .await
+        .expect("client should connect within 5s")
+        .expect("client should connect");
+        assert!(
+            read_message_of_type(&mut client, "config").await.is_some(),
+            "config should arrive"
+        );
+        client
+    }
+
+    const CLEAN_STATS: &str = r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":3,"underruns":1,"receive_timeouts":0}"#;
+
+    /// A `stats` report from a target's peer is stored on that target and answered with nothing,
+    /// like a registration; the `mix` that follows on the same socket is still acknowledged, so its
+    /// acknowledgement is the very next reply.
+    #[tokio::test]
+    async fn a_stats_report_is_stored_on_the_peers_target_without_a_reply() {
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &GroupLayout::default(),
+            )
+            .expect("registry should build"),
+        );
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+        let slot = targets.link_report(target_ip).expect("configured target");
+        let mut client = connect_client(address).await;
+        let sent_at = Instant::now();
+
+        client
+            .send(Message::Text(CLEAN_STATS.into()))
+            .await
+            .expect("client should send");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            if let Some(report) = *slot.lock().expect("report lock") {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "the report should be stored");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(report.interval_ms, 1_000);
+        assert_eq!(report.packets_received, 200);
+        assert_eq!(report.packets_lost, 3);
+        assert_eq!(report.underruns, 1);
+        assert_eq!(report.receive_timeouts, 0);
+        assert!(report.received_at >= sent_at, "stamped on arrival");
+
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        let reply = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(
+            reply.get("type").and_then(|kind| kind.as_str()),
+            Some("mix_ack"),
+            "the stats report must not be answered, so the next reply is the mix ack: {reply}"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A `stats` report from an IP with no target gets the same error a `mix` gets, and nothing is
+    /// created or stored for it.
+    #[tokio::test]
+    async fn a_stats_report_from_an_ip_with_no_target_gets_the_no_target_error() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let mut client = connect_client(address).await;
+
+        client
+            .send(Message::Text(CLEAN_STATS.into()))
+            .await
+            .expect("client should send");
+
+        let reply = read_next_reply(&mut client).await.expect("an error reply");
+        assert_eq!(
+            reply.get("type").and_then(|kind| kind.as_str()),
+            Some("error")
+        );
+        assert_eq!(
+            reply.get("message").and_then(|message| message.as_str()),
+            Some("no UDP target configured for client IP")
+        );
+        assert!(targets.read().is_empty(), "a report never creates a target");
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// An invalid `stats` report is answered with an error naming the problem and stores nothing.
+    #[tokio::test]
+    async fn an_invalid_stats_report_gets_an_error_and_stores_nothing() {
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &GroupLayout::default(),
+            )
+            .expect("registry should build"),
+        );
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let slot = targets
+            .link_report("127.0.0.1".parse().expect("target IP"))
+            .expect("configured target");
+        let mut client = connect_client(address).await;
+
+        client
+            .send(Message::Text(
+                r#"{"type":"stats","interval_ms":0,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}"#.into(),
+            ))
+            .await
+            .expect("client should send");
+
+        let reply = read_next_reply(&mut client).await.expect("an error reply");
+        assert_eq!(
+            reply.get("type").and_then(|kind| kind.as_str()),
+            Some("error")
+        );
+        let message = reply
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("interval_ms"),
+            "the error names the field: {message}"
+        );
+        assert!(slot.lock().expect("report lock").is_none());
+
+        stop_server(address, &stopped, server).await;
     }
 
     /// The grace period over a real socket: dropping the control channel keeps the target, and the

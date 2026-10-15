@@ -3,33 +3,35 @@
 // The host is the ARIA slider: it is focusable, carries the value, and takes the keys (arrows one
 // step, Page Up and Page Down ten, Home and End either end). A pointer drag on the thumb keeps the
 // grab point; a press on the track jumps there. A double-click resets to the `default` attribute.
+// The gestures themselves live in lib/slider-gesture.js, which is tested; this class only turns
+// DOM events into gesture calls, renders the value and dispatches what the gesture returns.
 //
 // Events (bubbling, composed): `input` { value } on every change the user makes, `change`
 // { value } when a gesture ends (pointer released, each key press, a reset). Setting `value`
-// never fires them. While a drag is in progress the user wins: a value set from outside is held
-// and applied when the drag ends, so the thumb never jumps under the pointer.
+// never fires them. While a drag is in progress a value set from outside waits until it ends.
 //
 // A subclass sets `static range` (see values.js) and `static orientation`, and implements
 // `pointerFractionAt(event)`, `isThumb(node)`, `valueText(value)` and `render(value)`; it may
 // override `snap(value)`. Host attributes are set on connection, never in a constructor.
 
-import { clampLevel, keyValue, levelFraction, levelFromFraction } from "../lib/values.js";
+import { SliderGesture } from "../lib/slider-gesture.js";
+import { clampLevel } from "../lib/values.js";
 import { emit, numberAttribute, syncLabel, upgradeProperty } from "./support.js";
 
 export class SliderElement extends HTMLElement {
   static observedAttributes = ["value", "default", "label", "disabled"];
 
-  #value = null;
-  #drag = null;
-  #held = null;
+  #gesture;
 
   constructor() {
     super();
+    const { range } = this.constructor;
+    this.#gesture = new SliderGesture({ range, snap: (value) => this.snap(value) });
     this.addEventListener("pointerdown", this.#onPointerDown);
     this.addEventListener("pointermove", this.#onPointerMove);
-    this.addEventListener("pointerup", this.#endDrag);
-    this.addEventListener("pointercancel", this.#endDrag);
-    this.addEventListener("lostpointercapture", this.#endDrag);
+    this.addEventListener("pointerup", this.#onPointerUp);
+    this.addEventListener("pointercancel", this.#onPointerUp);
+    this.addEventListener("lostpointercapture", this.#onPointerUp);
     this.addEventListener("keydown", this.#onKeyDown);
     this.addEventListener("dblclick", this.#onDoubleClick);
   }
@@ -43,7 +45,7 @@ export class SliderElement extends HTMLElement {
     this.setAttribute("aria-valuemax", String(range.max));
     this.#syncDisabled();
     syncLabel(this);
-    this.#show(this.value);
+    this.#show();
   }
 
   attributeChangedCallback(name) {
@@ -62,16 +64,13 @@ export class SliderElement extends HTMLElement {
   }
 
   get value() {
-    return this.#value ?? clampLevel(numberAttribute(this, "value", this.defaultValue));
+    return this.#gesture.value;
   }
 
   set value(value) {
-    const next = clampLevel(value);
-    if (this.#drag) {
-      this.#held = next;
-      return;
+    if (this.#gesture.set(value)) {
+      this.#show();
     }
-    this.#show(next);
   }
 
   get disabled() {
@@ -87,8 +86,8 @@ export class SliderElement extends HTMLElement {
     return value;
   }
 
-  #show(value) {
-    this.#value = value;
+  #show() {
+    const { value } = this.#gesture;
     this.setAttribute("aria-valuenow", String(value));
     this.setAttribute("aria-valuetext", this.valueText(value));
     this.render(value);
@@ -99,14 +98,17 @@ export class SliderElement extends HTMLElement {
     this.setAttribute("aria-disabled", String(this.disabled));
   }
 
-  #change(value, { commit }) {
-    if (value !== this.value) {
-      this.#show(value);
-      emit(this, "input", { value });
+  // Renders the value the gesture shows, then dispatches its events, so a listener that sets the
+  // value in answer has the last word.
+  #apply(events) {
+    if (events === null) {
+      return false;
     }
-    if (commit) {
-      emit(this, "change", { value: this.value });
+    this.#show();
+    for (const { type, value } of events) {
+      emit(this, type, { value });
     }
+    return true;
   }
 
   #onPointerDown = (event) => {
@@ -116,37 +118,19 @@ export class SliderElement extends HTMLElement {
     event.preventDefault();
     this.focus();
     this.setPointerCapture(event.pointerId);
-    const pointer = this.pointerFractionAt(event);
     const onThumb = event.composedPath().some((node) => this.isThumb(node));
-    this.#drag = {
-      start: this.value,
-      offset: onThumb ? levelFraction(this.value) - pointer : 0,
-    };
-    this.#held = null;
-    this.#change(this.snap(levelFromFraction(pointer + this.#drag.offset)), { commit: false });
+    this.#apply(this.#gesture.press(this.pointerFractionAt(event), { onThumb }));
   };
 
   #onPointerMove = (event) => {
-    if (!this.#drag) {
-      return;
+    if (this.#gesture.dragging) {
+      this.#apply(this.#gesture.move(this.pointerFractionAt(event)));
     }
-    const fraction = this.pointerFractionAt(event) + this.#drag.offset;
-    this.#change(this.snap(levelFromFraction(fraction)), { commit: false });
   };
 
-  #endDrag = () => {
-    if (!this.#drag) {
-      return;
-    }
-    const { start } = this.#drag;
-    this.#drag = null;
-    if (this.value !== start) {
-      emit(this, "change", { value: this.value });
-    }
-    if (this.#held !== null) {
-      const held = this.#held;
-      this.#held = null;
-      this.#show(held);
+  #onPointerUp = () => {
+    if (this.#gesture.dragging) {
+      this.#apply(this.#gesture.release());
     }
   };
 
@@ -154,12 +138,9 @@ export class SliderElement extends HTMLElement {
     if (this.disabled || event.altKey || event.ctrlKey || event.metaKey) {
       return;
     }
-    const next = keyValue(event.key, this.value, this.constructor.range);
-    if (next === null) {
-      return;
+    if (this.#apply(this.#gesture.key(event.key))) {
+      event.preventDefault();
     }
-    event.preventDefault();
-    this.#change(next, { commit: next !== this.value });
   };
 
   #onDoubleClick = (event) => {
@@ -167,7 +148,6 @@ export class SliderElement extends HTMLElement {
       return;
     }
     event.preventDefault();
-    const reset = this.defaultValue;
-    this.#change(reset, { commit: reset !== this.value });
+    this.#apply(this.#gesture.reset(this.defaultValue));
   };
 }

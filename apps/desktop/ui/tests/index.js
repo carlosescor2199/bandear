@@ -8,3 +8,4 @@ import "./console-state.test.js";
 import "./coalesce.test.js";
 import "./bridge.test.js";
 import "./router.test.js";
+import "./slider-gesture.test.js";

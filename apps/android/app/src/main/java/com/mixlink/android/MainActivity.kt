@@ -474,6 +474,13 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
             portInput.isEnabled = true
             controlPortInput.isEnabled = true
             statusText.text = "Status: Stopped"
+            // The session is over even when the receiver ended on its own, so the control channel
+            // closes and stops reconnecting. A session started again meanwhile is left alone.
+            if (!running.get()) {
+                control.close(1000, "receiver stopped")
+                control.controlState = ControlState.IDLE
+                renderControlStatus()
+            }
         }
     }
 

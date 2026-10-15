@@ -37,6 +37,22 @@ class ControlStatusTest {
     }
 
     @Test
+    fun reconnectingAfterAcknowledgementKeepsServerOwnership() {
+        assertEquals(
+            "reconnecting - mix held at the server",
+            controlStatusLabel(ControlState.RECONNECTING, remoteMixAcknowledged = true),
+        )
+    }
+
+    @Test
+    fun reconnectingWithoutAcknowledgementMixesOnThisDevice() {
+        assertEquals(
+            "reconnecting - mixing on this device",
+            controlStatusLabel(ControlState.RECONNECTING, remoteMixAcknowledged = false),
+        )
+    }
+
+    @Test
     fun idleAndConnectingNeverClaimOwnership() {
         assertEquals("not connected", controlStatusLabel(ControlState.IDLE, remoteMixAcknowledged = false))
         assertEquals("not connected", controlStatusLabel(ControlState.IDLE, remoteMixAcknowledged = true))

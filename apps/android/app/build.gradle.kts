@@ -17,6 +17,17 @@ android {
 
     }
 
+    buildTypes {
+        release {
+            // R8 removes unused code and resources and optimises the rest. Compose, OkHttp, Okio,
+            // coroutines and the AndroidX libraries ship their own keep rules; the app's are in
+            // proguard-rules.pro.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

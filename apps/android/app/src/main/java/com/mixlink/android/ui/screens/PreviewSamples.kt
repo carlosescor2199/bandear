@@ -157,7 +157,7 @@ internal object PreviewActions : MonitorActions {
 
     override fun setMusicianChannel(channel: Int?) = Unit
 
-    override fun saveMix(name: String) = Unit
+    override fun saveMix(name: String) = false
 
     override fun recallMix(name: String) = Unit
 

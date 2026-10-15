@@ -13,6 +13,7 @@ import com.mixlink.android.LinkStatsReport
 import com.mixlink.android.PmonPlayer
 import com.mixlink.android.ServerDiscovery
 import com.mixlink.android.ui.components.MainTab
+import com.mixlink.android.ui.screens.MonitorActions
 import com.mixlink.android.ui.state.MonitorEvent.AudioError
 import com.mixlink.android.ui.state.MonitorEvent.ChannelLevelChanged
 import com.mixlink.android.ui.state.MonitorEvent.ChannelMuteChanged
@@ -66,10 +67,12 @@ private val PORTS = 1..65535
  *
  * Callbacks arrive on the receiver, control and discovery threads. The state is updated by an
  * atomic compare-and-set, so any thread may report. Starting and ending a session is serialised by
- * one lock, as the Activity's UI thread serialised it, so a receiver ending late cannot close a
- * session started after it. Intents are meant for the main thread.
+ * one lock, as the Activity's UI thread serialised it. A session ends once: the receiver's stop
+ * report only ends the session it belongs to, so a report arriving late cannot end a session twice
+ * or close a session started after it, and after [onCleared] it touches nothing. Intents are meant
+ * for the main thread. They are the screens' [MonitorActions], so the app binds them directly.
  */
-internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel() {
+internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel(), MonitorActions {
     private val store = collaborators.store
     private val clientId = collaborators.clientId
 
@@ -80,6 +83,22 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     private val playerMix = ClientMixState()
 
     private val sessionLock = Any()
+
+    // Which session a receiver stop report belongs to. The receiver reports exactly one stop for
+    // each launch, from the launch's `finally`, in launch order, so the n-th report is the n-th
+    // session's. All three are guarded by [sessionLock].
+
+    /** Sessions launched so far; the current (or last) session is number [sessionsLaunched]. */
+    private var sessionsLaunched = 0L
+
+    /** Stop reports received so far. */
+    private var stopsReported = 0L
+
+    /** The last session torn down, by Stop or by its receiver; it is never torn down again. */
+    private var lastEndedSession = 0L
+
+    /** Set by [onCleared]: the channel and discovery are shut down, so nothing may end a session. */
+    private var cleared = false
 
     private val _state = MutableStateFlow(restoredState())
 
@@ -172,17 +191,17 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     // The session.
 
     /** Connects to a found [server], listening for audio on the port set in Settings. */
-    fun connect(server: ServerEndpoint) {
+    override fun connect(server: ServerEndpoint) {
         startSession(server.address, server.controlPort.toString(), _state.value.connection.manual.audioPort)
     }
 
     /** Connects to a typed address. The form keeps what was typed, so a mistake can be corrected. */
-    fun connectManual(host: String, controlPort: String, audioPort: String) {
+    override fun connectManual(host: String, controlPort: String, audioPort: String) {
         dispatch(ManualAddressEdited(ManualAddress(host, controlPort, audioPort)))
         startSession(host, controlPort, audioPort)
     }
 
-    fun editManualAddress(address: ManualAddress) {
+    override fun editManualAddress(address: ManualAddress) {
         dispatch(ManualAddressEdited(address))
     }
 
@@ -205,6 +224,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             // The name and the UDP port travel in the registration, so the server adds this musician
             // as a target with no address typed; the client id keeps their row when the IP changes.
             control.connect(host, controlPort, audioPort, _state.value.musicianName, clientId())
+            sessionsLaunched++
             receiver.launch(host, audioPort)
         }
     }
@@ -214,30 +234,39 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     }
 
     /** Ends the session: the receiver stops, the control channel closes and discovery listens again. */
-    fun disconnect() {
+    override fun disconnect() {
         synchronized(sessionLock) {
             if (!running.getAndSet(false)) return
+            // Ended before the receiver is asked to stop, so its stop report finds nothing left to end.
+            lastEndedSession = sessionsLaunched
             receiver.stop()
-            control.close(NORMAL_CLOSE, "stopped")
-            control.controlState = ControlState.IDLE
-            dispatch(SessionEnded)
-            scanner.start()
+            closeSession("stopped")
         }
     }
 
     /**
-     * The receiver ended, on request or on its own. The session is over then, so the control channel
-     * closes and stops reconnecting, and discovery listens again. A session started meanwhile is
-     * left alone.
+     * The receiver ended, on request or on its own, and reported it. Only the latest session's
+     * report ends a session, and only once: a report for a session already ended (by Stop, or one
+     * replaced by a newer session) does nothing, and after [onCleared] no report does anything.
      */
     private fun receiverStopped() {
         synchronized(sessionLock) {
-            if (running.get()) return
-            control.close(NORMAL_CLOSE, "receiver stopped")
-            control.controlState = ControlState.IDLE
-            dispatch(SessionEnded)
-            scanner.start()
+            // The real receiver never reports more stops than launches; a stray report counts as
+            // the latest session's, so the counts cannot drift apart.
+            stopsReported = minOf(stopsReported + 1, sessionsLaunched)
+            val session = stopsReported
+            if (cleared || session != sessionsLaunched || session == lastEndedSession) return
+            lastEndedSession = session
+            closeSession("receiver stopped")
         }
+    }
+
+    /** The end of a session: the control channel closes and stops reconnecting, and discovery listens again. */
+    private fun closeSession(reason: String) {
+        control.close(NORMAL_CLOSE, reason)
+        control.controlState = ControlState.IDLE
+        dispatch(SessionEnded)
+        scanner.start()
     }
 
     private fun publishControlState() {
@@ -256,21 +285,21 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     // The mix. A change that changes nothing (a value already set, a channel that does not exist)
     // sends nothing, as a slider that did not move never did.
 
-    fun setChannelLevel(channel: Int, level: Int) = changeMix(ChannelLevelChanged(channel, level))
+    override fun setChannelLevel(channel: Int, level: Int) = changeMix(ChannelLevelChanged(channel, level))
 
     fun setChannelPan(channel: Int, pan: Int) = changeMix(ChannelPanChanged(channel, pan))
 
-    fun setChannelMuted(channel: Int, muted: Boolean) = changeMix(ChannelMuteChanged(channel, muted))
+    override fun setChannelMuted(channel: Int, muted: Boolean) = changeMix(ChannelMuteChanged(channel, muted))
 
-    fun setChannelSoloed(channel: Int, soloed: Boolean) = changeMix(ChannelSoloChanged(channel, soloed))
+    override fun setChannelSoloed(channel: Int, soloed: Boolean) = changeMix(ChannelSoloChanged(channel, soloed))
 
-    fun setGroupLevel(group: Int, level: Int) = changeMix(GroupLevelChanged(group, level))
+    override fun setGroupLevel(group: Int, level: Int) = changeMix(GroupLevelChanged(group, level))
 
-    fun setMasterVolume(level: Int) = changeMix(MasterVolumeChanged(level))
+    override fun setMasterVolume(level: Int) = changeMix(MasterVolumeChanged(level))
 
-    fun setMasterMuted(muted: Boolean) = changeMix(MasterMuteChanged(muted))
+    override fun setMasterMuted(muted: Boolean) = changeMix(MasterMuteChanged(muted))
 
-    fun setLevelCap(level: Int) = changeMix(LevelCapChanged(level))
+    override fun setLevelCap(level: Int) = changeMix(LevelCapChanged(level))
 
     private fun changeMix(event: MonitorEvent) {
         val (before, after) = dispatch(event)
@@ -293,13 +322,13 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     // More of me.
 
     /** Turns More of me on or off; it stays off, with a notice, until a channel is chosen. */
-    fun setMoreOfMe(on: Boolean) {
+    override fun setMoreOfMe(on: Boolean) {
         val (before, after) = dispatch(MoreOfMeToggled(on))
         if (before.moreOfMe.enabled != after.moreOfMe.enabled) control.sendMixControl()
     }
 
     /** Takes [channel] as the musician's, or none, and remembers it on the phone. */
-    fun setMusicianChannel(channel: Int?) {
+    override fun setMusicianChannel(channel: Int?) {
         val (before, after) = dispatch(MusicianChannelChosen(channel))
         if (after.moreOfMe.musicianChannel != channel) return
         store.setMusicianChannel(channel)
@@ -309,18 +338,23 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
 
     // Saved mixes. They hold the stored mix, never the More of me derivation.
 
-    fun saveMix(name: String) {
+    /**
+     * Saves the current mix as [name], trimmed; a name already used is updated. Returns whether it
+     * was saved: a blank name is refused with a notice, and the screen keeps what was typed.
+     */
+    override fun saveMix(name: String): Boolean {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) {
             dispatch(MixNotice(NAME_NEEDED))
-            return
+            return false
         }
         store.saveBank(trimmed, _state.value.mix.toSnapshot())
         dispatch(MixSaved(trimmed, savedNames()))
+        return true
     }
 
     /** Applies a saved mix and sends it, exactly as if the musician had moved every control. */
-    fun recallMix(name: String) {
+    override fun recallMix(name: String) {
         val bank = store.loadBanks().firstOrNull { it.name == name }
         if (bank == null) {
             dispatch(MixMissing(name, savedNames()))
@@ -332,7 +366,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     }
 
     /** Renames a saved mix. A name another mix already has is refused, so no mix is overwritten. */
-    fun renameMix(from: String, to: String) {
+    override fun renameMix(from: String, to: String) {
         val target = to.trim()
         val banks = store.loadBanks()
         val bank = banks.firstOrNull { it.name == from }
@@ -349,7 +383,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         }
     }
 
-    fun deleteMix(name: String) {
+    override fun deleteMix(name: String) {
         store.deleteBank(name)
         dispatch(MixDeleted(name, savedNames()))
     }
@@ -362,18 +396,23 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
      * Keeps the name as typed, remembers it and re-announces it on the open control channel. The
      * channel waits for a pause in typing before it sends, so a word is one message, not one per key.
      */
-    fun setName(name: String) {
+    override fun setName(name: String) {
         dispatch(NameChanged(name))
         store.setMusicianName(name)
         control.updateRegistrationName(name)
     }
 
-    fun selectTab(tab: MainTab) {
+    override fun selectTab(tab: MainTab) {
         dispatch(TabSelected(tab))
     }
 
     override fun onCleared() {
-        disconnect()
+        synchronized(sessionLock) {
+            disconnect()
+            // A receiver report arriving from now on must not reach the channel or discovery,
+            // which are shut down below.
+            cleared = true
+        }
         control.close(NORMAL_CLOSE, "destroyed")
         control.shutdown()
         scanner.shutdown()

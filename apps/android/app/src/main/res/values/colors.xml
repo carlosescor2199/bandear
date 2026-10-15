@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window's colours before Compose draws; the same as MixLinkColors' ground and accent. -->
+    <color name="mixlink_ground">#FF0D1117</color>
+    <color name="mixlink_accent">#FFF5A524</color>
+</resources>

@@ -74,11 +74,21 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
 - [x] T2 (state): `MonitorViewModel` holding connection, discovered servers, mix, saved mixes and
   diagnostics; pure reducers with JVM tests; `MainActivity` logic moved behind it (the Activity
   itself switches in T4). Commit: this commit.
+- [x] T2b (review follow-ups): T2's native review (lineage `review-ead3157fe7a55d5c`) approved and
+  acknowledged with two warnings, both fixed here: the receiver's stop report ends only its own
+  session, once, and nothing after `onCleared`; a late `mix_ack` after the session ended changes
+  nothing. Lands after T3. Commit: this commit.
 - [x] T3 (screens): Connect, Mix, Saved mixes and Settings composed from the atoms, with previews;
   `MonitorApp(state, actions)` as the root; the T1 review's fader follow-ups. The app still runs
   the XML screen. Commits: `a17522b` (fader fixes) and this commit (screens).
 - [ ] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
   state fixed; live check on the S23.
+  - [x] Code: T3 review follow-ups (`69f613d`), receiver stop ordering (`538f990`), the switch to
+    Compose (`0f51cb2`), R8 for release (see Progress). Checks per commit in Progress.
+  - [ ] Live check on the S23 (parent), on the debug and the minified release build.
+  - [ ] Pan: the old screen had a pan slider per channel; the new screens have none, so after the
+    switch pan cannot be changed (it is still kept, sent, saved and recalled). Needs a decision on
+    where pan lives in the redesign. Reopens the acceptance criterion "every existing control".
 - [ ] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
   download.
 
@@ -276,3 +286,117 @@ features.
 - T3 `cargo fmt --all -- --check`: clean (no Rust changes).
 - T3 has no Compose UI tests (they need instrumentation): the screens are checked by compiling
   their previews and by the pure tests; the live check is T4's.
+- T2b done (route: delegated direct, one writer; a correction unit for T2's review, `ui/state`
+  only). What landed:
+  - `R3-late-onstopped-after-teardown`: `MonitorViewModel` counts launched sessions and stop
+    reports under the session lock. The receiver reports exactly one stop per launch, in launch
+    order, so the n-th report belongs to the n-th session; a report ends a session only when it is
+    the latest session's and that session has not ended yet. `disconnect()` marks the session ended
+    before asking the receiver to stop, so the late report finds nothing to end; a report for a
+    session a newer one replaced does nothing; `onCleared` sets a cleared flag under the lock, so
+    no later report reaches the shut-down channel or discovery. A stray extra report counts as the
+    latest session's, so the counts cannot drift. The shared teardown is `closeSession`.
+  - `R3-late-ack-not-session-guarded`: the reducer drops `MixAcknowledged` while no session runs,
+    as it already dropped a late `ControlChanged`.
+  - Fakes: `FakeReceiver.stop()` now only asks the loop to end; `finishStopping()` delivers the
+    late report (flag down, then `onStopped`), as the real `finally` does. `FakeScanner.start()`
+    fails after `shutdown()`, as the real discovery's executor rejects work.
+- T2b note (not fixed, outside `ui/state`): `PmonPlayer`'s `finally` clears `receiverThread`
+  before it sets the shared `running` flag false, so a session started in that window has its
+  flag dropped by the previous receiver; that session then ends when its own loop sees the flag.
+  The ViewModel now attributes both reports correctly (test
+  `theLastSessionsLateStopReportCannotEndTheNextSession`), but the early end itself is
+  `PmonPlayer`'s.
+- T2b RED: the 7 new tests (5 ViewModel, 2 reducer) against the unchanged code: 89 `ui.state`
+  tests run, 6 failed (4 assertions, 2 `IllegalStateException` from `scanner.start()` after
+  shutdown); the seventh, `anAcknowledgementInTheNextSessionIsHeldByTheServer`, is a regression
+  guard that passes on both. GREEN: all 89 pass.
+- T2b `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD SUCCESSFUL,
+  41 tasks executed; 30 result files, 278 tests (271 plus 7), 0 failures, 0 errors; no Kotlin
+  warnings.
+- T2b `cargo fmt --all -- --check`: clean (no Rust changes).
+- T4 (route: delegated direct, one writer; trigger: 2+ non-trivial files per work unit). Work-unit
+  commits, in order:
+  - T3 review follow-ups (lineage `review-3a5eba80821594c9`, approved), this commit:
+    - WARNING `SaveCard` cleared the typed name whatever the save did. `saveMix` (ViewModel and
+      `MonitorActions`) now returns whether the mix was saved, and the field is cleared only then,
+      through the pure `nameAfterSave`. The only refusal is a blank name: saving under a name
+      already used updates that mix, as the old screen did (now pinned by a test).
+    - SUGGESTION the horizontal fader's flip (tap measured from the right edge, drag delta negated)
+      moved into the pure `HorizontalFaderGesture`, which `HorizontalFader` now uses.
+    - SUGGESTION `RenameDialog` passes the trimmed name (`renameTarget`); `canRename` reads it.
+    - RED: 13 new tests (8 `HorizontalFaderGestureTest`, 4 `SavedMixesTextTest`, 1 ViewModel) and
+      a new assertion in `savingAndRecallingAMix`, against `TODO` stubs and a `saveMix` that
+      always returned false: 48 run, 14 failed (12 `NotImplementedError`, 2 assertions). GREEN:
+      all pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 31 result files, 291 tests (278 plus 13), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,300,706 bytes. `cargo fmt --all -- --check`: clean.
+  - `69f613d` is the commit above. `PmonPlayer` stop ordering (the T2b note), this commit:
+    - The receive loop's `finally` cleared the receiver before it lowered the shared session flag,
+      so a session started in that gap had its flag dropped by the previous loop and ended early.
+      The new `ReceiverLaunches` (in `PmonPlayer.kt`, pure, generic over the receiver) records the
+      latest launch; a finishing loop lowers the flag only while it is still the latest launch,
+      then reports `onStopped`, and only then frees the receiver. A caller that waits for the
+      receiver to be free (the ViewModel does) therefore never starts a session the old loop can
+      end, and still gets one stop report per launch, in launch order (now documented on
+      `Listener.onStopped`). The `socket` field is cleared as before; a newer launch can only open
+      its socket after the old loop has freed the receiver.
+    - RED: the 5 new `ReceiverLaunchesTest` tests against `TODO` stubs: 5 run, 5 failed
+      (`NotImplementedError`). A probe with the old ordering (free, then lower the flag
+      unconditionally, then report; not committed) failed exactly the 2 race tests. GREEN: all 5
+      pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 32 result files, 296 tests (291 plus 5), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,300,706 bytes. `cargo fmt --all -- --check`: clean.
+  - `538f990` is the commit above. The switch to Compose, this commit:
+    - `MainActivity` is a `ComponentActivity`: `enableEdgeToEdge` with dark bar styles (transparent
+      bars, light icons whatever the phone's theme), `MonitorViewModel` from its `Factory` via
+      `viewModels`, state collected with `collectAsStateWithLifecycle`, and
+      `MixLinkTheme { MonitorApp(state, viewModel) }`. `MonitorViewModel` implements
+      `MonitorActions` (`setChannelPan` stays a ViewModel-only intent).
+    - Theme: `Theme.MixLink` now extends the dark `Theme.Material.NoActionBar` with the window
+      background, status bar and navigation bar in the ground `#0d1117` (new `values/colors.xml`)
+      and light bar icons, so nothing white shows at launch. The manifest label is
+      `@string/app_name`, now "MixLink" (was "MixLink M0"); the activity uses `adjustResize` so
+      the keyboard arrives as an inset the UI pads for.
+    - Deleted: `res/layout/activity_main.xml`; the old-UI view builders only `MainActivity` used:
+      `BankControlViews.kt` (`buildBankRows`, `buildMusicianChannelAdapter`),
+      `ChannelControlViews.kt` (`rebuildChannelControls`), `FoundServerViews.kt`
+      (`rebuildFoundServers`), `GroupControlViews.kt` (`rebuildGroupControls`). No other resource
+      was used only by the layout. `ControlStatus.kt`, `ClientMixState.kt` and the rest stay: the
+      ViewModel and reducer use them.
+    - Old-activity behaviour compared with the ViewModel: start and stop, validation messages, the
+      "still stopping" refusal, discovery stop and restart, registration with name, port and client
+      id, name re-announce, config resizing, groups, More of me, saved mixes, link reports, stop
+      handling and teardown are all the ViewModel's (T2, T2b). Carried over here, because only the
+      old layout had them: the name fields stop at 64 characters (`MAX_NAME_LENGTH`, the length
+      the server keeps; the old field had `maxLength="64"`), through the pure `keptEdit` in
+      `MixLinkTextField`; the full counters and recent errors can be selected and copied
+      (`SelectionContainer`; the old text was `textIsSelectable`).
+    - Changed on purpose: turning the phone no longer ends the session (the old `onDestroy` ran on
+      every rotation; the ViewModel survives it). The session still ends when the Activity
+      finishes for good. Back on the root screen moves the app to the background on Android 12
+      and later, as before.
+    - Found missing, not fixed (a design decision): the per-channel pan sliders (see the T4 task
+      items). The T3 note "No pan control: the old screen had none either" was wrong: the old
+      `ChannelControlViews` built a "Pan n" slider under every channel.
+    - RED: the 6 new `MixLinkTextFieldTest` tests against a `TODO` `keptEdit`: 9 run, 6 failed
+      (`NotImplementedError`). GREEN: all 9 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 32 result files, 302 tests (296 plus 6), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,248,536 bytes. `cargo fmt --all -- --check`: clean.
+  - `0f51cb2` is the commit above. Release shrinking (the T1 follow-up), this commit:
+    - `release` runs R8: `isMinifyEnabled` and `isShrinkResources`, the default
+      `proguard-android-optimize.txt` and a new `proguard-rules.pro`. The app needs no keep rules
+      (no reflection, JSON by explicit keys, the ViewModel from an explicit factory; the libraries
+      bring their own); the file keeps source files and line numbers for readable crash traces.
+      R8 needed no extra rule and reported no missing class.
+    - `gradle -p apps/android assembleRelease -x lintVitalAnalyzeRelease`: BUILD SUCCESSFUL before
+      and after. Unsigned release APK 19,682,720 bytes unminified (at `0f51cb2`), 2,390,604 bytes
+      with R8 (about 88 % smaller). The build script prints the existing `kotlinOptions`
+      deprecation warning when it is recompiled; it was not introduced here.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 302 tests, 0 failures, 0 errors. Debug APK 26,248,536 bytes
+      (debug is not minified). `cargo fmt --all -- --check`: clean.
+    - The minified release build has not run on a phone yet: the S23 check should use it too.

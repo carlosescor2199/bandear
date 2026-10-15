@@ -38,6 +38,7 @@ import com.mixlink.android.ui.components.LineIcons
 import com.mixlink.android.ui.components.MixLinkTextField
 import com.mixlink.android.ui.components.StatusBanner
 import com.mixlink.android.ui.state.ConnectionUiState
+import com.mixlink.android.ui.state.MAX_NAME_LENGTH
 import com.mixlink.android.ui.state.ServerEndpoint
 import com.mixlink.android.ui.theme.ColorToken
 import com.mixlink.android.ui.theme.MixLinkShapes
@@ -121,6 +122,7 @@ private fun NameSection(musicianName: String, onNameChange: (String) -> Unit) {
             placeholder = "Your name",
             large = true,
             capitalization = KeyboardCapitalization.Words,
+            maxLength = MAX_NAME_LENGTH,
         )
         Text(
             text = "The engineer sees this name on the desktop.",

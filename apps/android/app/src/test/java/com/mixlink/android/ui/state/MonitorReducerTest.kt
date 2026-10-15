@@ -179,6 +179,29 @@ class MonitorReducerTest {
     }
 
     @Test
+    fun aLateAcknowledgementChangesNothingOnceTheSessionEnded() {
+        val ended = running().after(ControlChanged(ControlState.CONNECTED, false), SessionEnded)
+
+        assertEquals(ended, ended.after(MixAcknowledged(ControlState.CONNECTED)))
+        assertEquals(ended, ended.after(MixAcknowledged(ControlState.IDLE)))
+        assertEquals(idle, idle.after(MixAcknowledged(ControlState.CONNECTED)))
+    }
+
+    @Test
+    fun anAcknowledgementInTheNextSessionIsHeldByTheServer() {
+        val next = running().after(
+            SessionEnded,
+            SessionStarted(server, DEFAULT_AUDIO_PORT),
+            ControlChanged(ControlState.CONNECTED, false),
+            MixAcknowledged(ControlState.CONNECTED),
+        )
+
+        assertEquals(PillKind.CONNECTED, next.connection.pill)
+        assertTrue(next.connection.mixHeldByServer)
+        assertEquals("connected - mix applied on the server", next.connection.statusDetail)
+    }
+
+    @Test
     fun aRefusedConnectSaysWhyAndStartsNothing() {
         val message = "Enter a valid UDP port between 1 and 65535"
 

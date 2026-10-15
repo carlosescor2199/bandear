@@ -82,7 +82,13 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
         } else {
             state.copy(connection = state.connection.showing(event.state, event.mixAcknowledged))
         }
-    is MixAcknowledged -> state.copy(connection = state.connection.showing(event.state, mixAcknowledged = true))
+    is MixAcknowledged ->
+        // An acknowledgement belongs to a session too: a late one cannot mark the mix held while idle.
+        if (!state.connection.sessionRunning) {
+            state
+        } else {
+            state.copy(connection = state.connection.showing(event.state, mixAcknowledged = true))
+        }
     is ServersChanged -> state.copy(servers = event.servers)
     is ManualAddressEdited -> state.copy(connection = state.connection.copy(manual = event.address))
     is ConfigReceived -> applyConfig(state, event.channels, event.groups)

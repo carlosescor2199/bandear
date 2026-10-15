@@ -66,7 +66,7 @@ import com.mixlink.android.ui.theme.MixLinkType
 @Composable
 fun SavedMixesScreen(
     savedMixes: SavedMixesUiState,
-    onSave: (String) -> Unit,
+    onSave: (String) -> Boolean,
     onRecall: (String) -> Unit,
     onRename: (from: String, to: String) -> Unit,
     onDelete: (String) -> Unit,
@@ -163,19 +163,21 @@ fun SavedMixesScreen(
     }
 }
 
+/**
+ * The name field and Save. [onSave] says whether the mix was saved: only then is the field
+ * cleared, so a refused name stays to be corrected.
+ */
 @Composable
-private fun SaveCard(onSave: (String) -> Unit, modifier: Modifier = Modifier) {
+private fun SaveCard(onSave: (String) -> Boolean, modifier: Modifier = Modifier) {
     val colors = MixLinkTheme.colors
     val focusManager = LocalFocusManager.current
     var name by rememberSaveable { mutableStateOf("") }
 
     fun save() {
-        onSave(name)
-        if (name.isNotBlank()) {
-            // Leave the field first, so it shows the cleared text instead of keeping what was typed.
-            focusManager.clearFocus()
-            name = ""
-        }
+        val saved = onSave(name)
+        // Leave the field first, so it shows the cleared text instead of keeping what was typed.
+        if (saved) focusManager.clearFocus()
+        name = nameAfterSave(name, saved)
     }
 
     Column(
@@ -287,14 +289,20 @@ private fun MixMenu(name: String, onRename: () -> Unit, onDelete: () -> Unit) {
     }
 }
 
+/** Asks for the new name; [onRename] gets it trimmed, and only once it can be confirmed. */
 @Composable
 private fun RenameDialog(from: String, onRename: (String) -> Unit, onDismiss: () -> Unit) {
     val colors = MixLinkTheme.colors
     var to by rememberSaveable(from) { mutableStateOf(from) }
+
+    fun confirm() {
+        renameTarget(from, to)?.let(onRename)
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
-            PrimaryButton("Rename", onClick = { onRename(to) }, enabled = canRename(from, to))
+            PrimaryButton("Rename", onClick = ::confirm, enabled = canRename(from, to))
         },
         dismissButton = { SecondaryButton("Cancel", onClick = onDismiss) },
         title = { Text("Rename \"$from\"") },
@@ -306,7 +314,7 @@ private fun RenameDialog(from: String, onRename: (String) -> Unit, onDismiss: ()
                 modifier = Modifier.fillMaxWidth(),
                 fill = colors.ground,
                 capitalization = KeyboardCapitalization.Sentences,
-                onDone = { if (canRename(from, to)) onRename(to) },
+                onDone = ::confirm,
             )
         },
         containerColor = colors.surface,
@@ -363,7 +371,7 @@ private fun NoMixesYet(message: String) {
 @Composable
 private fun SavedMixesFilledPreview() {
     MixLinkTheme {
-        SavedMixesScreen(PreviewSamples.connected.savedMixes, {}, {}, { _, _ -> }, {})
+        SavedMixesScreen(PreviewSamples.connected.savedMixes, { false }, {}, { _, _ -> }, {})
     }
 }
 
@@ -377,6 +385,6 @@ private fun SavedMixesFilledPreview() {
 @Composable
 private fun SavedMixesEmptyPreview() {
     MixLinkTheme {
-        SavedMixesScreen(PreviewSamples.emptyMixes.savedMixes, {}, {}, { _, _ -> }, {})
+        SavedMixesScreen(PreviewSamples.emptyMixes.savedMixes, { false }, {}, { _, _ -> }, {})
     }
 }

@@ -2,10 +2,18 @@
 //
 // Each section renders into the main region through a screen: a function `(main, route)` that
 // builds the section and may return a cleanup function, called when the engineer leaves it.
-// Screens are containers: they own the store and the bridge and compose the atoms. Until a
-// section has its screen, a placeholder heading stands in.
+// Screens are containers: they use the console app (lib/console-app.js), which the shell creates
+// once for the window, and compose the organisms. Until a section has its screen, a placeholder
+// heading stands in.
+//
+// In the MixLink app the console talks to the engine through Tauri. Opened in a browser as
+// `console.html?fake`, it runs against the simulated engine of lib/fake-bridge.js instead.
 
+import { createTauriBridge } from "./lib/bridge.js";
+import { createConsoleApp } from "./lib/console-app.js";
+import { createFakeBridge } from "./lib/fake-bridge.js";
 import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
+import { mountMixScreen } from "./screens/mix-screen.js";
 
 const ICONS = Object.freeze({
   mix: `<path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 14h4M10 8h4M16 12h4"/>`,
@@ -93,8 +101,57 @@ export function mountShell({ nav, main, skipLink = null, screens = {} }) {
   };
 }
 
+/** Shown in place of a screen when there is no engine to talk to. */
+function unavailableScreen(main) {
+  const header = document.createElement("header");
+  header.className = "screen-header";
+  const heading = document.createElement("h1");
+  heading.tabIndex = -1;
+  heading.textContent = "No engine to talk to";
+  const note = document.createElement("p");
+  note.append(
+    "This console runs inside the MixLink app. To preview it in a browser with a simulated " +
+      "engine, open ",
+  );
+  const link = document.createElement("a");
+  link.href = "?fake";
+  link.textContent = "console.html?fake";
+  note.append(link, ".");
+  header.append(heading, note);
+  main.append(header);
+}
+
+// The window's engine connection: Tauri in the app, the simulated engine with `?fake`, none in a
+// plain browser.
+function connectEngine() {
+  if (new URLSearchParams(window.location.search).has("fake")) {
+    const fake = createFakeBridge();
+    fake.startDemo();
+    return { app: createConsoleApp({ bridge: fake }), simulated: true };
+  }
+  try {
+    return { app: createConsoleApp({ bridge: createTauriBridge() }), simulated: false };
+  } catch {
+    return { app: null, simulated: false };
+  }
+}
+
 const nav = document.querySelector("[data-shell-nav]");
 const main = document.querySelector("[data-shell-main]");
 if (nav && main) {
-  mountShell({ nav, main, skipLink: document.querySelector("[data-skip-link]") });
+  const { app, simulated } = connectEngine();
+  mountShell({
+    nav,
+    main,
+    skipLink: document.querySelector("[data-skip-link]"),
+    screens: {
+      mix: app ? (screenMain) => mountMixScreen(screenMain, app) : unavailableScreen,
+    },
+  });
+  if (simulated) {
+    const note = document.createElement("p");
+    note.className = "sidebar-note";
+    note.textContent = "Simulated engine";
+    nav.append(note);
+  }
 }

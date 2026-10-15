@@ -98,6 +98,15 @@
   color: var(--ml-accent);
 }
 
+.sidebar-note {
+  margin-top: auto;
+  padding: var(--ml-space-2) var(--ml-space-3);
+  border: 1px dashed var(--ml-warn-border);
+  border-radius: var(--ml-radius-md);
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-sm);
+}
+
 .main {
   display: flex;
   flex-direction: column;
@@ -144,6 +153,10 @@ h1[tabindex="-1"]:focus {
     justify-content: center;
     width: 44px;
     padding: 0;
+  }
+
+  .sidebar-note {
+    display: none;
   }
 
   /* The words stay for screen readers and as each link's tooltip. */

@@ -9,3 +9,6 @@ import "./coalesce.test.js";
 import "./bridge.test.js";
 import "./router.test.js";
 import "./slider-gesture.test.js";
+import "./engine-config.test.js";
+import "./mix-view.test.js";
+import "./console-app.test.js";

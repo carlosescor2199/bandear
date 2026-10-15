@@ -9,8 +9,11 @@
 //              endedRun the newest run known to have ended.
 //   musicians  [musician] in the status's order: the status row with its mix nested as `mix`.
 //   selected   the address whose mix is open. It survives a stop, so a restart reopens it.
+//   departed   { address, label } of the open musician when a status no longer listed them and
+//              the first musician opened instead; cleared by a pick, their return or a run's end.
 //   pending    { address: { editKey: value } }: local edits still waiting for the engine.
 //   mixError   { address, message } of the last refused change, cleared by the next answer.
+//   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
 // never jumps back to an older value while its change is on the way. The engine's mix follows only
@@ -22,7 +25,8 @@
 // a payload of an ended or older run is ignored, so a late event can never bring back an engine
 // that has stopped.
 
-import { needsAttention } from "./format.js";
+import { DEFAULT_AUDIO, audioChoice } from "./engine-config.js";
+import { musicianLabel, needsAttention } from "./format.js";
 import { MIX_FIELDS, applyEdits, mixFromDto, parseEditKey, settleEdits } from "./mix.js";
 
 export const PHASES = Object.freeze(["idle", "starting", "running", "stopping", "stopped", "error"]);
@@ -37,8 +41,10 @@ export const initialState = Object.freeze({
   engine: Object.freeze({ phase: "idle", error: null, status: null, run: null, endedRun: 0 }),
   musicians: Object.freeze([]),
   selected: null,
+  departed: null,
   pending: NO_EDITS,
   mixError: null,
+  audio: DEFAULT_AUDIO,
 });
 
 /** Action creators, so a screen never spells an action by hand. */
@@ -59,6 +65,8 @@ export const actions = Object.freeze({
   mixApplied: (address, sent) => ({ type: "mix-applied", address, sent }),
   /** A `set_mix` that carried the edits `sent` was refused. */
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
+  /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
+  audio: (change) => ({ type: "audio", change }),
 });
 
 /**
@@ -101,6 +109,13 @@ function receiveStatus(state, status) {
   if (state.engine.phase === "stopping") {
     phase = "stopping";
   }
+  const stays = addresses.has(state.selected);
+  // The open musician was on screen and is gone now: the first one opens, and the console says so.
+  const leaving = stays ? null : musicianByAddress(state, state.selected);
+  let departed = leaving ? { address: leaving.address, label: musicianLabel(leaving) } : state.departed;
+  if (departed && addresses.has(departed.address)) {
+    departed = null;
+  }
   return {
     ...state,
     engine: {
@@ -111,7 +126,8 @@ function receiveStatus(state, status) {
       run: status.run,
     },
     musicians,
-    selected: addresses.has(state.selected) ? state.selected : (musicians[0]?.address ?? null),
+    selected: stays ? state.selected : (musicians[0]?.address ?? null),
+    departed,
     pending: onlyListed(state.pending, addresses),
     mixError: state.mixError && addresses.has(state.mixError.address) ? state.mixError : null,
   };
@@ -129,6 +145,7 @@ function setPhase(state, { phase, error }) {
       ...state,
       engine: { phase, error, status: null, run: null, endedRun: Math.max(endedRun, run ?? 0) },
       musicians: [],
+      departed: null,
       pending: NO_EDITS,
       mixError: null,
     };
@@ -207,9 +224,12 @@ export function consoleReducer(state, action) {
     case "engine":
       return setPhase(state, action);
     case "select":
-      return state.selected === action.address || !isListed(state, action.address)
+      if (!isListed(state, action.address)) {
+        return state;
+      }
+      return state.selected === action.address && state.departed === null
         ? state
-        : { ...state, selected: action.address };
+        : { ...state, selected: action.address, departed: null };
     case "mix-changed":
       return isLiveRun(state, action.run) ? replaceMix(state, action.address, action.mix) : state;
     case "mix-edit":
@@ -218,6 +238,8 @@ export function consoleReducer(state, action) {
       return answered(state, action);
     case "mix-failed":
       return refused(state, action);
+    case "audio":
+      return { ...state, audio: audioChoice(state.audio, action.change) };
     default:
       return state;
   }

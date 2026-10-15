@@ -375,6 +375,43 @@ test("musicians whose link is warning or bad need attention", () => {
   );
 });
 
+test("when the open musician is removed, the first one opens and the console remembers who left", () => {
+  const state = reduce([
+    twoMusicians,
+    actions.select(BO),
+    actions.status(status([row(ANA, { name: "Ana" })])),
+  ]);
+
+  assert.equal(state.selected, ANA);
+  assert.deepEqual(state.departed, { address: BO, label: "192.168.1.12" });
+
+  const dismissed = reduce([actions.select(ANA)], state);
+  assert.equal(dismissed.departed, null, "picking a musician, even the open one, clears it");
+
+  const back = reduce([actions.status(status([row(ANA), row(BO)]))], state);
+  assert.equal(back.departed, null, "it clears when that musician is listed again");
+
+  const ended = reduce([actions.engine("idle")], state);
+  assert.equal(ended.departed, null, "and when the run ends");
+});
+
+test("a musician who was not open leaving says nothing", () => {
+  const state = reduce([twoMusicians, actions.status(status([row(ANA)]))]);
+
+  assert.equal(state.selected, ANA);
+  assert.equal(state.departed, null);
+});
+
+test("the audio choices start on the system's own driver at 256 frames, and ASIO only when chosen", () => {
+  assert.deepEqual(initialState.audio, { host: "auto", bufferFrames: 256 });
+
+  const asio = reduce([actions.audio({ host: "asio" })]);
+  assert.deepEqual(asio.audio, { host: "asio", bufferFrames: 256 });
+
+  const odd = reduce([actions.audio({ host: "kernel", bufferFrames: 0 })]);
+  assert.deepEqual(odd.audio, { host: "auto", bufferFrames: null });
+});
+
 test("an action the console does not know leaves the state as it was", () => {
   const state = reduce([twoMusicians]);
 

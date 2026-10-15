@@ -35,12 +35,36 @@ const base = sheet(`
   }
 `);
 
-/** Attaches the shadow root with the base sheet, the element's sheet and its markup. */
+/**
+ * Attaches the shadow root with the base sheet, the element's sheet (or sheets) and its markup.
+ */
 export function attachShadowRoot(element, styles, html, options = {}) {
   const root = element.attachShadow({ mode: "open", ...options });
-  root.adoptedStyleSheets = [base, styles];
+  root.adoptedStyleSheets = [base, ...[styles].flat()];
   root.innerHTML = html;
   return root;
+}
+
+/**
+ * Sets an attribute only when it changes: `null`, `undefined` or `false` removes it, `true` sets
+ * it empty. Organisms re-render often, and an unchanged attribute should cost nothing.
+ */
+export function reflect(element, name, value) {
+  if (value === null || value === undefined || value === false) {
+    element.removeAttribute(name);
+    return;
+  }
+  const text = value === true ? "" : String(value);
+  if (element.getAttribute(name) !== text) {
+    element.setAttribute(name, text);
+  }
+}
+
+/** Sets an element's text only when it changes. */
+export function setText(element, text) {
+  if (element.textContent !== text) {
+    element.textContent = text;
+  }
 }
 
 /** Registers an element once, so importing a module twice is harmless. */

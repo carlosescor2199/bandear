@@ -296,8 +296,59 @@ user's decision.
   T5 bundles tokens, state, mapping, bridge and fake, seven atoms, the shell, the gallery and the
   dev server; the two commits split at the tested foundation and the visual layer. Commits:
   13217be (tokens, store and bridge); this commit (atoms, shell and gallery).
-- [ ] T6 (Mix screen): top bar, musician tabs, channel strips, group strips and master strip
-  wired to `set_mix` and the events. Route: delegated writer.
+- [x] T6 (Mix screen): top bar, musician tabs, channel strips, group strips and master strip
+  wired to `set_mix` and the events, with the T5 review's R3-001, R3-002 and R3-003. Route:
+  delegated writer. Three commits:
+  - R3-001 and R3-002 (0c6da0f). Every start, even a failed one, begins a new engine run:
+    `DesktopState` counts runs under the engine lock, `start_engine`'s summary, `engine_status`,
+    `switch_device` and every pump event (meters, status, mix-changed) name the run, and the
+    pump is started with it. The store keeps the run it shows and the newest run that ended
+    (start, failed start, stop) and ignores any payload of an ended or older run (`isLiveRun`);
+    a newer run's status is taken even before the start's answer. A `set_mix` answer only
+    settles the edits it carried; the stored mix follows `status` and `mix-changed`, which come
+    in the engine's order. The fake engine counts runs the same way and can fail its starts.
+  - R3-003 (ffec1e5). The slider gestures live in `lib/slider-gesture.js` (`SliderGesture`), and
+    the element only maps DOM events onto it. It now shows a value held during a drag before the
+    drag's `change` goes out, not after, so the listener that answers has the last word.
+  - The Mix screen (this commit). `lib/console-app.js` is the window's controller: it listens
+    to the events, loads the status, starts a stopped engine with the old window's request
+    (`lib/engine-config.js`: auto driver, 256 frames, no targets, port 50001, no groups; ASIO
+    only when chosen; the choice is the store's `audio`, for T7), drives start and stop, and
+    sends edits through the coalescer (one `set_mix` in flight per musician, latest edits
+    sent). `lib/mix-view.js` works out the top bar, tabs, strips, master, empty-state notice and
+    messages. The store also records who was removed while open (`departed`). Organisms are
+    in `app/components/`: `ml-top-bar` (engine pill, device and format, "N phones need
+    attention" link to `#/network`, Start or Stop), `ml-musician-tabs` (tablist, roving focus,
+    arrows, Home/End, the link as a word and a shaped mark), `ml-channel-strip` ("CH n", group
+    chip, pan, input meter, fader, readout that says "muted", Mute, Solo), `ml-group-strip`
+    (no group mute: the engine has none) and `ml-master-strip` (output L/R meters, level, level
+    cap as a compact fader, Mute). Each takes `data` and emits `mix-edit`. The screen
+    (`app/screens/mix-screen.js`) renders at most once per animation frame, routes meters to the
+    strips, and shows notices for a stopped engine (with Start), starting, stopping, an error
+    (with Try again), no phones (with a link to Network and system), a removed musician and a
+    refused change. `console.html?fake` runs on the fake engine (six channels, two groups, four
+    musicians with good, warning, unreported and lost links, moving meters, a phone change every
+    4 s); without Tauri and without `?fake` it says so. Phase 2-5 controls are left out.
+  RED observed: Rust 37 compile errors (`run` on `EngineStatusDto`, `MetersDto`, `StartSummary`,
+  `MixChangedDto::new` and `EventPump::start` arity, `DesktopState::run`); against the old
+  reducer 6 of 24 store tests failed (late status after idle and after a failed start, old vs
+  new run, late mix change, live meters, the answer replacing a later phone change); 3 fake
+  tests failed; then `slider-gesture.js`, `engine-config.js`, `mix-view.js` and
+  `console-app.js` missing, and 3 store tests failed (who left, audio choices). GREEN:
+  `fnm exec --using=default node --test apps/desktop/ui/tests` 135 passed, 0 failed (96 after
+  the first commit, 105 after the second); `cargo test -p mixlink-desktop` 44 passed (3 new);
+  `cargo fmt -p mixlink-desktop -- --check` clean, no new clippy warnings;
+  `cargo build -p mixlink-desktop` ok after `cargo clean -p mixlink-desktop`. Browser check of
+  `console.html?fake`: no console errors; keys on a fader, Mute, tab clicks and arrows, Stop
+  (stopped notice, Start), Start (the open musician kept), routing to `#/network` and back
+  with focus on the heading; 1280, 900 and 480 px without page scroll (channels scroll
+  sideways at 900 px). The gallery still works. Not covered: the custom elements have no
+  Node tests (their logic is in the tested modules); the real app does not load
+  `console.html` until T7. About 507 + 311 + 2,035 authored changed lines (about 450 of them
+  tests in the last), over the 400-line heuristic: the screen needs its controller, view
+  model, five organisms, the screen and the demo engine together to show anything; the
+  review fixes came first as their own commits.
+  Commit: this commit.
 - [ ] T7 (Network and system, switch): musicians table and audio setup moved from the old UI;
   switch `index.html` to the new shell; delete the old `main.js` and styles; docs. Route:
   delegated writer.
@@ -361,4 +412,4 @@ user's decision.
 
 ## Next step
 
-T6.
+T7.

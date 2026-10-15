@@ -26,7 +26,6 @@ import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
-import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -34,6 +33,7 @@ import com.mixlink.android.ui.state.MonitorEvent.MixesLoaded
 import com.mixlink.android.ui.state.MonitorEvent.MoreOfMeToggled
 import com.mixlink.android.ui.state.MonitorEvent.MusicianChannelChosen
 import com.mixlink.android.ui.state.MonitorEvent.NameChanged
+import com.mixlink.android.ui.state.MonitorEvent.ServerMixReceived
 import com.mixlink.android.ui.state.MonitorEvent.ServersChanged
 import com.mixlink.android.ui.state.MonitorEvent.SessionEnded
 import com.mixlink.android.ui.state.MonitorEvent.SessionStarted
@@ -465,7 +465,7 @@ class MonitorReducerTest {
         assertEquals(idle, idle.after(MusicianChannelChosen(0)))
     }
 
-    // A mix the server pushed.
+    // A mix the server reported: pushed, or answering the phone's newest mix.
 
     /** A session whose server announced [count] channels and [groups]. */
     private fun connectedWith(count: Int, groups: List<GroupInfo> = emptyList()): MonitorUiState =
@@ -488,7 +488,7 @@ class MonitorReducerTest {
         val groups = listOf(GroupInfo("Band", listOf(0, 1)))
         val state = connectedWith(2, groups)
 
-        val pushed = state.after(MixPushed(serverMix))
+        val pushed = state.after(ServerMixReceived(serverMix))
 
         assertEquals(2, pushed.mix.sourceChannels)
         assertEquals(listOf(80, 70), pushed.mix.levels)
@@ -507,7 +507,7 @@ class MonitorReducerTest {
         val state = connectedWith(2, listOf(GroupInfo("Band", listOf(0, 1)))).after(ChannelLevelChanged(1, 40))
 
         val pushed = state.after(
-            MixPushed(MixSnapshot(channelGains = intArrayOf(140), channelPans = intArrayOf(-5), volumePercent = 120, maxLevelPercent = -1)),
+            ServerMixReceived(MixSnapshot(channelGains = intArrayOf(140), channelPans = intArrayOf(-5), volumePercent = 120, maxLevelPercent = -1)),
         )
 
         assertEquals(listOf(100, 40), pushed.mix.levels)
@@ -521,7 +521,7 @@ class MonitorReducerTest {
     fun aPushedMixBeforeTheFirstConfigKeepsTheStripsThePhoneShows() {
         val recalled = running().after(MixRecalled("Old", MixSnapshot(channelGains = intArrayOf(30, 30, 30), groupLevels = intArrayOf(20))))
 
-        val pushed = recalled.after(MixPushed(serverMix))
+        val pushed = recalled.after(ServerMixReceived(serverMix))
 
         assertEquals(listOf(80, 70, 100), pushed.mix.levels)
         assertEquals(listOf(60), pushed.mix.groupLevels)
@@ -532,15 +532,15 @@ class MonitorReducerTest {
         val idleWithChannels = withChannels(2)
         val ended = connectedWith(2).after(SessionEnded)
 
-        assertEquals(idleWithChannels, idleWithChannels.after(MixPushed(serverMix)))
-        assertEquals(ended, ended.after(MixPushed(serverMix)))
+        assertEquals(idleWithChannels, idleWithChannels.after(ServerMixReceived(serverMix)))
+        assertEquals(ended, ended.after(ServerMixReceived(serverMix)))
     }
 
     @Test
     fun aPushedMixTurnsMoreOfMeOffAndKeepsTheMixAsTheServerPlaysIt() {
         val on = connectedWith(2).after(MusicianChannelChosen(1), MoreOfMeToggled(true))
 
-        val pushed = on.after(MixPushed(serverMix))
+        val pushed = on.after(ServerMixReceived(serverMix))
 
         assertFalse(pushed.moreOfMe.enabled)
         assertEquals(1, pushed.moreOfMe.musicianChannel)
@@ -553,9 +553,9 @@ class MonitorReducerTest {
         val plain = connectedWith(2).after(ChannelLevelChanged(0, 80))
         val lifted = plain.after(MusicianChannelChosen(1), MoreOfMeToggled(true))
 
-        assertEquals(plain, plain.after(MixPushed(plain.mix.toSnapshot())))
+        assertEquals(plain, plain.after(ServerMixReceived(plain.mix.toSnapshot())))
         // With More of me on the server plays the lifted mix; hearing it back keeps More of me on.
-        assertEquals(lifted, lifted.after(MixPushed(lifted.mix.toSnapshot().moreOfMe(1)!!)))
+        assertEquals(lifted, lifted.after(ServerMixReceived(lifted.mix.toSnapshot().moreOfMe(1)!!)))
     }
 
     @Test
@@ -565,7 +565,7 @@ class MonitorReducerTest {
             MixRecalled("Verse", MixSnapshot(channelGains = intArrayOf(30, 30))),
         )
 
-        assertEquals(recalled.savedMixes, recalled.after(MixPushed(serverMix)).savedMixes)
+        assertEquals(recalled.savedMixes, recalled.after(ServerMixReceived(serverMix)).savedMixes)
     }
 
     // Saved mixes.

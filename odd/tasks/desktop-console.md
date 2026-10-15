@@ -142,6 +142,25 @@ user's decision.
   server). RED observed (13 compile errors: `MixPushed`, `onMixPushed`, `MIX_CHANGED_ELSEWHERE`
   missing). GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 357 tests (14 new),
   0 failures. Commit: this commit.
+- [x] T3b (Android, review R3-001 of T3): converge the phone's mix on the server's answer.
+  `ControlChannel` counts the phone's unanswered mixes (counted before the send, taken back when
+  the socket refuses it, reset on every open, end and close). The server answers each `mix` in
+  order with `mix_ack` or `error`; both count as an answer, so a refused mix cannot leave the count
+  stuck. Only the ack that leaves nothing unanswered hands its mix on (`Listener.onServerMix`,
+  renamed from `onMixPushed`, through the same `ServerMixReceived` path as a push: no echo, same
+  mapping, clamping and More of me rule); older acks still acknowledge but their values are
+  ignored, and an ack whose mix cannot be read still acknowledges. A `mix_state` that arrives
+  while a mix is unanswered is dropped rather than held: the answer to that mix follows on the same
+  connection and is the server's latest word. `mixAcknowledged` is unchanged. Simultaneous edits of
+  the same mix on the phone and the desktop remain last-writer-wins on the server, because the
+  phone sends whole mixes; per-control sparse updates would need a protocol extension and are a
+  phase-2 candidate. Route: delegated writer. RED observed (after the rename-only step: 6 of 365
+  tests failed, `aNewConnectionStartsWithNoMixUnanswered`,
+  `theAnswerToTheNewestMixIsHandedOnAndAnAnswerToAnOlderOneIsNot`, `aRefusedMixCountsAsAnswered`,
+  `aPushWhileAMixIsUnansweredIsDroppedForTheAnswerThatFollows`,
+  `aPushOlderThanAMixStillInFlightGivesWayToTheAnswerToThatMix`,
+  `withTwoMixesInFlightOnlyTheAnswerToTheNewestIsTaken`). GREEN: `:app:testDebugUnitTest
+  assembleDebug --rerun-tasks` ok, 365 tests (8 new), 0 failures. Commit: this commit.
 - [ ] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
   about 30 Hz; the UI keeps one `engine_status` call for the first paint. Route: delegated writer.
 - [ ] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the

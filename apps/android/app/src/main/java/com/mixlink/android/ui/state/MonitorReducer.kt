@@ -27,7 +27,6 @@ import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
-import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -35,6 +34,7 @@ import com.mixlink.android.ui.state.MonitorEvent.MixesLoaded
 import com.mixlink.android.ui.state.MonitorEvent.MoreOfMeToggled
 import com.mixlink.android.ui.state.MonitorEvent.MusicianChannelChosen
 import com.mixlink.android.ui.state.MonitorEvent.NameChanged
+import com.mixlink.android.ui.state.MonitorEvent.ServerMixReceived
 import com.mixlink.android.ui.state.MonitorEvent.ServersChanged
 import com.mixlink.android.ui.state.MonitorEvent.SessionEnded
 import com.mixlink.android.ui.state.MonitorEvent.SessionStarted
@@ -110,7 +110,7 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
     is MasterVolumeChanged -> state.copy(mix = state.mix.copy(masterVolume = event.level.coerceIn(PERCENT)))
     is MasterMuteChanged -> state.copy(mix = state.mix.copy(masterMuted = event.muted))
     is LevelCapChanged -> state.copy(mix = state.mix.copy(levelCap = event.level.coerceIn(PERCENT)))
-    is MixPushed -> applyPushedMix(state, event.snapshot)
+    is ServerMixReceived -> applyServerMix(state, event.snapshot)
 
     is MoreOfMeToggled -> state.copy(moreOfMe = toggleMoreOfMe(state.moreOfMe, event.on))
     is MusicianChannelChosen -> chooseMusicianChannel(state, event.channel)
@@ -271,24 +271,26 @@ private fun MixUiState.recalled(snapshot: MixSnapshot): MixUiState {
 }
 
 /**
- * A mix the server pushed because it changed elsewhere, such as on the desktop: it becomes the
- * phone's current mix, exactly as the server plays it. The saved mixes are left alone.
+ * The server's whole mix, pushed because it changed elsewhere (such as on the desktop) or answering
+ * the phone's newest mix: it becomes the phone's current mix, exactly as the server plays it. The
+ * saved mixes are left alone.
  *
- * A push belongs to a session, so a late one changes nothing once the session ended. A push of the
- * mix the phone already plays (the server re-sends the whole mix after it missed events) changes
- * nothing either. Otherwise More of me goes off and says why: the pushed levels are what the server
- * plays, so lifting them again on the next send would lift them twice.
+ * A report belongs to a session, so a late one changes nothing once the session ended. A report of
+ * the mix the phone already plays (an answer to its own mix, or the whole mix the server re-sends
+ * after it missed events) changes nothing either. Otherwise More of me goes off and says why: the
+ * reported levels are what the server plays, so lifting them again on the next send would lift them
+ * twice.
  */
-private fun applyPushedMix(state: MonitorUiState, snapshot: MixSnapshot): MonitorUiState {
+private fun applyServerMix(state: MonitorUiState, snapshot: MixSnapshot): MonitorUiState {
     if (!state.connection.sessionRunning) return state
-    val pushed = state.mix.pushed(snapshot)
-    if (pushed == state.mix.asPlayed(state.moreOfMe)) return state
+    val reported = state.mix.fromServer(snapshot)
+    if (reported == state.mix.asPlayed(state.moreOfMe)) return state
     val moreOfMe = if (state.moreOfMe.enabled) {
         state.moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.MIX_CHANGED_ELSEWHERE)
     } else {
         state.moreOfMe
     }
-    return state.copy(mix = pushed, moreOfMe = moreOfMe)
+    return state.copy(mix = reported, moreOfMe = moreOfMe)
 }
 
 /**
@@ -297,7 +299,7 @@ private fun applyPushedMix(state: MonitorUiState, snapshot: MixSnapshot): Monito
  * `config` the strips the phone shows keep their count. A value the snapshot lacks keeps what the
  * phone has, and levels and pans stay between 0 and 100.
  */
-private fun MixUiState.pushed(snapshot: MixSnapshot): MixUiState {
+private fun MixUiState.fromServer(snapshot: MixSnapshot): MixUiState {
     val announced = sourceChannels > 0
     val channelCount = if (announced) sourceChannels else levels.size
     val groupCount = if (announced) groupDefinitions.size else groupLevels.size

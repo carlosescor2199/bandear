@@ -34,7 +34,6 @@ import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
-import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -42,6 +41,7 @@ import com.mixlink.android.ui.state.MonitorEvent.MixesLoaded
 import com.mixlink.android.ui.state.MonitorEvent.MoreOfMeToggled
 import com.mixlink.android.ui.state.MonitorEvent.MusicianChannelChosen
 import com.mixlink.android.ui.state.MonitorEvent.NameChanged
+import com.mixlink.android.ui.state.MonitorEvent.ServerMixReceived
 import com.mixlink.android.ui.state.MonitorEvent.ServersChanged
 import com.mixlink.android.ui.state.MonitorEvent.SessionEnded
 import com.mixlink.android.ui.state.MonitorEvent.SessionStarted
@@ -163,7 +163,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             dispatch(MixAcknowledged(control.controlState))
         }
 
-        override fun onMixPushed(mix: MixSnapshot) = mixPushed(mix)
+        override fun onServerMix(mix: MixSnapshot) = serverMixReceived(mix)
 
         override fun onClosed() = publishControlState()
 
@@ -317,16 +317,17 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     }
 
     /**
-     * The server pushed the musician's mix, changed on the desktop; it arrives on the control
-     * thread. The screen and the receive thread follow it, but it is never sent back: the server
-     * already plays it, so a send would only echo it.
+     * The server reported the musician's whole mix with none of the phone's mixes left unanswered:
+     * pushed because it changed on the desktop, or answering the newest mix sent. It arrives on the
+     * control thread. The screen and the receive thread follow it, but it is never sent back: the
+     * server already plays it, so a send would only echo it.
      *
-     * A fader the musician is still moving is not held back: the push lands at once, and the next
+     * A fader the musician is still moving is not held back: a push lands at once, and the next
      * step of the gesture sends its own value with the pushed mix around it. The server keeps
-     * whichever whole mix it got last.
+     * whichever whole mix it got last, and its answer to the phone's last mix brings the screen to it.
      */
-    private fun mixPushed(mix: MixSnapshot) {
-        val (before, after) = dispatch(MixPushed(mix))
+    private fun serverMixReceived(mix: MixSnapshot) {
+        val (before, after) = dispatch(ServerMixReceived(mix))
         if (before.mix != after.mix) syncPlayerMix()
     }
 

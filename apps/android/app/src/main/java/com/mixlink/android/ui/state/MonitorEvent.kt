@@ -65,10 +65,11 @@ internal sealed interface MonitorEvent {
     data class LevelCapChanged(val level: Int) : MonitorEvent
 
     /**
-     * The server pushed the musician's whole mix (`mix_state`) because it changed elsewhere, such as
-     * on the desktop. [snapshot] holds the server's full tables; the reducer keeps what the phone knows.
+     * The server reported the musician's whole mix with no mix of this phone left unanswered: a
+     * `mix_state` push (changed elsewhere, such as on the desktop) or the `mix_ack` of the newest mix
+     * sent. [snapshot] holds the server's full tables; the reducer keeps what the phone knows.
      */
-    data class MixPushed(val snapshot: MixSnapshot) : MonitorEvent
+    data class ServerMixReceived(val snapshot: MixSnapshot) : MonitorEvent
 
     // More of me.
 

@@ -21,7 +21,7 @@ private const val NORMAL_CLOSURE = 1000
  * The WebSocket control channel, its connection state machine, sending and closing.
  *
  * The channel owns its [transport] (OkHttp WebSockets in production) and its [scheduler] (one
- * background thread in production). It reports opened, acknowledged, config, pushed mix, error and
+ * background thread in production). It reports opened, acknowledged, config, server mix, error and
  * closed events through [Listener], so the Activity only renders and wires. [running] is the shared
  * session flag owned by the caller.
  *
@@ -45,11 +45,12 @@ internal class ControlChannel(
         fun onAcknowledged()
 
         /**
-         * The server pushed this musician's whole mix (`mix_state`) because it changed elsewhere,
-         * such as on the desktop. The channel sends nothing back: the server already plays it. A
-         * listener that does not follow pushed mixes keeps this default and ignores them.
+         * The server's whole mix for this musician, reported while none of this phone's mixes is
+         * left unanswered: a `mix_state` push (changed elsewhere, such as on the desktop) or the
+         * `mix_ack` of the newest mix sent. The channel sends nothing back: the server already plays
+         * it. A listener that does not follow the server's mix keeps this default and ignores it.
          */
-        fun onMixPushed(mix: MixSnapshot) = Unit
+        fun onServerMix(mix: MixSnapshot) = Unit
 
         fun onClosed()
         fun onControlError(message: String)
@@ -86,6 +87,14 @@ internal class ControlChannel(
     private var outageReported = false
 
     /**
+     * Mixes sent on the open connection that the server has not answered yet. It answers each one,
+     * in order, with `mix_ack` or `error`, so the mix in an answer is the server's latest word only
+     * when this drops to zero. Every connection starts again from zero: a lost one takes its
+     * unanswered mixes with it, and every open sends the mix again.
+     */
+    private var unansweredMixes = 0
+
+    /**
      * Listens to one connection attempt. Its [generation] ties every callback to the socket it came
      * from: the callbacks of a socket that is no longer current never change the channel's state,
      * and such a socket is only ever closed, never used.
@@ -110,7 +119,13 @@ internal class ControlChannel(
             try {
                 val message = JSONObject(text)
                 when (message.optString("type")) {
-                    "error" -> listener.onControlError(message.optString("message", "unknown control error"))
+                    "error" -> {
+                        // A refused mix is answered with an error, and must not stay unanswered. An
+                        // error answering a registration or a stats report instead only makes an older
+                        // answer count as the newest; the newest mix's own answer still follows.
+                        mixAnswered(generation)
+                        listener.onControlError(message.optString("message", "unknown control error"))
+                    }
                     "config" -> {
                         val announcedChannels = message.optInt("source_channels", -1)
                         if (announcedChannels in 1..MAX_CHANNELS) {
@@ -120,8 +135,19 @@ internal class ControlChannel(
                     "mix_ack" -> {
                         mixAcknowledged = true
                         listener.onAcknowledged()
+                        // The answer to the newest mix carries what the server now plays. An ack
+                        // whose mix cannot be read still acknowledges; it just has nothing to show.
+                        if (mixAnswered(generation)) {
+                            runCatching { parseMixReport(message) }.getOrNull()?.let(listener::onServerMix)
+                        }
                     }
-                    "mix_state" -> listener.onMixPushed(parseMixReport(message))
+                    // A push that arrives while a mix of this phone is unanswered is older than that
+                    // mix's answer, which follows on the same connection and is the server's latest
+                    // word anyway, so the push is dropped rather than held.
+                    "mix_state" -> {
+                        val mix = parseMixReport(message)
+                        if (noMixUnanswered(generation)) listener.onServerMix(mix)
+                    }
                 }
             } catch (error: Exception) {
                 listener.onControlError("Invalid control response: ${error.message ?: "unknown error"}")
@@ -208,9 +234,29 @@ internal class ControlChannel(
             if (!generations.isCurrent(generation)) return false
             currentSocket = socket
             controlWebSocket = socket
+            unansweredMixes = 0
             controlState = ControlState.CONNECTED
         }
         return true
+    }
+
+    /**
+     * Counts one answer to a mix on connection [generation] and returns true when no mix is left
+     * unanswered, so the mix in this answer is the server's latest word. False for a stale connection.
+     */
+    private fun mixAnswered(generation: Long): Boolean {
+        synchronized(connectionLock) {
+            if (!generations.isCurrent(generation)) return false
+            if (unansweredMixes > 0) unansweredMixes--
+            return unansweredMixes == 0
+        }
+    }
+
+    /** True when connection [generation] is current and the server has answered every mix sent on it. */
+    private fun noMixUnanswered(generation: Long): Boolean {
+        synchronized(connectionLock) {
+            return generations.isCurrent(generation) && unansweredMixes == 0
+        }
     }
 
     /**
@@ -246,6 +292,7 @@ internal class ControlChannel(
             if (!generations.end(generation)) return
             currentSocket = null
             controlWebSocket = null
+            unansweredMixes = 0
             val sessionRunning = running.get()
             val reconnect = ReconnectPolicy.shouldReconnect(sessionRunning, stopped)
             controlState = when {
@@ -325,14 +372,30 @@ internal class ControlChannel(
 
     fun sendMixControl() {
         scheduler.execute {
-            val webSocket = controlWebSocket ?: return@execute
+            // Counted before it is sent, so its answer can never arrive before the count.
+            val webSocket = beginMixSend() ?: return@execute
             val stored = currentSnapshot()
             // `More of me` is derived here, at send time, and never written back. The stored values
             // stay exactly as the musician left them, so turning the control off re-sends them.
             val outgoing = if (moreOfMeEnabled()) stored.moreOfMe(musicianChannel()) ?: stored else stored
-            if (!webSocket.send(buildMixMessage(outgoing)) && running.get()) {
-                listener.onControlError("WebSocket rejected mix update")
+            if (!webSocket.send(buildMixMessage(outgoing))) {
+                abandonMixSend(webSocket)
+                if (running.get()) listener.onControlError("WebSocket rejected mix update")
             }
+        }
+    }
+
+    /** The open socket, with one more mix counted as unanswered on it; null while none is open. */
+    private fun beginMixSend(): ControlSocket? {
+        synchronized(connectionLock) {
+            return controlWebSocket?.also { unansweredMixes++ }
+        }
+    }
+
+    /** Takes back the count of a mix [socket] refused to send, while it is still the open socket. */
+    private fun abandonMixSend(socket: ControlSocket) {
+        synchronized(connectionLock) {
+            if (controlWebSocket === socket && unansweredMixes > 0) unansweredMixes--
         }
     }
 
@@ -366,6 +429,7 @@ internal class ControlChannel(
             socket = currentSocket
             currentSocket = null
             controlWebSocket = null
+            unansweredMixes = 0
         }
         socket?.close(code, reason)
     }
@@ -447,7 +511,8 @@ internal fun buildStatsMessage(report: LinkStatsReport): String =
  * Reads a whole mix as the server reports it, in the field names of the `mix` message: `mix_state`
  * carries it, and `mix_ack` shares the shape. The lists are the server's full tables (32 channels,
  * 16 groups); the client keeps the channels and groups it knows. The server always sends every
- * field, so a missing or mistyped one throws and the message is reported as invalid, never applied.
+ * field, so a missing or mistyped one throws: such a push is reported as invalid, never applied, and
+ * such an ack still acknowledges but shows nothing.
  */
 internal fun parseMixReport(message: JSONObject): MixSnapshot =
     MixSnapshot(

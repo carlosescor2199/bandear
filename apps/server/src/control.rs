@@ -85,12 +85,12 @@ pub(crate) struct ConfigSnapshot {
 
 /// The live control configuration, shared by the engine and every connection.
 ///
-/// The engine publishes a new snapshot whenever what `config` says changes: a device switch that
-/// changes the channel count (and with it which groups are valid). Each connection notices the
-/// higher generation and re-sends `config` on the same socket, so a client rebuilds its controls
-/// without losing the control channel, and a phone that registers takes the live membership for its
-/// mix. The generation is an atomic, so a connection's poll is one load; the snapshot behind its lock
-/// is only read when it changed.
+/// The engine publishes a new snapshot whenever what `config` says changes: the engineer edits the
+/// groups, or a device switch changes the channel count (and with it which groups are valid). Each
+/// connection notices the higher generation and re-sends `config` on the same socket, so a client
+/// rebuilds its controls without losing the control channel, and a phone that registers takes the
+/// live membership for its mix. The generation is an atomic, so a connection's poll is one load; the
+/// snapshot behind its lock is only read when it changed.
 pub(crate) struct ConfigState {
     current: RwLock<Arc<ConfigSnapshot>>,
     generation: AtomicU64,
@@ -125,8 +125,9 @@ impl ConfigState {
         )
     }
 
-    /// Publishes a configuration and returns whether it differs from the one in force. An
-    /// unchanged one keeps its generation, so no connection re-sends `config` for nothing.
+    /// Publishes a configuration and returns the one it replaced, or `None` when it is the one in
+    /// force: an unchanged configuration keeps its generation, so no connection re-sends `config`
+    /// for nothing.
     ///
     /// The generation is raised while the new snapshot is held under the write lock, so a reader
     /// that sees the new generation always reads the new snapshot.
@@ -135,7 +136,7 @@ impl ConfigState {
         source_channels: u8,
         groups: Vec<GroupStatus>,
         layout: GroupLayout,
-    ) -> bool {
+    ) -> Option<Arc<ConfigSnapshot>> {
         let mut current = self
             .current
             .write()
@@ -144,17 +145,20 @@ impl ConfigState {
             && current.groups == groups
             && current.layout == layout
         {
-            return false;
+            return None;
         }
         let generation = current.generation + 1;
-        *current = Arc::new(ConfigSnapshot {
-            generation,
-            source_channels,
-            groups,
-            layout,
-        });
+        let previous = std::mem::replace(
+            &mut *current,
+            Arc::new(ConfigSnapshot {
+                generation,
+                source_channels,
+                groups,
+                layout,
+            }),
+        );
         self.generation.store(generation, Ordering::SeqCst);
-        true
+        Some(previous)
     }
 }
 
@@ -181,6 +185,7 @@ fn config_message(config: &ConfigSnapshot) -> Result<String, serde_json::Error> 
             .groups()
             .iter()
             .map(|group| GroupConfig {
+                id: group.id.clone(),
                 name: group.name.clone(),
                 channels: group.channels.clone(),
             })
@@ -229,6 +234,14 @@ impl ConfigFeed {
 /// Sends `message` on the shared writer, preceded by `config` when the phone lacks the
 /// configuration in force, in one hold of the writer so nothing can come between them. With no
 /// message it only brings the phone's `config` up to date.
+///
+/// Every report of the musician's mix (`mix_state`, `mix_ack`) goes through here, read before the
+/// call and under the mix's writer lock ([crate::mix::MixState::current],
+/// [crate::mix::MixState::apply]). That order is what keeps a phone's group levels on the right
+/// groups, because the phone keeps its levels by position: an edit of the groups publishes the new
+/// configuration before it moves any level (see [crate::engine::apply_groups]), so a mix read with
+/// moved levels was read after the publish, the check here finds the new configuration, and the
+/// phone gets the new `config` ahead of the levels placed for it.
 async fn send_with_config<S>(
     writer: &tokio::sync::Mutex<S>,
     config: &ConfigFeed,
@@ -450,20 +463,23 @@ enum BoundedSend {
     TimedOut,
 }
 
-/// Sends one message on the shared writer, giving up at `deadline`.
+/// Sends one message on the shared writer as [send_with_config] does (after `config` when the
+/// phone lacks the configuration in force), giving up at `deadline`.
 ///
 /// A write to a vanished peer can stall once its buffers fill, and so can waiting for the writer
 /// while another write is stuck on it, so both are bounded. The connection loop ends the
 /// connection on anything but [BoundedSend::Sent].
 async fn send_by<S>(
     writer: &tokio::sync::Mutex<S>,
+    config: &ConfigFeed,
     message: Message,
     deadline: tokio::time::Instant,
 ) -> BoundedSend
 where
     S: Sink<Message> + Unpin,
+    S::Error: Error + Send + Sync + 'static,
 {
-    let send = async { writer.lock().await.send(message).await };
+    let send = send_with_config(writer, config, Some(message));
     match tokio::time::timeout_at(deadline, send).await {
         Ok(Ok(())) => BoundedSend::Sent,
         Ok(Err(_)) => BoundedSend::Failed,
@@ -571,9 +587,12 @@ async fn handle_control_connection(
                 let Some(mix_state) = targets.mix_state(peer.ip()) else {
                     continue;
                 };
-                let message = mix_state_message(mix_state.snapshot())?;
+                // Read under the mix's writer lock and before the configuration check in the send,
+                // so levels moved by an edit of the groups follow the new `config` (see
+                // [send_with_config]).
+                let message = mix_state_message(mix_state.current())?;
                 // Bounded like the ping: a push that cannot be written in time means a dead peer.
-                match send_by(&writer, Message::Text(message.into()), dead_at).await {
+                match send_by(&writer, &config, Message::Text(message.into()), dead_at).await {
                     BoundedSend::Sent => continue,
                     BoundedSend::Failed => break,
                     BoundedSend::TimedOut => {
@@ -584,7 +603,7 @@ async fn handle_control_connection(
             }
             _ = ping_timer.tick() => {
                 // A ping that cannot be sent in time is as good as no answer.
-                match send_by(&writer, Message::Ping(Default::default()), dead_at).await {
+                match send_by(&writer, &config, Message::Ping(Default::default()), dead_at).await {
                     BoundedSend::Sent => continue,
                     BoundedSend::Failed => break,
                     BoundedSend::TimedOut => {
@@ -694,11 +713,10 @@ async fn handle_control_connection(
                         }
                     })
                 };
+                // An ack carries the mix `apply` stored, read under its writer lock, so it follows
+                // a new `config` like a push does (see [send_with_config]).
                 if let Some(response) = response {
-                    if writer
-                        .lock()
-                        .await
-                        .send(Message::Text(response.into()))
+                    if send_with_config(&writer, &config, Some(Message::Text(response.into())))
                         .await
                         .is_err()
                     {
@@ -739,25 +757,24 @@ mod tests {
     use crate::cli::GroupDefinition;
     use crate::engine::revalidate_groups;
 
+    fn definition(id: &str, name: &str, channels: &[usize]) -> GroupDefinition {
+        GroupDefinition {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            channels: channels.to_vec(),
+        }
+    }
+
     fn drums() -> Vec<GroupDefinition> {
-        vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 2],
-        }]
+        vec![definition("kit", "Drums", &[1, 2])]
     }
 
     /// Drums on CH 1-2 and Vocals on CH 3-4: a four-channel device has both, a two-channel one
     /// leaves Vocals invalid.
     fn band() -> Vec<GroupDefinition> {
         vec![
-            GroupDefinition {
-                name: "Drums".to_owned(),
-                channels: vec![1, 2],
-            },
-            GroupDefinition {
-                name: "Vocals".to_owned(),
-                channels: vec![3, 4],
-            },
+            definition("kit", "Drums", &[1, 2]),
+            definition("vox", "Vocals", &[3, 4]),
         ]
     }
 
@@ -774,7 +791,9 @@ mod tests {
     /// What a device switch to `channels` inputs publishes, as the engine does.
     fn publish_switch(config: &ConfigState, definitions: &[GroupDefinition], channels: u8) -> bool {
         let groups = revalidate_groups(definitions, usize::from(channels));
-        config.publish(channels, groups.statuses, groups.mixer_layout)
+        config
+            .publish(channels, groups.statuses, groups.mixer_layout)
+            .is_some()
     }
 
     #[test]
@@ -783,7 +802,7 @@ mod tests {
             config_message(&live_config(&drums(), 4).snapshot()).expect("config should serialize");
 
         assert!(json.contains(r#""source_channels":4"#));
-        assert!(json.contains(r#""groups":[{"name":"Drums","channels":[0,1]}]"#));
+        assert!(json.contains(r#""groups":[{"id":"kit","name":"Drums","channels":[0,1]}]"#));
     }
 
     #[test]
@@ -792,7 +811,7 @@ mod tests {
             config_message(&live_config(&band(), 2).snapshot()).expect("config should serialize");
 
         assert!(json.contains(
-            r#""groups":[{"name":"Drums","channels":[0,1]},{"name":"Vocals","channels":[]}]"#
+            r#""groups":[{"id":"kit","name":"Drums","channels":[0,1]},{"id":"vox","name":"Vocals","channels":[]}]"#
         ));
     }
 
@@ -1161,10 +1180,7 @@ mod tests {
         );
 
         // The same channel count with other groups: a new generation is pushed all the same.
-        let regrouped = vec![GroupDefinition {
-            name: "Keys".to_owned(),
-            channels: vec![2],
-        }];
+        let regrouped = vec![definition("keys", "Keys", &[2])];
         assert!(publish_switch(&config, &regrouped, 2));
         let pushed = read_message_of_type(&mut client, "config")
             .await
@@ -1207,6 +1223,86 @@ mod tests {
             mix.channel_group[2], None,
             "the invalid Vocals owns nothing"
         );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// Reads the next text message as JSON, whatever its type. Bounded by a deadline so a missing
+    /// message fails the test instead of hanging it.
+    async fn read_next_message(client: &mut ClientStream) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, client.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => return serde_json::from_str(&text).ok(),
+                Ok(Some(Ok(_))) => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The order a phone needs when the engineer edits the groups while it is connected: the new
+    /// `config` first, then the `mix_state` whose group levels are placed for it. A phone keeps its
+    /// group levels by position when a `config` arrives, and the server's mix then sets them, so
+    /// levels placed for the new groups that arrived before the new `config` would land on the
+    /// wrong groups.
+    #[tokio::test]
+    async fn after_a_group_edit_the_phone_gets_the_new_config_before_its_moved_levels() {
+        let config = live_config(&band(), 4);
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &config.snapshot().layout,
+            )
+            .expect("registry should build"),
+        );
+        targets
+            .mix_state("127.0.0.1".parse().expect("loopback IP"))
+            .expect("configured target")
+            .apply(&crate::mix::MixUpdate {
+                group_levels: Some(vec![30, 70]),
+                ..Default::default()
+            })
+            .expect("a valid update applies");
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_on(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+            Arc::clone(&config),
+        );
+        let mut client = connect_client(address).await;
+
+        // The engineer puts Vocals first.
+        let swapped = vec![band()[1].clone(), band()[0].clone()];
+        crate::engine::edit_groups(&targets, &config, &events, 4, &swapped)
+            .expect("the edit is valid");
+
+        let mut new_config = None;
+        let moved = loop {
+            let message = read_next_message(&mut client)
+                .await
+                .expect("the edit reaches the phone");
+            match message["type"].as_str() {
+                Some("config") => new_config = Some(message),
+                Some("mix_state") => break message,
+                _ => {}
+            }
+        };
+        let new_config = new_config
+            .unwrap_or_else(|| panic!("the moved levels {moved} arrived before the new groups"));
+        assert_eq!(
+            announced_groups(&new_config),
+            vec![
+                ("Vocals".to_owned(), vec![2, 3]),
+                ("Drums".to_owned(), vec![0, 1]),
+            ]
+        );
+        assert_eq!(new_config["groups"][0]["id"], "vox");
+        let levels: Vec<u8> = serde_json::from_value(moved["group_levels"].clone()).unwrap();
+        assert_eq!(&levels[..2], &[70, 30], "each level moved with its group");
 
         stop_server(address, &stopped, server).await;
     }
@@ -2513,6 +2609,14 @@ mod tests {
         tokio::time::Instant::now() + Duration::from_millis(100)
     }
 
+    /// A feed whose phone already has the configuration in force, so a send carries only its own
+    /// message.
+    fn settled_feed() -> ConfigFeed {
+        let feed = ConfigFeed::new(live_config(&drums(), 2));
+        feed.take_pending().expect("config serializes");
+        feed
+    }
+
     /// The outcomes the connection loop acts on: a sent push or ping carries on, and a failed or
     /// late one ends the connection (the loop maps both to `break`).
     #[tokio::test]
@@ -2520,17 +2624,18 @@ mod tests {
         let open = tokio::sync::Mutex::new(futures_util::sink::drain());
         let broken = tokio::sync::Mutex::new(BrokenSink);
         let stalled = tokio::sync::Mutex::new(StalledSink);
+        let feed = settled_feed();
 
         assert_eq!(
-            send_by(&open, Message::Text("{}".into()), soon()).await,
+            send_by(&open, &feed, Message::Text("{}".into()), soon()).await,
             BoundedSend::Sent
         );
         assert_eq!(
-            send_by(&broken, Message::Text("{}".into()), soon()).await,
+            send_by(&broken, &feed, Message::Text("{}".into()), soon()).await,
             BoundedSend::Failed
         );
         assert_eq!(
-            send_by(&stalled, Message::Text("{}".into()), soon()).await,
+            send_by(&stalled, &feed, Message::Text("{}".into()), soon()).await,
             BoundedSend::TimedOut
         );
     }
@@ -2543,8 +2648,89 @@ mod tests {
         let _stuck = writer.lock().await;
 
         assert_eq!(
-            send_by(&writer, Message::Ping(Default::default()), soon()).await,
+            send_by(
+                &writer,
+                &settled_feed(),
+                Message::Ping(Default::default()),
+                soon()
+            )
+            .await,
             BoundedSend::TimedOut
         );
+    }
+
+    /// A sink that keeps everything written to it, in order.
+    #[derive(Default)]
+    struct RecordingSink(Vec<Message>);
+
+    impl Sink<Message> for RecordingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            mut self: std::pin::Pin<&mut Self>,
+            message: Message,
+        ) -> Result<(), Self::Error> {
+            self.0.push(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The mechanism behind the order: a message to a phone that lacks the configuration in force
+    /// goes out right behind a new `config`, and the next one goes out alone.
+    #[tokio::test]
+    async fn a_message_to_a_phone_behind_the_configuration_follows_a_new_config() {
+        let state = live_config(&band(), 4);
+        let feed = ConfigFeed::new(Arc::clone(&state));
+        let sent = tokio::sync::Mutex::new(RecordingSink::default());
+        send_with_config(&sent, &feed, None)
+            .await
+            .expect("config is sent");
+        assert!(publish_switch(&state, &drums(), 4));
+
+        send_with_config(&sent, &feed, Some(Message::Text("first".into())))
+            .await
+            .expect("the message is sent");
+        send_with_config(&sent, &feed, Some(Message::Text("second".into())))
+            .await
+            .expect("the message is sent");
+
+        let texts: Vec<String> = sent
+            .lock()
+            .await
+            .0
+            .iter()
+            .map(|message| message.to_text().expect("text").to_owned())
+            .collect();
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        assert!(
+            texts[0].contains(r#""id":"vox""#),
+            "the first config: {texts:?}"
+        );
+        assert!(
+            texts[1].contains(r#""type":"config""#) && !texts[1].contains("vox"),
+            "the new config comes first: {texts:?}"
+        );
+        assert_eq!(&texts[2..], ["first", "second"]);
     }
 }

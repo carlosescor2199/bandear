@@ -242,9 +242,14 @@ struct MixReport {
     group_levels: Vec<u8>,
 }
 
-/// One group as it appears in the `config` message: a name and 0-based source channel indices.
+/// One group as it appears in the `config` message: its stable id, a name and 0-based source
+/// channel indices.
+///
+/// The id was added after the name and the channels: a phone that predates it ignores it, as it
+/// ignores every field it does not know, and keeps matching group levels by position.
 #[derive(Serialize)]
 pub(crate) struct GroupConfig {
+    pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) channels: Vec<usize>,
 }
@@ -679,12 +684,13 @@ mod tests {
     }
 
     #[test]
-    fn config_carries_groups_with_zero_based_channels() {
+    fn config_carries_groups_with_their_ids_and_zero_based_channels() {
         let config = ControlConfig {
             message_type: "config",
             source_channels: 2,
             sample_rate: 48_000,
             groups: vec![GroupConfig {
+                id: "kit".to_owned(),
                 name: "Drums".to_owned(),
                 channels: vec![0, 1],
             }],
@@ -692,6 +698,6 @@ mod tests {
 
         let json = serde_json::to_string(&config).unwrap();
 
-        assert!(json.contains(r#""groups":[{"name":"Drums","channels":[0,1]}]"#));
+        assert!(json.contains(r#""groups":[{"id":"kit","name":"Drums","channels":[0,1]}]"#));
     }
 }

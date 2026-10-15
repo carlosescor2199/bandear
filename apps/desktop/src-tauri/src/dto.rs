@@ -463,6 +463,7 @@ mod tests {
     fn channels_label_by_number_with_their_group_and_level() {
         let status = status_with(
             vec![GroupStatus {
+                id: "kit".to_owned(),
                 name: "Drums".to_owned(),
                 channels: vec![0],
                 invalid: false,
@@ -497,6 +498,7 @@ mod tests {
     fn an_invalid_group_is_flagged_for_the_window_and_keeps_its_channels() {
         let status = status_with(
             vec![GroupStatus {
+                id: "vox".to_owned(),
                 name: "Vocals".to_owned(),
                 channels: vec![2, 3],
                 invalid: true,
@@ -906,6 +908,7 @@ mod tests {
     fn a_channel_of_an_invalid_group_is_not_labelled_with_it() {
         let status = status_with(
             vec![GroupStatus {
+                id: "kit".to_owned(),
                 name: "Drums".to_owned(),
                 channels: vec![0, 1],
                 invalid: true,

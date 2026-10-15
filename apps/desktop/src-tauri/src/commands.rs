@@ -94,10 +94,13 @@ fn to_engine_config(request: StartRequest) -> EngineConfig {
         device_filter: request.device_filter,
         targets: request.targets,
         control_port: request.control_port.unwrap_or(DEFAULT_CONTROL_PORT),
+        // Numbered by order, as the command line numbers its groups.
         groups: request
             .groups
             .into_iter()
-            .map(|group: GroupRequest| GroupDefinition {
+            .enumerate()
+            .map(|(index, group): (usize, GroupRequest)| GroupDefinition {
+                id: (index + 1).to_string(),
                 name: group.name,
                 channels: group.channels,
             })

@@ -497,6 +497,7 @@ mod tests {
     #[test]
     fn an_added_target_carries_the_group_layout_it_was_added_with() {
         let layout = GroupLayout::new(vec![Group {
+            id: "1".to_owned(),
             name: "Drums".to_owned(),
             channels: vec![0],
         }]);

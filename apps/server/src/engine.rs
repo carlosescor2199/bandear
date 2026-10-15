@@ -13,11 +13,11 @@ use crate::capture::{
     build_input_stream, describe_buffer, input_host, select_device, select_device_by_name,
     select_input_config, AudioHost, TARGET_SAMPLE_RATE,
 };
-use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
+use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
-use crate::mix::{Group, GroupLayout, MixUpdate, MixValues, MAX_MIX_CHANNELS};
+use crate::mix::{group_sources, Group, GroupLayout, MixUpdate, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
 use crate::targets::{TargetEntry, TargetRegistry};
@@ -118,11 +118,15 @@ pub struct MusicianStatus {
 /// One configured group of source channels, as the observation API exposes it.
 ///
 /// Channels are 0-based source indices, the same numbering the protocol's `config` message and the
-/// mixer use. Membership is fixed at startup and is never rewritten by a device switch; instead
-/// [Self::invalid] reports when the current device no longer has one of the channels the group names,
-/// so a UI can warn without the engineer's configuration being destroyed.
+/// mixer use. The groups change only when the engineer edits them ([EngineHandle::set_groups]); a
+/// device switch never rewrites them, and instead [Self::invalid] reports when the current device no
+/// longer has one of the channels the group names, so a UI can warn without the engineer's
+/// configuration being destroyed. The position of a group in the list is the index of its level in
+/// every mix's `group_levels`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupStatus {
+    /// The group's stable id (see [GroupDefinition]).
+    pub id: String,
     pub name: String,
     pub channels: Vec<usize>,
     /// True when the current capture device is missing a channel this group names. An invalid group
@@ -569,7 +573,7 @@ pub(crate) fn musician_mix(
         .map(|entry| (entry.address, entry.mix_state.current()))
 }
 
-/// Snapshots the fixed group layout into the observation-friendly [GroupStatus] list.
+/// Snapshots the start-up group layout into the observation-friendly [GroupStatus] list.
 ///
 /// Used at startup, where [validate_groups] has already proven every group valid.
 fn group_statuses(layout: &GroupLayout) -> Vec<GroupStatus> {
@@ -577,6 +581,7 @@ fn group_statuses(layout: &GroupLayout) -> Vec<GroupStatus> {
         .groups()
         .iter()
         .map(|group| GroupStatus {
+            id: group.id.clone(),
             name: group.name.clone(),
             channels: group.channels.clone(),
             invalid: false,
@@ -594,11 +599,12 @@ pub(crate) struct GroupRevalidation {
     pub(crate) mixer_layout: GroupLayout,
 }
 
-/// Re-checks the engineer's fixed groups against a channel count without failing or mutating them.
+/// Re-checks the engineer's groups against a channel count without failing or mutating them.
 ///
 /// Unlike [validate_groups], which rejects an out-of-range group at startup, this is the lenient
-/// post-switch check: a channel the new device does not have marks the whole group invalid but keeps
-/// its definition, so switching back restores it. Definitions are read only.
+/// check of a running engine (after a device switch or an edit): a channel the device does not have
+/// marks the whole group invalid but keeps its definition, so switching back restores it.
+/// Definitions are read only.
 pub(crate) fn revalidate_groups(
     definitions: &[GroupDefinition],
     channel_count: usize,
@@ -616,6 +622,7 @@ pub(crate) fn revalidate_groups(
             .map(|&channel| channel.saturating_sub(1))
             .collect();
         statuses.push(GroupStatus {
+            id: definition.id.clone(),
             name: definition.name.clone(),
             channels: channels.clone(),
             invalid,
@@ -623,6 +630,7 @@ pub(crate) fn revalidate_groups(
         // Invalid groups keep their slot in the list so group indices line up with `group_levels`,
         // but map no channel; the mixer then cannot apply their level to anything.
         mixer_groups.push(Group {
+            id: definition.id.clone(),
             name: definition.name.clone(),
             channels: if invalid { Vec::new() } else { channels },
         });
@@ -667,30 +675,82 @@ pub(crate) fn plan_switch_from_attempt(
     Ok(plan_device_switch(definitions, new_channels))
 }
 
-/// Publishes `source_channels` and `groups` as the live configuration and points every musician's
-/// mixer at the new membership. Returns whether anything changed; an unchanged configuration
-/// touches nothing and makes no connection re-send `config`.
+/// Publishes `source_channels` and `groups` as the live configuration and moves every musician's
+/// mix onto it. Returns whether anything changed; an unchanged configuration touches nothing and
+/// makes no connection re-send `config`.
+///
+/// When every group keeps its position (a device switch, a rename, other channels for a group),
+/// each mixer is only pointed at the new membership: every stored level is already in its place.
+/// Otherwise every mix moves its group levels by group id ([MixState::regroup]): a kept group takes
+/// its level to its new position, a new group starts neutral and a deleted group's level is
+/// dropped. Each moved mix takes a new revision and is announced as a change made through the
+/// engine, so the desktop and the musician's phone are sent it.
+///
+/// The order is what keeps a phone's levels on the right groups: the new configuration is
+/// published before any level moves, so a phone's connection, which reads the mix before it checks
+/// the configuration (see [crate::control]), always sends the new `config` ahead of moved levels.
 ///
 /// The registry is held for reading throughout, and a new musician's mix is created under its write
 /// lock from the live configuration (see [crate::mix::Membership]). A phone registering at the same
 /// moment therefore either exists already and is moved here, or comes after the publish and starts
-/// with the new membership; none is left on the old one. Group positions do not change here, so
-/// every stored group level stays with its group.
+/// with the new membership; none is left on the old one.
+///
+/// [MixState::regroup]: crate::mix::MixState::regroup
 pub(crate) fn apply_groups(
     targets: &TargetRegistry,
     config: &ConfigState,
+    events: &EventBus,
     source_channels: u8,
     groups: GroupRevalidation,
 ) -> bool {
     let entries = targets.read();
     let layout = groups.mixer_layout.clone();
-    if !config.publish(source_channels, groups.statuses, groups.mixer_layout) {
+    let Some(previous) = config.publish(source_channels, groups.statuses, groups.mixer_layout)
+    else {
         return false;
+    };
+    if previous.layout.same_positions(&layout) {
+        for entry in entries.iter() {
+            entry.mix_state.set_group_layout(&layout);
+        }
+        return true;
     }
-    for entry in entries.iter() {
-        entry.mix_state.set_group_layout(&layout);
+    let sources = group_sources(&previous.layout, &layout);
+    let moved: Vec<SocketAddr> = entries
+        .iter()
+        .map(|entry| {
+            entry.mix_state.regroup(&layout, &sources);
+            entry.address
+        })
+        .collect();
+    // Announced once the registry is released: a listener may read it at once.
+    drop(entries);
+    for address in moved {
+        events.emit(EngineEvent::MixChanged {
+            address,
+            origin: MixOrigin::Engine,
+        });
     }
     true
+}
+
+/// Replaces the engineer's groups with `definitions` on a device with `source_channels` inputs, as
+/// [EngineHandle::set_groups] does, and returns the groups now in force.
+///
+/// The definitions are checked as at start-up ([check_groups]); a group naming a channel the device
+/// lacks is kept but invalid, as after a device switch. A definition that fails the check is an
+/// error naming the problem, and nothing changes.
+pub(crate) fn edit_groups(
+    targets: &TargetRegistry,
+    config: &ConfigState,
+    events: &EventBus,
+    source_channels: u8,
+    definitions: &[GroupDefinition],
+) -> Result<Vec<GroupStatus>, String> {
+    check_groups(definitions)?;
+    let groups = revalidate_groups(definitions, usize::from(source_channels));
+    apply_groups(targets, config, events, source_channels, groups);
+    Ok(config.snapshot().groups.clone())
 }
 
 /// The live engine. Dropping it does not stop the engine; call [EngineHandle::stop].
@@ -882,6 +942,7 @@ impl EngineHandle {
         apply_groups(
             &self.targets,
             &self.config_state,
+            &self.events,
             plan.source_channels,
             plan.groups,
         );
@@ -889,6 +950,39 @@ impl EngineHandle {
         // would keep theirs frozen until a switch back; the new stream raises its own at once.
         self.levels.clear();
         Ok(self.capture_format.clone())
+    }
+
+    /// Replaces the engineer's groups while the engine runs, and returns the groups now in force.
+    ///
+    /// The definitions are checked as at start-up: at most 16 groups, each with a non-empty id no
+    /// other group has and a non-empty name, and no channel in two groups. A group naming a channel
+    /// the current device lacks is kept but invalid (it maps no channel), exactly as after a device
+    /// switch, so the definition survives until a device that has the channel is back.
+    ///
+    /// Every musician's group levels follow their groups by id: a renamed group, or one given other
+    /// channels, keeps its level; a moved one takes it to its new position; a new group starts at
+    /// 100; a deleted group's level is dropped. Each phone is sent the new `config` and then, when
+    /// levels moved, its mix as `mix_state`, in that order (see [apply_groups]); each moved mix is
+    /// also announced as [EngineEvent::MixChanged] from [MixOrigin::Engine]. Capture, the network,
+    /// the control server and the discovery beacon keep running.
+    ///
+    /// Definitions that fail the check are an error naming the problem, and nothing changes.
+    pub fn set_groups(
+        &mut self,
+        definitions: Vec<GroupDefinition>,
+    ) -> Result<Vec<GroupStatus>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let groups = edit_groups(
+            &self.targets,
+            &self.config_state,
+            &self.events,
+            self.source_channels,
+            &definitions,
+        )?;
+        self.group_definitions = definitions;
+        Ok(groups)
     }
 
     /// Adds a UDP target while the engine runs.
@@ -1673,6 +1767,7 @@ mod tests {
         use crate::mix::Group;
 
         let layout = GroupLayout::new(vec![Group {
+            id: "kit".to_owned(),
             name: "Drums".to_owned(),
             channels: vec![0, 1],
         }]);
@@ -1680,6 +1775,7 @@ mod tests {
         assert_eq!(
             group_statuses(&layout),
             vec![GroupStatus {
+                id: "kit".to_owned(),
                 name: "Drums".to_owned(),
                 channels: vec![0, 1],
                 invalid: false,
@@ -1687,22 +1783,26 @@ mod tests {
         );
     }
 
+    fn definition(id: &str, name: &str, channels: &[usize]) -> GroupDefinition {
+        GroupDefinition {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            channels: channels.to_vec(),
+        }
+    }
+
     #[test]
     fn revalidating_groups_reports_out_of_range_groups_without_changing_them() {
         let definitions = vec![
-            GroupDefinition {
-                name: "Drums".to_owned(),
-                channels: vec![1, 2],
-            },
-            GroupDefinition {
-                name: "Vocals".to_owned(),
-                channels: vec![5],
-            },
+            definition("kit", "Drums", &[1, 2]),
+            definition("vox", "Vocals", &[5]),
         ];
 
         let revalidation = revalidate_groups(&definitions, 2);
 
         assert_eq!(revalidation.statuses.len(), 2);
+        assert_eq!(revalidation.statuses[0].id, "kit");
+        assert_eq!(revalidation.mixer_layout.groups()[1].id, "vox");
         assert_eq!(revalidation.statuses[0].name, "Drums");
         assert_eq!(revalidation.statuses[0].channels, vec![0, 1]);
         assert!(!revalidation.statuses[0].invalid);
@@ -1715,14 +1815,8 @@ mod tests {
     #[test]
     fn an_invalid_group_is_excluded_from_the_mixer_but_kept_for_reporting() {
         let definitions = vec![
-            GroupDefinition {
-                name: "Drums".to_owned(),
-                channels: vec![1, 2],
-            },
-            GroupDefinition {
-                name: "Vocals".to_owned(),
-                channels: vec![3, 4],
-            },
+            definition("1", "Drums", &[1, 2]),
+            definition("2", "Vocals", &[3, 4]),
         ];
 
         // A two-channel device: "Vocals" names channels 3 and 4, so it is invalid.
@@ -1739,10 +1833,7 @@ mod tests {
 
     #[test]
     fn a_smaller_device_invalidates_a_group_and_switching_back_restores_it() {
-        let definitions = vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 2, 3, 4],
-        }];
+        let definitions = vec![definition("1", "Drums", &[1, 2, 3, 4])];
 
         let smaller = plan_device_switch(&definitions, 2);
         assert_eq!(smaller.source_channels, 2);
@@ -1764,16 +1855,19 @@ mod tests {
 
     #[test]
     fn a_switch_to_the_same_channel_count_does_not_ask_for_a_config_resend() {
-        let definitions = vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 2],
-        }];
+        let definitions = vec![definition("1", "Drums", &[1, 2])];
         let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
         let config = config_for(&definitions, 2);
         let before = config.generation();
 
         let plan = plan_device_switch(&definitions, 2);
-        let changed = apply_groups(&registry, &config, plan.source_channels, plan.groups);
+        let changed = apply_groups(
+            &registry,
+            &config,
+            &EventBus::default(),
+            plan.source_channels,
+            plan.groups,
+        );
 
         assert!(!changed);
         assert_eq!(config.generation(), before, "no connection re-sends config");
@@ -1785,14 +1879,8 @@ mod tests {
     #[test]
     fn a_device_switch_publishes_the_live_groups_and_moves_every_mix_onto_them() {
         let definitions = vec![
-            GroupDefinition {
-                name: "Drums".to_owned(),
-                channels: vec![1, 2],
-            },
-            GroupDefinition {
-                name: "Vocals".to_owned(),
-                channels: vec![3, 4],
-            },
+            definition("1", "Drums", &[1, 2]),
+            definition("2", "Vocals", &[3, 4]),
         ];
         let config = config_for(&definitions, 4);
         let registry = TargetRegistry::new(
@@ -1806,6 +1894,7 @@ mod tests {
         assert!(apply_groups(
             &registry,
             &config,
+            &EventBus::default(),
             plan.source_channels,
             plan.groups
         ));
@@ -1836,10 +1925,7 @@ mod tests {
 
     #[test]
     fn a_failed_capture_rebuild_yields_no_plan_and_leaves_the_previous_state() {
-        let definitions = vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 2, 3, 4],
-        }];
+        let definitions = vec![definition("1", "Drums", &[1, 2, 3, 4])];
         let error: Box<dyn Error> = "input device \"Gone\" is no longer available".into();
 
         let result = plan_switch_from_attempt(&definitions, Err(error));
@@ -1851,14 +1937,197 @@ mod tests {
 
     #[test]
     fn a_successful_capture_rebuild_plans_the_new_channels_and_group_validity() {
-        let definitions = vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 2, 3, 4],
-        }];
+        let definitions = vec![definition("1", "Drums", &[1, 2, 3, 4])];
 
         let plan = plan_switch_from_attempt(&definitions, Ok(2)).expect("plan should build");
 
         assert_eq!(plan.source_channels, 2);
         assert!(plan.groups.statuses[0].invalid);
+    }
+
+    /// Drums (CH 1), Bass (CH 2) and Keys (CH 3), by ids `drums`, `bass` and `keys`.
+    fn trio() -> Vec<GroupDefinition> {
+        vec![
+            definition("drums", "Drums", &[1]),
+            definition("bass", "Bass", &[2]),
+            definition("keys", "Keys", &[3]),
+        ]
+    }
+
+    /// Two musicians on a four-channel engine with [trio], the first with Drums at 10, Bass at 20
+    /// and Keys at 30, the second with every group at 50.
+    fn trio_session() -> (TargetRegistry, ConfigState) {
+        let config = config_for(&trio(), 4);
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+            ],
+            &config.snapshot().layout,
+        )
+        .expect("registry should build");
+        for (musician, levels) in [
+            ("192.168.1.3", vec![10, 20, 30]),
+            ("192.168.1.4", vec![50; 3]),
+        ] {
+            registry
+                .mix_state(ip(musician))
+                .expect("configured")
+                .apply(&MixUpdate {
+                    group_levels: Some(levels),
+                    ..MixUpdate::default()
+                })
+                .expect("a valid update applies");
+        }
+        (registry, config)
+    }
+
+    fn group_levels(registry: &TargetRegistry, musician: &str) -> Vec<u8> {
+        registry
+            .mix_state(ip(musician))
+            .expect("configured")
+            .current()
+            .group_levels[..4]
+            .to_vec()
+    }
+
+    /// The engineer moves Keys to the front, deletes Bass and adds Vocals on CH 4: every musician's
+    /// levels follow their groups by id, the new configuration is live, and each moved mix is
+    /// announced as an engine change so the desktop and the phone are sent it.
+    #[test]
+    fn editing_groups_moves_every_musicians_levels_with_their_groups() {
+        let (registry, config) = trio_session();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let revision_before = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .current()
+            .revision;
+        let edited = vec![
+            definition("keys", "Keys", &[3]),
+            definition("drums", "Drums", &[1]),
+            definition("vocals", "Vocals", &[4]),
+        ];
+
+        let groups =
+            edit_groups(&registry, &config, &events, 4, &edited).expect("the edit is valid");
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<Vec<_>>(),
+            ["keys", "drums", "vocals"]
+        );
+        assert_eq!(group_levels(&registry, "192.168.1.3"), [30, 10, 100, 100]);
+        assert_eq!(group_levels(&registry, "192.168.1.4"), [50, 50, 100, 100]);
+        let first = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .current();
+        assert!(
+            first.revision > revision_before,
+            "the move takes a revision"
+        );
+        assert_eq!(
+            first.channel_group[2],
+            Some(0),
+            "CH 3 is in Keys, now first"
+        );
+        assert_eq!(first.channel_group[1], None, "CH 2 was in the deleted Bass");
+        assert_eq!(first.channel_group[3], Some(2));
+        assert_eq!(config.snapshot().groups, groups);
+        let announced: Vec<EngineEvent> = observed.try_iter().collect();
+        assert_eq!(
+            announced,
+            ["192.168.1.3:50000", "192.168.1.4:50000"].map(|address| EngineEvent::MixChanged {
+                address: address.parse().unwrap(),
+                origin: MixOrigin::Engine,
+            })
+        );
+    }
+
+    /// Renaming a group and giving it another channel keeps every level where it is: nothing is
+    /// moved and no mix is announced, but the phones are sent the new names and membership.
+    #[test]
+    fn an_edit_that_keeps_every_position_moves_no_level() {
+        let (registry, config) = trio_session();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let generation = config.generation();
+        let revision = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .current()
+            .revision;
+        let renamed = vec![
+            definition("drums", "Kit", &[1, 4]),
+            definition("bass", "Bass", &[2]),
+            definition("keys", "Keys", &[3]),
+        ];
+
+        edit_groups(&registry, &config, &events, 4, &renamed).expect("the edit is valid");
+
+        let mix = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .current();
+        assert_eq!(mix.revision, revision, "the stored mix did not change");
+        assert_eq!(&mix.group_levels[..3], &[10, 20, 30]);
+        assert_eq!(mix.channel_group[3], Some(0), "CH 4 joined the Kit");
+        assert!(
+            config.generation() > generation,
+            "the phones get the new names"
+        );
+        assert_eq!(config.snapshot().groups[0].name, "Kit");
+        assert!(observed.try_recv().is_err(), "no mix changed");
+    }
+
+    /// A group naming a channel the device lacks is kept, invalid and mapping nothing, exactly as
+    /// after a device switch; definitions that cannot work anywhere are refused and change nothing.
+    #[test]
+    fn an_edit_is_checked_as_at_start_up_and_a_missing_channel_only_invalidates_its_group() {
+        let (registry, config) = trio_session();
+        let events = EventBus::default();
+
+        let groups = edit_groups(
+            &registry,
+            &config,
+            &events,
+            4,
+            &[
+                definition("drums", "Drums", &[1]),
+                definition("x", "Rack", &[7]),
+            ],
+        )
+        .expect("a missing channel is not an error while running");
+        assert!(groups[1].invalid);
+        assert_eq!(groups[1].channels, vec![6]);
+        assert_eq!(
+            config.snapshot().layout.groups()[1].channels,
+            Vec::<usize>::new()
+        );
+
+        let before = config.snapshot();
+        let levels = group_levels(&registry, "192.168.1.3");
+        for refused in [
+            vec![
+                definition("a", "Drums", &[1]),
+                definition("a", "Bass", &[2]),
+            ],
+            vec![
+                definition("a", "Drums", &[1]),
+                definition("b", "Bass", &[1]),
+            ],
+            vec![definition("a", " ", &[1])],
+            (0..17)
+                .map(|index| definition(&index.to_string(), "Group", &[]))
+                .collect(),
+        ] {
+            assert!(edit_groups(&registry, &config, &events, 4, &refused).is_err());
+            assert_eq!(config.snapshot(), before, "nothing changed");
+            assert_eq!(group_levels(&registry, "192.168.1.3"), levels);
+        }
     }
 }

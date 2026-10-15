@@ -45,9 +45,10 @@ internal class PmonPlayer(
         )
 
         /**
-         * One link report for the server, about once a second while the receiver runs, packets or
-         * not. Called on the receive thread, which also feeds the audio track, so it must only hand
-         * the report over and never block.
+         * One link report for the server, about once a second once the audio starts or a startup
+         * grace passes without it, packets or not (see [LinkStatsAccumulator]). Called on the
+         * receive thread, which also feeds the audio track, so it must only hand the report over
+         * and never block.
          */
         fun onLinkStats(report: LinkStatsReport)
 
@@ -141,10 +142,10 @@ internal class PmonPlayer(
                             // playing it now would be out of order, and its gap is already counted.
                             continue
                         }
-                        linkStats.onPacket(lostBefore)
                         packetsReceived++
                         lastSampleRate = packet.sampleRate
                         val packetReceivedAtNanos = System.nanoTime()
+                        linkStats.onPacket(lostBefore, packetReceivedAtNanos / NANOS_PER_MILLISECOND)
                         previousPacketAtNanos?.let { previousAtNanos ->
                             val intervalMs = (packetReceivedAtNanos - previousAtNanos) / 1_000_000.0
                             if (interArrivalMs == 0.0) {

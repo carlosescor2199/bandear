@@ -31,8 +31,9 @@ never counted. Reporting those numbers as they are would make the traffic light 
     has closed (the musician stopped or left).
   - `bad`: the last report is older than 3 s while the control channel is still connected (stats
     travel over the same Wi-Fi as the audio, so a phone that lost its link can never report it; no
-    rates are shown), or, on a fresh report, any receive timeout, or underruns >= 2/s, or
-    loss >= 2 %.
+    rates are shown), or, on a fresh report, nothing received over its interval whatever the other
+    counts (the phone hears no audio at all; the received rate is exposed as 0 so the window can say
+    so), any receive timeout, or underruns >= 2/s, or loss >= 2 %.
   - `warning`: any underrun, or loss >= 0.5 %.
   - `good`: otherwise.
 - **Late and duplicate packets are dropped, not played.** A packet whose sequence is not newer than
@@ -71,14 +72,16 @@ never counted. Reporting those numbers as they are would make the traffic light 
   the musicians table.
 - [x] T3 (android): pure `SequenceTracker` (drop late/duplicate, count gaps once), counted receive
   timeouts, a pure stats accumulator and message builder, and the 1 s report sent through
-  `ControlChannel`. JVM tests for each pure helper. Evidence: slice 4 commit (see Progress and
-  Verification).
+  `ControlChannel`. JVM tests for each pure helper. Evidence: `6c93b9f`, refined by the slice 4
+  commit that stops counting timeouts before the first packet (see Progress and Verification).
 
 ## Acceptance criteria
 
 - A phone that streams cleanly shows green within ~2 s of connecting.
 - Pulling the phone off Wi-Fi turns its dot red once its last report is older than 3 s, and grey
   once its control channel closes.
+- A phone whose control channel works but that receives no audio at all shows red, with
+  `No audio received` on hover; it is never green.
 - A phone build without stats support shows grey and keeps working.
 - A `stats` message from an IP with no target gets the existing no-target error and changes nothing.
 
@@ -114,15 +117,18 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, this commit |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
 
 Slice 4 also lands above the budget: the new-session fix is about 170 authored lines (about 140 of
-them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), so about
-650 in all, not counting this document. Its two commits are separate work units, so it can be
-split into two pull requests at those commit boundaries if a smaller review is wanted.
+them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), plus about
+50 for the timeouts-before-the-first-packet fix, about 100 for the no-audio fix (about 70 of
+them tests) and about 145 for the startup-grace fix (about 90 of them tests), so about 950 in all,
+not counting this document.
+Its commits are separate work units, so it can be split into pull requests at those commit
+boundaries if a smaller review is wanted.
 
 ## Progress
 
@@ -192,7 +198,7 @@ split into two pull requests at those commit boundaries if a smaller review is w
   - `control.rs`: the first successful `register` of a connection clears the report. A later
     `register` on the same socket is a rename (the phone re-announces its name while streaming) and
     keeps the current report, so typing a name does not blank the light.
-- T3 done (this commit, slice 4; route: delegated direct, one writer). Android side of link health:
+- T3 done (`6c93b9f`, slice 4; route: delegated direct, one writer). Android side of link health:
   - `SequenceTracker.kt` (new, pure): the first packet starts the stream; a newer packet is played
     and its gap counted once as lost; a duplicate or late packet is dropped (not written to the
     track) and rewinds nothing; a packet `STREAM_RESTART_PACKETS` (256, about 2.5 s) or more behind
@@ -213,9 +219,76 @@ split into two pull requests at those commit boundaries if a smaller review is w
     delta, unchanged. The local stats screen now shows played packets and the tracker's loss count.
     The `AudioAttributes` block is untouched.
   - `MainActivity.kt`: `onLinkStats` forwards the report to `ControlChannel.sendLinkStats`.
-  - Receive timeouts count from the moment the receiver starts, so the first report of a session can
-    carry one from before the first packet and show red for that one second; a phone that never
-    gets audio keeps reporting timeouts and stays red, which is the point.
+- Timeouts before the first packet (`d46402c`, slice 4; route: delegated direct, one writer): the
+  receiver starts before the server knows where to send audio, so T3's first report of a session
+  could carry a receive timeout from before the first packet and show a phone that connected
+  cleanly as red for its first second. `LinkStatsAccumulator` now counts a receive timeout only
+  once the stream has started (a packet was played); once started it stays started, so a wait
+  while a restarted server comes back is still counted.
+  - Decision (resolved by the no-audio fix below): a phone whose control channel works but which
+    never receives audio (UDP blocked, wrong port) now reports zero packets, zero loss and zero
+    timeouts every second, and the server judged such a report `good` (`judge` in `health.rs`;
+    `loss_percent` is 0 when nothing was expected). Before `d46402c` it showed red. Candidates
+    were: send no report until the stream starts (the light stays grey), or count timeouts before
+    the first packet only after a startup grace of a second or two (it turns red).
+- No-audio fix (`7b7e194`, slice 4; route: delegated direct, one writer; resolves the decision
+  above). Rule: a fresh report whose `packets_received` is 0 over its interval is `bad`, whatever
+  the other counts. Reason: the objective is whether the phone hears clean audio, and a phone
+  hearing nothing must never be green; the server rule covers every cause (UDP blocked, a wrong
+  port, the engine stopped) without changing the phone.
+  - `health.rs`: `judge` checks `packets_received == 0` first. `LinkStatus` gains
+    `packets_per_second` (received packets over the interval; `None` without a fresh report, like
+    the other rates).
+  - `dto.rs`: `MusicianDto.packets_per_second`, JSON `packetsPerSecond` (`null` when absent).
+    `engine.rs` and `commands.rs` only gain the field in test fixtures.
+  - `main.js`: `describeLink` shows the word "silent" and the tooltip `No audio received` for
+    `bad` with `packetsPerSecond === 0`; every other case is unchanged.
+- Review 3 (lineage `review-17d283b442597b70`, range `90f7a33..7b7e194`): approved and
+  acknowledged. Advisory R3-001 (the phone reports from the start, so a first interval that ends
+  before any audio arrives sends a 0-packet report and shows a healthy phone as bad) is fixed by
+  the startup-grace commit below. Advisory R3-002 (no test that a `DROPPED` packet is not written
+  to the track, or that reports are sent while no packets arrive) stays a known gap: both live in
+  `PmonPlayer`'s receive loop, which owns the `DatagramSocket` and the `AudioTrack`, and no tiny
+  seam reaches them; covering them needs that loop split from its Android I/O. The decisions
+  themselves are covered by the pure tests: `SequenceTrackerTest` for `DROPPED`, and
+  `LinkStatsTest` for reports with no packets after the startup grace.
+- Startup-grace fix (`9fbbd13`, slice 4; route: delegated direct, one writer; review 3 R3-001):
+  `LinkStatsAccumulator` holds reports back until the stream starts (the first packet is played) or
+  `LINK_STATS_STARTUP_GRACE_MS` (3000 ms, the same span the server keeps a report fresh) has passed
+  since the receiver started, whichever comes first; after that a report is due every 1000 ms as
+  before. The timeouts-before-the-first-packet rule is unchanged.
+  - Stream starts within the grace: the first interval starts at the first packet (`onPacket` now
+    takes the packet's arrival time), so the first report comes one interval later, carries packets
+    and describes the stream alone; the startup silence before it is not reported.
+  - Grace passes with no packet: the first report covers everything since the receiver started
+    (`interval_ms` is the real elapsed time, about 3000 ms or up to one 250 ms receive timeout more,
+    clamped to 60000) with 0 packets, 0 timeouts and 0 underruns, so the server shows the phone as
+    bad ("No audio received") about 3 s after it connects; reports then follow every second.
+  - A stream that starts after the grace joins the interval already running, so the cadence stays.
+  - `PmonPlayer.kt` passes the packet's arrival time to `onPacket`; the `Listener.onLinkStats`
+    comment describes the hold-back. Until the first report the server has none for the new
+    control session, so the musician shows grey, not red.
+- Review 4 (lineage `review-55d96b6638201158`, range `7b7e194..9fbbd13`): approved and
+  acknowledged. Its only advisory, R3-001 (a suggestion), asks for a boundary test where the first
+  packet arrives exactly at `LINK_STATS_STARTUP_GRACE_MS` before any poll; the behaviour is the
+  documented one, so it is recorded as a follow-up test, not a defect.
+- A separate review of the whole unpushed range (`origin/main` `f231dad`..`90f7a33`, lineage
+  `review-67dd43fed2154ac3`) was approved; its findings are all in earlier, unrelated commits (the
+  audio panel, ASIO buffer defaults, the playback cushion) and are tracked outside this feature.
+
+## Status and next steps
+
+- Code complete: T1, T2 and T3 are done and every slice range has an approved native review.
+- Final checks: `cargo test -p personal-monitoring` 156 passed, `cargo test -p mixlink-desktop` 21
+  passed, Android JVM tests 81 passed with the debug APK assembled.
+- Pending: the acceptance criteria have not been verified on a device. Live check with the S23 and
+  the desktop: green within ~2 s on clean Wi-Fi; red ("silent") ~3 s after connecting with UDP
+  blocked; red once reports stop while connected (Wi-Fi off); grey once the app closes its control
+  channel; grey for an older build that never reports.
+- Pending (user decision): push and the stacked-to-main pull requests, one per slice.
+- Known gaps: no JS test runner for `describeLink` (review 2 R3-002); the `PmonPlayer` receive loop
+  is only covered through its pure helpers (review 3 R3-002); the startup-grace boundary test
+  (review 4 R3-001).
 
 ## Verification
 
@@ -290,3 +363,45 @@ split into two pull requests at those commit boundaries if a smaller review is w
     `cargo test -p mixlink-desktop`: 21 passed. `cargo check --workspace --all-targets`: clean.
 - T3 runtime check on a phone: not run here (no device in this session). The JVM tests cover the
   pure helpers; the wiring in `PmonPlayer` and `MainActivity` is covered only by the debug build.
+- Timeouts-before-the-first-packet RED (three new `LinkStatsTest` tests, accumulator unchanged):
+  `gradle -p apps/android :app:testDebugUnitTest` gave 77 tests, 2 failed:
+  `aTimeoutBeforeTheFirstPacketIsNotCounted` and `aTimeoutAfterTheFirstPacketIsCounted` (the
+  timeout from before the first packet was counted too). `theStreamStaysStartedAcrossReports`
+  already passed and is kept as a guard.
+- Timeouts-before-the-first-packet GREEN:
+  - `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 77 tests, 0
+    failures; the debug APK assembled with no Kotlin warnings.
+  - `cargo fmt --all -- --check`: exit 0 (no Rust changes).
+- No-audio fix RED (`LinkStatus.packets_per_second` and `MusicianDto.packets_per_second` added as
+  always `None`, `judge` unchanged):
+  - `cargo test -p personal-monitoring` gave 153 passed and 3 failed:
+    `health::tests::nothing_received_is_bad_even_with_no_loss_and_no_timeouts` and
+    `health::tests::nothing_received_is_bad_whatever_the_other_counts` (`Good` and `Warning` where
+    `Bad` was expected), and `health::tests::link_status_reports_the_rates_normalised_by_the_interval`
+    (`packets_per_second` `None` where `Some(495.0)` was expected).
+    `a_single_packet_received_is_not_silence` already passed and is kept as the boundary guard.
+  - `cargo test -p mixlink-desktop` gave 19 passed and 2 failed:
+    `the_rates_the_health_was_judged_on_are_passed_through` and
+    `the_link_fields_are_camel_case_json_with_absent_rates_as_null`.
+- No-audio fix GREEN:
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo test -p personal-monitoring`: 156 passed, 0 failed (baseline 154).
+  - `cargo test -p mixlink-desktop`: 21 passed, 0 failed.
+  - `cargo check --workspace --all-targets`: finished, no errors or warnings.
+  - `main.js` has no test runner (known gap R3-002). The T2 scratch harness, rerun in headless Chrome
+    with a sixth musician (`bad`, all rates 0), showed "silent" / `No audio received` for it and
+    the five earlier cases unchanged, with no script errors.
+- Startup-grace fix RED (`LINK_STATS_STARTUP_GRACE_MS` and the `onPacket` time argument added but
+  unused; existing `LinkStatsTest` tests given packet times, and the ones that relied on reports
+  with no packet before the grace now feed a packet or poll after the grace):
+  `gradle -p apps/android :app:testDebugUnitTest` gave 81 tests, 3 failed:
+  `noReportBeforeTheStreamStartsWithinTheStartupGrace`,
+  `theFirstReportComesOneIntervalAfterTheStreamStartsAndCoversOnlyTheStream` and
+  `withNoAudioTheFirstReportComesAfterTheGraceAndCoversAllOfIt` (each got a report where none was
+  due yet). `afterTheGraceReportsFlowEveryIntervalAndAStreamThatStartsLateKeepsTheCadence` already
+  passed and is kept as a guard for the cadence after the grace.
+- Startup-grace fix GREEN:
+  - `gradle -p apps/android :app:testDebugUnitTest assembleDebug` (Gradle 9.6.0 with Android
+    Studio's JBR and the local SDK, as for T3): BUILD SUCCESSFUL, 81 tests, 0 failures; the debug
+    APK assembled with no Kotlin warnings.
+  - `cargo fmt --all -- --check`: exit 0 (no Rust changes).

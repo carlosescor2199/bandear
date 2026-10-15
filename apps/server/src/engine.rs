@@ -841,6 +841,7 @@ mod tests {
 
         let reporting = LinkStatus {
             health: crate::health::LinkHealth::Warning,
+            packets_per_second: Some(200.0),
             underruns_per_second: Some(1.0),
             loss_percent: Some(0.0),
             receive_timeouts_per_second: Some(0.0),

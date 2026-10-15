@@ -94,6 +94,10 @@ pub struct MusicianDto {
     /// The name the musician typed on their phone and announced when registering, straight from the
     /// engine. It is client input, never a desktop label, and is never sent back to a client.
     pub client_name: Option<String>,
+    /// The stable id the musician's phone announced, straight from the engine; null for a
+    /// configured target and a phone that sent none. It survives a change of IP, so the desk keys
+    /// what it keeps about a musician (its label) on it rather than on the address.
+    pub client_id: Option<String>,
     /// The name this desk shows: the client's own announced name when it has one, otherwise the
     /// engineer's local label. Filled by the command layer; the engine knows nothing of the label.
     pub name: Option<String>,
@@ -318,6 +322,7 @@ impl From<&MusicianStatus> for MusicianDto {
         Self {
             address: musician.address.to_string(),
             client_name: musician.name.clone(),
+            client_id: musician.client_id.clone(),
             name: None,
             name_is_local: false,
             control_connected: musician.control_connected,
@@ -510,6 +515,7 @@ mod tests {
         let musician = MusicianStatus {
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: Some("Ana".to_owned()),
+            client_id: None,
             control_connected: false,
             mix: Default::default(),
             counters: Default::default(),
@@ -528,6 +534,7 @@ mod tests {
         let musician = MusicianStatus {
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: None,
+            client_id: None,
             control_connected: false,
             mix: Default::default(),
             counters: Default::default(),
@@ -541,10 +548,32 @@ mod tests {
         assert!(!dto.name_is_local);
     }
 
+    #[test]
+    fn the_phones_client_id_reaches_the_window_and_is_null_without_one() {
+        let phone = MusicianStatus {
+            client_id: Some("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
+            ..musician_with_link(LinkStatus::default())
+        };
+        let rack = musician_with_link(LinkStatus::default());
+
+        let phone_row = serde_json::to_value(MusicianDto::from(&phone)).expect("a row serializes");
+        let rack_row = serde_json::to_value(MusicianDto::from(&rack)).expect("a row serializes");
+
+        assert_eq!(
+            phone_row["clientId"],
+            "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b"
+        );
+        assert!(
+            rack_row["clientId"].is_null(),
+            "a configured target or an older phone has no id: {rack_row}"
+        );
+    }
+
     fn musician_with_link(link: LinkStatus) -> MusicianStatus {
         MusicianStatus {
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: None,
+            client_id: None,
             control_connected: true,
             mix: Default::default(),
             counters: Default::default(),

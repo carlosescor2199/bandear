@@ -53,6 +53,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         musicians: vec![MusicianStatus {
             address: ADDRESS.parse().expect("the probe address should parse"),
             name: client_name.map(str::to_owned),
+            client_id: None,
             // Announcing a name means a control channel was there to carry it.
             control_connected: client_name.is_some(),
             mix: Default::default(),

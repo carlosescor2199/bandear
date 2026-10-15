@@ -405,6 +405,7 @@ mod tests {
                 .map(|address| MusicianDto {
                     address: (*address).to_owned(),
                     client_name: None,
+                    client_id: None,
                     name: None,
                     name_is_local: false,
                     control_connected: false,

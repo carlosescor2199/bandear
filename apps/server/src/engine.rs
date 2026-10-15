@@ -97,6 +97,12 @@ pub struct MusicianStatus {
     /// It is client input, not configuration: the desktop may show its own local label instead,
     /// but this is the name that travelled from the phone.
     pub name: Option<String>,
+    /// The stable id the musician's phone announced when registering, if it sent one the server
+    /// keeps; `None` for a configured target and for a phone that sent none.
+    ///
+    /// Unlike the address it survives a change of IP (the row moves with the phone), so it is what
+    /// a consumer keys anything about the musician on. It is opaque, random and LAN-only.
+    pub client_id: Option<String>,
     pub control_connected: bool,
     pub mix: MixValues,
     pub counters: MusicianCounters,
@@ -236,6 +242,30 @@ pub(crate) fn set_target_mix(
     Ok(applied)
 }
 
+/// What a musician's phone announced about itself when it registered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Announced {
+    pub(crate) name: Option<String>,
+    pub(crate) client_id: Option<String>,
+}
+
+/// What every target announced, by IP: a registered phone's name and client id, each when it sent
+/// one. A configured target is the engineer's and announced nothing, so both are `None`.
+pub(crate) fn announced_identities(entries: &[TargetEntry]) -> HashMap<IpAddr, Announced> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.address.ip(),
+                Announced {
+                    name: entry.origin.name().map(str::to_owned),
+                    client_id: entry.origin.client_id().map(str::to_owned),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Joins the per-target state into one row per musician.
 ///
 /// Rows are driven by the target list, so a target with no control connection is still reported.
@@ -245,16 +275,18 @@ pub(crate) fn join_musicians(
     connected: &HashSet<IpAddr>,
     counters: &HashMap<IpAddr, MusicianCounters>,
     mixes: &HashMap<IpAddr, MixValues>,
-    names: &HashMap<IpAddr, String>,
+    announced: &HashMap<IpAddr, Announced>,
     links: &HashMap<IpAddr, LinkStatus>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
         .map(|address| {
             let ip = address.ip();
+            let announced = announced.get(&ip).cloned().unwrap_or_default();
             MusicianStatus {
                 address: *address,
-                name: names.get(&ip).cloned(),
+                name: announced.name,
+                client_id: announced.client_id,
                 control_connected: connected.contains(&ip),
                 mix: mixes.get(&ip).copied().unwrap_or_default(),
                 counters: counters.get(&ip).copied().unwrap_or_default(),
@@ -739,15 +771,7 @@ impl EngineHandle {
             .iter()
             .map(|entry| (entry.address.ip(), entry.mix_state.current()))
             .collect();
-        let names: HashMap<IpAddr, String> = entries
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .origin
-                    .name()
-                    .map(|name| (entry.address.ip(), name.to_owned()))
-            })
-            .collect();
+        let announced = announced_identities(&entries);
         let links = link_statuses(&entries, &connected, Instant::now());
         EngineStatus {
             device_name: self.device_name.clone(),
@@ -761,7 +785,7 @@ impl EngineHandle {
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
-            musicians: join_musicians(&targets, &connected, &counters, &mixes, &names, &links),
+            musicians: join_musicians(&targets, &connected, &counters, &mixes, &announced, &links),
         }
     }
 
@@ -1088,6 +1112,71 @@ mod tests {
         value.parse().expect("test IP should parse")
     }
 
+    const PHONE_ID: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
+
+    #[test]
+    fn a_registered_phone_announces_its_name_and_client_id_and_a_configured_target_nothing() {
+        let layout = GroupLayout::default();
+        let registry = TargetRegistry::new(&["192.168.1.3:50000".parse().unwrap()], &layout)
+            .expect("registry should build");
+        registry.register(
+            ip("192.168.1.4"),
+            50000,
+            Some("Ana".to_owned()),
+            Some(PHONE_ID),
+            &layout,
+        );
+        registry.register(ip("192.168.1.5"), 50000, None, None, &layout);
+
+        let announced = announced_identities(&registry.read());
+
+        assert_eq!(
+            announced
+                .get(&ip("192.168.1.3"))
+                .cloned()
+                .unwrap_or_default(),
+            Announced::default(),
+            "a configured target is the engineer's and announced nothing"
+        );
+        assert_eq!(
+            announced[&ip("192.168.1.4")],
+            Announced {
+                name: Some("Ana".to_owned()),
+                client_id: Some(PHONE_ID.to_owned()),
+            }
+        );
+        assert_eq!(
+            announced
+                .get(&ip("192.168.1.5"))
+                .and_then(|phone| phone.client_id.clone()),
+            None,
+            "an older phone sends no id"
+        );
+    }
+
+    #[test]
+    fn a_phone_back_from_a_new_ip_reports_the_same_client_id_at_its_new_address() {
+        let layout = GroupLayout::default();
+        let registry = TargetRegistry::new(&[], &layout).expect("empty registry");
+        registry.register(ip("192.168.1.10"), 50000, None, Some(PHONE_ID), &layout);
+        registry.register(ip("192.168.1.22"), 50000, None, Some(PHONE_ID), &layout);
+        let entries = registry.read();
+        let targets: Vec<SocketAddr> = entries.iter().map(|entry| entry.address).collect();
+
+        let musicians = join_musicians(
+            &targets,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &announced_identities(&entries),
+            &HashMap::new(),
+        );
+
+        assert_eq!(musicians.len(), 1, "the row moved instead of doubling");
+        assert_eq!(musicians[0].address, "192.168.1.22:50000".parse().unwrap());
+        assert_eq!(musicians[0].client_id.as_deref(), Some(PHONE_ID));
+    }
+
     #[test]
     fn joins_targets_and_connected_peer_ips_into_one_row_per_musician() {
         let targets = vec![
@@ -1123,8 +1212,14 @@ mod tests {
             },
         );
 
-        let mut names = HashMap::new();
-        names.insert(ip("192.168.1.4"), "Ana".to_owned());
+        let mut announced = HashMap::new();
+        announced.insert(
+            ip("192.168.1.4"),
+            Announced {
+                name: Some("Ana".to_owned()),
+                client_id: Some(PHONE_ID.to_owned()),
+            },
+        );
 
         let reporting = LinkStatus {
             health: crate::health::LinkHealth::Warning,
@@ -1136,13 +1231,14 @@ mod tests {
         let mut links = HashMap::new();
         links.insert(ip("192.168.1.3"), reporting);
 
-        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &names, &links);
+        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &announced, &links);
 
         assert_eq!(musicians.len(), 3);
 
         let connected_with_mix = &musicians[0];
         assert_eq!(connected_with_mix.address, targets[0]);
         assert_eq!(connected_with_mix.name, None);
+        assert_eq!(connected_with_mix.client_id, None);
         assert!(connected_with_mix.control_connected);
         assert_eq!(connected_with_mix.mix.volume_percent, 42);
         assert_eq!(
@@ -1157,6 +1253,7 @@ mod tests {
         let disconnected = &musicians[1];
         assert_eq!(disconnected.address, targets[1]);
         assert_eq!(disconnected.name.as_deref(), Some("Ana"));
+        assert_eq!(disconnected.client_id.as_deref(), Some(PHONE_ID));
         assert!(!disconnected.control_connected);
         assert_eq!(disconnected.mix, MixValues::default());
         assert_eq!(

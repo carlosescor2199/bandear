@@ -64,6 +64,11 @@ test("channel details are checked as the engine checks them", () => {
     ]),
   );
 
+  assert.doesNotThrow(
+    () => checkChannels([{ kind: "keys", link: true }, { kind: "keys" }, {}]),
+    "an entry may leave out its name (and its kind, which is other)",
+  );
+
   for (const [refused, named] of [
     [[detail("Kazoo", "kazoo")], /kazoo/],
     [Array.from({ length: 33 }, () => detail("")), /33/],

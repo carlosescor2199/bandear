@@ -58,8 +58,8 @@ pub enum EngineEvent {
     /// for them.
     GroupsChanged,
     /// The channel details the status reports changed: the engineer named, hid or linked inputs
-    /// ([EngineHandle::set_channels]), or a device switch dropped the details of inputs it lacks. It
-    /// comes before the [Self::MixChanged] of every mix a new stereo pair panned apart.
+    /// ([EngineHandle::set_channels]), or a device switch changed which inputs they are shown for.
+    /// It comes before the [Self::MixChanged] of every mix a new stereo pair panned apart.
     ChannelsChanged,
 }
 
@@ -280,8 +280,9 @@ pub fn check_channels(channels: &[ChannelMeta]) -> Result<(), String> {
 /// The channel details for a device with `source_channels` inputs: one entry per input, in order.
 ///
 /// Details of inputs the device has are kept, inputs with none get the defaults, and details past
-/// the last input are dropped, along with a pair whose second side is gone: a device switch keeps
-/// what the inputs that remain were called and drops the rest.
+/// the last input are left out, along with a pair whose second side is gone. It only shapes what
+/// clients see: the engine keeps the details as set (see [crate::control::ConfigSnapshot]), so a
+/// device with more inputs shows them again.
 pub(crate) fn fit_channels(channels: &[ChannelMeta], source_channels: u8) -> Vec<ChannelMeta> {
     let count = usize::from(source_channels);
     let mut fitted: Vec<ChannelMeta> = channels.iter().take(count).cloned().collect();
@@ -293,7 +294,9 @@ pub(crate) fn fit_channels(channels: &[ChannelMeta], source_channels: u8) -> Vec
     fitted
 }
 
-/// The mixer's flags for fitted channel details (see [crate::mix::ChannelFlags]). Details past the
+/// The mixer's flags for the engineer's channel details as set (see [crate::mix::ChannelFlags]),
+/// including those of inputs the device lacks: a hidden spare is silent the moment its input
+/// exists, and a pair stays linked in every mix while its second side is missing. Details past the
 /// mixer's channels carry no flag: the mixer does not hear those inputs.
 pub(crate) fn channel_flags(channels: &[ChannelMeta]) -> ChannelFlags {
     let mut flags = ChannelFlags::default();
@@ -872,9 +875,10 @@ pub(crate) fn plan_switch_from_attempt(
 /// moment therefore either exists already and is moved here, or comes after the publish and starts
 /// with the new membership; none is left on the old one.
 ///
-/// The channel details are kept for the inputs the new channel count has and dropped for the rest
-/// (see [fit_channels]); every mix takes the flags that remain, and [EngineEvent::ChannelsChanged]
-/// follows [EngineEvent::GroupsChanged] when the details changed.
+/// The engineer's channel details are kept whole and fitted to the new channel count (see
+/// [crate::control::ConfigSnapshot::requested_channels]): clients see the details of the inputs the
+/// device has, and those of inputs that come back are shown again. [EngineEvent::ChannelsChanged]
+/// follows [EngineEvent::GroupsChanged] when what clients see of them changed.
 ///
 /// [MixState::regroup]: crate::mix::MixState::regroup
 pub(crate) fn apply_groups(
@@ -927,11 +931,12 @@ pub(crate) fn apply_groups(
     true
 }
 
-/// Gives every mix the channel flags of the configuration `live` (see
-/// [crate::mix::MixState::set_channel_flags]) and returns the musicians whose stored mix changed:
-/// those a newly linked pair panned apart.
+/// Gives every mix the channel flags of the configuration `live`, taken from the details as set
+/// (see [channel_flags] and [crate::mix::MixState::set_channel_flags]), and returns the musicians
+/// whose stored mix changed: those a newly linked pair panned apart. A device switch never changes
+/// the flags, so it never moves a pan.
 fn follow_channels(entries: &[TargetEntry], live: &ConfigSnapshot) -> Vec<SocketAddr> {
-    let flags = channel_flags(&live.channels);
+    let flags = channel_flags(&live.requested_channels);
     entries
         .iter()
         .filter_map(|entry| {
@@ -943,15 +948,17 @@ fn follow_channels(entries: &[TargetEntry], live: &ConfigSnapshot) -> Vec<Socket
         .collect()
 }
 
-/// Publishes the engineer's channel details `channels`, fitted to the live channel count, and moves
-/// every musician's mix onto them, as [EngineHandle::set_channels] does. Returns whether anything
-/// changed; the details in force again touch nothing and make no connection re-send `config`.
+/// Publishes the engineer's channel details `channels`, kept whole and fitted to the live channel
+/// count, and moves every musician's mix onto them, as [EngineHandle::set_channels] does. Returns
+/// whether anything changed; the details in force again touch nothing and make no connection
+/// re-send `config`, and a change only to inputs the device lacks is kept without one.
 ///
 /// The order is the one [apply_groups] keeps: the new `config` is published before any pan moves,
 /// so a phone is sent the pair before the pans its link set, and the desktop is told
-/// ([EngineEvent::ChannelsChanged]) before each moved mix ([EngineEvent::MixChanged] from
-/// [MixOrigin::Engine]). The registry is held for reading throughout, so a musician registering at
-/// the same moment is either moved here or starts from the new details.
+/// ([EngineEvent::ChannelsChanged], when what it shows changed) before each moved mix
+/// ([EngineEvent::MixChanged] from [MixOrigin::Engine]). The registry is held for reading
+/// throughout, so a musician registering at the same moment is either moved here or starts from
+/// the new details.
 pub(crate) fn apply_channels(
     targets: &TargetRegistry,
     config: &ConfigState,
@@ -959,12 +966,14 @@ pub(crate) fn apply_channels(
     channels: &[ChannelMeta],
 ) -> bool {
     let entries = targets.read();
-    let Some((_, live)) = config.publish_channels(channels) else {
+    let Some((previous, live)) = config.publish_channels(channels) else {
         return false;
     };
     let moved = follow_channels(&entries, &live);
     drop(entries);
-    events.emit(EngineEvent::ChannelsChanged);
+    if previous.channels != live.channels {
+        events.emit(EngineEvent::ChannelsChanged);
+    }
     for address in moved {
         events.emit(EngineEvent::MixChanged {
             address,
@@ -1146,9 +1155,9 @@ impl EngineHandle {
     /// the discovery beacon are untouched, and the packet sequence continues from where it was. The
     /// new stream is built and started before the old one is dropped, so a device that has vanished
     /// or a format that cannot be opened leaves the previous capture exactly as it was and returns
-    /// the error. On success, groups are re-validated (never rewritten), the channel details of the
-    /// inputs the new device has are kept and the rest dropped ([ChannelMeta]), and connected
-    /// clients are sent the new `config` when any of it changed.
+    /// the error. On success, groups are re-validated (never rewritten), the channel details are
+    /// shown for the inputs the new device has and kept for the rest ([Self::set_channels]), and
+    /// connected clients are sent the new `config` when any of it changed.
     pub fn switch_device(&mut self, filter: Option<&str>) -> Result<CaptureFormat, Box<dyn Error>> {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
@@ -1250,9 +1259,13 @@ impl EngineHandle {
     /// `channels` is in channel order (the first entry is CH 1) and is checked first
     /// ([check_channels]): at most 32 entries, names of at most [MAX_CHANNEL_NAME_LENGTH]
     /// characters, stereo pairs only between two listed channels and never overlapping, and both
-    /// sides of a pair hidden or both shown. Entries past the device's last input are dropped and
-    /// inputs past the list get the defaults ([ChannelMeta::default]). A device switch later keeps
-    /// the details of the inputs the new device has and drops the rest.
+    /// sides of a pair hidden or both shown. The engine keeps the list whole, as it keeps the group
+    /// definitions: clients are shown the entries of the inputs the device has, inputs past the
+    /// list get the defaults ([ChannelMeta::default]), and after a device switch the entries of
+    /// inputs that come back are shown again, names, pairs and hidden flags included. While its
+    /// input is missing a hidden spare stays hidden; a pair whose second side is missing is shown
+    /// as its first input alone, stays linked in every mix and returns with its balance. A change
+    /// only to entries past the device is kept without sending `config`.
     ///
     /// Every phone is sent the details at once in `config`. A hidden channel is silent in every
     /// musician's mix from the next packet on; showing it again restores it, since hiding changes
@@ -2702,71 +2715,125 @@ mod tests {
         assert_eq!(&joined.pans[1..3], &[0, 100]);
     }
 
+    /// What a device switch to `channels` inputs does to the live configuration.
+    fn switch_to(registry: &TargetRegistry, config: &ConfigState, events: &EventBus, channels: u8) {
+        let plan = plan_device_switch(&[], channels);
+        apply_groups(registry, config, events, plan.source_channels, plan.groups);
+    }
+
+    /// Kick, Keys L and Keys R linked, and a hidden spare on CH 4.
+    fn keys_and_spare() -> Vec<ChannelMeta> {
+        vec![
+            channel("Kick", ChannelKind::Drums),
+            linked(channel("Keys L", ChannelKind::Keys)),
+            channel("Keys R", ChannelKind::Keys),
+            hidden(channel("Spare", ChannelKind::Other)),
+        ]
+    }
+
+    /// The engineer's details survive a smaller device the way groups do: the inputs it lacks are
+    /// left out of what clients see, and when they come back so do their names, their pair and,
+    /// above all, the hidden spare's silence.
     #[test]
-    fn a_device_switch_keeps_the_details_of_the_inputs_that_remain_and_drops_the_rest() {
+    fn a_device_switch_restores_the_details_of_inputs_that_come_back() {
         let (registry, config) = duo();
         let events = EventBus::default();
-        edit_channels(
-            &registry,
-            &config,
-            &events,
-            &[
-                channel("Kick", ChannelKind::Drums),
-                hidden(channel("Spare", ChannelKind::Other)),
-                linked(channel("Keys L", ChannelKind::Keys)),
-                channel("Keys R", ChannelKind::Keys),
-            ],
-        )
-        .expect("the details are valid");
+        edit_channels(&registry, &config, &events, &keys_and_spare())
+            .expect("the details are valid");
         let observed = events.subscribe();
 
-        let smaller = plan_device_switch(&[], 3);
-        assert!(apply_groups(
-            &registry,
-            &config,
-            &events,
-            smaller.source_channels,
-            smaller.groups
-        ));
+        switch_to(&registry, &config, &events, 2);
 
         assert_eq!(
             config.snapshot().channels,
             vec![
                 channel("Kick", ChannelKind::Drums),
-                hidden(channel("Spare", ChannelKind::Other)),
                 channel("Keys L", ChannelKind::Keys),
-            ]
+            ],
+            "clients see the inputs the device has, and no pair whose second side is missing"
         );
         assert!(observed
             .try_iter()
             .any(|event| event == EngineEvent::ChannelsChanged));
-        let mix = registry
-            .mix_state(ip("192.168.1.3"))
-            .expect("configured")
+        let state = registry.mix_state(ip("192.168.1.3")).expect("configured");
+        state
             .apply(&MixUpdate {
-                channel_gains: Some(vec![100, 100, 50]),
+                channel_gains: Some(vec![100, 45]),
                 ..MixUpdate::default()
             })
             .expect("a valid update applies");
-        assert_eq!(mix.hidden_channels, 0b10, "the spare input stays silent");
+        let before = state.current();
+
+        switch_to(&registry, &config, &events, 4);
+
+        assert_eq!(config.snapshot().channels, keys_and_spare(), "all restored");
+        for musician in DUO {
+            assert_eq!(
+                heard(&registry, musician, [0, 0, 0, 10_000]),
+                [0, 0],
+                "the spare is silent again for {musician}"
+            );
+        }
+        let after = state.current();
+        assert_eq!(after.revision, before.revision, "the switch moved no level");
+        assert_eq!(&after.pans[1..3], &[0, 100], "the pair keeps its balance");
         assert_eq!(
-            &mix.channel_gains[2..4],
-            &[50, 100],
-            "CH 3 is on its own now"
+            &after.channel_gains[1..3],
+            &[45, 45],
+            "the pair comes back with one level"
         );
 
-        let back = plan_device_switch(&[], 4);
-        apply_groups(
-            &registry,
-            &config,
-            &events,
-            back.source_channels,
-            back.groups,
-        );
+        switch_to(&registry, &config, &events, 6);
+        let live = config.snapshot().channels.clone();
+        assert_eq!(live[..4], keys_and_spare()[..]);
         assert_eq!(
-            config.snapshot().channels[3],
-            ChannelMeta::default(),
-            "a dropped detail does not come back"
+            live[4..],
+            [ChannelMeta::default(), ChannelMeta::default()],
+            "only inputs that never had details show the defaults"
+        );
+    }
+
+    /// Details for inputs the device lacks are kept for later; clients are only sent `config`
+    /// when what they see changed.
+    #[test]
+    fn details_past_the_device_are_kept_for_later_without_a_new_config() {
+        let config = config_for(&[], 2);
+        let registry = TargetRegistry::new(
+            &["192.168.1.3:50000".parse().unwrap()],
+            &config.snapshot().layout,
+        )
+        .expect("registry should build");
+        let events = EventBus::default();
+        let shown = vec![
+            channel("Kick", ChannelKind::Drums),
+            channel("Snare", ChannelKind::Drums),
+        ];
+        edit_channels(&registry, &config, &events, &shown).expect("the details are valid");
+        let generation = config.generation();
+        let observed = events.subscribe();
+
+        let mut later = shown.clone();
+        later.push(hidden(channel("Spare", ChannelKind::Other)));
+        let live =
+            edit_channels(&registry, &config, &events, &later).expect("the details are valid");
+
+        assert_eq!(live, shown, "one entry per input of this device");
+        assert_eq!(config.generation(), generation, "no phone is sent anything");
+        assert!(
+            observed.try_recv().is_err(),
+            "nothing the window shows changed"
+        );
+
+        switch_to(&registry, &config, &events, 3);
+        assert_eq!(config.snapshot().channels, later);
+        let mix = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .snapshot();
+        assert_eq!(
+            crate::mix::mix_channels(&[0, 0, 10_000], 3, mix),
+            [0, 0],
+            "the spare is hidden from the moment its input exists"
         );
     }
 

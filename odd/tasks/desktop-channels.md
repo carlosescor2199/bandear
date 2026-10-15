@@ -328,8 +328,31 @@ slice. Push and PRs are the user's decision.
   - Size: about 1,280 authored changed lines in the engine commit and 1,500 in the desktop commit
     (with this document), above the 400-line heuristic mostly in tests (about 1,300 lines); not
     split artificially.
-  - Commits: aa8f8e3 `feat(engine): name, hide and link channels while running`; this commit
+  - Commits: aa8f8e3 `feat(engine): name, hide and link channels while running`; 42009e6
     (`feat(desktop): keep channel details in the session and apply them live`).
+- [x] T3a-fix (review fixes for T3a, review `review-47e2a093d93eabca`): the engine keeps the
+  engineer's channel details whole (`ConfigSnapshot.requested_channels`, at most 32 entries, the
+  source of truth, as the group definitions are) and fits them only into what clients see
+  (`channels`); a device switch refits, so the details of inputs that come back are shown again,
+  names, hidden flags and pairs included. The mixer's flags come from the whole table: a hidden
+  spare stays silent while its input is missing and from the moment it returns, and a pair whose
+  second side is missing is shown as its first input alone (no `link` in `config` or the status)
+  but stays linked in every mix, so it returns with its balance, both sides equal and no pan moved.
+  An edit that changes only entries past the device is kept without raising the generation (no
+  `config`, no `ChannelsChanged`) (R3-switch-drops-details-session-diverges). `checkChannels`
+  defaults a missing name and kind (R3-checkchannels-missing-name-typeerror). Route: inline writer
+  of the delegated T3a worker (bounded fixes in two engine files and one UI module).
+  - RED: against the T3a code 3 of 249 server tests failed:
+    `a_device_switch_restores_the_details_of_inputs_that_come_back` ("all restored": Keys R and
+    the hidden Spare came back as defaults and Keys L unlinked, so the spare was audible),
+    `config_after_a_switch_back_carries_the_details_of_the_inputs_that_returned` (`link` false
+    after the switch back) and `details_past_the_device_are_kept_for_later_without_a_new_config`;
+    UI: 1 of 210 failed (`checkChannels` threw on an entry without a name).
+  - GREEN: `cargo test -p personal-monitoring` 249 passed (3 new, 1 replaced), control tests 34
+    passed in three runs; `cargo test -p mixlink-desktop` 94 passed; UI 210 passed (one assertion
+    added); `cargo fmt` clean; clippy: no new warnings. About 300 authored changed lines.
+  - Commit: this commit (`fix(engine): keep channel details for inputs that come back after a
+    switch`).
 - [ ] T3b (channel metadata, Android): read `config.channels` (lenient: absent on older servers,
   unknown kinds as `other`); show names (else "CH n") and kind icons; drop hidden channels;
   collapse linked pairs into one strip whose level, mute and solo write both channels and whose
@@ -376,12 +399,19 @@ slice. Push and PRs are the user's decision.
     "not saved: null."; guard both.
 
 - T3a done (channel metadata in the engine, protocol and desktop); see its entry for evidence.
-  Follow-ups: the engine drops the details of inputs a switched-to device lacks while the session
-  keeps them all, so after switching back to a larger device those inputs show the defaults until
-  the next start or edit (the desk does not re-apply the session on a switch; T4 may); an older
-  phone shows a pair's sides apart and the server keeps them equal; the Mix screen still labels
-  strips by number and shows hidden inputs and both sides of a pair (T4 uses `channelLabel`,
-  drops hidden inputs and collapses pairs with `balanceToPans`).
+  Follow-ups: an older phone shows a pair's sides apart and the server keeps them equal; the Mix
+  screen still labels strips by number and shows hidden inputs and both sides of a pair (T4 uses
+  `channelLabel`, drops hidden inputs and collapses pairs with `balanceToPans`). The earlier
+  follow-up (a switch dropping details the session keeps) is resolved by T3a-fix in the engine.
+- Review `review-47e2a093d93eabca` over 85e4409..42009e6 (T3a) approved and acknowledged; next
+  review base 42009e6. Both findings (R3-switch-drops-details-session-diverges,
+  R3-checkchannels-missing-name-typeerror) are fixed by T3a-fix. Follow-ups left by the fix: the
+  fake bridge (`fake-bridge.js`, outside the fix's edit surfaces) still fits its running details on
+  a switch and so drops them, and its test "a device switch keeps the fake details of the inputs
+  that remain and drops the rest" pins that; T4 should keep the fake's whole table and fit it only
+  when showing, and flip that test to "restores". The desktop event docs (`events.rs`) still say a
+  switch "drops" details (true of what is shown). Linking a pair whose second side the device
+  lacks pans its first input hard left while it shows alone.
 
 ## Next step
 

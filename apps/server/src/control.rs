@@ -70,8 +70,9 @@ impl Default for Heartbeat {
 /// What `config` tells a phone, as one immutable value: the captured channel count, the groups and
 /// the channel details.
 ///
-/// A change publishes a whole new snapshot with a higher generation (see [ConfigState::publish]),
-/// so a reader never sees a channel count paired with the groups of another configuration.
+/// A change of what it says publishes a whole new snapshot with a higher generation (see
+/// [ConfigState::publish]), so a reader never sees a channel count paired with the groups of
+/// another configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConfigSnapshot {
     /// Which published configuration this is: every change has a higher one, so a connection can
@@ -84,8 +85,18 @@ pub(crate) struct ConfigSnapshot {
     /// The membership the mixer applies: an invalid group keeps its position, so group levels stay
     /// aligned with the list, but maps no channel.
     pub(crate) layout: GroupLayout,
-    /// The engineer's channel details, exactly one entry per source channel (see [fit_channels]).
+    /// The engineer's channel details as clients see them: exactly one entry per source channel,
+    /// fitted from [Self::requested_channels] (see [fit_channels]).
     pub(crate) channels: Vec<ChannelMeta>,
+    /// The engineer's channel details as set, whatever the device (at most 32 entries, checked).
+    ///
+    /// They are the source of truth, as the group definitions are: a device switch only changes
+    /// what is fitted from them, so the details of inputs a smaller device lacks come back with a
+    /// device that has them, names, pairs and hidden spares included. The mixer's flags are taken
+    /// from them (see [channel_flags]): a spare stays hidden while its input is missing, and a pair
+    /// whose second side is missing is shown as its first input alone but stays linked in every
+    /// mix, so it returns with its balance and with both sides equal.
+    pub(crate) requested_channels: Vec<ChannelMeta>,
 }
 
 /// Every snapshot field but the generation, which [ConfigState] assigns.
@@ -94,6 +105,7 @@ struct ConfigParts {
     groups: Vec<GroupStatus>,
     layout: GroupLayout,
     channels: Vec<ChannelMeta>,
+    requested_channels: Vec<ChannelMeta>,
 }
 
 /// A published change: the configuration it replaced and the one now in force.
@@ -123,6 +135,7 @@ impl ConfigState {
             groups,
             layout,
             channels: fit_channels(&[], source_channels),
+            requested_channels: Vec::new(),
         };
         Self {
             current: RwLock::new(Arc::new(first)),
@@ -145,10 +158,10 @@ impl ConfigState {
         )
     }
 
-    /// Publishes a channel count and groups, keeping the channel details of the inputs the count
-    /// has (see [fit_channels]). Returns the configuration it replaced and the one now in force, or
-    /// `None` when nothing changed: an unchanged configuration keeps its generation, so no
-    /// connection re-sends `config` for nothing.
+    /// Publishes a channel count and groups, fitting the engineer's channel details to the inputs
+    /// the count has (see [ConfigSnapshot::requested_channels]). Returns the configuration it
+    /// replaced and the one now in force, or `None` when nothing changed: an unchanged
+    /// configuration keeps its generation, so no connection re-sends `config` for nothing.
     pub(crate) fn publish(
         &self,
         source_channels: u8,
@@ -159,18 +172,20 @@ impl ConfigState {
             source_channels,
             groups,
             layout,
-            channels: fit_channels(&current.channels, source_channels),
+            channels: fit_channels(&current.requested_channels, source_channels),
+            requested_channels: current.requested_channels.clone(),
         })
     }
 
-    /// Publishes the engineer's channel details, fitted to the channel count in force (see
-    /// [fit_channels]), as [Self::publish] publishes groups.
+    /// Publishes the engineer's channel details: they are kept whole and fitted to the channel
+    /// count in force (see [fit_channels]), as [Self::publish] publishes groups.
     pub(crate) fn publish_channels(&self, channels: &[ChannelMeta]) -> Option<Published> {
         self.publish_with(|current| ConfigParts {
             source_channels: current.source_channels,
             groups: current.groups.clone(),
             layout: current.layout.clone(),
             channels: fit_channels(channels, current.source_channels),
+            requested_channels: channels.to_vec(),
         })
     }
 
@@ -178,26 +193,34 @@ impl ConfigState {
     ///
     /// The whole step runs under the write lock, and the generation is raised while the new
     /// snapshot is held there, so a reader that sees the new generation always reads the new
-    /// snapshot and two publishes never build on the same old one.
+    /// snapshot and two publishes never build on the same old one. The generation only rises when
+    /// what `config` says changed: details kept for inputs the device lacks are stored with the
+    /// generation in force, since no client would see a difference.
     fn publish_with(&self, next: impl FnOnce(&ConfigSnapshot) -> ConfigParts) -> Option<Published> {
         let mut current = self
             .current
             .write()
             .expect("control configuration lock poisoned");
         let parts = next(&current);
-        if current.source_channels == parts.source_channels
+        let seen_unchanged = current.source_channels == parts.source_channels
             && current.groups == parts.groups
             && current.layout == parts.layout
-            && current.channels == parts.channels
-        {
+            && current.channels == parts.channels;
+        if seen_unchanged && current.requested_channels == parts.requested_channels {
             return None;
         }
+        let generation = if seen_unchanged {
+            current.generation
+        } else {
+            current.generation + 1
+        };
         let live = Arc::new(ConfigSnapshot {
-            generation: current.generation + 1,
+            generation,
             source_channels: parts.source_channels,
             groups: parts.groups,
             layout: parts.layout,
             channels: parts.channels,
+            requested_channels: parts.requested_channels,
         });
         let previous = std::mem::replace(&mut *current, Arc::clone(&live));
         self.generation.store(live.generation, Ordering::SeqCst);
@@ -210,7 +233,7 @@ impl ConfigState {
 impl Membership for ConfigState {
     fn new_mix(&self) -> MixState {
         let config = self.snapshot();
-        MixState::configured(&config.layout, channel_flags(&config.channels))
+        MixState::configured(&config.layout, channel_flags(&config.requested_channels))
     }
 }
 
@@ -1413,6 +1436,34 @@ mod tests {
             config.publish_channels(&linked_keys()).is_none(),
             "the same details are no change"
         );
+    }
+
+    /// A phone on a smaller device is sent the details of the inputs it has, and after the switch
+    /// back it is sent every detail again, the pair included.
+    #[test]
+    fn config_after_a_switch_back_carries_the_details_of_the_inputs_that_returned() {
+        let config = live_config(&drums(), 4);
+        config.publish_channels(&linked_keys());
+        let channels = |config: &ConfigState| -> serde_json::Value {
+            let json: serde_json::Value =
+                serde_json::from_str(&config_message(&config.snapshot()).expect("serializes"))
+                    .expect("config is JSON");
+            json["channels"].clone()
+        };
+
+        assert!(publish_switch(&config, &drums(), 2));
+        let smaller = channels(&config);
+        assert_eq!(smaller.as_array().map(Vec::len), Some(2));
+        assert_eq!(smaller[1]["name"], "Keys L");
+        assert_eq!(smaller[1]["link"], false, "its second side is missing");
+
+        assert!(publish_switch(&config, &drums(), 4));
+        let back = channels(&config);
+        assert_eq!(
+            back[1],
+            serde_json::json!({ "name": "Keys L", "kind": "keys", "hidden": false, "link": true })
+        );
+        assert_eq!(back[2]["name"], "Keys R");
     }
 
     /// The order a phone needs when the engineer links a pair while it is connected: the `config`

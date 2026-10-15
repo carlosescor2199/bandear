@@ -68,10 +68,12 @@ export function checkChannels(channels) {
   }
   channels.forEach((channel, index) => {
     const number = index + 1;
-    if (!CHANNEL_KINDS.includes(channel.kind)) {
-      throw new Error(`CH ${number} has the instrument kind \`${channel.kind}\`, which is none of ${CHANNEL_KINDS.join(", ")}`);
+    // Every field may be left out, as in what the desk sends: no name, kind "other".
+    const kind = channel.kind ?? "other";
+    if (!CHANNEL_KINDS.includes(kind)) {
+      throw new Error(`CH ${number} has the instrument kind \`${kind}\`, which is none of ${CHANNEL_KINDS.join(", ")}`);
     }
-    if ([...channel.name].length > MAX_CHANNEL_NAME_LENGTH) {
+    if ([...String(channel.name ?? "")].length > MAX_CHANNEL_NAME_LENGTH) {
       throw new Error(`the name of CH ${number} is longer than ${MAX_CHANNEL_NAME_LENGTH} characters`);
     }
     if (!channel.link) {

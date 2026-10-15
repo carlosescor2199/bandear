@@ -8,8 +8,9 @@ import java.util.concurrent.atomic.AtomicLong
  * The first retries come quickly, so a short Wi-Fi blip or a server restart costs the musician
  * well under a few seconds, then the wait grows and settles at [MAX_DELAY_MS]: a server that stays
  * away is retried every five seconds for as long as the session runs, which bounds how long the
- * phone takes to notice the network is back without hammering it meanwhile. A successful open
- * calls [reset], so the next loss starts from the short end of the schedule again.
+ * phone takes to notice the network is back without hammering it meanwhile. A connection that
+ * proves itself, by receiving its first message from the server, calls [reset], so the next loss
+ * starts from the short end of the schedule again; a server that accepts and drops at once does not.
  *
  * Not thread-safe on its own: the channel only touches it while holding its connection lock.
  */
@@ -24,7 +25,7 @@ internal class ReconnectPolicy {
         return delay
     }
 
-    /** Starts the schedule again, after a connection opened. */
+    /** Starts the schedule again, after a connection heard from the server. */
     fun reset() {
         attempt = 0
     }

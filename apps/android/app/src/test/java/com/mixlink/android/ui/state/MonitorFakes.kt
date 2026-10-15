@@ -8,6 +8,7 @@ import com.mixlink.android.ControlTransport
 import com.mixlink.android.MixBank
 import com.mixlink.android.MixSnapshot
 import com.mixlink.android.PmonPlayer
+import com.mixlink.android.ReceiverLaunches
 import com.mixlink.android.ScheduledTask
 import com.mixlink.android.ServerDiscovery
 import org.json.JSONObject
@@ -55,27 +56,41 @@ internal class FakeStore(
 /**
  * Records what the session asked of the receiver, and keeps what it was built with.
  *
- * Like the real receiver, [stop] only asks the receive loop to end: the loop reports `onStopped`
- * later, from its own thread, once the session's lock is free. [finishStopping] delivers that late
- * report, so a test decides when it arrives.
+ * It keeps the real receiver's contract by using the real [ReceiverLaunches]: each launch is a
+ * receive loop that counts as alive from its launch until its stop report has been handled, and a
+ * loop that ends lowers the shared session flag only while it is the latest launch, then reports
+ * `onStopped` once, in launch order. Like the real receiver, [stop] only asks the loop to end; the
+ * loop reports later, from its own thread. [finishStopping] and [endOnItsOwn] end it, so a test
+ * decides when the report arrives.
  */
 internal class FakeReceiver(
     val listener: PmonPlayer.Listener,
     val running: AtomicBoolean,
     val mixState: ClientMixState,
 ) : AudioReceiver {
+    /** One launch's receive loop; the gate tells loops apart by identity, as the real one tells threads. */
+    private class Loop
+
+    private val gate = ReceiverLaunches<Loop>(running)
+
+    /** Loops launched and not ended yet, oldest first. */
+    private val loops = ArrayDeque<Loop>()
+
     val launches = mutableListOf<Pair<String, Int>>()
     var stops = 0
-    var alive = false
 
     /** True after a [stop] whose report [finishStopping] has not delivered yet. */
     var stopping = false
         private set
 
-    override fun isAlive(): Boolean = alive
+    /** As `PmonPlayer.isReceiverAlive`: from a launch until its loop's stop report was handled. */
+    override fun isAlive(): Boolean = gate.current != null
 
     override fun launch(host: String, port: Int) {
         launches += host to port
+        val loop = Loop()
+        loops.addLast(loop)
+        gate.launched(loop)
     }
 
     override fun stop() {
@@ -84,16 +99,24 @@ internal class FakeReceiver(
     }
 
     /** The receive loop asked to stop ends now and reports it, as the real one's `finally` does. */
-    fun finishStopping() {
+    fun finishStopping(beforeReport: () -> Unit = {}) {
         check(stopping) { "stop() was not called" }
         stopping = false
-        endOnItsOwn()
+        endOnItsOwn(beforeReport)
     }
 
-    /** Ends the receive loop the way the real one does: the session flag drops, then onStopped. */
-    fun endOnItsOwn() {
-        running.set(false)
-        listener.onStopped()
+    /**
+     * The oldest running loop ends the way the real one does: the session flag drops if it is the
+     * latest launch, then `onStopped`, and only then is the receiver free. [beforeReport] runs
+     * between the flag drop and the report, where the main thread can still act before the report
+     * takes the session's lock.
+     */
+    fun endOnItsOwn(beforeReport: () -> Unit = {}) {
+        val loop = checkNotNull(loops.removeFirstOrNull()) { "no receive loop is running" }
+        gate.finished(loop) {
+            beforeReport()
+            listener.onStopped()
+        }
     }
 }
 

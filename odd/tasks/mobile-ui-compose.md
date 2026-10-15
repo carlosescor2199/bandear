@@ -451,7 +451,7 @@ features.
     - No Compose UI tests (they need instrumentation): the sheet, the label button and the strip
       height need the live check.
   - Paste truncation in name fields (WARNING R3-keptedit-truncates-existing-text-on-mid-insert),
-    this commit:
+    `cc65cef`:
     - `keptEdit` kept the first `maxLength` characters of the whole new text, so a paste at the
       start or in the middle of a name that passed the limit cut off the end of the name (limit
       10, "Carlos", "Escudero " pasted at the start gave "Escudero C"). It now works like the old
@@ -472,3 +472,31 @@ features.
     - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
       SUCCESSFUL, 41 tasks executed; 34 result files, 333 tests (324 plus 9), 0 failures, 0
       errors; no Kotlin warnings. Debug APK 26,363,224 bytes. `cargo fmt --all -- --check`: clean.
+  - The fake receiver follows the real launch gating (SUGGESTION
+    R3-fake-receiver-drops-flag-unconditionally), this commit; tests only:
+    - `FakeReceiver` lowered the shared session flag on every stop and never counted as alive,
+      while the real receiver (since `538f990`) lowers it only while its launch is the latest and
+      counts as alive until its stop report has been handled. The fake now runs the real
+      `ReceiverLaunches`: each launch is a loop that is alive until its report, a loop ends
+      through `ReceiverLaunches.finished`, and `endOnItsOwn` / `finishStopping` take a
+      `beforeReport` hook that runs between the flag drop and the report, where the main thread
+      can still act. The `alive` switch is gone.
+    - `theLastSessionsLateStopReportCannotEndTheNextSession` no longer starts a session before the
+      last one's report, which the real receiver now prevents; it tests the race that is left: a
+      Connect right after Stop is refused until the stopped loop has reported, and the session
+      started afterwards ends only with its own loop. `connectWaitsForThePreviousReceiverToEnd`
+      reaches the refusal the real way (Stop, then Connect before the report), and
+      `aReceiverThatEndedOnItsOwnBeforeClearingAndReportsAfterTouchesNothing` clears the
+      ViewModel through the hook instead of lowering the flag by hand.
+    - New `aLoopEndingWhileTheMusicianStopsAndReconnectsEndsOnlyItsOwnSession` combines the real
+      gating with the ViewModel's stop counting: a loop that ends on its own drops the flag, Stop
+      and Connect land before its report (Stop does nothing, Connect is refused), the report ends
+      its session once, and the next session's report, after Stop, ends nothing again.
+    - RED: a probe fake with the old contract (flag dropped unconditionally, never alive; only the
+      hook added so the tests compile; not committed): 92 `ui.state` tests run, 3 failed (the new
+      test, the adjusted race test and the rewritten refusal test). GREEN with the real gating:
+      all 92 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 34 result files, 334 tests (333 plus 1), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,363,224 bytes (tests only). `cargo fmt --all --
+      --check`: clean.

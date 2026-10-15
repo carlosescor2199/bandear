@@ -203,22 +203,61 @@ class MonitorViewModelTest {
     fun theLastSessionsLateStopReportCannotEndTheNextSession() {
         connected()
         viewModel.disconnect()
-        // The real receiver stops counting as alive just before it reports, so a new session can
-        // start in between; its report, flag drop included, still belongs to the session before.
+        // The musician connects again at once. The receiver counts as alive until the stopped
+        // loop's report has been handled, so this Connect is refused rather than start a session
+        // the late report could reach.
+        viewModel.connect(SERVER)
+        assertEquals(1, transport.sockets.size)
+
+        receiver.finishStopping()
         viewModel.connect(SERVER)
         val next = socket()
 
-        receiver.finishStopping()
-
+        assertEquals(2, transport.sockets.size)
         assertNull(next.closedWith)
+        assertTrue(receiver.running.get())
         assertTrue(state.connection.sessionRunning)
+        assertNull(state.connection.problem)
         assertEquals(2, scanner.starts)
 
-        // The next session's own receive loop then sees the flag down and ends that session.
+        // The next session ends only when its own receive loop does.
         receiver.endOnItsOwn()
 
         assertEquals(1000 to "receiver stopped", next.closedWith)
         assertFalse(state.connection.sessionRunning)
+        assertEquals(3, scanner.starts)
+    }
+
+    @Test
+    fun aLoopEndingWhileTheMusicianStopsAndReconnectsEndsOnlyItsOwnSession() {
+        connected()
+        val first = socket()
+
+        // The loop ends on its own: as the latest launch it drops the flag, and before its report
+        // takes the session's lock the musician taps Stop and Connect.
+        receiver.endOnItsOwn(beforeReport = {
+            viewModel.disconnect()
+            viewModel.connect(SERVER)
+        })
+
+        // Stop found the flag already down and did nothing; Connect was refused while the loop
+        // was still reporting; the report then ended the session it belongs to, once.
+        assertEquals(0, receiver.stops)
+        assertEquals("The previous receiver is still stopping", state.connection.problem)
+        assertEquals(1, transport.sockets.size)
+        assertEquals(1000 to "receiver stopped", first.closedWith)
+        assertFalse(state.connection.sessionRunning)
+        assertFalse(receiver.isAlive())
+        assertEquals(2, scanner.starts)
+
+        // The second session's report is counted as the second: after Stop it ends nothing again.
+        viewModel.connect(SERVER)
+        val second = socket()
+        viewModel.disconnect()
+        receiver.finishStopping()
+
+        assertEquals(1000 to "stopped", second.closedWith)
+        assertFalse(receiver.isAlive())
         assertEquals(3, scanner.starts)
     }
 
@@ -244,12 +283,13 @@ class MonitorViewModelTest {
         val model = ownedBy(owner)
         model.connect(SERVER)
         socket().open()
-        // The receive loop ended and dropped the flag; its report has not arrived yet.
-        receiver.running.set(false)
-        owner.clear()
-        val cleared = model.state.value
+        lateinit var cleared: MonitorUiState
 
-        receiver.listener.onStopped()
+        // The receive loop ended and dropped the flag; the Activity finished before its report.
+        receiver.endOnItsOwn(beforeReport = {
+            owner.clear()
+            cleared = model.state.value
+        })
 
         assertEquals(1, scanner.starts)
         assertEquals(1000 to "destroyed", socket().closedWith)
@@ -300,13 +340,15 @@ class MonitorViewModelTest {
 
     @Test
     fun connectWaitsForThePreviousReceiverToEnd() {
-        started()
-        receiver.alive = true
+        connected()
+        viewModel.disconnect()
 
+        // The stopped loop has not reported yet, so its receiver still counts as alive.
         viewModel.connect(SERVER)
 
         assertEquals("The previous receiver is still stopping", state.connection.problem)
-        assertTrue(transport.sockets.isEmpty())
+        assertEquals(1, transport.sockets.size)
+        assertEquals(1, receiver.launches.size)
         assertFalse(state.connection.sessionRunning)
     }
 

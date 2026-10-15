@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -10,6 +11,7 @@ use cpal::{
 };
 
 use crate::engine::LevelMeter;
+use crate::mix::MAX_MIX_CHANNELS;
 use crate::network::PacketStats;
 use crate::protocol::AudioPacket;
 
@@ -247,11 +249,7 @@ pub(crate) fn select_input_config(
         };
 
         let config = range.with_sample_rate(sample_rate);
-        let rank = (
-            u8::from(sample_rate != TARGET_SAMPLE_RATE),
-            u8::from(config.channels() != 2),
-            sample_format_rank(config.sample_format()),
-        );
+        let rank = input_config_rank(sample_rate, config.channels(), config.sample_format());
         if best_config
             .as_ref()
             .map_or(true, |(best_rank, _)| rank < *best_rank)
@@ -266,6 +264,21 @@ pub(crate) fn select_input_config(
         )
         .into()
     })
+}
+
+/// Orders candidate input configurations, lowest first: the target rate, then every input the
+/// interface offers (up to what the mixer can hold), then the cheapest sample format to convert.
+fn input_config_rank(
+    sample_rate: u32,
+    channels: u16,
+    sample_format: SampleFormat,
+) -> (u8, u8, Reverse<u16>, u8) {
+    (
+        u8::from(sample_rate != TARGET_SAMPLE_RATE),
+        u8::from(usize::from(channels) > MAX_MIX_CHANNELS),
+        Reverse(channels),
+        sample_format_rank(sample_format),
+    )
 }
 
 fn supported_reduction_sample_rate(range: &SupportedStreamConfigRange) -> Option<u32> {
@@ -633,6 +646,51 @@ mod tests {
     fn rejects_target_sample_rate_outside_supported_range() {
         assert!(!supports_sample_rate(8_000, 44_100, TARGET_SAMPLE_RATE));
         assert!(!supports_sample_rate(96_000, 192_000, TARGET_SAMPLE_RATE));
+    }
+
+    #[test]
+    fn the_target_rate_beats_more_channels_at_a_reduced_rate() {
+        assert!(
+            input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::I16)
+                < input_config_rank(TARGET_SAMPLE_RATE * 2, 8, SampleFormat::I16)
+        );
+    }
+
+    #[test]
+    fn more_input_channels_beat_a_stereo_config() {
+        assert!(
+            input_config_rank(TARGET_SAMPLE_RATE, 4, SampleFormat::F32)
+                < input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::I16)
+        );
+        assert!(
+            input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::I16)
+                < input_config_rank(TARGET_SAMPLE_RATE, 1, SampleFormat::I16)
+        );
+    }
+
+    #[test]
+    fn a_config_over_the_mix_channel_limit_ranks_last() {
+        let over_limit = (MAX_MIX_CHANNELS + 1) as u16;
+
+        assert!(
+            input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::U16)
+                < input_config_rank(TARGET_SAMPLE_RATE, over_limit, SampleFormat::I16)
+        );
+        assert!(
+            input_config_rank(
+                TARGET_SAMPLE_RATE,
+                MAX_MIX_CHANNELS as u16,
+                SampleFormat::I16
+            ) < input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::I16)
+        );
+    }
+
+    #[test]
+    fn the_sample_format_decides_between_equal_channel_counts() {
+        assert!(
+            input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::I16)
+                < input_config_rank(TARGET_SAMPLE_RATE, 2, SampleFormat::F32)
+        );
     }
 
     #[test]

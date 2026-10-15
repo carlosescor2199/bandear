@@ -127,6 +127,22 @@ user's decision.
   ok. About 940 changed lines, mostly tests: over the 400-line heuristic because the engine API,
   the push and the desktop command only prove the behaviour together.
   Commit: this commit.
+- [x] T2b (review follow-ups R3-001 and R3-002 of T2): the control connection's live-event
+  recovery lives in `MixPushFeed`, which resolves only when the phone must be sent its whole mix
+  (a change it did not make, or a feed that lagged behind the bus); a closed bus parks the feed for
+  good, so the connection neither ends nor spins. Pushes and pings share `send_by`, bounded by the
+  heartbeat deadline (`Sent`, `Failed`, `TimedOut`); the loop ends the connection on the last two.
+  Tests: lagged asks for a push, unrelated events keep it waiting, closed parks with no wake-ups,
+  and failed, stalled and writer-starved sends. Not covered end to end: a closed bus over a real
+  socket (the connection holds a sender of its own bus, so it cannot close today) and a failed
+  push over a real socket (the biased read sees the close first); the loop's mapping of `Failed`
+  and `TimedOut` to `break` is two match arms. `MixState::update` takes the writer lock and is
+  test-only; every server writer goes through `apply`. Route: delegated writer. RED observed: 16
+  compile errors (`MixPushFeed`, `send_by`, `BoundedSend` missing), then
+  `replacing_the_whole_mix_waits_for_the_writer_lock` failed against the lock-free `update`.
+  Mutation check: with the lock removed from `apply`,
+  `concurrent_writers_of_disjoint_fields_never_lose_a_change` failed in 3 of 3 runs. GREEN:
+  `cargo test -p personal-monitoring` 191 passed (7 new). Commit: this commit.
 - [x] T3 (Android): parse the pushed mix and apply it in the ViewModel without sending it back;
   JVM tests. Route: delegated writer. `mix_ack` parsed no values before, so nothing was reused:
   `ControlChannel` reads `mix_state` with `parseMixReport` (every field required; a malformed push
@@ -185,6 +201,7 @@ user's decision.
   - R3-002: `MixState::update` is still a lock-free `pub(crate)` store beside the locking
     `apply`; today only tests call it, but route remaining writers through `apply` (or lock in
     `update`) and add a two-thread test with disjoint fields.
+  - Both resolved in T2b.
 
 ## Next step
 

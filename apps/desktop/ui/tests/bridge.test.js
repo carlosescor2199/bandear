@@ -138,6 +138,42 @@ test("starting the fake engine announces a status and stopping it ends engine_st
   await assert.rejects(fake.invoke("engine_status"), /not running/);
 });
 
+test("the fake engine names its run on every payload, and each start begins the next", async () => {
+  const fake = createFakeBridge();
+  const seen = [];
+  for (const event of ["status", "meters", "mix-changed"]) {
+    await fake.listen(event, (payload) => seen.push([event, payload.run]));
+  }
+
+  const first = await fake.invoke("start_engine", { config: {} });
+  const status = await fake.invoke("engine_status");
+  fake.changeFromPhone(status.musicians[0].address, { muted: true });
+  fake.emitMeters();
+  const second = await fake.invoke("start_engine", { config: {} });
+
+  assert.equal(first.run, 1);
+  assert.equal(status.run, 1);
+  assert.equal(second.run, 2);
+  assert.equal((await fake.invoke("engine_status")).run, 2);
+  assert.deepEqual(seen, [
+    ["status", 1],
+    ["mix-changed", 1],
+    ["meters", 1],
+    ["status", 2],
+  ]);
+});
+
+test("a failed start of the fake engine still ends the run before it", async () => {
+  const fake = createFakeBridge({ running: true, failStart: "No input device is available." });
+
+  await assert.rejects(fake.invoke("start_engine", { config: {} }), /No input device/);
+  await assert.rejects(fake.invoke("engine_status"), /not running/);
+  fake.failStart(null);
+  const summary = await fake.invoke("start_engine", { config: {} });
+
+  assert.equal(summary.run, 3, "the sample engine was run 1 and the failed start took run 2");
+});
+
 test("the fake engine merges a desk's change from the first channel, answers the mix and announces it", async () => {
   const fake = createFakeBridge({ running: true });
   const changes = [];
@@ -150,7 +186,7 @@ test("the fake engine merges a desk's change from the first channel, answers the
   });
 
   assert.deepEqual(answer.channelGains, [10, 20, ...before.channelGains.slice(2)]);
-  assert.deepEqual(changes, [{ address: before.address, origin: "desktop", mix: answer }]);
+  assert.deepEqual(changes, [{ run: 1, address: before.address, origin: "desktop", mix: answer }]);
   const status = await fake.invoke("engine_status");
   assert.deepEqual(status.musicians[1].channelGains, answer.channelGains);
 });
@@ -244,6 +280,7 @@ test("synthetic meters cover every channel and musician with whole 0-100 peaks",
 
   const payload = syntheticMeters(status, 1234);
 
+  assert.equal(payload.run, status.run);
   assert.equal(payload.channels.length, status.sourceChannels);
   assert.deepEqual(
     Object.keys(payload.musicians).sort(),

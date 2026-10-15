@@ -79,6 +79,8 @@ impl CaptureFormatDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartSummary {
+    /// The engine run this start began (see [crate::commands::DesktopState::run]).
+    pub run: u64,
     pub device_name: String,
     pub capture_format: CaptureFormatDto,
 }
@@ -155,6 +157,8 @@ impl From<&MixValues> for MixDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixChangedDto {
+    /// The engine run the change happened in.
+    pub run: u64,
     /// The musician's address as the status rows show it, whoever made the change.
     pub address: String,
     /// "phone" for a change from the musician's phone, "desktop" for one made here.
@@ -164,8 +168,9 @@ pub struct MixChangedDto {
 }
 
 impl MixChangedDto {
-    pub fn new(address: SocketAddr, origin: MixOrigin, mix: &MixValues) -> Self {
+    pub fn new(address: SocketAddr, origin: MixOrigin, mix: &MixValues, run: u64) -> Self {
         Self {
+            run,
             address: address.to_string(),
             origin: match origin {
                 MixOrigin::Client { .. } => "phone",
@@ -181,6 +186,8 @@ impl MixChangedDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetersDto {
+    /// The engine run the levels were read from; 0 until the reader sets it.
+    pub run: u64,
     /// One 0-100 input peak per source channel, index-aligned with the status's `channels`.
     pub channels: Vec<u8>,
     /// Each musician's 0-100 output peak, keyed by the address the status rows show.
@@ -197,6 +204,7 @@ pub struct OutputLevelsDto {
 impl From<&EngineMeters> for MetersDto {
     fn from(meters: &EngineMeters) -> Self {
         Self {
+            run: 0,
             channels: meters.channel_levels.clone(),
             musicians: meters
                 .musicians
@@ -333,6 +341,10 @@ fn link_health_name(health: LinkHealth) -> &'static str {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatusDto {
+    /// The engine run the snapshot was taken from, so the window can ignore a snapshot of an
+    /// engine that has already stopped. 0 until the command layer sets it: the engine's own
+    /// status knows nothing of runs.
+    pub run: u64,
     pub device_name: String,
     pub capture_format: CaptureFormatDto,
     pub control_port: u16,
@@ -374,6 +386,7 @@ impl From<&EngineStatus> for EngineStatusDto {
             })
             .collect();
         Self {
+            run: 0,
             device_name: status.device_name.clone(),
             capture_format: (&status.capture_format).into(),
             control_port: status.control_port,
@@ -715,6 +728,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
+                "run": 0,
                 "channels": [50, 0],
                 "musicians": {
                     "192.168.1.3:50000": { "left": 100, "right": 50 },
@@ -733,8 +747,8 @@ mod tests {
         let address = "192.168.1.3:50000".parse().expect("test address");
         let peer = "192.168.1.3:41000".parse().expect("test address");
 
-        let from_phone = MixChangedDto::new(address, MixOrigin::Client { peer }, &mix);
-        let from_desktop = MixChangedDto::new(address, MixOrigin::Engine, &mix);
+        let from_phone = MixChangedDto::new(address, MixOrigin::Client { peer }, &mix, 1);
+        let from_desktop = MixChangedDto::new(address, MixOrigin::Engine, &mix, 1);
         let json = serde_json::to_value(&from_phone).expect("a change serializes");
 
         assert_eq!(from_phone.origin, "phone");
@@ -750,6 +764,54 @@ mod tests {
             json.get("volumePercent").is_none(),
             "the mix is nested: {json}"
         );
+    }
+
+    #[test]
+    fn every_payload_names_the_engine_run_it_belongs_to() {
+        let mut status = EngineStatusDto::from(&status_with(Vec::new(), vec![0, 0]));
+        status.run = 3;
+        let mut meters = MetersDto::from(&EngineMeters {
+            channel_levels: vec![0],
+            musicians: Vec::new(),
+        });
+        meters.run = 3;
+        let change = MixChangedDto::new(
+            "192.168.1.3:50000".parse().expect("test address"),
+            MixOrigin::Engine,
+            &MixValues::default(),
+            3,
+        );
+        let summary = StartSummary {
+            run: 3,
+            device_name: "Test device".to_owned(),
+            capture_format: CaptureFormatDto {
+                channels: 2,
+                sample_rate: 48_000,
+                sample_format: "I16".to_owned(),
+                buffer_size: "Default".to_owned(),
+            },
+        };
+
+        for json in [
+            serde_json::to_value(&status).expect("a status serializes"),
+            serde_json::to_value(&meters).expect("meters serialize"),
+            serde_json::to_value(&change).expect("a change serializes"),
+            serde_json::to_value(&summary).expect("a summary serializes"),
+        ] {
+            assert_eq!(json["run"], 3, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_translated_status_or_meters_belong_to_no_run_until_one_is_set() {
+        let status = EngineStatusDto::from(&status_with(Vec::new(), vec![0, 0]));
+        let meters = MetersDto::from(&EngineMeters {
+            channel_levels: Vec::new(),
+            musicians: Vec::new(),
+        });
+
+        assert_eq!(status.run, 0);
+        assert_eq!(meters.run, 0);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 // An in-memory engine behind the bridge interface (see bridge.js), for tests, the component
 // gallery and a browser preview of the console. It answers the desktop commands with the same
 // shapes, the same mix-merge rules and the same refusals as the real engine, and emits the same
-// events. Like a Tauri command, a refused call rejects with the error text, not an Error.
+// events. Like a Tauri command, a refused call rejects with the error text, not an Error. Every
+// start, even a failed one, begins a new engine run, and every payload names its run.
 
 import { defaultMix, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { clampLevel } from "./values.js";
@@ -67,6 +68,7 @@ export function sampleStatus() {
     { name: "Vocals", channels: [3], invalid: false },
   ];
   return {
+    run: 1,
     deviceName: "Volt 4",
     captureFormat: { channels: 4, sampleRate: 48000, sampleFormat: "I24", bufferSize: "Fixed(256)" },
     controlPort: 50001,
@@ -118,6 +120,7 @@ export function syntheticMeters(status, time) {
     };
   });
   return {
+    run: status.run,
     channels: Array.from({ length: status.sourceChannels }, (_, index) => wave(seconds, index)),
     musicians,
   };
@@ -141,20 +144,25 @@ function withPort(address) {
 }
 
 /**
- * The fake bridge. `running` starts the engine already running. Besides `invoke` and `listen` it
- * offers `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
- * `startMeters(intervalMs)` (synthetic meters until the returned stop function is called) and
- * `calls`, every `{ command, args }` invoked.
+ * The fake bridge. `running` starts the engine already running, as run `status.run`; `failStart`
+ * is the error every start fails with (none by default). Besides `invoke` and `listen` it offers
+ * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
+ * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` (synthetic meters until
+ * the returned stop function is called), `failStart(message)` and `calls`, every
+ * `{ command, args }` invoked.
  */
 export function createFakeBridge({
   status = sampleStatus(),
   devices = sampleDevices(),
   running = false,
+  failStart = null,
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
   const calls = [];
   let isRunning = running;
+  let run = running ? engine.run : 0;
+  let startError = failStart;
 
   function emit(event, payload) {
     for (const handler of [...(listeners.get(event) ?? [])]) {
@@ -177,7 +185,17 @@ export function createFakeBridge({
   }
 
   function summary() {
-    return { deviceName: engine.deviceName, captureFormat: clone(engine.captureFormat) };
+    return { run, deviceName: engine.deviceName, captureFormat: clone(engine.captureFormat) };
+  }
+
+  function announceMix(address, origin, mix) {
+    emit("mix-changed", { run, address, origin, mix: clone(mix) });
+  }
+
+  function emitMeters() {
+    if (isRunning) {
+      emit("meters", syntheticMeters(engine, performance.now()));
+    }
   }
 
   function mergeInto(row, update) {
@@ -197,7 +215,14 @@ export function createFakeBridge({
       return clone(engine);
     },
     start_engine() {
+      // As in the desktop, a start ends the previous engine and takes a run even when it fails.
+      run += 1;
+      isRunning = false;
+      if (startError) {
+        throw startError;
+      }
       isRunning = true;
+      engine.run = run;
       engine.stopped = false;
       emit("status", clone(engine));
       return summary();
@@ -250,7 +275,7 @@ export function createFakeBridge({
     set_mix({ address, mix }) {
       requireRunning();
       const merged = mergeInto(musicianAt(address), mix);
-      emit("mix-changed", { address, origin: "desktop", mix: clone(merged) });
+      announceMix(address, "desktop", merged);
       return clone(merged);
     },
   };
@@ -282,19 +307,20 @@ export function createFakeBridge({
       });
     },
     emit,
+    emitMeters,
     /** A change made on the musician's phone: merged as the engine would, announced as "phone". */
     changeFromPhone(address, update) {
       const merged = mergeInto(musicianAt(address), update);
-      emit("mix-changed", { address, origin: "phone", mix: clone(merged) });
+      announceMix(address, "phone", merged);
     },
     /** Emits synthetic `meters` while the engine runs; returns the function that stops them. */
     startMeters(intervalMs = 33) {
-      const timer = setInterval(() => {
-        if (isRunning) {
-          emit("meters", syntheticMeters(engine, performance.now()));
-        }
-      }, intervalMs);
+      const timer = setInterval(emitMeters, intervalMs);
       return () => clearInterval(timer);
+    },
+    /** Makes every later start fail with `message`, or succeed again with `null`. */
+    failStart(message) {
+      startError = message;
     },
   };
 }

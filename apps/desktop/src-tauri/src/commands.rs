@@ -5,6 +5,7 @@
 //! what these functions return.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
@@ -19,8 +20,8 @@ use crate::dto::{
 use crate::events::EventPump;
 use crate::names::MusicianNames;
 
-/// Starts the event pump for a new engine, given that engine's event bus.
-pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>) -> EventPump + Send + Sync>;
+/// Starts the event pump for a new engine, given that engine's event bus and run.
+pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
 
 /// The state the desktop commands share: the running engine, its event pump, and the desktop-only
 /// name store.
@@ -34,6 +35,10 @@ pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>) -> EventPump + Send + S
 /// is always stopped before the engine lock is taken, never while it is held.
 pub struct DesktopState {
     engine: Mutex<Option<EngineHandle>>,
+    /// The engine run: 0 before the first start, then one more for each start, taken under the
+    /// engine lock as the previous engine ends. The engine in `engine`, its pump and every event
+    /// and snapshot it produces belong to this run.
+    run: AtomicU64,
     pump: Mutex<Option<EventPump>>,
     start_pump: Option<PumpStarter>,
     names: MusicianNames,
@@ -44,19 +49,26 @@ impl DesktopState {
     pub fn new(names: MusicianNames) -> Self {
         Self {
             engine: Mutex::new(None),
+            run: AtomicU64::new(0),
             pump: Mutex::new(None),
             start_pump: None,
             names,
         }
     }
 
-    /// Streams every engine started from now on through a pump that `start_pump` builds.
+    /// Streams every engine started from now on through a pump that `start_pump` builds, given the
+    /// engine's event bus and run.
     pub fn with_event_pump(
         mut self,
-        start_pump: impl Fn(Receiver<EngineEvent>) -> EventPump + Send + Sync + 'static,
+        start_pump: impl Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync + 'static,
     ) -> Self {
         self.start_pump = Some(Box::new(start_pump));
         self
+    }
+
+    /// The current engine run: the run of the engine now running, or of the last start attempt.
+    pub fn run(&self) -> u64 {
+        self.run.load(Ordering::SeqCst)
     }
 }
 
@@ -107,6 +119,9 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 /// Starting while one is already running replaces it rather than stacking a second capture stream,
 /// and its event pump with it: the previous pump is stopped before anything else, and the new one
 /// starts with the new engine.
+///
+/// Every start, even one that fails, begins a new engine run: the previous engine has ended either
+/// way, so the window can tell its late events from the new engine's.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let config = to_engine_config(request);
     let mut pump = state
@@ -118,6 +133,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
         .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    // Under the engine lock, so a snapshot can never pair the old engine with the new run.
+    let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
 
     if let Some(mut running) = guard.take() {
         running
@@ -128,6 +145,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     match start(config).map_err(|error| error.to_string())? {
         Some(handle) => {
             let summary = StartSummary {
+                run,
                 device_name: handle.device_name().to_owned(),
                 capture_format: handle.capture_format().into(),
             };
@@ -141,7 +159,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
             *guard = Some(handle);
             drop(guard);
             if let (Some(start_pump), Some(events)) = (&state.start_pump, events) {
-                *pump = Some(start_pump(events));
+                *pump = Some(start_pump(events, run));
             }
             Ok(summary)
         }
@@ -151,8 +169,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     }
 }
 
-/// Returns the engine's current status, with each musician row's displayed name resolved by
-/// [apply_names].
+/// Returns the engine's current status, naming its run, with each musician row's displayed name
+/// resolved by [apply_names].
 pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     let guard = state
         .engine
@@ -162,6 +180,7 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
     let mut status = EngineStatusDto::from(&handle.status());
+    status.run = state.run();
     apply_names(&mut status, &state.names);
     Ok(status)
 }
@@ -177,7 +196,10 @@ pub fn engine_meters(state: &DesktopState) -> Result<MetersDto, String> {
     let handle = guard
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
-    Ok(MetersDto::from(&handle.meters()))
+    Ok(MetersDto {
+        run: state.run(),
+        ..MetersDto::from(&handle.meters())
+    })
 }
 
 /// The musician at `address`'s IP, at the address the status rows show, and their current mix;
@@ -328,6 +350,7 @@ pub fn switch_device(state: &DesktopState, device: String) -> Result<StartSummar
         format.describe()
     );
     Ok(StartSummary {
+        run: state.run(),
         device_name: handle.device_name().to_owned(),
         capture_format: format,
     })
@@ -341,6 +364,7 @@ mod tests {
 
     fn status_with_musicians(addresses: &[&str]) -> EngineStatusDto {
         EngineStatusDto {
+            run: 1,
             device_name: "Test device".to_owned(),
             capture_format: CaptureFormatDto {
                 channels: 2,
@@ -501,6 +525,7 @@ mod tests {
         let (bus, events) = std::sync::mpsc::channel();
         let pump = EventPump::start(
             events,
+            1,
             Silent {
                 _alive: std::sync::Arc::clone(&alive),
             },
@@ -546,6 +571,25 @@ mod tests {
             std::sync::Arc::strong_count(&alive),
             1,
             "the previous pump's thread has ended"
+        );
+    }
+
+    #[test]
+    fn every_start_takes_the_next_engine_run_even_when_it_fails() {
+        let state = DesktopState::new(MusicianNames::load(names_path("runs")));
+        assert_eq!(state.run(), 0, "no engine has run yet");
+        let failing = || StartRequest {
+            targets: vec!["not a target".to_owned()],
+            ..StartRequest::default()
+        };
+
+        start_engine(&state, failing()).expect_err("the engine cannot start");
+        assert_eq!(state.run(), 1);
+        start_engine(&state, failing()).expect_err("the engine cannot start");
+        assert_eq!(
+            state.run(),
+            2,
+            "a failed start still ends the run before it, so it takes a run of its own"
         );
     }
 

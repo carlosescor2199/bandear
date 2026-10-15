@@ -3,26 +3,38 @@
 // to the meter elements.
 //
 // State:
-//   engine     { phase, error, status }: phase is "idle", "starting", "running", "stopping",
-//              "stopped" or "error"; status is the last `EngineStatusDto` without its musicians.
+//   engine     { phase, error, status, run, endedRun }: phase is "idle", "starting", "running",
+//              "stopping", "stopped" or "error"; status is the last `EngineStatusDto` without its
+//              musicians; run is the engine run that status came from (null when none runs), and
+//              endedRun the newest run known to have ended.
 //   musicians  [musician] in the status's order: the status row with its mix nested as `mix`.
 //   selected   the address whose mix is open. It survives a stop, so a restart reopens it.
 //   pending    { address: { editKey: value } }: local edits still waiting for the engine.
 //   mixError   { address, message } of the last refused change, cleared by the next answer.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
-// never jumps back to an older value while its change is on the way.
+// never jumps back to an older value while its change is on the way. The engine's mix follows only
+// the `status` and `mix-changed` events, which arrive in the engine's order; a `set_mix` answer
+// only settles the edits it carried, since a phone may have changed the mix again by the time it
+// arrives.
+//
+// Every engine payload names its run. Starting, a failed start and a stop end the current run, and
+// a payload of an ended or older run is ignored, so a late event can never bring back an engine
+// that has stopped.
 
 import { needsAttention } from "./format.js";
 import { MIX_FIELDS, applyEdits, mixFromDto, parseEditKey, settleEdits } from "./mix.js";
 
 export const PHASES = Object.freeze(["idle", "starting", "running", "stopping", "stopped", "error"]);
 
+/** The phases in which the engine of the current run is gone or being replaced. */
+const RUN_ENDING_PHASES = new Set(["idle", "starting", "error"]);
+
 const NO_EDITS = Object.freeze({});
 const MIX_FIELD_SET = new Set(MIX_FIELDS);
 
 export const initialState = Object.freeze({
-  engine: Object.freeze({ phase: "idle", error: null, status: null }),
+  engine: Object.freeze({ phase: "idle", error: null, status: null, run: null, endedRun: 0 }),
   musicians: Object.freeze([]),
   selected: null,
   pending: NO_EDITS,
@@ -33,18 +45,30 @@ export const initialState = Object.freeze({
 export const actions = Object.freeze({
   /** An `EngineStatusDto` from `engine_status` or the `status` event. */
   status: (status) => ({ type: "status", status }),
-  /** The engine's phase as a screen learns it from its own start and stop calls. */
+  /**
+   * The engine's phase as a screen learns it from its own start and stop calls. "starting",
+   * "idle" and "error" end the current run.
+   */
   engine: (phase, error = null) => ({ type: "engine", phase, error }),
   select: (address) => ({ type: "select", address }),
-  /** A `mix-changed` payload: `{ address, origin, mix }`. */
-  mixChanged: ({ address, origin, mix }) => ({ type: "mix-changed", address, origin, mix }),
+  /** A `mix-changed` payload: `{ run, address, origin, mix }`. */
+  mixChanged: ({ run, address, origin, mix }) => ({ type: "mix-changed", run, address, origin, mix }),
   /** Local edits to one musician's mix, keyed as `editKey` makes them. */
   mixEdit: (address, edits) => ({ type: "mix-edit", address, edits }),
-  /** The engine's answer to a `set_mix` that carried the edits `sent`. */
-  mixApplied: (address, sent, mix) => ({ type: "mix-applied", address, sent, mix }),
+  /** The engine answered a `set_mix` that carried the edits `sent`. */
+  mixApplied: (address, sent) => ({ type: "mix-applied", address, sent }),
   /** A `set_mix` that carried the edits `sent` was refused. */
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
 });
+
+/**
+ * True when a payload of engine run `run` belongs to the engine the console shows, or to a newer
+ * one whose first status has not arrived yet; false for an ended or older run, or no run at all.
+ */
+export function isLiveRun(state, run) {
+  const { run: current, endedRun } = state.engine;
+  return Number.isInteger(run) && run > endedRun && (current === null || run >= current);
+}
 
 /** A status row as the console keeps it: every field but the mix, and the mix nested. */
 export function musicianFromDto(row) {
@@ -68,6 +92,9 @@ function onlyListed(pending, addresses) {
 }
 
 function receiveStatus(state, status) {
+  if (!isLiveRun(state, status.run)) {
+    return state;
+  }
   const musicians = status.musicians.map(musicianFromDto);
   const addresses = new Set(musicians.map((musician) => musician.address));
   let phase = status.stopped ? "stopped" : "running";
@@ -77,9 +104,11 @@ function receiveStatus(state, status) {
   return {
     ...state,
     engine: {
+      ...state.engine,
       phase,
       error: phase === "running" ? null : state.engine.error,
       status: withoutMusicians(status),
+      run: status.run,
     },
     musicians,
     selected: addresses.has(state.selected) ? state.selected : (musicians[0]?.address ?? null),
@@ -92,10 +121,13 @@ function setPhase(state, { phase, error }) {
   if (!PHASES.includes(phase)) {
     throw new Error(`unknown engine phase: ${phase}`);
   }
-  if (phase === "idle") {
+  if (RUN_ENDING_PHASES.has(phase)) {
+    // The engine of the current run is gone, or a start is replacing it: forget its snapshot and
+    // never take its late payloads again.
+    const { run, endedRun } = state.engine;
     return {
       ...state,
-      engine: { phase, error, status: null },
+      engine: { phase, error, status: null, run: null, endedRun: Math.max(endedRun, run ?? 0) },
       musicians: [],
       pending: NO_EDITS,
       mixError: null,
@@ -143,16 +175,16 @@ function edit(state, address, edits) {
 }
 
 // Only a listed musician can have pending edits (a status drops the others), so an answer for
-// anyone else has nothing to settle.
-function answered(state, { address, sent, mix }) {
+// anyone else has nothing to settle. The answer's own copy of the mix is never adopted: it is the
+// mix as it was when the request landed, and the events that followed it may already be newer.
+function answered(state, { address, sent }) {
   if (!isListed(state, address)) {
     return state;
   }
-  const next = mix ? replaceMix(state, address, mix) : state;
   return {
-    ...next,
-    pending: withPending(next, address, settleEdits(next.pending[address], sent)),
-    mixError: next.mixError?.address === address ? null : next.mixError,
+    ...state,
+    pending: withPending(state, address, settleEdits(state.pending[address], sent)),
+    mixError: state.mixError?.address === address ? null : state.mixError,
   };
 }
 
@@ -179,7 +211,7 @@ export function consoleReducer(state, action) {
         ? state
         : { ...state, selected: action.address };
     case "mix-changed":
-      return replaceMix(state, action.address, action.mix);
+      return isLiveRun(state, action.run) ? replaceMix(state, action.address, action.mix) : state;
     case "mix-edit":
       return edit(state, action.address, action.edits);
     case "mix-applied":

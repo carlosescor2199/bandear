@@ -5,6 +5,7 @@ import {
   actions,
   consoleReducer,
   initialState,
+  isLiveRun,
   musicianByAddress,
   musiciansNeedingAttention,
   pendingEdits,
@@ -38,6 +39,7 @@ function row(address, extra = {}) {
 
 function status(musicians, extra = {}) {
   return {
+    run: 1,
     deviceName: "Volt 4",
     captureFormat: { channels: 4, sampleRate: 48000, sampleFormat: "I24", bufferSize: "Fixed(256)" },
     controlPort: 50001,
@@ -153,33 +155,94 @@ test("an idle engine forgets its snapshot, musicians and edits, but not whose mi
   assert.equal(busy.selected, BO);
   assert.equal(selectedMusician(busy), null);
 
-  const back = reduce([twoMusicians], busy);
+  const back = reduce(
+    [actions.engine("starting"), actions.status(status([row(ANA), row(BO)], { run: 2 }))],
+    busy,
+  );
   assert.equal(back.selected, BO, "the same musician opens again after a restart");
 });
 
-test("a mix change replaces that musician's mix, from the phone or from this desk", () => {
-  const state = reduce([
+test("a late status from an engine that stopped does not bring it back", () => {
+  const stopped = reduce([twoMusicians, actions.engine("stopping"), actions.engine("idle")]);
+
+  assert.equal(consoleReducer(stopped, twoMusicians), stopped);
+  assert.equal(stopped.engine.phase, "idle");
+});
+
+test("a late status from the engine a failed start replaced does not bring it back", () => {
+  const failed = reduce([
     twoMusicians,
-    actions.mixChanged({ address: BO, origin: "phone", mix: mixWith({ volumePercent: 30 }) }),
+    actions.engine("starting"),
+    actions.engine("error", "No input device is available."),
   ]);
+
+  assert.equal(consoleReducer(failed, twoMusicians), failed);
+  assert.equal(failed.engine.phase, "error");
+  assert.equal(failed.engine.error, "No input device is available.");
+
+  const next = reduce([actions.status(status([row(ANA)], { run: 2 }))], failed);
+  assert.equal(next.engine.phase, "running", "a status of the next run is taken");
+  assert.equal(next.engine.run, 2);
+});
+
+test("a status of the new run is taken before the start's answer, and the old run's are not", () => {
+  const restarting = reduce([twoMusicians, actions.engine("starting")]);
+
+  const late = consoleReducer(restarting, twoMusicians);
+  assert.equal(late, restarting, "run 1 ended when the restart began");
+
+  const fresh = reduce([actions.status(status([row(BO)], { run: 2 }))], restarting);
+  assert.equal(fresh.engine.phase, "running");
+  assert.deepEqual(
+    fresh.musicians.map((musician) => musician.address),
+    [BO],
+  );
+  assert.equal(consoleReducer(fresh, twoMusicians), fresh, "an older run never wins");
+});
+
+test("a late mix change from an ended run is ignored", () => {
+  const stopped = reduce([twoMusicians, actions.engine("starting")]);
+  const restarted = reduce([actions.status(status([row(BO)], { run: 2 }))], stopped);
+
+  const late = actions.mixChanged({
+    run: 1,
+    address: BO,
+    origin: "phone",
+    mix: mixWith({ volumePercent: 5 }),
+  });
+
+  assert.equal(consoleReducer(restarted, late), restarted);
+});
+
+test("meters are live only for the current run, or for a newer one", () => {
+  const running = reduce([twoMusicians]);
+  const restarting = reduce([actions.engine("starting")], running);
+
+  assert.equal(isLiveRun(running, 1), true);
+  assert.equal(isLiveRun(running, 0), false);
+  assert.equal(isLiveRun(running, undefined), false, "a payload without a run is not trusted");
+  assert.equal(isLiveRun(restarting, 1), false);
+  assert.equal(isLiveRun(restarting, 2), true);
+});
+
+function change(address, origin, mix) {
+  return actions.mixChanged({ run: 1, address, origin, mix });
+}
+
+test("a mix change replaces that musician's mix, from the phone or from this desk", () => {
+  const state = reduce([twoMusicians, change(BO, "phone", mixWith({ volumePercent: 30 }))]);
 
   assert.equal(viewMix(state, BO).volumePercent, 30);
   assert.equal(viewMix(state, ANA).volumePercent, 100);
 
-  const fromDesk = reduce(
-    [actions.mixChanged({ address: BO, origin: "desktop", mix: mixWith({ volumePercent: 55 }) })],
-    state,
-  );
+  const fromDesk = reduce([change(BO, "desktop", mixWith({ volumePercent: 55 }))], state);
   assert.equal(viewMix(fromDesk, BO).volumePercent, 55);
 });
 
 test("a mix change for a musician not listed changes nothing", () => {
   const state = reduce([twoMusicians]);
 
-  assert.equal(
-    consoleReducer(state, actions.mixChanged({ address: CY, origin: "phone", mix: defaultMix() })),
-    state,
-  );
+  assert.equal(consoleReducer(state, change(CY, "phone", defaultMix())), state);
   assert.equal(viewMix(state, CY), null);
 });
 
@@ -199,7 +262,7 @@ test("a later phone change does not hide an edit still waiting for its answer", 
   const state = reduce([
     twoMusicians,
     actions.mixEdit(BO, { "channelGains.1": 40 }),
-    actions.mixChanged({ address: BO, origin: "phone", mix: phoneMix }),
+    change(BO, "phone", phoneMix),
   ]);
 
   assert.equal(viewMix(state, BO).channelGains[1], 40);
@@ -207,25 +270,48 @@ test("a later phone change does not hide an edit still waiting for its answer", 
 });
 
 test("an answer settles the edits it carried, and an edit made since keeps showing", () => {
-  const answered = mixWith({});
-  answered.channelGains[1] = 40;
-
   const state = reduce([
     twoMusicians,
     actions.mixEdit(BO, { "channelGains.1": 40 }),
     actions.mixEdit(BO, { "channelGains.1": 45 }),
-    actions.mixApplied(BO, { "channelGains.1": 40 }, answered),
+    actions.mixApplied(BO, { "channelGains.1": 40 }),
   ]);
 
-  assert.equal(musicianByAddress(state, BO).mix.channelGains[1], 40);
   assert.equal(viewMix(state, BO).channelGains[1], 45);
   assert.deepEqual(pendingEdits(state, BO), { "channelGains.1": 45 });
 
-  const final = mixWith({});
-  final.channelGains[1] = 45;
-  const settled = reduce([actions.mixApplied(BO, { "channelGains.1": 45 }, final)], state);
-  assert.equal("192.168.1.12:50000" in settled.pending, false);
+  const engineMix = mixWith({});
+  engineMix.channelGains[1] = 45;
+  const settled = reduce(
+    [
+      actions.mixChanged({ run: 1, address: BO, origin: "desktop", mix: engineMix }),
+      actions.mixApplied(BO, { "channelGains.1": 45 }),
+    ],
+    state,
+  );
+  assert.equal(BO in settled.pending, false);
   assert.equal(viewMix(settled, BO).channelGains[1], 45);
+});
+
+test("an answer never replaces the engine's mix, so a phone change that came after it stays", () => {
+  const phoneMix = mixWith({ volumePercent: 30 });
+  phoneMix.channelGains[1] = 90;
+  const answerMix = mixWith({});
+  answerMix.channelGains[1] = 40;
+
+  const state = reduce([
+    twoMusicians,
+    actions.mixEdit(BO, { "channelGains.1": 40 }),
+    // The engine applied the desk's change, then the phone's; the events come in that order...
+    actions.mixChanged({ run: 1, address: BO, origin: "desktop", mix: answerMix }),
+    actions.mixChanged({ run: 1, address: BO, origin: "phone", mix: phoneMix }),
+    // ...and the answer to the desk's request, holding the mix as it was then, comes last.
+    { ...actions.mixApplied(BO, { "channelGains.1": 40 }), mix: answerMix },
+  ]);
+
+  assert.equal(viewMix(state, BO).channelGains[1], 90, "the phone's later change stays");
+  assert.equal(viewMix(state, BO).volumePercent, 30);
+  assert.equal(BO in state.pending, false);
 });
 
 test("a refused change falls back to the server's mix and keeps the error for that musician", () => {
@@ -239,14 +325,10 @@ test("a refused change falls back to the server's mix and keeps the error for th
   assert.deepEqual(refused.mixError, { address: BO, message: "the engine is not running" });
 
   const recovered = reduce(
-    [
-      actions.mixEdit(BO, { volumePercent: 70 }),
-      actions.mixApplied(BO, { volumePercent: 70 }, mixWith({ volumePercent: 70 })),
-    ],
+    [actions.mixEdit(BO, { volumePercent: 70 }), actions.mixApplied(BO, { volumePercent: 70 })],
     refused,
   );
   assert.equal(recovered.mixError, null);
-  assert.equal(viewMix(recovered, BO).volumePercent, 70);
 });
 
 test("edits for a musician who is not listed are ignored, and a bad edit fails loudly", () => {

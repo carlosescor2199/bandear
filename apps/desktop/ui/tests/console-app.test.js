@@ -12,6 +12,14 @@ function settle() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+// Resolves once `done()` holds, polling every few milliseconds for up to two seconds.
+async function until(done, limitMs = 2000) {
+  const deadline = Date.now() + limitMs;
+  while (!done() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 function commands(fake, name) {
   return fake.calls.filter(({ command }) => command === name);
 }
@@ -282,7 +290,8 @@ test("a start whose status never comes says so and offers to try again", async (
   fake.failNext("engine_status", "the status could not be read", { times: 4 });
 
   await app.start();
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  // Timers are coarse on some systems (about 15 ms on Windows): wait for the outcome, not a time.
+  await until(() => app.store.getState().connection.status === "failed");
 
   const { connection } = app.store.getState();
   assert.equal(connection.status, "failed", "not left on starting with nothing to press");
@@ -456,6 +465,19 @@ test("a refused live switch is said, and the engine keeps its device", async () 
   assert.deepEqual(state.commandError, { action: "switch", message: "the device is busy" });
   assert.equal(state.engine.phase, "running");
   assert.equal(state.engine.status.deviceName, "Demo interface");
+  app.dispose();
+});
+
+test("a switch that works clears the refusal of an earlier one", async () => {
+  const { fake, app } = await connected();
+  await app.applyAudio({ host: "wasapi" });
+  fake.failNext("switch_device", "the device is busy");
+  await app.switchDevice("Microphone (USB audio)");
+
+  await app.switchDevice("Microphone (USB audio)");
+
+  assert.equal(app.store.getState().commandError, null);
+  assert.equal(app.store.getState().engine.status.deviceName, "Microphone (USB audio)");
   app.dispose();
 });
 

@@ -264,6 +264,7 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
     try {
       await api.switchDevice(name);
+      store.dispatch(actions.commandDone("switch"));
     } catch (error) {
       // The engine keeps the device it had.
       store.dispatch(actions.commandFailed("switch", message(error)));

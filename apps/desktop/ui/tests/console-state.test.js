@@ -488,6 +488,13 @@ test("a failed stop keeps the run and its musicians, and says what failed", () =
   assert.equal(retried.commandError, null, "the next start or stop clears it");
 });
 
+test("a command that works clears the refusal of the same command, and only that one", () => {
+  const refused = reduce([twoMusicians, actions.commandFailed("switch", "the device is busy")]);
+
+  assert.equal(reduce([actions.commandDone("switch")], refused).commandError, null);
+  assert.equal(consoleReducer(refused, actions.commandDone("stop")), refused);
+});
+
 test("the console is connecting until it hears the engine, and says when it cannot", () => {
   assert.deepEqual(initialState.connection, { status: "connecting", error: null });
 

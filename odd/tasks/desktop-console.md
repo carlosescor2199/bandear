@@ -447,6 +447,13 @@ user's decision.
   failed (a start after a stop and the reconnect auto start without the driver, an ASIO start
   without one reaching the engine, a failed apply leaving "asio" applied, the settings shape).
   GREEN: `fnm exec --using=default node --test apps/desktop/ui/tests` 179 passed (4 new).
+  Commit: 29a84cf.
+- [x] T7c (review notes R3-002 and R3-003 of T7). A live WASAPI switch that works now clears the
+  refusal of an earlier one (`commandDone("switch")`); before, only a start or stop cleared it.
+  The "status never comes" test polls the store until the connection fails (up to 2 s) instead
+  of waiting a fixed 40 ms, which coarse Windows timers could make flaky. Route: delegated
+  writer. RED observed: 2 of 181 node tests failed (the refusal kept after a working switch, and
+  the store's `commandDone`). GREEN: 181 passed in each of three runs.
   Commit: this commit.
 
 ## Progress
@@ -520,6 +527,11 @@ user's decision.
     connecting is single-flight.
   - R3-003: the auto-start depended on matching the Rust error text. Fixed structurally:
     `engine_status` answers `state: "notRunning"` instead of failing.
+- T7 c1fc18b + bec8398 + 2b1dd46: lineage `review-1b73ee8c1982ea16` over 8c867c3..2b1dd46
+  returned correction_required with CRITICAL R3-001 (an ASIO start without the picked driver
+  after ASIO was applied), corrected by T7b 29a84cf; targeted validation passed; approved and
+  acknowledged. Its WARNINGs R3-002 (a switch refusal outliving a working switch) and R3-003 (a
+  timing-dependent test) are fixed by T7c. Next review base: 29a84cf.
 - Local preview: `.claude/launch.json` (excluded through `.git/info/exclude`) runs
   `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`; since T7 the console is
   `/index.html?fake` (the running server answers `/` with the new index only after a restart).

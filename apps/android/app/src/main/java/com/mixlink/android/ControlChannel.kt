@@ -1,16 +1,7 @@
 package com.mixlink.android
 
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.Executors
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -23,22 +14,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 private const val NAME_RESEND_DEBOUNCE_MS = 400L
 
-/**
- * How often the client pings the server on an open control connection. A pong that has not come
- * back by the next ping fails the socket, so a half-open link (Wi-Fi gone without any close) is
- * noticed within a few seconds and reconnection starts, instead of waiting for a write to fail.
- */
-private const val PING_INTERVAL_SECONDS = 2L
-
 /** The WebSocket close code for a deliberate, normal close. */
 private const val NORMAL_CLOSURE = 1000
 
 /**
- * The OkHttp WebSocket control channel, its connection state machine, sending and closing.
+ * The WebSocket control channel, its connection state machine, sending and closing.
  *
- * The channel owns the executor, the OkHttp client and the WebSocket listeners. It reports opened,
- * acknowledged, config, error and closed events through [Listener], so the Activity only renders
- * and wires. [running] is the shared session flag owned by the caller.
+ * The channel owns its [transport] (OkHttp WebSockets in production) and its [scheduler] (one
+ * background thread in production). It reports opened, acknowledged, config, error and closed
+ * events through [Listener], so the Activity only renders and wires. [running] is the shared
+ * session flag owned by the caller.
  *
  * While the session runs, a connection that fails or closes is reopened on its own, following
  * [ReconnectPolicy], to the server and control port given to [connect]. Every open re-sends the
@@ -51,6 +36,8 @@ internal class ControlChannel(
     private val currentSnapshot: () -> MixSnapshot,
     private val moreOfMeEnabled: () -> Boolean,
     private val musicianChannel: () -> Int?,
+    private val transport: ControlTransport = OkHttpControlTransport(),
+    private val scheduler: ControlScheduler = ExecutorControlScheduler(),
 ) {
     interface Listener {
         fun onOpened()
@@ -60,16 +47,11 @@ internal class ControlChannel(
         fun onControlError(message: String)
     }
 
-    private val controlExecutor = Executors.newSingleThreadScheduledExecutor()
-    private val httpClient = OkHttpClient.Builder()
-        .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
-        .build()
-
     /** The open socket that sends go to; null while no connection is open. */
-    @Volatile private var controlWebSocket: WebSocket? = null
+    @Volatile private var controlWebSocket: ControlSocket? = null
     @Volatile private var registrationMessage: String? = null
     @Volatile private var announcedUdpPort: Int? = null
-    private var pendingNameResend: ScheduledFuture<*>? = null
+    private var pendingNameResend: ScheduledTask? = null
     @Volatile var controlState = ControlState.IDLE
     @Volatile var mixAcknowledged = false
         private set
@@ -82,22 +64,28 @@ internal class ControlChannel(
     private var serverControlPort = 0
 
     /** The socket of the current attempt, from its creation until it ends; [close] closes it. */
-    private var currentSocket: WebSocket? = null
-    private var pendingReconnect: ScheduledFuture<*>? = null
+    private var currentSocket: ControlSocket? = null
+    private var pendingReconnect: ScheduledTask? = null
 
     /** Set by [close]: the session was stopped, so nothing reconnects until the next [connect]. */
     private var stopped = true
+
+    /** Whether the current connection has heard from the server yet; see [connectionHeardFrom]. */
+    private var connectionProved = false
+
+    /** Whether the current outage already showed its error; one error per outage, not per retry. */
+    private var outageReported = false
 
     /**
      * Listens to one connection attempt. Its [generation] ties every callback to the socket it came
      * from: the callbacks of a socket that is no longer current never change the channel's state,
      * and such a socket is only ever closed, never used.
      */
-    private inner class ConnectionListener(private val generation: Long) : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            if (!adoptOpenedSocket(generation, webSocket)) {
+    private inner class ConnectionListener(private val generation: Long) : ControlSocketEvents {
+        override fun onOpen(socket: ControlSocket) {
+            if (!adoptOpenedSocket(generation, socket)) {
                 // Stopped or replaced while it was still opening.
-                webSocket.close(NORMAL_CLOSURE, "superseded")
+                socket.close(NORMAL_CLOSURE, "superseded")
                 return
             }
             listener.onOpened()
@@ -108,8 +96,8 @@ internal class ControlChannel(
             sendCurrentMix()
         }
 
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            if (!generations.isCurrent(generation)) return
+        override fun onMessage(socket: ControlSocket, text: String) {
+            if (!connectionHeardFrom(generation)) return
             try {
                 val message = JSONObject(text)
                 when (message.optString("type")) {
@@ -130,18 +118,18 @@ internal class ControlChannel(
             }
         }
 
-        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+        override fun onClosing(socket: ControlSocket, code: Int, reason: String) {
             // The server is closing. Answer, so the close handshake completes, and treat the
             // connection as ended now: the onClosed that follows belongs to an ended generation.
-            webSocket.close(NORMAL_CLOSURE, null)
+            socket.close(NORMAL_CLOSURE, null)
             connectionEnded(generation, failure = null)
         }
 
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            connectionEnded(generation, failure = "WebSocket error: ${t.message ?: "connection failed"}")
+        override fun onFailure(socket: ControlSocket, error: Throwable) {
+            connectionEnded(generation, failure = "WebSocket error: ${error.message ?: "connection failed"}")
         }
 
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        override fun onClosed(socket: ControlSocket, code: Int, reason: String) {
             connectionEnded(generation, failure = null)
         }
     }
@@ -162,13 +150,14 @@ internal class ControlChannel(
             serverControlPort = port
             stopped = false
             reconnectPolicy.reset()
+            outageReported = false
             cancelPendingReconnectLocked()
         }
-        executeOnControl { attemptConnection() }
+        scheduler.execute { attemptConnection() }
     }
 
     /**
-     * Opens one connection to the stored server, on the control executor. Does nothing once the
+     * Opens one connection to the stored server, on the control scheduler. Does nothing once the
      * session stopped or the receiver ended, so an attempt that was already due when Stop came
      * never connects.
      */
@@ -182,14 +171,12 @@ internal class ControlChannel(
             host = serverHost ?: return
             port = serverControlPort
             generation = generations.begin()
+            connectionProved = false
         }
         try {
-            val request = Request.Builder()
-                .url("ws://$host:$port")
-                .build()
-            val socket = httpClient.newWebSocket(request, ConnectionListener(generation))
-            // The attempt can fail, or the session can stop, before newWebSocket returns: only a
-            // socket that is still current is kept, and a stopped one is dropped before it opens.
+            val socket = transport.open("ws://$host:$port", ConnectionListener(generation))
+            // The attempt can fail, or the session can stop, before open returns: only a socket
+            // that is still current is kept, and a stopped one is dropped before it opens.
             val kept = synchronized(connectionLock) {
                 generations.isCurrent(generation).also { current -> if (current) currentSocket = socket }
             }
@@ -200,16 +187,33 @@ internal class ControlChannel(
     }
 
     /**
-     * Makes the socket of [generation] the open one, if that attempt is still current. A successful
-     * open also starts the reconnect schedule again from its shortest wait.
+     * Makes the socket of [generation] the open one, if that attempt is still current. Opening alone
+     * does not reset the backoff: a server that accepts and drops at once must still back off.
      */
-    private fun adoptOpenedSocket(generation: Long, webSocket: WebSocket): Boolean {
+    private fun adoptOpenedSocket(generation: Long, socket: ControlSocket): Boolean {
         synchronized(connectionLock) {
             if (!generations.isCurrent(generation)) return false
-            currentSocket = webSocket
-            controlWebSocket = webSocket
+            currentSocket = socket
+            controlWebSocket = socket
             controlState = ControlState.CONNECTED
-            reconnectPolicy.reset()
+        }
+        return true
+    }
+
+    /**
+     * True when a message on connection [generation] should be handled, that is, while it is
+     * current. The first message proves the connection healthy (the server sends `config` right
+     * after connect): the backoff starts again from its shortest wait, and the next failure counts
+     * as a new outage.
+     */
+    private fun connectionHeardFrom(generation: Long): Boolean {
+        synchronized(connectionLock) {
+            if (!generations.isCurrent(generation)) return false
+            if (!connectionProved) {
+                connectionProved = true
+                reconnectPolicy.reset()
+                outageReported = false
+            }
         }
         return true
     }
@@ -219,14 +223,17 @@ internal class ControlChannel(
      * current connection counts; a stale or repeated one is ignored. While the session runs and was
      * not stopped, the channel shows [ControlState.RECONNECTING] and schedules the next attempt.
      * Ownership of the mix is left exactly as it was.
+     *
+     * A failure is shown once per outage: the first one of the session, or the first after a
+     * connection that had heard from the server. Retries that keep failing only update the state.
      */
     private fun connectionEnded(generation: Long, failure: String?) {
-        val sessionRunning: Boolean
+        val error: String?
         synchronized(connectionLock) {
             if (!generations.end(generation)) return
             currentSocket = null
             controlWebSocket = null
-            sessionRunning = running.get()
+            val sessionRunning = running.get()
             val reconnect = ReconnectPolicy.shouldReconnect(sessionRunning, stopped)
             controlState = when {
                 reconnect -> ControlState.RECONNECTING
@@ -235,35 +242,23 @@ internal class ControlChannel(
                 else -> ControlState.CLOSED
             }
             if (reconnect) scheduleReconnectLocked()
+            error = failure?.takeIf { sessionRunning && !outageReported }
+            if (error != null) outageReported = true
         }
         listener.onClosed()
-        if (failure != null && sessionRunning) listener.onControlError(failure)
+        if (error != null) listener.onControlError(error)
     }
 
     /** Schedules the next attempt after the policy's wait. Call only while holding [connectionLock]. */
     private fun scheduleReconnectLocked() {
-        val delayMs = reconnectPolicy.nextDelayMs()
-        pendingReconnect = try {
-            controlExecutor.schedule({ attemptConnection() }, delayMs, TimeUnit.MILLISECONDS)
-        } catch (_: RejectedExecutionException) {
-            // The channel shut down; nothing reconnects after that.
-            null
-        }
+        // Null once the scheduler shut down: nothing reconnects after that.
+        pendingReconnect = scheduler.schedule(reconnectPolicy.nextDelayMs()) { attemptConnection() }
     }
 
     /** Cancels a scheduled attempt, if any. Call only while holding [connectionLock]. */
     private fun cancelPendingReconnectLocked() {
-        pendingReconnect?.cancel(false)
+        pendingReconnect?.cancel()
         pendingReconnect = null
-    }
-
-    /** Runs [task] on the control executor, or drops it once the channel has shut down. */
-    private fun executeOnControl(task: () -> Unit) {
-        try {
-            controlExecutor.execute(task)
-        } catch (_: RejectedExecutionException) {
-            // Shut down: the Activity is gone and nothing is listening any more.
-        }
     }
 
     /**
@@ -280,21 +275,17 @@ internal class ControlChannel(
         val udpPort = announcedUdpPort ?: return
         val message = buildRegisterMessage(name, udpPort)
         registrationMessage = message
-        pendingNameResend?.cancel(false)
-        pendingNameResend = controlExecutor.schedule(
-            { sendRegistrationMessage(message) },
-            NAME_RESEND_DEBOUNCE_MS,
-            TimeUnit.MILLISECONDS,
-        )
+        pendingNameResend?.cancel()
+        pendingNameResend = scheduler.schedule(NAME_RESEND_DEBOUNCE_MS) { sendRegistrationMessage(message) }
     }
 
     /**
-     * Sends the registration once, on open, ahead of the first mix. Queued on the same executor as
+     * Sends the registration once, on open, ahead of the first mix. Queued on the same scheduler as
      * the mix sends, so the server always sees the registration first.
      */
     private fun sendRegistration() {
         val message = registrationMessage ?: return
-        executeOnControl {
+        scheduler.execute {
             sendRegistrationMessage(message)
         }
     }
@@ -320,8 +311,8 @@ internal class ControlChannel(
     }
 
     fun sendMixControl() {
-        executeOnControl {
-            val webSocket = controlWebSocket ?: return@executeOnControl
+        scheduler.execute {
+            val webSocket = controlWebSocket ?: return@execute
             val stored = currentSnapshot()
             // `More of me` is derived here, at send time, and never written back. The stored values
             // stay exactly as the musician left them, so turning the control off re-sends them.
@@ -333,22 +324,18 @@ internal class ControlChannel(
     }
 
     /**
-     * Sends one link-stats report on the control executor, behind any registration or mix already
+     * Sends one link-stats report on the control scheduler, behind any registration or mix already
      * queued. Called from the receive thread, so it only hands the report over and never waits.
      *
      * A report describes one interval and is worthless later, so it is dropped, never queued, when
-     * the channel is not open or has shut down. A rejected send is not shown as an error either: the
-     * next report follows within a second, and the server's view of a link that stops reporting is
-     * exactly what the report is for.
+     * the channel is not open or has shut down (the scheduler drops work after shutdown). A rejected
+     * send is not shown as an error either: the next report follows within a second, and the
+     * server's view of a link that stops reporting is exactly what the report is for.
      */
     fun sendLinkStats(report: LinkStatsReport) {
         if (controlWebSocket == null) return
-        try {
-            controlExecutor.execute {
-                controlWebSocket?.send(buildStatsMessage(report))
-            }
-        } catch (_: RejectedExecutionException) {
-            // The channel shut down while the receiver was still stopping.
+        scheduler.execute {
+            controlWebSocket?.send(buildStatsMessage(report))
         }
     }
 
@@ -358,7 +345,7 @@ internal class ControlChannel(
      * the next [connect].
      */
     fun close(code: Int, reason: String) {
-        val socket: WebSocket?
+        val socket: ControlSocket?
         synchronized(connectionLock) {
             stopped = true
             cancelPendingReconnectLocked()
@@ -375,8 +362,8 @@ internal class ControlChannel(
             stopped = true
             cancelPendingReconnectLocked()
         }
-        controlExecutor.shutdownNow()
-        httpClient.dispatcher.executorService.shutdown()
+        scheduler.shutdown()
+        transport.shutdown()
     }
 
     private fun buildMixMessage(snapshot: MixSnapshot): String {

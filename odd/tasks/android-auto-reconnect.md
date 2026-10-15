@@ -26,14 +26,17 @@ Three facts from the code make it worse:
 
 - **The phone owns reconnection.** While a session is running (`running` is true) and the control
   connection fails, closes or is closed by the server, the channel schedules a new connection on its
-  existing `controlExecutor`, with a capped backoff: 0.5 s, 1 s, 2 s, 4 s, then every 5 s. A
-  successful open resets the backoff. Stop, the receiver dying on its own, and `onDestroy` cancel
-  any pending attempt.
+  existing `controlExecutor`, with a capped backoff: 0.5 s, 1 s, 2 s, 4 s, then every 5 s. The
+  backoff resets once a connection hears from the server (its first message, the `config` sent
+  right after connect), not on open, so a server that accepts and drops at once still backs off.
+  Stop, the receiver dying on its own, and `onDestroy` cancel any pending attempt. The control
+  error is shown once per outage, not once per failed retry.
 - **Nothing new on the server.** Every open already sends `register` then `mix`, and the server
   keeps the musician's target and mix for its 15 s grace period after the heartbeat or a close; a
   later reconnect simply re-registers and re-sends the phone's own mix.
-- **The phone detects dead links itself:** OkHttp gets a 2 s `pingInterval`, so a half-open
-  connection fails within a few seconds instead of hanging.
+- **The phone detects dead links itself:** OkHttp gets a 5 s `pingInterval` (2 s in T1, raised
+  after review), so a half-open connection fails within about 10 s, inside the server's own 10 s
+  silence limit, instead of hanging.
 - **Callbacks are tied to their socket:** events from a socket that is no longer the current one
   are ignored.
 - **The musician sees it:** a `RECONNECTING` control state with its own status label.
@@ -62,7 +65,10 @@ Three facts from the code make it worse:
 
 - [x] T1 (android): reconnect on control failure with a capped backoff, socket-identity guard,
   client `pingInterval`, `RECONNECTING` state and label, cancellation on Stop, receiver death and
-  destroy. RED-first JVM tests for the pure policy, the guard and the label. Commit: this commit.
+  destroy. RED-first JVM tests for the pure policy, the guard and the label. Commit: `2d73b7a`.
+- [x] T1b (android, review follow-ups): backoff resets on the first server message instead of on
+  open; one control error per outage; client ping 5 s; a transport and scheduler seam so the
+  channel's state machine runs under JVM tests with fakes. Commit: this commit.
 - [ ] T2 (live): verify on the S23 with the desktop: Wi-Fi off then on reconnects on its own and the
   musician turns green again with their mix; Stop during reconnection stops retrying.
 
@@ -83,6 +89,7 @@ Three facts from the code make it worse:
 ## Route
 
 - T1: delegated direct, one writer (2+ non-trivial Android files).
+- T1b: delegated direct, the same writer (seam plus behaviour fixes across 2+ Android files).
 - T2: parent with the user on the device.
 
 ## Delivery forecast
@@ -118,6 +125,25 @@ About 300 to 400 authored changed lines, mostly tests; one pull request stacked 
   - Pre-existing, not changed: `PmonPlayer` sets `running` to false in its `finally` after a new
     session may already have started; `onStopped` only closes the channel when `running` is false.
   - About 450 authored changed lines, over the ~400 heuristic, mostly tests and KDoc.
+- T1 review: native review of `2d73b7a` (lineage `review-7c305b3072d3aed3`) approved and
+  acknowledged, with four advisories. The user accepted all four as T1b.
+- T1b done (route: delegated direct, one writer). The four advisories, each fixed here:
+  - R3-backoff-reset-on-open: the backoff and the outage flag reset on the first message of the
+    current connection (`connectionHeardFrom`), no longer on open.
+  - R3-error-per-retry: `connectionEnded` shows the failure only when the outage has not shown one
+    yet; the flag clears at `connect` and when a connection hears from the server. The state and
+    label still change on every end.
+  - R3-ping-interval-aggressive: `CONTROL_PING_INTERVAL_SECONDS` is 5 (was 2).
+  - R3-state-machine-untested: `ControlTransport.kt` (new) holds the seams, `ControlTransport` /
+    `ControlSocket` / `ControlSocketEvents` with the OkHttp implementation, and `ControlScheduler` /
+    `ScheduledTask` with the single-thread executor implementation (which drops work after
+    shutdown). `ControlChannel` takes both as constructor parameters with production defaults, so
+    `MainActivity` is unchanged. `ControlChannelReconnectTest` (new, 12 tests) drives it with a fake
+    transport and a manual scheduler: first connection, register-then-mix on every open, retry with
+    the policy delay, server close answered and retried once, Stop cancelling a pending retry (and an
+    already-due attempt doing nothing), Stop closing a socket that is still opening, late callbacks
+    from an older attempt ignored, flapping server backing off to the cap, backoff reset after the
+    server is heard, one error per outage, receiver end stopping retries, and the ping interval.
 
 ## Verification
 
@@ -128,4 +154,13 @@ About 300 to 400 authored changed lines, mostly tests; one pull request stacked 
   tests (81 before, 13 new), 0 failures, 0 errors; `compileDebugKotlin` and `assembleDebug` ran
   with no Kotlin warnings.
 - `cargo fmt --all -- --check`: clean (no Rust changes).
+- T1b RED, in two steps: with the tests written first, `:app:testDebugUnitTest` failed to compile
+  (27 errors, all the missing seam). After the behaviour-preserving seam refactor, 106 tests ran
+  and 3 failed, exactly the three behaviour changes: ping `expected:<5> but was:<2>`; errors per
+  outage `expected:<1> but was:<4>`; flapping backoff `expected:<[500, 1000, 2000, 4000, 5000,
+  5000]> but was:<[500, 500, 500, 500, 500, 500]>`. The other 9 new tests passed already: they pin
+  the T1 behaviour that the seam made testable.
+- T1b GREEN: `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 106
+  tests (94 before, 12 new), 0 failures, 0 errors; `compileDebugKotlin` and `assembleDebug` ran
+  with no Kotlin warnings. `cargo fmt --all -- --check`: clean.
 - T2 (live on the S23): pending.

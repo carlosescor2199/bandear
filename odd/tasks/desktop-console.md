@@ -345,6 +345,19 @@ user's decision.
   - SUGGESTION R3-002: the stall test sleeps a fixed 1 s; poll until zero with an upper limit.
   - SUGGESTION R3-003: the meter clears on device switch and on stop are not tested through
     `EngineHandle`.
+- T5 13217be + 43304a7: lineage `review-e137623b00b6d24b` over 1b0ec7d..43304a7 approved and
+  acknowledged. Next review base: 43304a7. Non-blocking notes, folded into T6:
+  - WARNING R3-001: `receiveStatus` guards only the `stopping` phase; a status event already
+    queued when the engine stopped can bring back the dead engine's snapshot after `idle` or
+    `error`. Tag events with the engine run they belong to (or an equivalent guard) and test a
+    late status after idle.
+  - WARNING R3-002: a `set_mix` answer replaces the whole stored mix, so a phone change that
+    lands between the desk's request and its answer is shown as the older mix. The answer
+    should only settle pending edits; `mix-changed` events (server order) carry the truth.
+  - SUGGESTION R3-003: the shared slider logic (drag hold, one `change` at drag end, grab
+    offset, double-click reset) has no automated tests; move it into a pure module and test it.
+- Local preview: `.claude/launch.json` (excluded through `.git/info/exclude`) runs
+  `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`.
 
 ## Next step
 

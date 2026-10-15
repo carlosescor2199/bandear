@@ -82,11 +82,12 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (bundled i
 - [x] T3 (screens): Connect, Mix, Saved mixes and Settings composed from the atoms, with previews;
   `MonitorApp(state, actions)` as the root; the T1 review's fader follow-ups. The app still runs
   the XML screen. Commits: `a17522b` (fader fixes) and this commit (screens).
-- [ ] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
-  state fixed; live check on the S23.
+- [x] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
+  state fixed; live check on the S23 (debug build; the items still unobserved are listed below as
+  follow-ups).
   - [x] Code: T3 review follow-ups (`69f613d`), receiver stop ordering (`538f990`), the switch to
     Compose (`0f51cb2`), R8 for release (see Progress). Checks per commit in Progress.
-  - [ ] Live check on the S23 (parent), on the debug and the minified release build, including
+  - [x] Live check on the S23 (parent), on the debug build, including
     the channel sheet (pan detent, TalkBack) and the strip height from T4b. Observed so far (parent,
     S23): the Mix screen fits (header, More of me, both strips with Mute and Solo, the Master card
     with the level cap, the tabs), and pan works end to end in the UI (after using the channel
@@ -99,13 +100,24 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (bundled i
     T4b (`f86414e`; see Progress), which closes the acceptance criterion "every existing control"
     again.
 - [x] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
-  download. The user approved it; see Progress. Commit: this commit.
+  download. The user approved it; see Progress. Commit: `e116aa3`.
 - [x] T6 (launcher icon): the app still showed the default Android robot; an adaptive MixLink icon
-  drawn in-house as vectors. Commit: this commit.
+  drawn in-house as vectors. Commit: `e1a4e7c`.
 - [x] T4c (review follow-ups): the two suggestions of T4b's native review (lineage
   `review-750e0cd8bc15bcc0`, approved): the channel sheet finds its channel by index, and a paste
-  with no room changes nothing. Commit: this commit.
-- [ ] Live check of the bundled fonts and the launcher icon on the S23 (parent).
+  with no room changes nothing. Commit: `fc925f9`.
+- [x] Live check of the bundled fonts and the launcher icon on the S23: confirmed by the user.
+  Native review of `e116aa3`..`fc925f9` (lineage `review-9478d7063e947bbb`) approved with no
+  findings.
+
+## Follow-ups
+
+- Not yet observed on a phone: the pan detent at C, TalkBack on the channel sheet and the fader
+  slider semantics, and the minified (R8) release build.
+- The variable-font weights use the `@ExperimentalTextApi` `Font(..., variationSettings)`
+  overload; the stable `Font(resId, weight)` sets the same `wght` axis and could replace it.
+- No Compose UI tests (they need instrumentation); the screens are covered by previews, pure
+  tests and the live checks above.
 
 ## Acceptance criteria
 

@@ -24,6 +24,9 @@ pub(crate) enum TargetOrigin {
     Registered {
         /// The name the client announced, if it typed one.
         name: Option<String>,
+        /// The stable id the client announced, if it sent one the server keeps. It is what lets a
+        /// phone that comes back from a new IP keep this entry instead of starting a second one.
+        client_id: Option<String>,
         /// When the last control channel for this target closed; `None` while connected or while
         /// the grace period has not started.
         disconnected_at: Option<Instant>,
@@ -37,6 +40,21 @@ impl TargetOrigin {
             TargetOrigin::Registered { name, .. } => name.as_deref(),
         }
     }
+
+    pub(crate) fn client_id(&self) -> Option<&str> {
+        match self {
+            TargetOrigin::Configured => None,
+            TargetOrigin::Registered { client_id, .. } => client_id.as_deref(),
+        }
+    }
+}
+
+/// What a registration did: the address the target now has and, when a known client came back
+/// from another IP, the address its entry moved from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Registration {
+    pub(crate) address: SocketAddr,
+    pub(crate) moved_from: Option<SocketAddr>,
 }
 
 /// One configured musician destination: the UDP address plus the state that belongs to it.
@@ -102,34 +120,70 @@ impl TargetRegistry {
     /// removal from the grace period. A configured target at the same IP is adopted by the
     /// registration, because the client that is actually there is the authority on where its own
     /// audio should go.
+    ///
+    /// A `client_id` that an entry at another IP already holds means that phone came back from a
+    /// new address (DHCP after a Wi-Fi blip). Its entry moves here instead of a second one being
+    /// created: the mix state, counters, report slot and place in the list are kept, the old
+    /// address leaves the table at once, and any other entry still keyed to this IP gives way, so
+    /// the table keeps one entry per IP. Without a `client_id` nothing moves. Every registration
+    /// records the id it announced (or none), so a row belongs to whoever registered from its IP
+    /// last. Ids are random and only ever travel on the LAN, so this adds no trust beyond the IP
+    /// rule above.
     pub(crate) fn register(
         &self,
         peer: IpAddr,
         udp_port: u16,
         name: Option<String>,
+        client_id: Option<&str>,
         layout: &GroupLayout,
-    ) -> SocketAddr {
+    ) -> Registration {
         let address = SocketAddr::new(peer, udp_port);
+        let origin = TargetOrigin::Registered {
+            name,
+            client_id: client_id.map(str::to_owned),
+            disconnected_at: None,
+        };
         let mut entries = self.entries.write().expect("target registry lock poisoned");
+        let returning = client_id.and_then(|id| {
+            entries.iter().position(|entry| {
+                entry.address.ip() != peer && entry.origin.client_id() == Some(id)
+            })
+        });
+        if let Some(mut index) = returning {
+            let moved_from = entries[index].address;
+            if let Some(stale) = entries.iter().position(|entry| entry.address.ip() == peer) {
+                entries.remove(stale);
+                if stale < index {
+                    index -= 1;
+                }
+            }
+            let entry = &mut entries[index];
+            entry.address = address;
+            entry.origin = origin;
+            return Registration {
+                address,
+                moved_from: Some(moved_from),
+            };
+        }
         if let Some(existing) = entries.iter_mut().find(|entry| entry.address.ip() == peer) {
             existing.address = address;
-            existing.origin = TargetOrigin::Registered {
-                name,
-                disconnected_at: None,
+            existing.origin = origin;
+            return Registration {
+                address,
+                moved_from: None,
             };
-            return address;
         }
         entries.push(TargetEntry {
             address,
             mix_state: Arc::new(MixState::new(layout)),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
-            origin: TargetOrigin::Registered {
-                name,
-                disconnected_at: None,
-            },
+            origin,
         });
-        address
+        Registration {
+            address,
+            moved_from: None,
+        }
     }
 
     /// Marks a registered target as disconnected, starting its grace period.
@@ -469,10 +523,12 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
 
-        assert_eq!(added, address("192.168.1.50:50000"));
+        assert_eq!(added.address, address("192.168.1.50:50000"));
+        assert_eq!(added.moved_from, None);
         assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
         assert_eq!(
             registered_name(&registry, ip("192.168.1.50")).as_deref(),
@@ -494,10 +550,11 @@ mod tests {
             ip("192.168.1.50"),
             command.udp_port,
             Some("Mallory".to_owned()),
+            None,
             &GroupLayout::default(),
         );
 
-        assert_eq!(added, address("192.168.1.50:50000"));
+        assert_eq!(added.address, address("192.168.1.50:50000"));
         assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
         assert!(
             registry
@@ -515,6 +572,7 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
         let now = Instant::now();
@@ -535,6 +593,7 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
         let now = Instant::now();
@@ -554,6 +613,7 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
         let mix = registry
@@ -566,10 +626,11 @@ mod tests {
             ip("192.168.1.50"),
             50123,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
 
-        assert_eq!(updated, address("192.168.1.50:50123"));
+        assert_eq!(updated.address, address("192.168.1.50:50123"));
         assert!(Arc::ptr_eq(
             &mix,
             &registry.mix_state(ip("192.168.1.50")).expect("kept target")
@@ -588,6 +649,7 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
         let mix = registry
@@ -604,10 +666,11 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Bea".to_owned()),
+            None,
             &GroupLayout::default(),
         );
 
-        assert_eq!(updated, address("192.168.1.50:50000"));
+        assert_eq!(updated.address, address("192.168.1.50:50000"));
         assert_eq!(
             registered_name(&registry, ip("192.168.1.50")).as_deref(),
             Some("Bea"),
@@ -654,6 +717,7 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
         let slot = registry
@@ -667,6 +731,7 @@ mod tests {
             ip("192.168.1.50"),
             50123,
             Some("Bea".to_owned()),
+            None,
             &GroupLayout::default(),
         );
 
@@ -684,6 +749,7 @@ mod tests {
             ip("192.168.1.50"),
             50000,
             Some("Ana".to_owned()),
+            None,
             &GroupLayout::default(),
         );
         let slot = registry
@@ -727,5 +793,220 @@ mod tests {
             .sweep_expired(now + REGISTRATION_GRACE_PERIOD * 10)
             .is_empty());
         assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
+    }
+
+    const PHONE_A: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
+    const PHONE_B: &str = "7d2e4c1a-9b3f-4e6d-8a5c-1f0e2d3c4b5a";
+
+    /// Registers a phone from `peer` the way the control channel does, with an optional client id.
+    fn register_phone(
+        registry: &TargetRegistry,
+        peer: &str,
+        udp_port: u16,
+        name: &str,
+        client_id: Option<&str>,
+    ) -> Registration {
+        registry.register(
+            ip(peer),
+            udp_port,
+            Some(name.to_owned()),
+            client_id,
+            &GroupLayout::default(),
+        )
+    }
+
+    /// The live case: Wi-Fi comes back and DHCP hands the phone a new IP. The phone announces the
+    /// same client id, so its row follows it: one row at the new address with the same mix, counters
+    /// and report slot, and the old address gone at once instead of lingering as a lost musician
+    /// until its grace period ends.
+    #[test]
+    fn a_known_client_id_from_a_new_ip_moves_the_musicians_row() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        let mix = registry
+            .mix_state(ip("192.168.1.10"))
+            .expect("registered target");
+        mix.update(crate::mix::MixValues {
+            volume_percent: 42,
+            ..Default::default()
+        });
+        let (counters, report) = {
+            let entries = registry.read();
+            entries[0].counters.sent.store(7, Ordering::Relaxed);
+            (
+                Arc::clone(&entries[0].counters),
+                Arc::clone(&entries[0].link_report),
+            )
+        };
+        // The old connection may already have closed, starting the grace period.
+        let now = Instant::now();
+        registry.mark_disconnected(ip("192.168.1.10"), now);
+
+        let moved = register_phone(&registry, "192.168.1.3", 50001, "Ana", Some(PHONE_A));
+
+        assert_eq!(
+            moved,
+            Registration {
+                address: address("192.168.1.3:50001"),
+                moved_from: Some(address("192.168.1.10:50000")),
+            }
+        );
+        assert_eq!(addresses(&registry), vec![address("192.168.1.3:50001")]);
+        assert!(
+            registry.mix_state(ip("192.168.1.10")).is_none(),
+            "the old address is gone at once"
+        );
+        assert!(Arc::ptr_eq(
+            &mix,
+            &registry.mix_state(ip("192.168.1.3")).expect("moved target")
+        ));
+        assert_eq!(mix.snapshot().volume_percent, 42);
+        {
+            let entries = registry.read();
+            assert!(
+                Arc::ptr_eq(&counters, &entries[0].counters),
+                "counters kept"
+            );
+            assert_eq!(entries[0].counters.sent.load(Ordering::Relaxed), 7);
+            assert!(
+                Arc::ptr_eq(&report, &entries[0].link_report),
+                "the report slot travels with the row; the control session decides whether to clear it"
+            );
+            assert_eq!(entries[0].origin.name(), Some("Ana"));
+            assert_eq!(entries[0].origin.client_id(), Some(PHONE_A));
+        }
+        // The move is a live registration: the grace period that had started no longer runs.
+        assert!(registry
+            .sweep_expired(now + REGISTRATION_GRACE_PERIOD * 2)
+            .is_empty());
+    }
+
+    /// Without an id nothing changes: a new IP is a new musician, even while another row (with or
+    /// without an id) waits out its grace period.
+    #[test]
+    fn without_a_client_id_a_new_ip_is_a_separate_row() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", None);
+        register_phone(&registry, "192.168.1.11", 50000, "Eva", Some(PHONE_A));
+
+        let added = register_phone(&registry, "192.168.1.3", 50000, "Ana", None);
+
+        assert_eq!(added.moved_from, None);
+        assert_eq!(
+            addresses(&registry),
+            vec![
+                address("192.168.1.10:50000"),
+                address("192.168.1.11:50000"),
+                address("192.168.1.3:50000"),
+            ]
+        );
+    }
+
+    /// After a move, the old IP's leftover connection (a half-open socket the heartbeat closes
+    /// later) ends and marks its IP disconnected. That IP has no row any more, so the moved musician
+    /// stays connected and is never removed by a grace period it did not earn.
+    #[test]
+    fn the_old_ip_disconnecting_after_a_move_leaves_the_moved_row_alone() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        register_phone(&registry, "192.168.1.3", 50000, "Ana", Some(PHONE_A));
+        let now = Instant::now();
+
+        registry.mark_disconnected(ip("192.168.1.10"), now);
+
+        assert!(
+            matches!(
+                registry.read()[0].origin,
+                TargetOrigin::Registered {
+                    disconnected_at: None,
+                    ..
+                }
+            ),
+            "the moved row is still connected"
+        );
+        assert!(registry
+            .sweep_expired(now + REGISTRATION_GRACE_PERIOD * 2)
+            .is_empty());
+        assert_eq!(addresses(&registry), vec![address("192.168.1.3:50000")]);
+    }
+
+    #[test]
+    fn two_client_ids_keep_two_rows_and_only_the_returning_one_moves() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        register_phone(&registry, "192.168.1.11", 50000, "Bea", Some(PHONE_B));
+        let bea_mix = registry.mix_state(ip("192.168.1.11")).expect("Bea's row");
+        assert_eq!(addresses(&registry).len(), 2, "two ids, two rows");
+
+        let moved = register_phone(&registry, "192.168.1.3", 50000, "Ana", Some(PHONE_A));
+
+        assert_eq!(moved.moved_from, Some(address("192.168.1.10:50000")));
+        // The moved row keeps its place in the list, so the desktop does not reorder musicians.
+        assert_eq!(
+            addresses(&registry),
+            vec![address("192.168.1.3:50000"), address("192.168.1.11:50000")]
+        );
+        assert!(Arc::ptr_eq(
+            &bea_mix,
+            &registry.mix_state(ip("192.168.1.11")).expect("Bea's row")
+        ));
+        assert_eq!(
+            registered_name(&registry, ip("192.168.1.11")).as_deref(),
+            Some("Bea")
+        );
+    }
+
+    /// One row per IP is what every lookup relies on. When a returning phone lands on an IP that a
+    /// stale row still holds (another phone's, waiting out its grace period), that row gives way: the
+    /// phone actually at the IP is the authority on it, as it is over a configured target.
+    #[test]
+    fn a_move_onto_an_ip_a_stale_row_still_holds_replaces_that_row() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.3", 50000, "Bea", Some(PHONE_B));
+        registry.mark_disconnected(ip("192.168.1.3"), Instant::now());
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        let ana_mix = registry.mix_state(ip("192.168.1.10")).expect("Ana's row");
+
+        let moved = register_phone(&registry, "192.168.1.3", 50001, "Ana", Some(PHONE_A));
+
+        assert_eq!(
+            moved,
+            Registration {
+                address: address("192.168.1.3:50001"),
+                moved_from: Some(address("192.168.1.10:50000")),
+            }
+        );
+        assert_eq!(addresses(&registry), vec![address("192.168.1.3:50001")]);
+        assert!(Arc::ptr_eq(
+            &ana_mix,
+            &registry.mix_state(ip("192.168.1.3")).expect("Ana's row")
+        ));
+        assert_eq!(registry.read()[0].origin.client_id(), Some(PHONE_A));
+    }
+
+    /// A registration records the id it announced, or the lack of one. Whoever registers from an IP
+    /// owns its row, so a phone that left and later comes back from elsewhere cannot pull the row
+    /// away from the client that took over its old IP.
+    #[test]
+    fn a_registration_records_the_client_id_it_announced() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+
+        // An older app build (no id) is handed the same IP and takes the row over, as today.
+        register_phone(&registry, "192.168.1.10", 50000, "Eva", None);
+        assert_eq!(registry.read()[0].origin.client_id(), None);
+
+        // The first phone returns from another IP: its id names no row now, so it starts its own.
+        let added = register_phone(&registry, "192.168.1.3", 50000, "Ana", Some(PHONE_A));
+
+        assert_eq!(added.moved_from, None);
+        assert_eq!(
+            addresses(&registry),
+            vec![address("192.168.1.10:50000"), address("192.168.1.3:50000")]
+        );
+        assert_eq!(
+            registered_name(&registry, ip("192.168.1.10")).as_deref(),
+            Some("Eva")
+        );
     }
 }

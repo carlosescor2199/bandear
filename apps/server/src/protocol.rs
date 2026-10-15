@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::mix::{merge_flags, merge_levels, MixValues};
 
@@ -80,7 +80,11 @@ pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixVal
 /// audio, and the cap keeps one client from dictating an unbounded string to every UI.
 pub(crate) const MAX_MUSICIAN_NAME_LENGTH: usize = 64;
 
-/// A `register` control message: the musician's name and the UDP port the client listens on.
+/// The longest client id the server keeps from a registration. A UUID (36 characters) fits.
+pub(crate) const MAX_CLIENT_ID_LENGTH: usize = 64;
+
+/// A `register` control message: the musician's name, the UDP port the client listens on and,
+/// from newer phones, the client id that phone generated once and keeps.
 ///
 /// There is deliberately no address field. The server takes the address from the socket, so a
 /// client cannot claim to be someone else's address even if it includes one in the message.
@@ -90,6 +94,33 @@ pub(crate) struct RegisterCommand {
     pub(crate) message_type: String,
     pub(crate) name: String,
     pub(crate) udp_port: u16,
+    /// The phone's stable id, or `None` when it sent none or one the server does not keep.
+    #[serde(default, deserialize_with = "lenient_client_id")]
+    pub(crate) client_id: Option<String>,
+}
+
+/// Returns `raw` when it is a client id the server keeps: 1 to [MAX_CLIENT_ID_LENGTH] ASCII
+/// letters, digits and hyphens. Anything else is `None`, exactly as if no id had been sent.
+fn valid_client_id(raw: &str) -> Option<String> {
+    let valid = (1..=MAX_CLIENT_ID_LENGTH).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    valid.then(|| raw.to_owned())
+}
+
+/// Reads `client_id` without ever failing the registration: a value of any other JSON type, or a
+/// string outside [valid_client_id], is read as no id. A musician must not lose their audio
+/// because a phone sent an id the server cannot use; they only lose the row-following it buys.
+fn lenient_client_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(valid_client_id))
 }
 
 /// Parses a `register` control message. Errors name what is wrong so a client (or a person
@@ -344,6 +375,76 @@ mod tests {
 
         assert_eq!(command.name, "Mallory");
         assert_eq!(command.udp_port, 50000);
+    }
+
+    #[test]
+    fn parses_a_registration_with_a_client_id() {
+        let command = parse_register_command(
+            r#"{"type":"register","name":"Ana","udp_port":50000,"client_id":"0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b"}"#,
+        )
+        .expect("a registration with a client id should parse");
+
+        assert_eq!(command.name, "Ana");
+        assert_eq!(command.udp_port, 50000);
+        assert_eq!(
+            command.client_id.as_deref(),
+            Some("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b")
+        );
+    }
+
+    #[test]
+    fn a_registration_without_a_client_id_parses_as_before() {
+        let command =
+            parse_register_command(r#"{"type":"register","name":"Ana","udp_port":50000}"#)
+                .expect("an older phone sends no client id");
+
+        assert_eq!(command.udp_port, 50000);
+        assert_eq!(command.client_id, None);
+    }
+
+    #[test]
+    fn a_client_id_of_up_to_64_letters_digits_and_hyphens_is_kept() {
+        let longest = "A-9".repeat(21) + "z";
+        assert_eq!(longest.len(), MAX_CLIENT_ID_LENGTH);
+
+        for id in ["a", "phone-1", "ABC-def-123", longest.as_str()] {
+            let command = parse_register_command(&format!(
+                r#"{{"type":"register","name":"Ana","udp_port":50000,"client_id":"{id}"}}"#
+            ))
+            .expect("a valid id should parse");
+
+            assert_eq!(command.client_id.as_deref(), Some(id));
+        }
+    }
+
+    /// A malformed id must never cost the musician their audio: the registration goes through as
+    /// if the phone had sent no id at all.
+    #[test]
+    fn an_invalid_client_id_is_ignored_and_the_registration_still_parses() {
+        let too_long = format!(r#""{}""#, "a".repeat(MAX_CLIENT_ID_LENGTH + 1));
+        let invalid = [
+            r#""""#,
+            r#""has space""#,
+            r#""under_score""#,
+            r#""slash/id""#,
+            r#""acentuación""#,
+            too_long.as_str(),
+            "42",
+            "true",
+            "null",
+            r#"["a"]"#,
+            r#"{"id":"a"}"#,
+        ];
+
+        for client_id in invalid {
+            let command = parse_register_command(&format!(
+                r#"{{"type":"register","name":"Ana","udp_port":50000,"client_id":{client_id}}}"#
+            ))
+            .unwrap_or_else(|error| panic!("client_id {client_id} broke the parse: {error}"));
+
+            assert_eq!(command.client_id, None, "client_id {client_id} is ignored");
+            assert_eq!(command.udp_port, 50000);
+        }
     }
 
     #[test]

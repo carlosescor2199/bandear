@@ -404,12 +404,19 @@ async fn handle_control_connection(
                     match parse_register_command(&text) {
                         Ok(command) => {
                             let name = registered_name(&command.name);
-                            let address = targets.register(
+                            // A phone that announces a client id the registry already holds at
+                            // another IP came back from a new address (DHCP after a Wi-Fi blip): its
+                            // row moves here instead of a second one appearing. Nothing else changes
+                            // for this connection: the moved row now lives at this peer's IP, and the
+                            // old IP's leftover connection finds no row of its own when it closes.
+                            let registration = targets.register(
                                 peer.ip(),
                                 command.udp_port,
                                 name.clone(),
+                                command.client_id.as_deref(),
                                 &groups,
                             );
+                            let address = registration.address;
                             // A new session starts with no link report: the one left by an earlier
                             // session describes a link that is gone, and kept it would turn stale
                             // while this session is connected and read as a lost link. A rename on
@@ -418,12 +425,16 @@ async fn handle_control_connection(
                                 targets.clear_link_report(peer.ip());
                                 session_registered = true;
                             }
+                            let moved = registration
+                                .moved_from
+                                .map(|from| format!(", moved from {from}"))
+                                .unwrap_or_default();
                             match &name {
                                 Some(name) => println!(
-                                    "control registration from {peer}: {address} as \"{name}\""
+                                    "control registration from {peer}: {address} as \"{name}\"{moved}"
                                 ),
                                 None => println!(
-                                    "control registration from {peer}: {address} (unnamed)"
+                                    "control registration from {peer}: {address} (unnamed){moved}"
                                 ),
                             }
                             None
@@ -1442,6 +1453,94 @@ mod tests {
             before,
             "a rename keeps the report"
         );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    const RETURNING_PHONE_ID: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
+
+    /// The live DHCP case over a real socket: a phone registered from one IP comes back from
+    /// another after a Wi-Fi blip, announcing the same client id. Its row moves to the new address
+    /// with its mix and counters, the new session starts with no link report, and the old IP's
+    /// half-open connection closing later (the heartbeat drops it) leaves the moved musician alone.
+    #[tokio::test]
+    async fn a_phone_returning_from_a_new_ip_with_its_client_id_keeps_its_row() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+        // The earlier session came from an IP this test cannot open a socket from, so its
+        // registration and its still-open connection are placed in the registries directly, as the
+        // connection task would have left them.
+        let old_peer: SocketAddr = "192.168.1.10:57874".parse().expect("old peer");
+        let old_connection = register_peer(&peers, &EventBus::default(), &targets, old_peer);
+        targets.register(
+            old_peer.ip(),
+            50000,
+            Some("Ana".to_owned()),
+            Some(RETURNING_PHONE_ID),
+            &GroupLayout::default(),
+        );
+        let mix = targets.mix_state(old_peer.ip()).expect("registered target");
+        let counters = Arc::clone(&targets.read()[0].counters);
+        *targets
+            .link_report(old_peer.ip())
+            .expect("registered target")
+            .lock()
+            .expect("report lock") = Some(LinkReport {
+            interval_ms: 1_000,
+            packets_received: 200,
+            packets_lost: 0,
+            underruns: 0,
+            receive_timeouts: 0,
+            received_at: Instant::now(),
+        });
+        let (address, stopped, server) = start_server(
+            Arc::clone(&targets),
+            Arc::clone(&peers),
+            Heartbeat::default(),
+        );
+        let new_ip: IpAddr = "127.0.0.1".parse().expect("loopback IP");
+
+        let mut client = connect_client(address).await;
+        let register = format!(
+            r#"{{"type":"register","name":"Ana","udp_port":50123,"client_id":"{RETURNING_PHONE_ID}"}}"#
+        );
+        send_then_sync(&mut client, &register).await;
+
+        {
+            let entries = targets.read();
+            assert_eq!(entries.len(), 1, "one row, not a second one for the new IP");
+            assert_eq!(
+                entries[0].address,
+                "127.0.0.1:50123"
+                    .parse::<SocketAddr>()
+                    .expect("target address")
+            );
+            assert!(Arc::ptr_eq(&mix, &entries[0].mix_state), "mix kept");
+            assert!(
+                Arc::ptr_eq(&counters, &entries[0].counters),
+                "counters kept"
+            );
+            assert_eq!(
+                *entries[0].link_report.lock().expect("report lock"),
+                None,
+                "a new session starts with no link report"
+            );
+        }
+        assert!(targets.mix_state(old_peer.ip()).is_none());
+
+        // The heartbeat later closes the old IP's half-open connection.
+        drop(old_connection);
+
+        assert_eq!(control_connections(&peers, old_peer.ip()), 0);
+        assert_eq!(control_connections(&peers, new_ip), 1);
+        assert!(
+            !marked_disconnected(&targets, new_ip),
+            "the moved musician stays connected"
+        );
+        assert!(targets
+            .sweep_expired(Instant::now() + crate::targets::REGISTRATION_GRACE_PERIOD * 2)
+            .is_empty());
 
         stop_server(address, &stopped, server).await;
     }

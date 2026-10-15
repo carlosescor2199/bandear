@@ -31,7 +31,8 @@ Three facts from the code make it worse:
   right after connect), not on open, so a server that accepts and drops at once still backs off.
   Stop, the receiver dying on its own, and `onDestroy` cancel any pending attempt. The control
   error is shown once per outage, not once per failed retry.
-- **Nothing new on the server.** Every open already sends `register` then `mix`, and the server
+- **Nothing new on the server for reconnecting itself (T1).** Every open already sends `register`
+  then `mix`, and the server
   keeps the musician's target and mix for its 15 s grace period after the heartbeat or a close; a
   later reconnect simply re-registers and re-sends the phone's own mix.
 - **The phone detects dead links itself:** OkHttp gets a 5 s `pingInterval` (2 s in T1, raised
@@ -40,6 +41,24 @@ Three facts from the code make it worse:
 - **Callbacks are tied to their socket:** events from a socket that is no longer the current one
   are ignored.
 - **The musician sees it:** a `RECONNECTING` control state with its own status label.
+- **A phone that comes back from a new IP keeps its row (T3).** The server keys musicians by IP,
+  so when DHCP hands the returning phone a new address it used to become a second row while the
+  old one showed as lost until the heartbeat (10 s) and the grace period (15 s) removed it. The
+  phone now generates a random client id once (a UUID), keeps it, and sends it in every
+  `register` as `client_id`. When a `register` carries an id that an entry at another IP holds,
+  the server moves that entry to the new address (peer IP plus `udp_port`, still never taken from
+  the message): mix state, counters, report slot and list position are kept, the old address
+  leaves the registry at once, and any other entry still keyed to the new IP gives way (one entry
+  per IP). The link report follows the existing rule: the first `register` of a control session
+  clears it. The old IP's leftover connection finds no entry at its IP when it closes, so it
+  neither marks the moved entry disconnected nor starts its grace period. Without `client_id`
+  (older phones) the behaviour is exactly as before. An id is accepted when it is 1 to 64 ASCII
+  letters, digits and hyphens; anything else (another JSON type included) is read as no id and
+  never fails the registration. Every registration records the id it announced, or none, so a row
+  belongs to whoever registered from its IP last.
+- **Trust model unchanged (T3).** The control channel stays a trusted-LAN protocol. A client id is
+  random, never displayed and only travels on the LAN, so it is not guessable by another phone; a
+  client able to read LAN traffic could already claim any musician by IP before this change.
 
 ## Scope
 
@@ -47,6 +66,10 @@ Three facts from the code make it worse:
   socket-identity guard, `pingInterval`, cancellation.
 - `MainActivity`: cancel on Stop, on `onStopped` (also closing the control channel) and on destroy.
 - Status label for `RECONNECTING`.
+- T3, server: optional `client_id` in `register`, entry move in `TargetRegistry::register`, the
+  move logged on the control connection.
+- T3, Android: a client id generated once and kept in `SharedPreferences`, sent in every
+  `register`.
 
 ## Out of scope
 
@@ -69,8 +92,22 @@ Three facts from the code make it worse:
 - [x] T1b (android, review follow-ups): backoff resets on the first server message instead of on
   open; one control error per outage; client ping 5 s; a transport and scheduler seam so the
   channel's state machine runs under JVM tests with fakes. Commit: this commit.
-- [ ] T2 (live): verify on the S23 with the desktop: Wi-Fi off then on reconnects on its own and the
-  musician turns green again with their mix; Stop during reconnection stops retrying.
+- [x] T2 (live): verify on the S23 with the desktop: Wi-Fi off then on reconnects on its own and the
+  musician turns green again with their mix; Stop during reconnection stops retrying. Done: a
+  Wi-Fi blip and a desktop engine restart both reconnected on their own. The Wi-Fi return came
+  with a new DHCP address, which produced a duplicate row (see T3).
+- [ ] T3 (server + android): a phone that returns from a new IP keeps its musician row, through a
+  stable client id announced in `register`.
+  - [x] T3a (server): optional `client_id` parsed leniently; a known id from a new IP moves the
+    entry; the old IP's leftover connection leaves the moved entry alone. Commit: this commit.
+  - [ ] T3b (android): generate and keep the client id, send it in every `register`.
+
+## Follow-ups
+
+- From review `review-f90e423bce7de49c` (test gaps, not defects; Android, not scheduled):
+  - The 5 s ping value is only asserted as a constant; nothing checks it reaches the OkHttp client.
+  - `ExecutorControlScheduler` dropping work after `shutdown` has no test.
+  - The outage flag resetting on `connect` after a Stop has no test.
 
 ## Acceptance criteria
 
@@ -79,23 +116,34 @@ Three facts from the code make it worse:
 - Restarting the desktop server: the phone reconnects once the server is back.
 - Pressing Stop while reconnecting stops all attempts; nothing reconnects after Stop or destroy.
 - A late callback from an old socket never affects the current connection.
+- A phone that returns from a new IP (DHCP) keeps one row on the desktop, with its mix; no second
+  row appears and no row is left showing as lost. Older phones without a client id behave as
+  before.
 
 ## Acceptance checks
 
 - `gradle -p apps/android :app:testDebugUnitTest assembleDebug` (with the JAVA_HOME and
   ANDROID_HOME used for the link-health feature)
-- `cargo test -p personal-monitoring` (unchanged, regression only)
+- `cargo test -p personal-monitoring` (regression for T1/T1b; new tests for T3)
+- `cargo test -p mixlink-desktop`, `cargo fmt --all -- --check`,
+  `cargo check --workspace --all-targets` (T3)
 
 ## Route
 
 - T1: delegated direct, one writer (2+ non-trivial Android files).
 - T1b: delegated direct, the same writer (seam plus behaviour fixes across 2+ Android files).
 - T2: parent with the user on the device.
+- T3: delegated direct, one writer (2+ non-trivial files across the server and the Android app),
+  two work-unit commits: server, then Android.
 
 ## Delivery forecast
 
 About 300 to 400 authored changed lines, mostly tests; one pull request stacked on
 `feat/link-health-6-heartbeat` (#6). Strategy: `ask-on-risk`.
+
+T3 was added after the forecast: about 520 authored changed lines for the server commit (mostly
+tests) plus the Android commit, so the branch is now well over the ~400 forecast. The chain
+strategy for it is still to be chosen.
 
 ## Progress
 
@@ -144,6 +192,32 @@ About 300 to 400 authored changed lines, mostly tests; one pull request stacked 
     already-due attempt doing nothing), Stop closing a socket that is still opening, late callbacks
     from an older attempt ignored, flapping server backing off to the cap, backoff reset after the
     server is heard, one error per outage, receiver end stopping retries, and the ping interval.
+- Review `review-f90e423bce7de49c` left three test-gap suggestions; they are recorded under
+  Follow-ups.
+- T2 done (live on the S23 with the desktop). A Wi-Fi blip and a desktop engine restart both
+  reconnected on their own: registrations from new ports without any user action. When Wi-Fi
+  returned, DHCP gave the phone a new IP (192.168.1.10 to 192.168.1.3), and the server, which keys
+  musicians by IP, showed a second row while the old one stayed red ("lost") until the heartbeat
+  closed its connection and the grace period removed it. Server log, in order:
+  `control registration from 192.168.1.10:57874 ...`, `control registration from
+  192.168.1.3:58058 ...`, `control connection 192.168.1.10:57874 closed: nothing received for
+  10s, heartbeat missed`, `control registration 192.168.1.10:50000 removed after the grace
+  period`. That duplicate row is T3.
+- T3a done (route: delegated direct, one writer). What landed:
+  - `protocol.rs`: `RegisterCommand.client_id: Option<String>`, read through a lenient
+    deserializer: a string of 1 to 64 ASCII letters, digits and hyphens is kept; any other string
+    or JSON type is read as no id and the registration still parses.
+  - `targets.rs`: `TargetOrigin::Registered` stores the announced `client_id`;
+    `TargetRegistry::register` takes the id and returns a `Registration { address, moved_from }`.
+    A known id at another IP moves that entry (same `MixState`, `TargetCounters` and report slot
+    allocations, same list position, grace period cancelled), and an entry still keyed to the new
+    IP is removed so the table keeps one entry per IP.
+  - `control.rs`: passes the id to the registry and logs a move as
+    `control registration from <peer>: <address> as "<name>", moved from <old address>`. The
+    first-register-of-session rule clears the report on the moved entry because it now lives at
+    the peer's IP; the old IP's `PeerGuard` finds no entry at its IP, so its later close neither
+    marks the moved entry disconnected nor removes it.
+  - About 520 authored changed lines, over the ~400 heuristic: about 400 of them are tests.
 
 ## Verification
 
@@ -163,4 +237,15 @@ About 300 to 400 authored changed lines, mostly tests; one pull request stacked 
 - T1b GREEN: `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL, 106
   tests (94 before, 12 new), 0 failures, 0 errors; `compileDebugKotlin` and `assembleDebug` ran
   with no Kotlin warnings. `cargo fmt --all -- --check`: clean.
-- T2 (live on the S23): pending.
+- T2 (live on the S23): reconnection verified by the user; the duplicate row on an IP change is
+  the evidence that opened T3 (see Progress).
+- T3a RED (tests first; stubs that compile: `client_id` skipped by serde, `register` ignoring the
+  id): `cargo test -p personal-monitoring`: 170 tests, 7 failed: both protocol tests that expect an
+  id (`left: None, right: Some(...)`), four registry tests (`moved_from: None` where
+  `Some(192.168.1.10:50000)` was expected; "the moved row is still connected"), and the socket
+  test (`one row, not a second one for the new IP`, `left: 2, right: 1`). The other 4 new tests
+  passed already: they pin the id-less behaviour, the ignored invalid ids and the id recorded on
+  takeover.
+- T3a GREEN: `cargo test -p personal-monitoring`: 170 passed (159 before, 11 new), 0 failed;
+  `cargo test -p mixlink-desktop`: 21 passed; `cargo fmt --all -- --check`: clean;
+  `cargo check --workspace --all-targets`: no warnings.

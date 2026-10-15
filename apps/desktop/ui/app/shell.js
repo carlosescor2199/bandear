@@ -7,7 +7,8 @@
 // heading stands in.
 //
 // In the MixLink app the console talks to the engine through Tauri. Opened in a browser as
-// `console.html?fake`, it runs against the simulated engine of lib/fake-bridge.js instead.
+// `index.html?fake` (served by dev/serve.mjs), it runs against the simulated engine of
+// lib/fake-bridge.js instead.
 
 import { createTauriBridge } from "./lib/bridge.js";
 import { createConsoleApp } from "./lib/console-app.js";
@@ -116,7 +117,7 @@ function unavailableScreen(main) {
   );
   const link = document.createElement("a");
   link.href = "?fake";
-  link.textContent = "console.html?fake";
+  link.textContent = "index.html?fake";
   note.append(link, ".");
   header.append(heading, note);
   main.append(header);

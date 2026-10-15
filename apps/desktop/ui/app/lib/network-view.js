@@ -1,5 +1,5 @@
 // What the Network and system screen shows and decides, worked out from the console state. Pure
-// functions, no DOM. The rules are the old window's (main.js), kept on purpose:
+// functions, no DOM. The rules are those of the first window, which they replace, kept on purpose:
 //
 // - ASIO loads a kernel-mode driver, so it is never chosen by default and never applied by a
 //   driver change alone: the engineer picks an ASIO driver explicitly before anything starts.

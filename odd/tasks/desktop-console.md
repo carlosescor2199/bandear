@@ -85,12 +85,26 @@ IBM Plex Sans for text and JetBrains Mono for numbers.
 
 ## Acceptance criteria
 
+Status at the end of T7: verified means proven by automated tests and the browser preview on
+the simulated engine; pending means it needs the live test with the Volt and the Galaxy S23.
+
 - Moving a fader, pan, mute or solo on the desktop changes what that phone plays, and the phone's
-  screen follows without the phone sending the change back.
-- A change made on the phone shows on the desktop.
-- With an interface that offers 4 inputs, 4 channels appear.
-- Meters move smoothly (event driven, not 250 ms polling).
-- All existing desktop features work from the new screens.
+  screen follows without the phone sending the change back. Verified: the engine's `set_mix`,
+  the `mix_state` push and the no-echo rule (server tests), the phone applying a pushed mix
+  (Android tests), the console's edits, coalescing and revisions (node tests). Pending: live.
+- A change made on the phone shows on the desktop. Verified: `mix-changed` events (desktop
+  tests) and the store taking the newest revision (node tests, the fake engine's phone changes
+  in the preview). Pending: live.
+- With an interface that offers 4 inputs, 4 channels appear. Verified: the capture's
+  configuration ranking (T1 server tests) and one strip per source channel (node tests).
+  Pending: live with the Volt.
+- Meters move smoothly (event driven, not 250 ms polling). Verified: the 30 Hz `meters` event
+  (desktop tests), the falloff on audio time (T4b), one draw per animation frame (preview).
+  Pending: live.
+- All existing desktop features work from the new screens. Verified: start and stop (Mix top
+  bar), driver, device and buffer selection with the ASIO and group safeguards, device switch,
+  add and remove by address, rename, link health and the window title (Network and system;
+  node tests and the preview). Pending: live, ASIO included.
 
 ## Checks
 
@@ -379,9 +393,49 @@ user's decision.
   152 passed (143 after the first commit); `console.html?fake` with no console errors. No new
   clippy warnings. About 426 + 421 authored changed lines.
   Commit: this commit.
-- [ ] T7 (Network and system, switch): musicians table and audio setup moved from the old UI;
-  switch `index.html` to the new shell; delete the old `main.js` and styles; docs. Route:
-  delegated writer.
+- [x] T7 (Network and system, switch): musicians table and audio setup moved from the old UI;
+  switch `index.html` to the new shell; delete the old `main.js` and styles; docs; and the T6b
+  review's R3-001 to R3-003. Route: delegated writer. Three commits:
+  - Review fixes (c1fc18b). R3-001: a start whose status cannot be read and gets no status
+    event ends its retries with a connection error ("The engine started, but its status could
+    not be read: ...", Try again), the run kept live. R3-002: connecting is single-flight, so
+    overlapping Try again presses never register the listeners twice. R3-003: the contract is
+    structural: the `engine_status` command answers `{ state: "notRunning", run }` or the status
+    with `state: "running"` (`EngineStateDto`, `commands::engine_state`, one engine lock); the
+    console no longer matches the Rust error text. The Rust `engine_status` the probe example
+    uses is unchanged. A stale `dto.rs` comment that said "auto" prefers ASIO is corrected.
+  - The Network and system screen (bec8398): `lib/network-view.js` (rows, device labels, the
+    switch plan with the groups warning, live vs restart, the audio view, address checks, the
+    confirm gate, the window title), the controller's device list, `applyAudio` (ASIO refused
+    without a picked driver), `setAudio`, `switchDevice` and musician commands, and the
+    organisms `ml-musicians-table` (rename, local label, link with its numbers, guarded Remove:
+    Keep takes Remove's place and confirming works only after 600 ms; add by address) and
+    `ml-audio-setup` (driver, ASIO caution and explicit driver pick, devices, switch warning,
+    buffer, readouts, the restart explanation). A device list for another driver is never
+    offered. The window is titled after the device again (`setTitle` on the bridge).
+  - The switch (this commit): `console.html` became `ui/index.html`; the old `index.html`,
+    `main.js` and `styles.css` are gone; the dev server serves `/` as the console;
+    `apps/desktop/README.md` (run, preview with `?fake`, tests); the crate's description.
+  RED observed: Rust 4 compile errors (`engine_state`, `EngineStateDto`); node 7 failures
+  (the fake's state answers, the start left on "starting", listeners registered twice:
+  `{ status: 2, "mix-changed": 2, meters: 2 }`); then 9 for the Network logic (missing
+  `network-view.js`, the controller's device and musician commands, the window title).
+  GREEN: `cargo fmt -p mixlink-desktop -- --check` clean; `cargo test -p mixlink-desktop` 48
+  passed (3 new); `cargo build -p mixlink-desktop` ok after `cargo clean -p mixlink-desktop`,
+  and the binary embeds `index.html`, `app/lib/console-app.js` and
+  `app/screens/network-screen.js` but no `main.js`, `styles.css` or `console.html`; no
+  reference to them is left under `apps/desktop`; `fnm exec --using=default node --test
+  apps/desktop/ui/tests` 175 passed (154 after the first commit). Browser (served
+  `index.html?fake`, `#/mix` and `#/network`, the gallery): no console errors; add (a bad
+  address refused in words, a duplicate refused by the engine), rename with the local label,
+  the guarded Remove (a click before the pause does nothing, focus on Keep), ASIO listing only
+  its drivers with nothing picked and starting only on the picked one, the WASAPI switch warning
+  for groups, a buffer change on the same device, and the "2 phones need attention" link
+  landing on Network and system. The engine is untouched in this task. About 341 + 1,645 authored
+  changed lines plus this commit's moves and docs, over the 400-line heuristic: the screen
+  needs its view model, controller commands, two organisms and the container to replace the
+  old window's features, which are deleted in the same series.
+  Commit: this commit.
 
 ## Progress
 
@@ -446,9 +500,18 @@ user's decision.
   - SUGGESTION R3-003: any `engine_status` failure auto-started, and a failed event
     registration rejected `ready` unseen. Fixed: only "not running" starts; failures show with
     Try again.
+- T6b 08fe631 + 8c867c3: lineage `review-5bd7afae380f7484` over a31d96c..8c867c3 approved and
+  acknowledged. Next review base: 8c867c3. Its three WARNINGs, all fixed by T7 (c1fc18b):
+  - R3-001: a start with an unreadable status and no status event stayed on "starting" with
+    nothing to press. Fixed: after the retries it is a connection error with Try again.
+  - R3-002: overlapping reconnects could register the event listeners twice. Fixed:
+    connecting is single-flight.
+  - R3-003: the auto-start depended on matching the Rust error text. Fixed structurally:
+    `engine_status` answers `state: "notRunning"` instead of failing.
 - Local preview: `.claude/launch.json` (excluded through `.git/info/exclude`) runs
-  `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`.
+  `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`; since T7 the console is
+  `/index.html?fake` (the running server answers `/` with the new index only after a restart).
 
 ## Next step
 
-T7.
+Live test with the Volt and the Galaxy S23, then PRs.

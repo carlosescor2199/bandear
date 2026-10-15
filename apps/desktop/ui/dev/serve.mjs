@@ -3,7 +3,8 @@
 //
 //   node apps/desktop/ui/dev/serve.mjs [port]      (port 5199 by default)
 //
-// Then open http://127.0.0.1:5199/console.html or http://127.0.0.1:5199/dev/gallery.html.
+// Then open http://127.0.0.1:5199/?fake (the console on a simulated engine) or
+// http://127.0.0.1:5199/dev/gallery.html (the components).
 
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -36,7 +37,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 function fileFor(url) {
   let pathname = decodeURIComponent(new URL(url, "http://localhost").pathname);
   if (pathname === "/") {
-    pathname = "/console.html";
+    pathname = "/index.html";
   }
   const file = resolve(ROOT, `.${pathname}`);
   return file === ROOT || file.startsWith(ROOT + sep) ? file : null;
@@ -82,6 +83,6 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, "127.0.0.1", () => {
   console.log(`Serving ${ROOT}`);
-  console.log(`  http://127.0.0.1:${port}/console.html`);
+  console.log(`  http://127.0.0.1:${port}/?fake`);
   console.log(`  http://127.0.0.1:${port}/dev/gallery.html`);
 });

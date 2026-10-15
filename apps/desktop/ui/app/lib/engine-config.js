@@ -1,6 +1,6 @@
 // The engine's start request and the audio choices it is built from. Pure functions, no DOM.
 //
-// The request is the one the old window sent (main.js `defaultConfig`): nobody configured (phones
+// The request is the one the first window sent (its `defaultConfig`): nobody configured (phones
 // join on their own or are added by address), the default control port, no groups, the chosen
 // driver and buffer. The driver is "auto" (the system's own) unless the engineer chose another:
 // ASIO is never picked by default.

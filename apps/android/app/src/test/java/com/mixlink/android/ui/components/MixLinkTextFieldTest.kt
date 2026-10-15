@@ -108,6 +108,22 @@ class MixLinkTextFieldTest {
     }
 
     @Test
+    fun overTheLimitAPasteOverASelectionChangesNothing() {
+        // A 15-character name given from outside to a 10-character field; "Es" selected and "XYZ"
+        // pasted over it. There is no room for any of it, so the selection is not deleted either.
+        val shown = FieldText("Carlos Escudero", 7, 9)
+        assertEquals(shown, keptEdit(shown, FieldText("Carlos XYZcudero", 10), maxLength = 10))
+    }
+
+    @Test
+    fun atTheLimitAPasteOverASelectionThatCannotKeepAWholeCharacterChangesNothing() {
+        // "s" selected in a full field and a guitar emoji (two UTF-16 units) pasted over it: one
+        // unit of room would split it, so nothing is pasted and the "s" stays.
+        val shown = FieldText("Carlos", 5, 6)
+        assertEquals(shown, keptEdit(shown, FieldText("Carlo🎸", 7), maxLength = 6))
+    }
+
+    @Test
     fun theCutOfAPasteNeverSplitsATwoUnitCharacter() {
         // Two guitar emoji, two UTF-16 units each, pasted before "Ana" with room for three units.
         val kept = keptEdit(FieldText("Ana", 0), FieldText("🎸🎸Ana", 4), maxLength = 6)

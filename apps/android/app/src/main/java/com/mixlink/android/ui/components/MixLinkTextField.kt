@@ -71,14 +71,15 @@ data class FieldText(
  * is kept and only what the edit inserts is cut to fit, as the old field's length filter did: a
  * name pasted in front of a name keeps the whole name after it. The cut is one character shorter
  * when it would split a character made of two UTF-16 units (an emoji, say), and the cursor goes
- * after the part that was kept. At the limit, further keys and pastes do nothing.
+ * after the part that was kept. An edit none of whose text fits changes nothing, not even the
+ * selection it would have replaced: at the limit, or over it, further keys and pastes do nothing.
  */
 fun keptEdit(shown: FieldText, proposed: FieldText, maxLength: Int): FieldText {
     if (proposed.text.length <= maxLength || proposed.text.length <= shown.text.length) return proposed
     val edit = editAtSelection(shown, proposed) ?: editByComparison(shown.text, proposed.text)
     val room = maxLength - (shown.text.length - edit.replacedLength)
     val kept = fitted(edit.inserted, room)
-    if (kept.isEmpty() && edit.replacedLength == 0) return shown
+    if (kept.isEmpty()) return shown
     val text = shown.text.substring(0, edit.start) + kept + shown.text.substring(edit.start + edit.replacedLength)
     return FieldText(text, edit.start + kept.length)
 }

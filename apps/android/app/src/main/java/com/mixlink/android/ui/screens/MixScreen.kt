@@ -105,7 +105,7 @@ fun MixScreen(
     val channels = remember(mix) { mix.channels }
     val groups = remember(mix) { mix.groups }
     val banner = connectionBanner(connection)
-    val sheetChannel = openChannel?.let { channels.getOrNull(it) }
+    val sheetChannel = sheetChannelFor(channels, openChannel)
     // A channel the server no longer announces has no sheet; it does not reopen if it comes back.
     LaunchedEffect(openChannel, sheetChannel == null) {
         if (sheetChannel == null) openChannel = null

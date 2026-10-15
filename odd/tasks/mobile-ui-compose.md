@@ -102,6 +102,9 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (bundled i
   download. The user approved it; see Progress. Commit: this commit.
 - [x] T6 (launcher icon): the app still showed the default Android robot; an adaptive MixLink icon
   drawn in-house as vectors. Commit: this commit.
+- [x] T4c (review follow-ups): the two suggestions of T4b's native review (lineage
+  `review-750e0cd8bc15bcc0`, approved): the channel sheet finds its channel by index, and a paste
+  with no room changes nothing. Commit: this commit.
 - [ ] Live check of the bundled fonts and the launcher icon on the S23 (parent).
 
 ## Acceptance criteria
@@ -559,3 +562,31 @@ features.
     - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
       SUCCESSFUL, 41 tasks executed; 35 result files, 338 tests, 0 failures, 0 errors; no Kotlin
       warnings. Debug APK 26,752,765 bytes. `cargo fmt --all -- --check`: clean.
+  - `e1a4e7c` is the commit above. The T4b review follow-ups (T4c; lineage
+    `review-750e0cd8bc15bcc0`, approved, two suggestions), this commit:
+    - The open channel sheet found its channel by position in the list
+      (`channels.getOrNull(openChannel)`) while a strip reports its `channel.index`; the two agree
+      today only because the list holds every channel in order. The lookup moved into the pure
+      `sheetChannelFor(channels, openChannel)` (`ChannelSheetText.kt`), which finds the channel by
+      index; when that channel is no longer announced it returns null and `MixScreen` closes the
+      sheet, as before.
+    - `keptEdit`: with a text already longer than `maxLength` (given from outside), a paste over a
+      selection had no room, so the selection was deleted and nothing pasted ("Carlos Escudero",
+      limit 10, "Es" selected, "XYZ" pasted gave "Carlos cudero"). The same happened at the limit
+      when the one unit of room would split an emoji pasted over a one-character selection. Now an
+      edit none of whose text fits changes nothing, selection included, as the KDoc says for the
+      limit; the KDoc names the over-limit case too.
+    - RED: 5 new tests (3 `ChannelSheetTextTest`: by index not position, a channel no longer
+      announced, no channel open; 2 `MixLinkTextFieldTest`: over the limit, and an emoji at the
+      limit, each over a selection) against the extracted position lookup and the unchanged
+      `keptEdit`: 27 run, 3 failed with assertions (`null` for channel 5 of [2, 5]; "Carlos cudero";
+      "Carlo"); the other two sheet tests are guards that pass on both. GREEN: all 27 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 35 result files, 343 tests (338 plus 5), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,752,765 bytes. `cargo fmt --all -- --check`: clean.
+    - `gradle -p apps/android assembleRelease -x lintVitalAnalyzeRelease` (with T5 and T6): BUILD
+      SUCCESSFUL; `aapt2 dump badging` reads `icon='res/BW.xml'` (the adaptive icon, path
+      shortened), and both fonts and both licenses are in the APK. Unsigned release APK 2,890,420
+      bytes.
+  - Next: the parent's live check on the S23 of the fonts and the icon (and the open T4 items),
+    then the stacked pull request.

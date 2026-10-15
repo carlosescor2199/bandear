@@ -1,9 +1,17 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
 pub(crate) const MAX_GROUPS: usize = 16;
 pub(crate) const OUTPUT_CHANNELS: u8 = 2;
+
+/// The next mix revision, shared by every mix in the process: a revision is never handed out
+/// twice, and a mix created later (a musician added again) starts above every earlier revision.
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The sentinel stored for a channel that belongs to no group, or to an invalid one.
 const NO_GROUP: u8 = u8::MAX;
@@ -67,7 +75,13 @@ pub(crate) struct MixState {
     /// musician's phone and the desktop) never interleave a read-merge-store and lose each other's
     /// fields. The network thread only loads the atomics and never takes it, so the audio path stays
     /// lock-free.
-    writer: Mutex<()>,
+    ///
+    /// It guards the mix's revision: every stored change takes a new, higher one, so a reader can
+    /// tell which of two copies of the mix is newer whatever order they reach it in.
+    writer: Mutex<u64>,
+    /// The revision for the lock-free [MixState::snapshot], set after each store. A snapshot taken
+    /// during a store may pair it with values of the change before; [MixState::current] never does.
+    published: AtomicU64,
 }
 
 /// A partial change to one client's mix: every absent field keeps its current value.
@@ -114,6 +128,8 @@ impl MixUpdate {
             // Membership is server configuration, never client input: preserve whatever the source
             // snapshot carried.
             channel_group: current.channel_group,
+            // The store that keeps the merge gives it its revision.
+            revision: current.revision,
             volume_percent: self
                 .volume_percent
                 .map_or(current.volume_percent, clamp_percent),
@@ -144,6 +160,9 @@ pub struct MixValues {
     pub volume_percent: u8,
     pub max_level_percent: u8,
     pub muted: bool,
+    /// Which stored version of the mix this is: every change stores a higher revision, so of two
+    /// copies of a musician's mix the one with the higher revision is newer. 0 is no stored mix.
+    pub revision: u64,
 }
 
 /// Default pan keeps the captured interleaved layout: even sources hard left, odd sources hard
@@ -158,6 +177,7 @@ fn default_pan(index: usize) -> u8 {
 
 impl Default for MixState {
     fn default() -> Self {
+        let revision = next_revision();
         Self {
             channel_gains: std::array::from_fn(|_| AtomicU8::new(100)),
             pans: std::array::from_fn(|index| AtomicU8::new(default_pan(index))),
@@ -168,7 +188,8 @@ impl Default for MixState {
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
-            writer: Mutex::new(()),
+            writer: Mutex::new(revision),
+            published: AtomicU64::new(revision),
         }
     }
 }
@@ -185,6 +206,7 @@ impl Default for MixValues {
             volume_percent: 100,
             max_level_percent: 100,
             muted: false,
+            revision: 0,
         }
     }
 }
@@ -235,13 +257,14 @@ impl MixState {
     /// a partial update's read and its store and undo part of that update.
     #[cfg(test)]
     pub(crate) fn update(&self, values: MixValues) {
-        let _writer = self.writer.lock().expect("mix writer lock poisoned");
-        self.store(values);
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        self.store(values, &mut revision);
     }
 
-    /// Stores every client-settable field. The caller holds the writer lock; the group membership
-    /// is server configuration and is left alone.
-    fn store(&self, values: MixValues) {
+    /// Stores every client-settable field under a new revision, which it returns. The caller holds
+    /// the writer lock and passes its revision; the group membership is server configuration and
+    /// is left alone.
+    fn store(&self, values: MixValues, revision: &mut u64) -> u64 {
         store_all(&self.channel_gains, &values.channel_gains);
         store_all(&self.pans, &values.pans);
         store_all_flags(&self.channel_muted, &values.channel_muted);
@@ -252,21 +275,37 @@ impl MixState {
         self.max_level_percent
             .store(values.max_level_percent, Ordering::Relaxed);
         self.muted.store(values.muted, Ordering::Relaxed);
+        *revision = next_revision();
+        self.published.store(*revision, Ordering::Release);
+        *revision
     }
 
-    /// Applies a partial update and returns the mix that is now stored.
+    /// Applies a partial update and returns the mix that is now stored, with its new revision.
     ///
     /// The read, merge and store happen under the writer lock, so the phone and the desktop can
     /// both change different parts of the same mix without one undoing the other: the last writer
     /// wins for the fields it carries, and nothing else. An update that cannot be applied leaves
-    /// the mix exactly as it was.
+    /// the mix exactly as it was, revision included.
     pub(crate) fn apply(&self, update: &MixUpdate) -> Result<MixValues, String> {
-        let _writer = self.writer.lock().expect("mix writer lock poisoned");
-        let merged = update.merge_into(self.snapshot())?;
-        self.store(merged);
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        let mut merged = update.merge_into(self.snapshot())?;
+        merged.revision = self.store(merged, &mut revision);
         Ok(merged)
     }
 
+    /// The stored mix with exactly its revision, read under the writer lock. For a reader that
+    /// compares revisions (a window, a status); the audio path uses the lock-free
+    /// [MixState::snapshot].
+    pub(crate) fn current(&self) -> MixValues {
+        let revision = self.writer.lock().expect("mix writer lock poisoned");
+        MixValues {
+            revision: *revision,
+            ..self.snapshot()
+        }
+    }
+
+    /// The stored mix, read without a lock for the audio path. Its revision may lag the values
+    /// while a store is in progress; use [MixState::current] when the revision must match.
     pub(crate) fn snapshot(&self) -> MixValues {
         MixValues {
             channel_gains: std::array::from_fn(|index| {
@@ -291,6 +330,7 @@ impl MixState {
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
+            revision: self.published.load(Ordering::Acquire),
         }
     }
 }
@@ -966,6 +1006,111 @@ mod tests {
             .join()
             .expect("the store finishes once the lock is free");
         assert_eq!(state.snapshot().volume_percent, 10);
+    }
+
+    #[test]
+    fn every_applied_change_takes_a_higher_revision() {
+        let state = MixState::new(&GroupLayout::default());
+        let start = state.current().revision;
+
+        let first = state
+            .apply(&MixUpdate {
+                volume_percent: Some(50),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let second = state
+            .apply(&MixUpdate {
+                muted: Some(true),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        assert!(first.revision > start);
+        assert!(second.revision > first.revision);
+        assert_eq!(
+            state.current(),
+            second,
+            "the stored mix carries its revision"
+        );
+        assert_eq!(state.snapshot().revision, second.revision);
+    }
+
+    #[test]
+    fn a_refused_change_keeps_the_revision() {
+        let state = MixState::new(&GroupLayout::default());
+        let before = state.current();
+
+        state
+            .apply(&MixUpdate {
+                group_levels: Some(vec![1; MAX_GROUPS + 1]),
+                ..MixUpdate::default()
+            })
+            .expect_err("a table longer than the mix is refused");
+
+        assert_eq!(state.current(), before);
+    }
+
+    #[test]
+    fn a_new_mix_starts_above_every_revision_handed_out_before() {
+        let old = MixState::new(&GroupLayout::default());
+        let changed = old
+            .apply(&MixUpdate {
+                volume_percent: Some(5),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        let fresh = MixState::new(&GroupLayout::default());
+
+        assert!(
+            fresh.current().revision > changed.revision,
+            "a musician removed and added again never looks older than before"
+        );
+    }
+
+    #[test]
+    fn concurrent_changes_take_distinct_increasing_revisions() {
+        const WRITERS: usize = 4;
+        const CHANGES: usize = 500;
+        let state = Arc::new(MixState::new(&GroupLayout::default()));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    (0..CHANGES)
+                        .map(|change| {
+                            state
+                                .apply(&MixUpdate {
+                                    volume_percent: Some(((writer + change) % 101) as i32),
+                                    ..MixUpdate::default()
+                                })
+                                .expect("a valid update applies")
+                                .revision
+                        })
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+
+        let mut all = Vec::new();
+        for writer in writers {
+            let revisions = writer.join().expect("the writer finishes");
+            assert!(
+                revisions.windows(2).all(|pair| pair[0] < pair[1]),
+                "each writer sees its own revisions rise"
+            );
+            all.extend(revisions);
+        }
+        let count = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), count, "no two changes share a revision");
+        assert_eq!(
+            Some(state.current().revision),
+            all.last().copied(),
+            "the stored mix carries the newest revision"
+        );
     }
 
     /// The phone and the desktop change different parts of one mix at the same moment, round after

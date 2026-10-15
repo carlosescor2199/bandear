@@ -8,7 +8,7 @@
 //   late events of an ended engine are ignored (see console-state.js).
 // - `edit` records local mix edits and sends them with `set_mix` through a per-musician
 //   coalescer: one request in flight per musician, the latest edits always sent, each answer
-//   settling the edits it carried.
+//   settling the edits it carried and offering its mix by revision.
 // - Meters skip the store: `onMeters` listeners get each `meters` payload of the live run.
 
 import { createEngineApi } from "./bridge.js";
@@ -46,8 +46,8 @@ export function createConsoleApp({ bridge, autoStart = true }) {
       return;
     }
     try {
-      await api.setMix(address, buildMixRequest(musician.mix, sent));
-      store.dispatch(actions.mixApplied(address, sent));
+      const answer = await api.setMix(address, buildMixRequest(musician.mix, sent));
+      store.dispatch(actions.mixApplied(address, sent, answer));
     } catch (error) {
       store.dispatch(actions.mixFailed(address, sent, error));
     }

@@ -1,9 +1,11 @@
 // A musician's mix: reading it from the engine's payloads, showing local edits over it, and turning
 // those edits into a `set_mix` request. Pure functions, no DOM.
 //
-// A mix is `{ channelGains, pans, channelMuted, channelSolo, groupLevels, volumePercent,
-// maxLevelPercent, muted }`, the camelCase `MixDto` of the desktop's JSON contract. The tables
-// always hold the engine's full 32 channel and 16 group entries.
+// A mix is `{ revision, channelGains, pans, channelMuted, channelSolo, groupLevels,
+// volumePercent, maxLevelPercent, muted }`, the camelCase `MixDto` of the desktop's JSON contract.
+// The tables always hold the engine's full 32 channel and 16 group entries. `revision` is the
+// engine's version of the stored mix: every change has a higher one, so of two copies the higher
+// revision is the newer. It is never edited or sent.
 //
 // A local edit is keyed by field, plus the entry for a table: "volumePercent", "channelGains.3".
 // The edits waiting for the engine's answer are a plain object of key to value.
@@ -25,11 +27,12 @@ const FLAGS = new Set(["muted", "channelMuted", "channelSolo"]);
 const FIELDS = new Set([...SCALARS, ...Object.keys(TABLES)]);
 
 /** The names of a mix's fields, as they appear flat on a status row. */
-export const MIX_FIELDS = Object.freeze([...FIELDS]);
+export const MIX_FIELDS = Object.freeze(["revision", ...FIELDS]);
 
 /** The mix the engine starts every musician with: unity levels, even channels left, odd right. */
 export function defaultMix() {
   return {
+    revision: 0,
     channelGains: new Array(MAX_CHANNELS).fill(100),
     pans: Array.from({ length: MAX_CHANNELS }, (_, index) => (index % 2 === 0 ? 0 : 100)),
     channelMuted: new Array(MAX_CHANNELS).fill(false),
@@ -46,7 +49,8 @@ export function defaultMix() {
  * `mix` of a `mix-changed` event. The tables are copied, so the mix owns them.
  */
 export function mixFromDto(source) {
-  const mix = {};
+  // A payload without a revision reads as the oldest copy there is.
+  const mix = { revision: Number.isInteger(source.revision) ? source.revision : 0 };
   for (const field of SCALARS) {
     mix[field] = source[field];
   }

@@ -128,6 +128,10 @@ pub struct MusicianDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MixDto {
+    /// The stored version of the mix: every change has a higher one. A status row, a
+    /// `mix-changed` event and a `set_mix` answer can reach the window in any order, so the window
+    /// keeps the copy with the highest revision.
+    pub revision: u64,
     pub volume_percent: u8,
     pub max_level_percent: u8,
     pub muted: bool,
@@ -141,6 +145,7 @@ pub struct MixDto {
 impl From<&MixValues> for MixDto {
     fn from(mix: &MixValues) -> Self {
         Self {
+            revision: mix.revision,
             volume_percent: mix.volume_percent,
             max_level_percent: mix.max_level_percent,
             muted: mix.muted,
@@ -665,6 +670,28 @@ mod tests {
         assert_eq!(json["channelSolo"][3], true);
         assert_eq!(json["groupLevels"][0], 70);
         assert!(json.get("mix").is_none(), "no nested object: {json}");
+    }
+
+    #[test]
+    fn the_mixs_revision_reaches_the_window_on_rows_changes_and_answers() {
+        let mix = MixValues {
+            revision: 41,
+            ..MixValues::default()
+        };
+        let musician = MusicianStatus {
+            mix,
+            ..musician_with_link(LinkStatus::default())
+        };
+        let address = "192.168.1.3:50000".parse().expect("test address");
+
+        let row = serde_json::to_value(MusicianDto::from(&musician)).expect("a row serializes");
+        let change = serde_json::to_value(MixChangedDto::new(address, MixOrigin::Engine, &mix, 1))
+            .expect("a change serializes");
+        let answer = serde_json::to_value(MixDto::from(&mix)).expect("an answer serializes");
+
+        assert_eq!(row["revision"], 41, "flat on a status row");
+        assert_eq!(change["mix"]["revision"], 41, "nested in a mix change");
+        assert_eq!(answer["revision"], 41, "in the set_mix answer");
     }
 
     #[test]

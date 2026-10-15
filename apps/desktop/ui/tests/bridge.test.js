@@ -191,6 +191,31 @@ test("the fake engine merges a desk's change from the first channel, answers the
   assert.deepEqual(status.musicians[1].channelGains, answer.channelGains);
 });
 
+test("every change of a fake mix takes a higher revision, from the desk or the phone", async () => {
+  const fake = createFakeBridge({ running: true });
+  const { address, revision: start } = sampleStatus().musicians[0];
+
+  const answer = await fake.invoke("set_mix", { address, mix: { volumePercent: 50 } });
+  fake.changeFromPhone(address, { muted: true });
+  const row = (await fake.invoke("engine_status")).musicians[0];
+
+  assert.ok(answer.revision > start);
+  assert.ok(row.revision > answer.revision);
+});
+
+test("the fake engine can answer a desk's change before announcing it, as the desktop may", async () => {
+  const fake = createFakeBridge({ running: true, answersFirst: true });
+  const order = [];
+  await fake.listen("mix-changed", () => order.push("event"));
+  const { address } = sampleStatus().musicians[0];
+
+  await fake.invoke("set_mix", { address, mix: { volumePercent: 50 } });
+  order.push("answer");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(order, ["answer", "event"]);
+});
+
 test("the fake engine refuses what the real one refuses", async () => {
   const fake = createFakeBridge({ running: true });
   const { address } = sampleStatus().musicians[0];
@@ -272,7 +297,8 @@ test("a request built from local edits leaves the fake engine with the mix the e
     mix: buildMixRequest(mix, edits),
   });
 
-  assert.deepEqual(answer, applyEdits(mix, edits));
+  assert.deepEqual({ ...answer, revision: 0 }, { ...applyEdits(mix, edits), revision: 0 });
+  assert.ok(answer.revision > mix.revision, "the change is a newer revision");
 });
 
 test("synthetic meters cover every channel and musician with whole 0-100 peaks", () => {

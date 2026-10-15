@@ -16,10 +16,10 @@
 //   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
-// never jumps back to an older value while its change is on the way. The engine's mix follows only
-// the `status` and `mix-changed` events, which arrive in the engine's order; a `set_mix` answer
-// only settles the edits it carried, since a phone may have changed the mix again by the time it
-// arrives.
+// never jumps back to an older value while its change is on the way. Each copy of a musician's mix
+// carries the engine's revision, and a status row, a `mix-changed` event and a `set_mix` answer
+// can arrive in any order: the store keeps the copy with the highest revision from any of them and
+// never goes back to a lower one. An answer also settles the edits it carried.
 //
 // Every engine payload names its run. Starting, a failed start and a stop end the current run, and
 // a payload of an ended or older run is ignored, so a late event can never bring back an engine
@@ -61,8 +61,8 @@ export const actions = Object.freeze({
   mixChanged: ({ run, address, origin, mix }) => ({ type: "mix-changed", run, address, origin, mix }),
   /** Local edits to one musician's mix, keyed as `editKey` makes them. */
   mixEdit: (address, edits) => ({ type: "mix-edit", address, edits }),
-  /** The engine answered a `set_mix` that carried the edits `sent`. */
-  mixApplied: (address, sent) => ({ type: "mix-applied", address, sent }),
+  /** The engine answered a `set_mix` that carried the edits `sent` with the mix it stored. */
+  mixApplied: (address, sent, mix = null) => ({ type: "mix-applied", address, sent, mix }),
   /** A `set_mix` that carried the edits `sent` was refused. */
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
   /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
@@ -99,11 +99,21 @@ function onlyListed(pending, addresses) {
   return kept.length === Object.keys(pending).length ? pending : Object.fromEntries(kept);
 }
 
+// True when `incoming` is a newer copy of a musician's mix than `current`.
+function isNewer(incoming, current) {
+  return incoming.revision > current.revision;
+}
+
 function receiveStatus(state, status) {
   if (!isLiveRun(state, status.run)) {
     return state;
   }
-  const musicians = status.musicians.map(musicianFromDto);
+  // A status may have been read before a change the console already has: keep the newer mix.
+  const musicians = status.musicians.map((row) => {
+    const musician = musicianFromDto(row);
+    const known = musicianByAddress(state, musician.address);
+    return known && !isNewer(musician.mix, known.mix) ? { ...musician, mix: known.mix } : musician;
+  });
   const addresses = new Set(musicians.map((musician) => musician.address));
   let phase = status.stopped ? "stopped" : "running";
   if (state.engine.phase === "stopping") {
@@ -157,14 +167,17 @@ function isListed(state, address) {
   return state.musicians.some((musician) => musician.address === address);
 }
 
-function replaceMix(state, address, mix) {
-  if (!isListed(state, address)) {
+// Takes `mix` for `address` when it is newer than the copy the console has; never goes back.
+function offerMix(state, address, mix) {
+  const known = musicianByAddress(state, address);
+  const incoming = mixFromDto(mix);
+  if (!known || !isNewer(incoming, known.mix)) {
     return state;
   }
   return {
     ...state,
     musicians: state.musicians.map((musician) =>
-      musician.address === address ? { ...musician, mix: mixFromDto(mix) } : musician,
+      musician.address === address ? { ...musician, mix: incoming } : musician,
     ),
   };
 }
@@ -192,16 +205,18 @@ function edit(state, address, edits) {
 }
 
 // Only a listed musician can have pending edits (a status drops the others), so an answer for
-// anyone else has nothing to settle. The answer's own copy of the mix is never adopted: it is the
-// mix as it was when the request landed, and the events that followed it may already be newer.
-function answered(state, { address, sent }) {
+// anyone else has nothing to settle. The answer's mix is offered like any other copy: taken when
+// it is the newest yet (its event has not arrived), ignored when an event already brought a newer
+// one. Either way the edits it carried never leave the fader on an older value.
+function answered(state, { address, sent, mix }) {
   if (!isListed(state, address)) {
     return state;
   }
+  const next = mix ? offerMix(state, address, mix) : state;
   return {
-    ...state,
-    pending: withPending(state, address, settleEdits(state.pending[address], sent)),
-    mixError: state.mixError?.address === address ? null : state.mixError,
+    ...next,
+    pending: withPending(next, address, settleEdits(next.pending[address], sent)),
+    mixError: next.mixError?.address === address ? null : next.mixError,
   };
 }
 
@@ -231,7 +246,7 @@ export function consoleReducer(state, action) {
         ? state
         : { ...state, selected: action.address, departed: null };
     case "mix-changed":
-      return isLiveRun(state, action.run) ? replaceMix(state, action.address, action.mix) : state;
+      return isLiveRun(state, action.run) ? offerMix(state, action.address, action.mix) : state;
     case "mix-edit":
       return edit(state, action.address, action.edits);
     case "mix-applied":

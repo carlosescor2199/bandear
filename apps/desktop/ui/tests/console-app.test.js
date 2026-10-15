@@ -137,6 +137,25 @@ test("fader moves reach set_mix one at a time, and the latest value always goes 
   app.dispose();
 });
 
+test("when the answer comes before its event, the fader never shows an older value", async () => {
+  const { fake, app } = await connected({ answersFirst: true });
+  const shown = [];
+  app.store.subscribe((state) => shown.push(viewMix(state, LEAD).channelGains[1]));
+
+  app.edit(LEAD, { "channelGains.1": 40 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(shown.length >= 2, "the edit, the answer and the event all reached the store");
+  assert.ok(
+    shown.every((value) => value === 40),
+    `shown: ${shown.join(", ")}`,
+  );
+  assert.deepEqual(pendingEdits(app.store.getState(), LEAD), {});
+  assert.equal(musicianByAddress(app.store.getState(), LEAD).mix.channelGains[1], 40);
+  assert.equal(commands(fake, "set_mix").length, 1);
+  app.dispose();
+});
+
 test("a phone change between the desk's request and its answer stays on screen", async () => {
   const { fake, app } = await connected();
   fake.holdAnswers("set_mix");

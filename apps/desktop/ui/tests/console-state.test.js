@@ -60,8 +60,12 @@ function reduce(list, state = initialState) {
   return list.reduce(consoleReducer, state);
 }
 
+// The status rows' mixes are revision 0; every mix made here is newer than all made before it,
+// unless the test names its revision.
+let lastRevision = 10;
 function mixWith(changes) {
-  return { ...defaultMix(), ...changes };
+  lastRevision += 1;
+  return { ...defaultMix(), revision: lastRevision, ...changes };
 }
 
 const twoMusicians = actions.status(status([row(ANA, { name: "Ana" }), row(BO)]));
@@ -293,11 +297,11 @@ test("an answer settles the edits it carried, and an edit made since keeps showi
   assert.equal(viewMix(settled, BO).channelGains[1], 45);
 });
 
-test("an answer never replaces the engine's mix, so a phone change that came after it stays", () => {
-  const phoneMix = mixWith({ volumePercent: 30 });
-  phoneMix.channelGains[1] = 90;
-  const answerMix = mixWith({});
+test("an older answer never rolls back the mix, so a phone change that came after it stays", () => {
+  const answerMix = mixWith({ revision: 5 });
   answerMix.channelGains[1] = 40;
+  const phoneMix = mixWith({ revision: 6, volumePercent: 30 });
+  phoneMix.channelGains[1] = 90;
 
   const state = reduce([
     twoMusicians,
@@ -306,12 +310,65 @@ test("an answer never replaces the engine's mix, so a phone change that came aft
     actions.mixChanged({ run: 1, address: BO, origin: "desktop", mix: answerMix }),
     actions.mixChanged({ run: 1, address: BO, origin: "phone", mix: phoneMix }),
     // ...and the answer to the desk's request, holding the mix as it was then, comes last.
-    { ...actions.mixApplied(BO, { "channelGains.1": 40 }), mix: answerMix },
+    actions.mixApplied(BO, { "channelGains.1": 40 }, answerMix),
   ]);
 
   assert.equal(viewMix(state, BO).channelGains[1], 90, "the phone's later change stays");
   assert.equal(viewMix(state, BO).volumePercent, 30);
   assert.equal(BO in state.pending, false);
+});
+
+test("an answer that comes before its event shows its mix at once, and the event changes nothing", () => {
+  const answerMix = mixWith({ revision: 5 });
+  answerMix.channelGains[1] = 40;
+  const sent = { "channelGains.1": 40 };
+
+  const answered = reduce([
+    twoMusicians,
+    actions.mixEdit(BO, sent),
+    actions.mixApplied(BO, sent, answerMix),
+  ]);
+
+  assert.equal(viewMix(answered, BO).channelGains[1], 40, "never the older value");
+  assert.equal(BO in answered.pending, false);
+  assert.equal(musicianByAddress(answered, BO).mix.revision, 5);
+  const late = actions.mixChanged({ run: 1, address: BO, origin: "desktop", mix: answerMix });
+  assert.equal(consoleReducer(answered, late), answered);
+});
+
+test("an event that comes before the answer shows the change, and the answer settles it", () => {
+  const engineMix = mixWith({ revision: 5 });
+  engineMix.channelGains[1] = 40;
+  const sent = { "channelGains.1": 40 };
+
+  const state = reduce([
+    twoMusicians,
+    actions.mixEdit(BO, sent),
+    actions.mixChanged({ run: 1, address: BO, origin: "desktop", mix: engineMix }),
+  ]);
+  assert.equal(viewMix(state, BO).channelGains[1], 40);
+
+  const settled = reduce([actions.mixApplied(BO, sent, engineMix)], state);
+  assert.equal(viewMix(settled, BO).channelGains[1], 40);
+  assert.equal(BO in settled.pending, false);
+});
+
+test("a status with an older revision never rolls the mix back, and a newer one is taken", () => {
+  const engineMix = mixWith({ revision: 5 });
+  engineMix.channelGains[1] = 40;
+  const changed = reduce([
+    twoMusicians,
+    actions.mixChanged({ run: 1, address: BO, origin: "phone", mix: engineMix }),
+  ]);
+
+  const older = reduce([actions.status(status([row(ANA), row(BO, { revision: 4 })]))], changed);
+  assert.equal(viewMix(older, BO).channelGains[1], 40, "the status was read before the change");
+
+  const newerRow = row(BO, { revision: 6 });
+  newerRow.channelGains = [...newerRow.channelGains];
+  newerRow.channelGains[1] = 70;
+  const newer = reduce([actions.status(status([row(ANA), newerRow]))], older);
+  assert.equal(viewMix(newer, BO).channelGains[1], 70);
 });
 
 test("a refused change falls back to the server's mix and keeps the error for that musician", () => {

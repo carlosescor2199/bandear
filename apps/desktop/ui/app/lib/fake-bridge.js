@@ -59,6 +59,7 @@ function musicianRow(address, names, link, mixChanges = {}) {
     nameIsLocal: false,
     ...names,
     ...mergeMixUpdate(defaultMix(), mixChanges),
+    revision: 1,
     packetsSent: 0,
     packetsDiscarded: 0,
     ...link,
@@ -158,7 +159,10 @@ function withPort(address) {
 
 /**
  * The fake bridge. `running` starts the engine already running, as run `status.run`; `failStart`
- * is the error every start fails with (none by default). Besides `invoke` and `listen` it offers
+ * is the error every start fails with (none by default); `answersFirst` delivers a `set_mix`
+ * answer before its `mix-changed` event, an order the desktop's two channels allow (by default
+ * the event comes first). Every stored mix change takes a higher `revision`, as in the engine.
+ * Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
  * (timers until the returned stop function is called), `holdAnswers(command)` and
@@ -170,6 +174,7 @@ export function createFakeBridge({
   devices = sampleDevices(),
   running = false,
   failStart = null,
+  answersFirst = false,
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
@@ -177,6 +182,7 @@ export function createFakeBridge({
   let isRunning = running;
   let run = running ? engine.run : 0;
   let startError = failStart;
+  let revision = Math.max(0, ...engine.musicians.map((musician) => musician.revision ?? 0));
 
   function emit(event, payload) {
     for (const handler of [...(listeners.get(event) ?? [])]) {
@@ -219,6 +225,8 @@ export function createFakeBridge({
     } catch (error) {
       throw error.message;
     }
+    revision += 1;
+    merged.revision = revision;
     Object.assign(row, merged);
     return merged;
   }
@@ -289,7 +297,12 @@ export function createFakeBridge({
     set_mix({ address, mix }) {
       requireRunning();
       const merged = mergeInto(musicianAt(address), mix);
-      announceMix(address, "desktop", merged);
+      if (answersFirst) {
+        // The answer settles at once; the event follows in a later task.
+        setTimeout(() => announceMix(address, "desktop", merged), 0);
+      } else {
+        announceMix(address, "desktop", merged);
+      }
       return clone(merged);
     },
   };

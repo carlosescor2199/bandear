@@ -22,6 +22,7 @@ const MIX_FIELDS = [
   "maxLevelPercent",
   "muted",
   "pans",
+  "revision",
   "volumePercent",
 ];
 
@@ -52,6 +53,20 @@ test("a status row's flat mix fields become a mix, and nothing else does", () =>
 
   assert.deepEqual(Object.keys(mix).sort(), MIX_FIELDS);
   assert.equal(mix.volumePercent, 42);
+});
+
+test("a mix keeps the engine's revision, and a payload without one reads as the oldest", () => {
+  assert.equal(defaultMix().revision, 0);
+  assert.equal(mixFromDto({ ...defaultMix(), revision: 41 }).revision, 41);
+  const { revision: _revision, ...withoutRevision } = defaultMix();
+  assert.equal(mixFromDto(withoutRevision).revision, 0);
+});
+
+test("the revision is the engine's, never part of an edit or a request", () => {
+  assert.throws(() => parseEditKey("revision"), /mix edit/);
+  const mix = { ...defaultMix(), revision: 7 };
+  assert.deepEqual(buildMixRequest(mix, { volumePercent: 80 }), { volumePercent: 80 });
+  assert.equal(applyEdits(mix, { volumePercent: 80 }).revision, 7);
 });
 
 test("a mix read from a payload owns its tables", () => {

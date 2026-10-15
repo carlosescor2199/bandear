@@ -53,31 +53,91 @@ import com.mixlink.android.ui.theme.MixLinkType
 fun adoptOutsideText(outside: String, shown: String, focused: Boolean): Boolean = !focused && outside != shown
 
 /**
+ * A field's text and its selection, as plain numbers so the editing rules can be tested on the
+ * JVM. Equal ends are a cursor; [selectionStart] comes after [selectionEnd] when the selection was
+ * made backwards.
+ */
+data class FieldText(
+    val text: String,
+    val selectionStart: Int = text.length,
+    val selectionEnd: Int = selectionStart,
+)
+
+/**
  * What a field limited to [maxLength] characters keeps when an edit turns [shown] into [proposed].
  *
  * An edit that fits, or that does not make the text longer, is kept as it is, so a text that is
- * already too long (given from outside) can still be shortened. At the limit, further keys do
- * nothing. A paste that would pass the limit keeps its first characters up to it, one fewer when
- * the cut would split a character made of two UTF-16 units (an emoji, say).
+ * already too long (given from outside) can still be shortened. Otherwise the text already there
+ * is kept and only what the edit inserts is cut to fit, as the old field's length filter did: a
+ * name pasted in front of a name keeps the whole name after it. The cut is one character shorter
+ * when it would split a character made of two UTF-16 units (an emoji, say), and the cursor goes
+ * after the part that was kept. At the limit, further keys and pastes do nothing.
  */
-fun keptEdit(shown: String, proposed: String, maxLength: Int): String = when {
-    proposed.length <= maxLength || proposed.length <= shown.length -> proposed
-    shown.length >= maxLength -> shown
-    else -> {
-        val splitsPair = maxLength > 0 && Character.isHighSurrogate(proposed[maxLength - 1])
-        proposed.substring(0, if (splitsPair) maxLength - 1 else maxLength)
+fun keptEdit(shown: FieldText, proposed: FieldText, maxLength: Int): FieldText {
+    if (proposed.text.length <= maxLength || proposed.text.length <= shown.text.length) return proposed
+    val edit = editAtSelection(shown, proposed) ?: editByComparison(shown.text, proposed.text)
+    val room = maxLength - (shown.text.length - edit.replacedLength)
+    val kept = fitted(edit.inserted, room)
+    if (kept.isEmpty() && edit.replacedLength == 0) return shown
+    val text = shown.text.substring(0, edit.start) + kept + shown.text.substring(edit.start + edit.replacedLength)
+    return FieldText(text, edit.start + kept.length)
+}
+
+/** [proposed] as [keptEdit] keeps it, for a plain text whose cursor is at its end. */
+fun keptEdit(shown: String, proposed: String, maxLength: Int): String =
+    keptEdit(FieldText(shown), FieldText(proposed), maxLength).text
+
+/** An edit of a text: [replacedLength] characters from [start] replaced by [inserted]. */
+private class TextEdit(val start: Int, val replacedLength: Int, val inserted: String)
+
+/**
+ * The edit as typing and pasting make it: the selection, or nothing at the cursor, replaced by
+ * new text. Null when [proposed] is not [shown] with its selection replaced, as after an edit made
+ * somewhere else (an autocorrection, say).
+ */
+private fun editAtSelection(shown: FieldText, proposed: FieldText): TextEdit? {
+    val length = shown.text.length
+    val start = minOf(shown.selectionStart, shown.selectionEnd).coerceIn(0, length)
+    val end = maxOf(shown.selectionStart, shown.selectionEnd).coerceIn(0, length)
+    val insertedLength = proposed.text.length - (length - (end - start))
+    if (insertedLength < 0) return null
+    val keepsStart = proposed.text.regionMatches(0, shown.text, 0, start)
+    val keepsEnd = proposed.text.regionMatches(start + insertedLength, shown.text, end, length - end)
+    if (!keepsStart || !keepsEnd) return null
+    return TextEdit(start, end - start, proposed.text.substring(start, start + insertedLength))
+}
+
+/**
+ * The edit read from the texts alone: what lies between the start and the end they share. Neither
+ * end splits a character made of two UTF-16 units.
+ */
+private fun editByComparison(shown: String, proposed: String): TextEdit {
+    val prefix = shown.commonPrefixWith(proposed).length
+    var suffix = shown.commonSuffixWith(proposed).length.coerceAtMost(minOf(shown.length, proposed.length) - prefix)
+    if (suffix > 0 && Character.isLowSurrogate(shown[shown.length - suffix])) suffix--
+    return TextEdit(prefix, shown.length - prefix - suffix, proposed.substring(prefix, proposed.length - suffix))
+}
+
+/** The start of [inserted] that fits in [room] characters without splitting a two-unit character. */
+private fun fitted(inserted: String, room: Int): String = when {
+    room <= 0 -> ""
+    room >= inserted.length -> inserted
+    Character.isHighSurrogate(inserted[room - 1]) -> inserted.substring(0, room - 1)
+    else -> inserted.substring(0, room)
+}
+
+/** [proposed] as [keptEdit] keeps it; an edit kept or refused whole keeps its own cursor. */
+private fun keptEdit(shown: TextFieldValue, proposed: TextFieldValue, maxLength: Int): TextFieldValue {
+    val shownText = shown.fieldText()
+    val proposedText = proposed.fieldText()
+    return when (val kept = keptEdit(shownText, proposedText, maxLength)) {
+        proposedText -> proposed
+        shownText -> shown
+        else -> TextFieldValue(kept.text, TextRange(kept.selectionStart, kept.selectionEnd))
     }
 }
 
-/** [proposed] as [keptEdit] keeps it, with the cursor kept inside the text. */
-private fun keptEdit(shown: TextFieldValue, proposed: TextFieldValue, maxLength: Int): TextFieldValue {
-    val text = keptEdit(shown.text, proposed.text, maxLength)
-    return when (text) {
-        proposed.text -> proposed
-        shown.text -> shown
-        else -> TextFieldValue(text, TextRange(proposed.selection.end.coerceAtMost(text.length)))
-    }
-}
+private fun TextFieldValue.fieldText() = FieldText(text, selection.start, selection.end)
 
 /** How a text field's text is set: in the text face, or in the number face for addresses and ports. */
 enum class FieldFace { TEXT, NUMBERS }

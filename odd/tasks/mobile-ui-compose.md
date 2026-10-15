@@ -91,8 +91,8 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
     switch pan could not be changed (it was still kept, sent, saved and recalled). The user chose:
     a strip's label opens a sheet for that channel with a large L–C–R pan control, its level, Mute
     and Solo, and each strip shows its pan under the label; the Mix screen must not grow. Done in
-    T4b (this commit; see Progress), which closes the acceptance criterion "every existing
-    control" again.
+    T4b (`f86414e`; see Progress), which closes the acceptance criterion "every existing control"
+    again.
 - [ ] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
   download.
 
@@ -410,7 +410,7 @@ features.
 - T4b (route: delegated direct, one writer; trigger: 2+ non-trivial files per work unit). The pan
   decision and the follow-ups of T4's native review (lineage `review-22d833ad2e134030`).
   Work-unit commits, in order:
-  - The channel sheet with pan (WARNING R3-pan-control-unreachable-after-switch), this commit:
+  - The channel sheet with pan (WARNING R3-pan-control-unreachable-after-switch), `f86414e`:
     - A strip's label is now a 44 dp button as wide as the strip ("Channel 3 settings" for a
       screen reader, which also hears "Pan left 30") showing the label and, under it, the pan:
       "C" at the centre, "L30" / "R20" for the share toward a side (L100 hard left, R100 hard
@@ -450,3 +450,25 @@ features.
       their previews, the pure mapping and 22 tests, which only make sense together.
     - No Compose UI tests (they need instrumentation): the sheet, the label button and the strip
       height need the live check.
+  - Paste truncation in name fields (WARNING R3-keptedit-truncates-existing-text-on-mid-insert),
+    this commit:
+    - `keptEdit` kept the first `maxLength` characters of the whole new text, so a paste at the
+      start or in the middle of a name that passed the limit cut off the end of the name (limit
+      10, "Carlos", "Escudero " pasted at the start gave "Escudero C"). It now works like the old
+      `InputFilter.LengthFilter`: it finds the edit (the selection, or nothing at the cursor,
+      replaced by the pasted text; or, when the selection does not explain it, what lies between
+      the start and the end both texts share, never splitting a two-unit character), keeps the
+      text already there, cuts only the inserted part to the room left (one unit shorter rather
+      than split an emoji), and puts the cursor after the kept part. The pure rule takes a new
+      `FieldText` (text and selection); the plain-text form stays for callers without a cursor.
+      Unchanged: an edit that fits or does not lengthen the text is kept whole, and at the limit
+      a key or paste does nothing.
+    - RED: 9 new `MixLinkTextFieldTest` tests (pastes that fit at the start, middle and end;
+      overflowing pastes at the start, middle and end; over a selection; at the limit; an emoji
+      at the cut; and the plain-text form found by comparison, twice) against a `TODO` stub for
+      the `FieldText` rule and the unchanged plain-text rule: 18 run, 9 failed (7
+      `NotImplementedError`; 2 assertions on the old rule, one of them "Escudero C" for
+      "EscuCarlos"). GREEN: all 18 pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 34 result files, 333 tests (324 plus 9), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,363,224 bytes. `cargo fmt --all -- --check`: clean.

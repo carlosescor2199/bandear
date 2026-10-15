@@ -84,8 +84,8 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
 - [ ] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
   state fixed; live check on the S23.
   - [x] Code: T3 review follow-ups (`69f613d`), receiver stop ordering (`538f990`), the switch to
-    Compose (see Progress). Checks per commit in Progress.
-  - [ ] Live check on the S23 (parent).
+    Compose (`0f51cb2`), R8 for release (see Progress). Checks per commit in Progress.
+  - [ ] Live check on the S23 (parent), on the debug and the minified release build.
   - [ ] Pan: the old screen had a pan slider per channel; the new screens have none, so after the
     switch pan cannot be changed (it is still kept, sent, saved and recalled). Needs a decision on
     where pan lives in the redesign. Reopens the acceptance criterion "every existing control".
@@ -386,3 +386,17 @@ features.
     - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
       SUCCESSFUL, 41 tasks executed; 32 result files, 302 tests (296 plus 6), 0 failures, 0
       errors; no Kotlin warnings. Debug APK 26,248,536 bytes. `cargo fmt --all -- --check`: clean.
+  - `0f51cb2` is the commit above. Release shrinking (the T1 follow-up), this commit:
+    - `release` runs R8: `isMinifyEnabled` and `isShrinkResources`, the default
+      `proguard-android-optimize.txt` and a new `proguard-rules.pro`. The app needs no keep rules
+      (no reflection, JSON by explicit keys, the ViewModel from an explicit factory; the libraries
+      bring their own); the file keeps source files and line numbers for readable crash traces.
+      R8 needed no extra rule and reported no missing class.
+    - `gradle -p apps/android assembleRelease -x lintVitalAnalyzeRelease`: BUILD SUCCESSFUL before
+      and after. Unsigned release APK 19,682,720 bytes unminified (at `0f51cb2`), 2,390,604 bytes
+      with R8 (about 88 % smaller). The build script prints the existing `kotlinOptions`
+      deprecation warning when it is recompiled; it was not introduced here.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 302 tests, 0 failures, 0 errors. Debug APK 26,248,536 bytes
+      (debug is not minified). `cargo fmt --all -- --check`: clean.
+    - The minified release build has not run on a phone yet: the S23 check should use it too.

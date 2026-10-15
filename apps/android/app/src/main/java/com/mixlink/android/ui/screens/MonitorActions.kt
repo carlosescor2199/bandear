@@ -21,6 +21,9 @@ interface MonitorActions {
 
     fun setChannelLevel(channel: Int, level: Int)
 
+    /** [pan] is 0 hard left, 50 centre, 100 hard right. */
+    fun setChannelPan(channel: Int, pan: Int)
+
     fun setChannelMuted(channel: Int, muted: Boolean)
 
     fun setChannelSoloed(channel: Int, soloed: Boolean)

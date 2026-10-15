@@ -2,6 +2,7 @@ package com.mixlink.android.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,8 +27,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mixlink.android.ui.components.GroupChip
@@ -35,6 +38,7 @@ import com.mixlink.android.ui.components.HorizontalFader
 import com.mixlink.android.ui.components.MuteSoloButtons
 import com.mixlink.android.ui.components.VerticalFader
 import com.mixlink.android.ui.components.groupToneFor
+import com.mixlink.android.ui.components.panText
 import com.mixlink.android.ui.state.ChannelUiState
 import com.mixlink.android.ui.state.GroupUiState
 import com.mixlink.android.ui.state.MixUiState
@@ -46,9 +50,20 @@ import com.mixlink.android.ui.theme.MixLinkType
 /** Two 44 dp keys, the gap between them and the strip's padding. */
 private val StripWidth = 104.dp
 
+/** The strip's padding above its content; a channel strip's label button sits closer to the top. */
+private val StripTopPadding = 10.dp
+private val ChannelStripTopPadding = 6.dp
+
+/**
+ * A channel strip's fader. The label button is 44 dp tall where the label was one line of about
+ * 17 dp, and it sits 4 dp closer to the top, so the fader gives up the remaining 24 dp of its usual
+ * 236 dp and the strip, and with it the Mix screen, is no taller than before.
+ */
+private val ChannelFaderHeight = 212.dp
+
 /** The fill colour of a strip's fader for [fill]. */
 @Composable
-private fun stripColor(fill: StripFill): Color {
+internal fun stripColor(fill: StripFill): Color {
     val colors = MixLinkTheme.colors
     return when (fill) {
         StripFill.ACCENT -> colors.accent
@@ -57,7 +72,10 @@ private fun stripColor(fill: StripFill): Color {
     }
 }
 
-/** One strip per channel, scrolling sideways; the musician's own strip stands out. */
+/**
+ * One strip per channel, scrolling sideways; the musician's own strip stands out. A strip's label
+ * opens that channel's sheet through [onOpen].
+ */
 @Composable
 internal fun ChannelRow(
     channels: List<ChannelUiState>,
@@ -65,6 +83,7 @@ internal fun ChannelRow(
     onLevel: (channel: Int, level: Int) -> Unit,
     onMuted: (channel: Int, muted: Boolean) -> Unit,
     onSoloed: (channel: Int, soloed: Boolean) -> Unit,
+    onOpen: (channel: Int) -> Unit,
 ) {
     if (channels.isEmpty()) {
         EmptyRow("Waiting for the server to announce its channels.")
@@ -82,6 +101,7 @@ internal fun ChannelRow(
                 onLevel = { onLevel(channel.index, it) },
                 onMuted = { onMuted(channel.index, it) },
                 onSoloed = { onSoloed(channel.index, it) },
+                onOpen = { onOpen(channel.index) },
             )
         }
     }
@@ -112,14 +132,16 @@ private fun ChannelStrip(
     onLevel: (Int) -> Unit,
     onMuted: (Boolean) -> Unit,
     onSoloed: (Boolean) -> Unit,
+    onOpen: () -> Unit,
 ) {
     val colors = MixLinkTheme.colors
     val highlighted = mine && moreOfMeOn
     StripPanel(
         background = if (mine) colors.surfaceSelected else colors.surface,
         border = if (highlighted) colors.accent else colors.border,
+        top = ChannelStripTopPadding,
     ) {
-        Text(channel.label, style = MixLinkType.Number, color = colors.text)
+        StripLabelButton(channel = channel, onOpen = onOpen)
         val group = channel.group
         if (group != null) {
             GroupChip(group.name, groupToneFor(group.index))
@@ -136,6 +158,7 @@ private fun ChannelStrip(
             onValueChange = onLevel,
             accent = stripColor(stripFillFor(channel.muted, mine, moreOfMeOn)),
             contentDescription = stripFaderDescription(channel.label, mine, channel.muted),
+            height = ChannelFaderHeight,
         )
         Text(
             text = stripValueText(channel.level, channel.muted),
@@ -176,15 +199,48 @@ private fun GroupStrip(group: GroupUiState, onLevel: (Int) -> Unit) {
     }
 }
 
+/**
+ * The channel's label as a button that opens its sheet, with the channel's pan written under it
+ * ("L30", "C", "R20") so the pan shows without opening anything. A full 44 dp tall and as wide as
+ * the strip.
+ */
 @Composable
-private fun StripPanel(background: Color, border: Color, content: @Composable () -> Unit) {
+private fun StripLabelButton(channel: ChannelUiState, onOpen: () -> Unit) {
+    val colors = MixLinkTheme.colors
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .clip(MixLinkShapes.Key)
+            .background(colors.surfaceRaised)
+            .border(1.dp, colors.border, MixLinkShapes.Key)
+            .clickable(role = Role.Button, onClickLabel = "Open the channel's settings", onClick = onOpen)
+            .semantics {
+                contentDescription = channelSettingsLabel(channel.index)
+                stateDescription = channelPanState(channel.pan)
+            },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(channel.label, style = MixLinkType.Number, color = colors.text)
+        Text(panText(channel.pan), style = MixLinkType.NumberSmall.copy(fontSize = 11.sp), color = colors.textSecondary)
+    }
+}
+
+@Composable
+private fun StripPanel(
+    background: Color,
+    border: Color,
+    top: Dp = StripTopPadding,
+    content: @Composable () -> Unit,
+) {
     Column(
         modifier = Modifier
             .width(StripWidth)
             .clip(MixLinkShapes.Panel)
             .background(background)
             .border(1.dp, border, MixLinkShapes.Panel)
-            .padding(start = 6.dp, end = 6.dp, top = 10.dp, bottom = 8.dp),
+            .padding(start = 6.dp, end = 6.dp, top = top, bottom = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {

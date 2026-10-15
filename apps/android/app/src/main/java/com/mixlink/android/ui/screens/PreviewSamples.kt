@@ -28,6 +28,7 @@ internal object PreviewSamples {
     private val mix = MixUiState(
         sourceChannels = 8,
         levels = listOf(72, 64, 88, 55, 60, 70, 45, 80),
+        pans = listOf(35, 60, 50, 0, 100, 50, 20, 80),
         mutes = listOf(false, false, false, true, false, false, false, false),
         solos = listOf(false, false, false, false, false, true, false, false),
         groupDefinitions = listOf(
@@ -140,6 +141,8 @@ internal object PreviewActions : MonitorActions {
     override fun disconnect() = Unit
 
     override fun setChannelLevel(channel: Int, level: Int) = Unit
+
+    override fun setChannelPan(channel: Int, pan: Int) = Unit
 
     override fun setChannelMuted(channel: Int, muted: Boolean) = Unit
 

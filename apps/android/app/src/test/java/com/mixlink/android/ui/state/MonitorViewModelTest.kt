@@ -10,6 +10,7 @@ import com.mixlink.android.MixSnapshot
 import com.mixlink.android.ui.components.LinkHealth
 import com.mixlink.android.ui.components.MainTab
 import com.mixlink.android.ui.components.PillKind
+import com.mixlink.android.ui.screens.MonitorActions
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -323,6 +324,16 @@ class MonitorViewModelTest {
         assertEquals(listOf(false, true), lastMix().getJSONArray("solos").booleans())
         assertEquals(listOf(50, 100), lastMix().ints("pans"))
         assertEquals(listOf(100, 40), state.mix.levels)
+    }
+
+    @Test
+    fun aPanFromTheScreensIsKeptAndSentAsAMix() {
+        val actions: MonitorActions = connected(channels = 2)
+
+        actions.setChannelPan(1, 35)
+
+        assertEquals(listOf(0, 35), state.mix.pans)
+        assertEquals(listOf(0, 35), lastMix().ints("pans"))
     }
 
     @Test

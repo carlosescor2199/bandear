@@ -16,12 +16,54 @@ private const val ADJUST_INTERVAL_PACKETS = 100
 private const val NANOS_PER_MILLISECOND = 1_000_000L
 
 /**
+ * Which receive loop owns the shared session flag: the one launched last.
+ *
+ * Every launch's loop runs while [running] is up, and a loop that ends lowers it, so a session
+ * whose receiver dies on its own ends too. Only the latest launch may do that: a loop still
+ * finishing after a newer launch leaves the flag, and so the newer session, alone.
+ *
+ * A finishing loop lowers the flag, reports its stop, and only then stops being [current]. A caller
+ * that launches again only once no receiver is current therefore never finds the receiver free
+ * with the old flag still to come down, and gets one stop report per launch, in launch order.
+ */
+internal class ReceiverLaunches<T : Any>(private val running: AtomicBoolean) {
+    /** The latest launch, until its loop has finished and reported; null when none is running. */
+    @Volatile
+    var current: T? = null
+        private set
+
+    /** [receiver] is the latest launch from now on; an older loop can no longer end the session. */
+    @Synchronized
+    fun launched(receiver: T) {
+        current = receiver
+    }
+
+    /**
+     * [receiver]'s loop ended. While it is still the latest launch it lowers the session flag; it
+     * reports through [report] either way, and then stops being [current].
+     */
+    fun finished(receiver: T, report: () -> Unit) {
+        synchronized(this) {
+            if (current === receiver) running.set(false)
+        }
+        try {
+            report()
+        } finally {
+            synchronized(this) {
+                if (current === receiver) current = null
+            }
+        }
+    }
+}
+
+/**
  * The UDP receive loop, AudioTrack playback and the receiver metrics.
  *
  * The player owns the socket, the receiver thread and the audio track, so it needs no `Context`.
  * It reports metrics, errors, completion and the `server owns the mix` decision through [Listener];
  * it never touches the UI itself. [running] is the shared session flag owned by the caller, so the
- * start/stop gating is identical to before the split.
+ * start/stop gating is identical to before the split. A loop that ends lowers the flag only while
+ * it is the latest launch ([ReceiverLaunches]), so a loop still finishing cannot end a newer session.
  */
 internal class PmonPlayer(
     private val listener: Listener,
@@ -54,23 +96,29 @@ internal class PmonPlayer(
 
         fun onError(message: String)
 
+        /**
+         * The loop of one launch ended, on request or on its own: called exactly once per launch,
+         * on the receive thread, after the session flag went down if this was the latest launch.
+         * The receiver still counts as alive until this returns, so a caller that waits for it to
+         * be free before launching gets the reports in launch order.
+         */
         fun onStopped()
     }
 
     @Volatile private var socket: DatagramSocket? = null
-    @Volatile private var receiverThread: Thread? = null
+    private val launches = ReceiverLaunches<Thread>(running)
 
-    fun isReceiverAlive(): Boolean = receiverThread?.isAlive == true
+    fun isReceiverAlive(): Boolean = launches.current?.isAlive == true
 
     fun launch(host: String, port: Int) {
         val thread = Thread({ receiveLoop(host, port) }, "pmon-udp-receiver")
-        receiverThread = thread
+        launches.launched(thread)
         thread.start()
     }
 
     fun stopReceiving() {
         socket?.close()
-        receiverThread?.interrupt()
+        launches.current?.interrupt()
     }
 
     private fun receiveLoop(host: String, port: Int) {
@@ -258,9 +306,9 @@ internal class PmonPlayer(
                 release()
             }
             socket = null
-            receiverThread = null
-            running.set(false)
-            listener.onStopped()
+            // The flag goes down (only if this is still the latest launch) before the receiver is
+            // free again, so no new session can start in between and be ended by this loop.
+            launches.finished(Thread.currentThread()) { listener.onStopped() }
         }
     }
 

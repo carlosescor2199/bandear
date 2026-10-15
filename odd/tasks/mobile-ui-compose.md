@@ -326,3 +326,20 @@ features.
     - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
       SUCCESSFUL, 41 tasks executed; 31 result files, 291 tests (278 plus 13), 0 failures, 0
       errors; no Kotlin warnings. Debug APK 26,300,706 bytes. `cargo fmt --all -- --check`: clean.
+  - `69f613d` is the commit above. `PmonPlayer` stop ordering (the T2b note), this commit:
+    - The receive loop's `finally` cleared the receiver before it lowered the shared session flag,
+      so a session started in that gap had its flag dropped by the previous loop and ended early.
+      The new `ReceiverLaunches` (in `PmonPlayer.kt`, pure, generic over the receiver) records the
+      latest launch; a finishing loop lowers the flag only while it is still the latest launch,
+      then reports `onStopped`, and only then frees the receiver. A caller that waits for the
+      receiver to be free (the ViewModel does) therefore never starts a session the old loop can
+      end, and still gets one stop report per launch, in launch order (now documented on
+      `Listener.onStopped`). The `socket` field is cleared as before; a newer launch can only open
+      its socket after the old loop has freed the receiver.
+    - RED: the 5 new `ReceiverLaunchesTest` tests against `TODO` stubs: 5 run, 5 failed
+      (`NotImplementedError`). A probe with the old ordering (free, then lower the flag
+      unconditionally, then report; not committed) failed exactly the 2 race tests. GREEN: all 5
+      pass.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 32 result files, 296 tests (291 plus 5), 0 failures, 0
+      errors; no Kotlin warnings. Debug APK 26,300,706 bytes. `cargo fmt --all -- --check`: clean.

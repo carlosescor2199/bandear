@@ -149,6 +149,8 @@ features.
 
 - T1 RED: the 24 new tests against `TODO` stubs: 24 run, 24 failed with `NotImplementedError`.
 - T1 GREEN: the same 24 pass.
-- T1 `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL; 155 tests
-  (131 before plus 24), 0 failures, 0 errors; no Kotlin warnings.
+- T1 `gradle -p apps/android :app:testDebugUnitTest assembleDebug`: BUILD SUCCESSFUL; 0 failures,
+  0 errors; no Kotlin warnings. Corrected count (parent recount with `--rerun-tasks`, 21 result
+  files): 139 tests, that is 115 before plus the 24 new ones. The writer's report of 155 (131 + 24)
+  was a miscount.
 - T1 `cargo fmt --all -- --check`: clean (no Rust changes).

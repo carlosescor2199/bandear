@@ -244,9 +244,58 @@ user's decision.
   missing). GREEN: `cargo test -p personal-monitoring` 204 passed (5 new, 1 read-decay test
   removed; the stall test 3 of 3 runs), `cargo test -p mixlink-desktop` 41 passed,
   `cargo build -p mixlink-desktop` ok, no new clippy warnings. Commit: this commit.
-- [ ] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the
-  state store and pure helpers with `node --test` tests; the old UI still runs. Route: delegated
-  writer.
+- [x] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the
+  state store and pure helpers with `node --test` tests; the old UI still runs (`index.html`,
+  `main.js` and `styles.css` untouched). Route: delegated writer. In `apps/desktop/ui`:
+  `app/tokens.css` (design colours, type, spacing, radii, 32/40 px targets, the IBM Plex Sans and
+  JetBrains Mono variable fonts copied from the Android app into `fonts/` with their OFL texts,
+  base styles, focus rings, reduced motion); pure modules in `app/lib/`: `store.js` (state,
+  reducer, subscribe; an action dispatched by a subscriber runs after the current round),
+  `console-state.js` (engine phase and status, musicians in status order with the mix nested,
+  the open musician kept across a stop, pending local edits shown over the engine's mix by
+  `viewMix` until the `set_mix` answer settles the edits it carried, the last refused change),
+  `mix.js` (`buildMixRequest`: only edited fields, a table sent from entry 0 up to the furthest
+  edit with the earlier entries as shown, whole 0-100 levels; `mergeMixUpdate` mirrors the
+  engine's merge), `values.js` (linear fader percent, keyboard steps 1/10 with Home/End, pan
+  labels L/C/R with a centre detent for drags and the keyboard, meters on a 60 dB scale with
+  hot from -6 dBFS and clip at full scale, group tones), `format.js` (readouts, capture format,
+  link words Good/Warning/Poor/Link lost/No audio/No reports/Not connected), `coalesce.js` (one
+  send in flight per musician, latest wins, trailing send guaranteed), `bridge.js` (the only
+  Tauri module, plus the engine API with the commands' argument names), `fake-bridge.js` (an
+  in-memory engine with the same shapes, merge rules and string refusals), `router.js`. Atoms
+  in `app/components/` (Shadow DOM, attributes in, CustomEvents out, no Tauri): `ml-fader`,
+  `ml-pan` (both on `slider.js`: role slider, arrows, Page Up/Down, Home/End, pointer drag that
+  keeps the grab point, double-click reset, `input`/`change`), `ml-meter` (role meter,
+  `setLevel` draws once per animation frame, spoken value at most twice a second), `ml-toggle`
+  (native button, aria-pressed, filled plus a lamp bar), `ml-group-chip`, `ml-status-pill`
+  (role status), `ml-link-state` (word plus a shaped mark). `console.html` and `app/shell.js`:
+  sidebar with Mix and Network and system, hash routing (`#/mix` default, unknown hashes
+  replaced), placeholder headings, focus moved to the heading on navigation, skip link, icon
+  rail below 1100 px and stacked below 640 px. `dev/gallery.html` shows every atom in its states
+  on the fake engine; `dev/serve.mjs` serves the folder on 127.0.0.1 (Node built-ins, traversal
+  refused). The sidebar is 212 px, not 200, so "Network and system" fits on one line. Known race
+  for T6: a `set_mix` answer replaces the stored mix, so a phone change that lands before the
+  answer to an earlier desk change shows the older mix until the next status (within 250 ms).
+  `node --test apps/desktop/ui/tests` loads the folder as one module, so `tests/index.js`
+  imports every suite (a new suite must be added there); `node --test` inside `apps/desktop/ui`
+  finds the `*.test.js` files on its own. Custom elements have no Node tests: their logic is in
+  the tested modules, and they were checked in a browser. RED observed: all 7 first suites
+  failed with `ERR_MODULE_NOT_FOUND` (store, values, format, mix, console-state, coalesce,
+  bridge), then the router suite the same way. GREEN: `fnm exec --using=default node --test
+  apps/desktop/ui/tests` 88 passed, 0 failed (83 in the first commit, 5 router tests);
+  `cargo build -p mixlink-desktop` ok after `cargo clean -p mixlink-desktop` (the UI folder
+  re-embedded). Dev server: gallery, console and modules served as text/html, text/javascript,
+  text/css and font/ttf; 404 for a missing file, 403 for an encoded traversal, 405 for POST,
+  400 for a malformed URL. Browser check (gallery and shell): no console errors; arrows,
+  Page Up/Down, Home/End, double-click reset, a thumb drag (one `change` at the end), the pan
+  stopping at the centre, the toggle; routing, title, focus and skip link; 1280, 900 and 480 px
+  wide without horizontal scroll. Preview: `fnm exec --using=default node
+  apps/desktop/ui/dev/serve.mjs 5199`, then http://127.0.0.1:5199/dev/gallery.html and
+  http://127.0.0.1:5199/console.html. About 2,660 + 1,990 authored changed lines (about 1,300
+  of them tests and 290 gallery markup), over the 400-line heuristic and the feature forecast:
+  T5 bundles tokens, state, mapping, bridge and fake, seven atoms, the shell, the gallery and the
+  dev server; the two commits split at the tested foundation and the visual layer. Commits:
+  13217be (tokens, store and bridge); this commit (atoms, shell and gallery).
 - [ ] T6 (Mix screen): top bar, musician tabs, channel strips, group strips and master strip
   wired to `set_mix` and the events. Route: delegated writer.
 - [ ] T7 (Network and system, switch): musicians table and audio setup moved from the old UI;
@@ -299,4 +348,4 @@ user's decision.
 
 ## Next step
 
-T5.
+T6.

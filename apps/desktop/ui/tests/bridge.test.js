@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { EVENTS, createEngineApi, createTauriBridge } from "../app/lib/bridge.js";
 import { createFakeBridge, sampleStatus, syntheticMeters } from "../app/lib/fake-bridge.js";
+import { formatGroupsSet } from "../app/lib/format.js";
 import { applyEdits, buildMixRequest, mixFromDto } from "../app/lib/mix.js";
 
 function recordingBridge() {
@@ -425,13 +426,19 @@ test("editing the fake engine's groups moves every musician's levels with their 
   const seen = await recordEvents(fake);
 
   // Vocals first and renamed, Drums deleted, Keys new.
-  const kept = await fake.invoke("set_groups", {
+  const outcome = await fake.invoke("set_groups", {
     groups: [
       { id: "vocals", name: "Vox", channels: [5, 6] },
       { name: "Keys", channels: [4] },
     ],
   });
 
+  assert.deepEqual(
+    { applied: outcome.applied, saved: outcome.saved, saveError: outcome.saveError },
+    { applied: true, saved: true, saveError: null },
+    "a running engine took them and they are kept",
+  );
+  const kept = outcome.groups;
   assert.equal(kept[0].id, "vocals");
   assert.ok(kept[1].id && kept[1].id !== "drums", `a new id: ${kept[1].id}`);
   assert.deepEqual(kept[1], { id: kept[1].id, name: "Keys", channels: [4] });
@@ -516,12 +523,15 @@ test("groups set while the fake engine is stopped apply at the next start, a mis
   const fake = createFakeBridge({ running: true });
   await fake.invoke("stop_engine");
 
-  await fake.invoke("set_groups", {
+  const outcome = await fake.invoke("set_groups", {
     groups: [
       { id: "drums", name: "Drums", channels: [1, 2] },
       { id: "rack", name: "Rack", channels: [9] },
     ],
   });
+  assert.equal(outcome.applied, false, "no engine took them");
+  assert.equal(outcome.saved, true);
+  assert.equal(formatGroupsSet(outcome), "Groups saved; they apply at the next start.");
   await fake.invoke("start_engine", { config: {} });
   const status = await fake.invoke("engine_status");
 

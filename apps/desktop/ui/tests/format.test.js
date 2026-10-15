@@ -5,6 +5,7 @@ import {
   formatBuffer,
   formatCaptureFormat,
   formatDb,
+  formatGroupsSet,
   formatPercent,
   formatSampleFormat,
   formatSampleRate,
@@ -14,6 +15,23 @@ import {
 } from "../app/lib/format.js";
 
 const MINUS = "−";
+
+test("a group edit says whether the phones have it now, later, or have it but it was not kept", () => {
+  const groups = [{ id: "kit", name: "Drums", channels: [1, 2] }];
+
+  assert.equal(
+    formatGroupsSet({ groups, applied: true, saved: true, saveError: null }),
+    "Groups applied to every phone.",
+  );
+  assert.equal(
+    formatGroupsSet({ groups, applied: false, saved: true, saveError: null }),
+    "Groups saved; they apply at the next start.",
+  );
+  assert.equal(
+    formatGroupsSet({ groups, applied: true, saved: false, saveError: "the disk is full" }),
+    "Groups applied to every phone, but not saved: the disk is full.",
+  );
+});
 
 function reporting(extra = {}) {
   return {

@@ -13,6 +13,8 @@ use personal_monitoring::{
     MixValues, MusicianStatus,
 };
 
+use crate::session::SessionGroup;
+
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
 /// Every field is optional so the window can send a partial object and let the defaults fill in.
@@ -50,6 +52,23 @@ pub struct GroupRequest {
     pub id: Option<String>,
     pub name: String,
     pub channels: Vec<usize>,
+}
+
+/// What [crate::commands::set_groups] did with an accepted list of groups.
+///
+/// `applied` says whether a running engine took the groups (every phone has them now); `saved`
+/// whether the session keeps them. With no engine running they are saved and apply at the next
+/// start (`applied: false, saved: true`). A running engine that took them while the save failed
+/// gives `applied: true, saved: false` with the reason in `saveError`. A list that is refused, by
+/// the check or by an engine that is stopping, is an error instead, and nothing changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsSetDto {
+    /// The groups in their order, each with its id (a new group's is the one the desk gave it).
+    pub groups: Vec<SessionGroup>,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
 }
 
 /// The capture format the engine selected, in plain values a webview can render.
@@ -950,6 +969,30 @@ mod tests {
             "joined by id, not name"
         );
         assert_eq!(json["channels"][1]["groupId"], "kit");
+    }
+
+    #[test]
+    fn a_group_edit_answers_what_was_done_in_camel_case() {
+        let answer = GroupsSetDto {
+            groups: vec![SessionGroup {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            }],
+            applied: false,
+            saved: true,
+            save_error: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(answer).expect("serializes"),
+            serde_json::json!({
+                "groups": [{ "id": "kit", "name": "Drums", "channels": [1, 2] }],
+                "applied": false,
+                "saved": true,
+                "saveError": null
+            })
+        );
     }
 
     #[test]

@@ -62,8 +62,11 @@ export function createEngineApi(bridge) {
     setMix: (address, mix) => bridge.invoke("set_mix", { address, mix }),
     /**
      * Replaces the groups: the whole list in its order, `[{ id, name, channels }]` with 1-based
-     * channels and no `id` for a new group. Resolves to the groups as kept, each with its id. The
-     * groups are saved and apply live; every musician's group levels follow their groups by id.
+     * channels and no `id` for a new group. Resolves to `{ groups, applied, saved, saveError }`:
+     * the groups each with its id, whether a running engine took them (every musician's group
+     * levels follow their groups by id) and whether they were saved; with no engine running they
+     * are saved and apply at the next start (see `formatGroupsSet`). A refused list rejects, and
+     * nothing changed.
      */
     setGroups: (groups) => bridge.invoke("set_groups", { groups }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),

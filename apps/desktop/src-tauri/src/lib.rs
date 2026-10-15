@@ -11,11 +11,11 @@ pub mod session;
 
 use commands::DesktopState;
 use dto::{
-    EngineStateDto, GroupRequest, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest,
-    StartSummary,
+    EngineStateDto, GroupRequest, GroupsSetDto, InputDeviceDto, MixDto, MixUpdateRequest,
+    StartRequest, StartSummary,
 };
 use events::EventPump;
-use session::{SessionGroup, SessionStore};
+use session::SessionStore;
 use tauri::{Manager, State};
 
 /// Fails to compile rather than at runtime if the shared state ever gains a non-`Send` field,
@@ -87,12 +87,13 @@ async fn set_musician_name(
 }
 
 /// Replaces the engineer's groups (`[{ id?, name, channels }]`, channels 1-based, a new group with
-/// no id) and answers the groups as kept, each with its id (see [commands::set_groups]).
+/// no id) and answers what was done: `{ groups, applied, saved, saveError }`, each group with its id
+/// (see [commands::set_groups] and [dto::GroupsSetDto]).
 #[tauri::command]
 async fn set_groups(
     state: State<'_, DesktopState>,
     groups: Vec<GroupRequest>,
-) -> Result<Vec<SessionGroup>, String> {
+) -> Result<GroupsSetDto, String> {
     commands::set_groups(state.inner(), groups)
 }
 

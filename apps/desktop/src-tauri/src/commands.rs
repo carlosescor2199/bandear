@@ -17,8 +17,8 @@ use personal_monitoring::{
 };
 
 use crate::dto::{
-    CaptureFormatDto, EngineStateDto, EngineStatusDto, GroupRequest, InputDeviceDto, MetersDto,
-    MixDto, MixUpdateRequest, StartRequest, StartSummary,
+    CaptureFormatDto, EngineStateDto, EngineStatusDto, GroupRequest, GroupsSetDto, InputDeviceDto,
+    MetersDto, MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
 use crate::session::{SessionGroup, SessionStore};
@@ -30,8 +30,10 @@ pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Sen
 /// session (see [crate::session]).
 ///
 /// The engine handle is behind a [Mutex] because the engine is already internally concurrent: the
-/// commands only need exclusive access to start, stop and take a snapshot. The session has its
-/// own lock, and the two are never held in the opposite order, so they cannot deadlock.
+/// commands only need exclusive access to start, stop, edit the groups and take a snapshot. The
+/// session has its own lock. Whenever both are held, the engine lock is taken first and the
+/// session's inside it (a status applies the labels, a start reads the groups, a group edit saves
+/// them), never the other way round, so they cannot deadlock.
 ///
 /// The pump's lock is taken first by start and stop and held throughout, so two quick starts can
 /// never leave two pumps running. The pump thread itself takes the engine lock to read, so a pump
@@ -182,9 +184,6 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 /// Groups the engine refuses there (a hand-edited session) are logged and the engine runs without
 /// them: the groups are a convenience and must not stop the server.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
-    // Read before the engine lock is taken: the two locks are never held together.
-    let saved_groups = session_groups_for(&request, &state.session);
-    let config = to_engine_config(request);
     let mut pump = state
         .pump
         .lock()
@@ -194,6 +193,10 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
         .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    // Read under the engine lock (the session's inside it), so a group edit cannot land between
+    // this read and the new engine taking the groups.
+    let saved_groups = session_groups_for(&request, &state.session);
+    let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -434,21 +437,55 @@ fn label_musician(
     Ok(())
 }
 
-/// Replaces the engineer's groups: keeps them in the session and, while an engine runs, applies
-/// them live. Returns the groups as kept, in their order and each with its id.
+/// Replaces the engineer's groups: applies them to the running engine, if any, and keeps them in
+/// the session. Returns what was done ([GroupsSetDto]), with the groups in their order, each with
+/// its id.
 ///
 /// `groups` is the whole list in its order (see [GroupRequest]); a group with no id is new and gets
-/// one. The list is checked as a running engine checks it ([check_groups]) before anything changes:
-/// at most 16 groups, a name each and no channel in two groups; a group naming a channel the current
-/// device lacks is kept and shows as invalid. The session is saved first and the running engine is
-/// changed only then, so a refused list or a failed save changes nothing at all. In the engine
-/// every musician's group levels follow their groups by id and every phone is sent the new groups
-/// (see [EngineHandle::set_groups]). An engine that is stopping refuses the change; the saved groups
-/// then apply at the next start.
-pub fn set_groups(
-    state: &DesktopState,
+/// one. The list is checked as a running engine checks it ([check_groups]): at most 16 groups, a
+/// name each and no channel in two groups; a group naming a channel the current device lacks is
+/// kept and shows as invalid. Then:
+///
+/// - With an engine running, the engine takes the groups first (every musician's group levels
+///   follow their groups by id and every phone is sent them, see [EngineHandle::set_groups]) and
+///   only then are they saved. A save that fails then is reported in the answer, not as an error,
+///   because the phones already have the groups.
+/// - An engine that is stopping refuses them: an error, and nothing changed.
+/// - With no engine, they are saved and apply at the next start (`applied: false`).
+///
+/// A refused list is an error and changes nothing. Each edit is one step under the engine lock, so
+/// two edits at once never leave the session and the engine with different groups.
+pub fn set_groups(state: &DesktopState, groups: Vec<GroupRequest>) -> Result<GroupsSetDto, String> {
+    let outcome = edit_groups(&state.engine, &state.session, groups)?;
+    println!(
+        "[mixlink-desktop] set_groups: {} groups, applied={} saved={}",
+        outcome.groups.len(),
+        outcome.applied,
+        outcome.saved
+    );
+    Ok(outcome)
+}
+
+/// What a group edit needs from the running engine: the engine itself in the app, a stand-in in
+/// the tests, which run without audio hardware.
+trait GroupEngine {
+    fn set_groups(&mut self, definitions: Vec<GroupDefinition>) -> Result<(), String>;
+}
+
+impl GroupEngine for EngineHandle {
+    fn set_groups(&mut self, definitions: Vec<GroupDefinition>) -> Result<(), String> {
+        EngineHandle::set_groups(self, definitions)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// [set_groups] over any engine slot and session.
+fn edit_groups<E: GroupEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
     groups: Vec<GroupRequest>,
-) -> Result<Vec<SessionGroup>, String> {
+) -> Result<GroupsSetDto, String> {
     let definitions = group_definitions(groups);
     check_groups(&definitions)?;
     let kept: Vec<SessionGroup> = definitions
@@ -459,19 +496,33 @@ pub fn set_groups(
             channels: group.channels.clone(),
         })
         .collect();
-    state.session.set_groups(kept.clone())?;
-    // The session's lock is released before the engine's is taken, as everywhere else.
-    let mut guard = state
-        .engine
+    // One step per edit: the engine lock is held from the apply through the save, so two edits
+    // never interleave and the session always ends with what the engine has. The session's lock
+    // is taken inside it, the order every command that holds both follows.
+    let mut guard = engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
-    if let Some(handle) = guard.as_mut() {
-        handle
-            .set_groups(definitions)
-            .map_err(|error| error.to_string())?;
-    }
-    println!("[mixlink-desktop] set_groups: {} groups", kept.len());
-    Ok(kept)
+    let applied = match guard.as_mut() {
+        // A refusal (an engine that is stopping) returns here, before anything is saved.
+        Some(engine) => {
+            engine.set_groups(definitions)?;
+            true
+        }
+        None => false,
+    };
+    let save_error = match session.set_groups(kept.clone()) {
+        Ok(()) => None,
+        // The phones already have the groups: say that they were not kept.
+        Err(error) if applied => Some(error),
+        // Nothing took them, so nothing changed.
+        Err(error) => return Err(error),
+    };
+    Ok(GroupsSetDto {
+        groups: kept,
+        applied,
+        saved: save_error.is_none(),
+        save_error,
+    })
 }
 
 /// Stops the engine's event pump, then the engine, and joins their threads. Stopping when idle is
@@ -941,7 +992,7 @@ mod tests {
     fn groups_set_without_an_engine_are_kept_with_their_ids_for_the_next_start() {
         let state = DesktopState::new(SessionStore::open(&session_directory("groups-idle")));
 
-        let kept = set_groups(
+        let outcome = set_groups(
             &state,
             vec![
                 request(None, " Drums ", &[1, 2]),
@@ -950,6 +1001,13 @@ mod tests {
         )
         .expect("the groups are kept");
 
+        assert!(
+            !outcome.applied,
+            "no engine took them: they apply at the next start"
+        );
+        assert!(outcome.saved);
+        assert_eq!(outcome.save_error, None);
+        let kept = outcome.groups;
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].name, "Drums", "names are trimmed");
         assert_eq!(state.session.groups(), kept);
@@ -961,9 +1019,137 @@ mod tests {
                 request(Some(&kept[0].id), "Drums", &[1, 2]),
             ],
         )
-        .expect("the groups are kept");
+        .expect("the groups are kept")
+        .groups;
         assert_eq!(renamed[0].id, kept[1].id);
         assert_eq!(renamed[1].id, kept[0].id);
+    }
+
+    /// Stands in for a running engine in a group edit: it records what it took, can be stopping,
+    /// and takes a moment to apply, as the real engine's regroup does.
+    #[derive(Default)]
+    struct StandInEngine {
+        applied: Option<Vec<GroupDefinition>>,
+        stopping: bool,
+    }
+
+    impl GroupEngine for StandInEngine {
+        fn set_groups(&mut self, definitions: Vec<GroupDefinition>) -> Result<(), String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.applied = Some(definitions);
+            Ok(())
+        }
+    }
+
+    fn running(engine: StandInEngine) -> Mutex<Option<StandInEngine>> {
+        Mutex::new(Some(engine))
+    }
+
+    fn applied_names(engine: &Mutex<Option<StandInEngine>>) -> Option<Vec<String>> {
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .and_then(|engine| engine.applied.as_ref())
+            .map(|groups| groups.iter().map(|group| group.name.clone()).collect())
+    }
+
+    #[test]
+    fn a_running_engine_takes_the_groups_and_then_they_are_saved() {
+        let session = SessionStore::open(&session_directory("groups-running"));
+        let engine = running(StandInEngine::default());
+
+        let outcome = edit_groups(&engine, &session, vec![request(None, "Drums", &[1, 2])])
+            .expect("the groups are taken");
+
+        assert!(outcome.applied && outcome.saved, "{outcome:?}");
+        assert_eq!(applied_names(&engine), Some(vec!["Drums".to_owned()]));
+        assert_eq!(session.groups(), outcome.groups);
+    }
+
+    #[test]
+    fn an_engine_that_is_stopping_refuses_the_groups_and_nothing_is_saved() {
+        let session = SessionStore::open(&session_directory("groups-stopping"));
+        session
+            .set_groups(vec![SessionGroup {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1],
+            }])
+            .expect("kept");
+        let before = session.groups();
+        let engine = running(StandInEngine {
+            stopping: true,
+            ..StandInEngine::default()
+        });
+
+        let error = edit_groups(&engine, &session, vec![request(None, "Vocals", &[3])])
+            .expect_err("a stopping engine refuses");
+
+        assert!(error.contains("stopping"), "{error}");
+        assert_eq!(session.groups(), before, "a refused list changes nothing");
+        assert_eq!(applied_names(&engine), None);
+    }
+
+    #[test]
+    fn groups_a_running_engine_took_but_the_session_could_not_keep_say_so() {
+        let directory = session_directory("groups-unsaved");
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(
+            directory.join(crate::session::SESSION_FILE),
+            r#"{"version":99}"#,
+        )
+        .expect("a newer session");
+        let session = SessionStore::open(&directory);
+        let engine = running(StandInEngine::default());
+
+        let outcome = edit_groups(&engine, &session, vec![request(None, "Drums", &[1])])
+            .expect("the engine took them");
+
+        assert!(outcome.applied);
+        assert!(!outcome.saved);
+        assert!(
+            outcome
+                .save_error
+                .as_deref()
+                .is_some_and(|error| error.contains("newer")),
+            "{outcome:?}"
+        );
+        assert_eq!(applied_names(&engine), Some(vec!["Drums".to_owned()]));
+    }
+
+    /// Two windows (or two quick clicks) edit the groups at the same moment while the engine is busy
+    /// (a status read holds it), round after round: whichever edit wins, the session and the running
+    /// engine always end with the same one.
+    #[test]
+    fn two_group_edits_at_once_leave_the_session_and_the_engine_with_the_same_groups() {
+        let session = SessionStore::open(&session_directory("groups-concurrent"));
+        let engine = running(StandInEngine::default());
+        for round in 0..30 {
+            std::thread::scope(|scope| {
+                let busy = engine.lock().expect("engine lock");
+                for name in ["First", "Second"] {
+                    let (engine, session) = (&engine, &session);
+                    scope.spawn(move || {
+                        edit_groups(engine, session, vec![request(Some(name), name, &[1])])
+                            .expect("a valid edit");
+                    });
+                }
+                // Both edits arrive while the engine is busy.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(busy);
+            });
+
+            let saved: Vec<String> = session
+                .groups()
+                .iter()
+                .map(|group| group.name.clone())
+                .collect();
+            assert_eq!(applied_names(&engine), Some(saved), "round {round}");
+        }
     }
 
     #[test]

@@ -262,8 +262,9 @@ function withPort(address) {
  * Local labels are kept as the desktop's session keeps them: for the phone's client id when it has
  * one, else for the address. Groups too: `set_groups` keeps them (a new group gets an id), applies
  * them while the engine runs (every musician's group levels follow their groups by id, and the new
- * groups are announced in a status before the moved mixes) and every start that names no groups
- * takes them. Besides `invoke` and `listen` it offers
+ * groups are announced in a status before the moved mixes), answers `{ groups, applied, saved,
+ * saveError }` as the desktop does, and every start that names no groups takes them. Besides
+ * `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
@@ -485,13 +486,15 @@ export function createFakeBridge({
       const next = withIds(groups ?? []);
       checkGroups(next);
       savedGroups = next;
+      // As the desktop answers: a running engine took them, or they apply at the next start.
+      const outcome = { groups: clone(next), applied: isRunning, saved: true, saveError: null };
       if (isRunning) {
         const previous = JSON.stringify(engine.groups);
         const before = engine.groups.map((group) => group.id);
         showGroups(next);
         if (JSON.stringify(engine.groups) === previous) {
           // As in the engine, the same groups change nothing and announce nothing.
-          return clone(next);
+          return outcome;
         }
         const after = engine.groups.map((group) => group.id);
         // As the desktop does: the new groups go out first, then every mix whose levels moved.
@@ -507,7 +510,7 @@ export function createFakeBridge({
           }
         }
       }
-      return clone(next);
+      return outcome;
     },
   };
 

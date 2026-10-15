@@ -5,6 +5,19 @@ import { clampLevel } from "./values.js";
 const MINUS = "−";
 const SEPARATOR = " · ";
 
+/**
+ * What a group edit did, from the `set_groups` answer `{ groups, applied, saved, saveError }`:
+ * live on every phone, saved for the next start (no engine was running), or live but not kept.
+ */
+export function formatGroupsSet({ applied, saved, saveError }) {
+  if (!applied) {
+    return "Groups saved; they apply at the next start.";
+  }
+  return saved
+    ? "Groups applied to every phone."
+    : `Groups applied to every phone, but not saved: ${saveError}.`;
+}
+
 /** "85%". */
 export function formatPercent(level) {
   return `${clampLevel(level)}%`;

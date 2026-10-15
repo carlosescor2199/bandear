@@ -33,7 +33,7 @@ The mockup is the Design artifact "MixLink mobile redesign"
 
 Look: ground `#0d1117`, surfaces `#161b22` and `#1f2630`, borders `#2b3440`, text `#e6edf3`,
 secondary text `#9ba8b5`, amber accent `#f5a524`, green `#3fb950`, red `#f85149`, blue `#4cc2ff`
-for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fonts until T5).
+for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (bundled in T5).
 
 ## Design decisions
 
@@ -86,15 +86,20 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
   - [x] Code: T3 review follow-ups (`69f613d`), receiver stop ordering (`538f990`), the switch to
     Compose (`0f51cb2`), R8 for release (see Progress). Checks per commit in Progress.
   - [ ] Live check on the S23 (parent), on the debug and the minified release build, including
-    the channel sheet (pan detent, TalkBack) and the strip height from T4b.
+    the channel sheet (pan detent, TalkBack) and the strip height from T4b. Observed so far (parent,
+    S23): the Mix screen fits (header, More of me, both strips with Mute and Solo, the Master card
+    with the level cap, the tabs), and pan works end to end in the UI (after using the channel
+    sheet, a recents screenshot showed CH 2 "R100" and CH 1 "C"). Not yet observed: the pan
+    detent, TalkBack on the sheet, and the minified release build on the phone.
   - [x] Pan: the old screen had a pan slider per channel; the new screens had none, so after the
     switch pan could not be changed (it was still kept, sent, saved and recalled). The user chose:
     a strip's label opens a sheet for that channel with a large L–C–R pan control, its level, Mute
     and Solo, and each strip shows its pan under the label; the Mix screen must not grow. Done in
     T4b (`f86414e`; see Progress), which closes the acceptance criterion "every existing control"
     again.
-- [ ] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
-  download.
+- [x] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
+  download. The user approved it; see Progress. Commit: this commit.
+- [ ] Live check of the bundled fonts on the S23 (parent).
 
 ## Acceptance criteria
 
@@ -116,7 +121,9 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
 - T1 to T4: delegated direct, one writer per task (2+ non-trivial files each).
 - T4b (pan sheet and the T4 review follow-ups): delegated direct, one writer (2+ non-trivial
   files per work unit).
-- T5: parent, after the download permission.
+- T5: the parent downloaded and verified the fonts after the download permission; bundling and
+  wiring them, delegated direct, one writer (the last units of the feature are one bounded
+  writer's work).
 
 ## Delivery forecast
 
@@ -500,3 +507,35 @@ features.
       SUCCESSFUL, 41 tasks executed; 34 result files, 334 tests (333 plus 1), 0 failures, 0
       errors; no Kotlin warnings. Debug APK 26,363,224 bytes (tests only). `cargo fmt --all --
       --check`: clean.
+  - `d834256` is the commit above.
+- T5 (route: delegated direct, one writer, with the launcher icon and the T4b review follow-ups
+  as further work-unit commits). The fonts, this commit:
+  - The user approved the download; the parent fetched both fonts from the official
+    github.com/google/fonts repository (SIL Open Font License 1.1, TrueType) and verified them. The
+    repository ships only variable fonts now, so each face is one file:
+    `res/font/ibm_plex_sans_variable.ttf` (IBM Plex Sans, axes `wdth` and `wght`, 537,244 bytes)
+    and `res/font/jetbrains_mono_variable.ttf` (JetBrains Mono, axis `wght`, 187,208 bytes),
+    copied byte for byte (same SHA-256 as the downloads; "Plex" is a Reserved Font Name, so the
+    files are not modified or renamed inside). The licenses ship with the app in
+    `assets/licenses/IBMPlexSans-OFL.txt` and `assets/licenses/JetBrainsMono-OFL.txt`, as the OFL
+    asks; git stores the IBM text with LF line ends (`core.autocrlf`), the words are unchanged.
+  - `MixLinkFonts.Text` is IBM Plex Sans at 400, 500 and 600 and `MixLinkFonts.Numbers` is
+    JetBrains Mono at 500 and 600 (`TextWeights`, `NumberWeights`): the weights the styles use.
+    The new `variableFontFamily(resId, weights)` makes one `Font` per weight from the one file,
+    each with `FontVariation.Settings(FontVariation.weight(n))`, so a style gets the font's own
+    weight, never the nearest one or a synthesised bold (minSdk 29 reads variable fonts). That
+    `Font` overload is still `@ExperimentalTextApi` in Compose 1.7, so the function opts in; the
+    stable overload would set the same axis by default, but not visibly. The type scale is
+    unchanged.
+  - RED: the 4 new `MixLinkFontsTest` tests (a variable family sets each font's weight axis; the
+    text face is IBM Plex Sans at 400/500/600; the number face is JetBrains Mono at 500/600; every
+    style asks for a weight its face bundles) against a `TODO` `variableFontFamily` and the system
+    faces: 4 run, 3 failed (1 `NotImplementedError`, 2 assertions); the fourth is a guard that
+    passes on both. GREEN: all 4 pass.
+  - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD SUCCESSFUL,
+    41 tasks executed; 35 result files, 338 tests (334 plus 4), 0 failures, 0 errors; no Kotlin
+    warnings. Debug APK 26,750,115 bytes (was 26,363,224).
+  - `gradle -p apps/android assembleRelease -x lintVitalAnalyzeRelease`: BUILD SUCCESSFUL; R8 and
+    the resource shrinker keep both fonts (in the APK as `res/f1.ttf`, 537,244 bytes, and
+    `res/Mb.ttf`, 187,208 bytes: release builds shorten resource paths) and both licenses.
+    Unsigned release APK 2,888,008 bytes (was 2,390,604). `cargo fmt --all -- --check`: clean.

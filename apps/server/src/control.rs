@@ -33,6 +33,36 @@ pub(crate) type ControlPeers = Arc<Mutex<HashMap<IpAddr, usize>>>;
 /// How often a control connection checks whether a device switch changed the channel count.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How often a control connection sends its client a WebSocket ping.
+const CONTROL_PING_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a control connection may go without receiving any frame before it is declared dead.
+///
+/// Five ping intervals: a client answers each ping on its own (any WebSocket library does), so a
+/// live phone is never silent this long, while one that vanished is let go within a glance.
+const CONTROL_DEAD_AFTER: Duration = Duration::from_secs(10);
+
+/// The control channel's heartbeat: how often a connection pings its client, and how long it may
+/// receive nothing (no pong, message, ping or close) before it is closed.
+///
+/// A phone that drops off Wi-Fi never closes its socket, so without this its half-open connection
+/// would stay counted as a live control peer forever. Closing it drops the connection's
+/// [PeerGuard], which is what starts the grace period and shows the musician as gone.
+#[derive(Clone, Copy, Debug)]
+struct Heartbeat {
+    ping_interval: Duration,
+    dead_after: Duration,
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self {
+            ping_interval: CONTROL_PING_INTERVAL,
+            dead_after: CONTROL_DEAD_AFTER,
+        }
+    }
+}
+
 /// The live control configuration shared between the engine and every connection.
 ///
 /// A device switch can change the captured channel count while the server runs. The engine stores the
@@ -119,10 +149,12 @@ pub(crate) fn spawn_control_thread(
             groups,
             peers,
             events,
+            Heartbeat::default(),
         ));
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_control_server(
     listener: std::net::TcpListener,
     targets: Arc<TargetRegistry>,
@@ -131,6 +163,7 @@ async fn run_control_server(
     groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
+    heartbeat: Heartbeat,
 ) {
     let listener = match TcpListener::from_std(listener) {
         Ok(listener) => listener,
@@ -170,6 +203,7 @@ async fn run_control_server(
                             groups,
                             peers,
                             events,
+                            heartbeat,
                         )
                         .await
                         {
@@ -188,7 +222,8 @@ async fn run_control_server(
 /// early return in the connection loop.
 ///
 /// On the last connection for an IP, the peer's registered target is marked disconnected: it is
-/// not removed here, because the grace period decides that, and it starts now.
+/// not removed here, because the grace period decides that, and it starts now. A connection whose
+/// client vanished without closing is ended by the [Heartbeat], so its guard drops too.
 struct PeerGuard {
     address: SocketAddr,
     peers: ControlPeers,
@@ -241,6 +276,7 @@ fn register_peer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_control_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
@@ -249,6 +285,7 @@ async fn handle_control_connection(
     groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
+    heartbeat: Heartbeat,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = accept_async(stream).await?;
     let _peer = register_peer(&peers, &events, &targets, peer);
@@ -298,6 +335,15 @@ async fn handle_control_connection(
     // Whether this connection has registered yet. Only its first registration starts a new link
     // session; a later one on the same socket is a rename.
     let mut session_registered = false;
+    // The heartbeat: a ping every interval, and the connection is closed once nothing at all has
+    // arrived for the dead-after window. A client answers pings on its own, so only a vanished one
+    // (a phone off Wi-Fi leaves its socket half-open) goes that long without a frame.
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut ping_timer = tokio::time::interval_at(
+        last_inbound + heartbeat.ping_interval,
+        heartbeat.ping_interval,
+    );
+    ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         // Safety net for a runtime that does not drive the watcher's timer while this task is parked
         // on a read: re-check the channel count before parking again, so the next client message also
@@ -312,10 +358,40 @@ async fn handle_control_connection(
                 .await?;
         }
 
-        let Some(message) = reader.next().await else {
+        let dead_at = last_inbound + heartbeat.dead_after;
+        // Biased so a frame that already arrived always counts before the deadline is judged.
+        let message = tokio::select! {
+            biased;
+            message = reader.next() => message,
+            _ = tokio::time::sleep_until(dead_at) => {
+                log_missed_heartbeat(peer, heartbeat.dead_after);
+                break;
+            }
+            _ = ping_timer.tick() => {
+                // A write to a vanished peer can stall once its buffers fill, so the ping is bounded
+                // by the same deadline: a ping that cannot be sent in time is as good as no answer.
+                let ping = async {
+                    writer
+                        .lock()
+                        .await
+                        .send(Message::Ping(Default::default()))
+                        .await
+                };
+                match tokio::time::timeout_at(dead_at, ping).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        log_missed_heartbeat(peer, heartbeat.dead_after);
+                        break;
+                    }
+                }
+            }
+        };
+        let Some(message) = message else {
             break;
         };
         let message = message?;
+        last_inbound = tokio::time::Instant::now();
         match message {
             Message::Text(text) => {
                 let message_type = control_message_type(&text).unwrap_or_default();
@@ -416,6 +492,13 @@ async fn handle_control_connection(
 
     watcher_task.abort();
     Ok(())
+}
+
+/// The one line a connection closed by the heartbeat leaves in the log.
+fn log_missed_heartbeat(peer: SocketAddr, dead_after: Duration) {
+    println!(
+        "control connection {peer} closed: nothing received for {dead_after:?}, heartbeat missed"
+    );
 }
 
 #[cfg(test)]
@@ -525,6 +608,7 @@ mod tests {
                 Arc::new(drums()),
                 Arc::new(Mutex::new(HashMap::new())),
                 EventBus::default(),
+                Heartbeat::default(),
             ));
         });
 
@@ -604,6 +688,7 @@ mod tests {
                 Arc::new(drums()),
                 Arc::new(Mutex::new(HashMap::new())),
                 EventBus::default(),
+                Heartbeat::default(),
             ));
         });
 
@@ -684,8 +769,29 @@ mod tests {
     fn start_registration_server(
         targets: Arc<TargetRegistry>,
     ) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        start_server(
+            targets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+        )
+    }
+
+    /// Starts a control server like [start_registration_server], with the peer registry and the
+    /// heartbeat supplied by the test, so a test can watch the per-IP connection count and run the
+    /// heartbeat in milliseconds.
+    fn start_server(
+        targets: Arc<TargetRegistry>,
+        peers: ControlPeers,
+        heartbeat: Heartbeat,
+    ) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
         let address = listener.local_addr().expect("listener address");
+        // Non-blocking, as `spawn_control_thread` sets it. On Windows an accepted socket inherits
+        // the listener's mode, and a blocking one would park the connection task inside its read,
+        // where no heartbeat timer can wake it.
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be non-blocking");
         let stopped = Arc::new(AtomicBool::new(false));
         let server_stopped = Arc::clone(&stopped);
         let server = std::thread::spawn(move || {
@@ -699,8 +805,9 @@ mod tests {
                 server_stopped,
                 Arc::new(ConfigState::new(2)),
                 Arc::new(drums()),
-                Arc::new(Mutex::new(HashMap::new())),
+                peers,
                 EventBus::default(),
+                heartbeat,
             ));
         });
         (address, stopped, server)
@@ -1336,6 +1443,188 @@ mod tests {
             "a rename keeps the report"
         );
 
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The heartbeat at test speed: a ping every 50 ms, and a connection that receives nothing for
+    /// 500 ms is closed.
+    const TEST_HEARTBEAT: Heartbeat = Heartbeat {
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(500),
+    };
+
+    /// How many live control connections the peer registry counts for `ip`.
+    fn control_connections(peers: &ControlPeers, ip: IpAddr) -> usize {
+        peers
+            .lock()
+            .expect("peer registry lock")
+            .get(&ip)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether the registered target at `ip` is marked disconnected, i.e. its grace period runs.
+    fn marked_disconnected(targets: &TargetRegistry, ip: IpAddr) -> bool {
+        targets.read().iter().any(|entry| {
+            entry.address.ip() == ip
+                && matches!(
+                    entry.origin,
+                    crate::targets::TargetOrigin::Registered {
+                        disconnected_at: Some(_),
+                        ..
+                    }
+                )
+        })
+    }
+
+    /// Waits until `done` holds, reading no client meanwhile. False if it did not hold within 5 s.
+    async fn wait_until(done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// Keeps reading `client` until `limit` passes or `done` holds, and returns how many pings
+    /// arrived. Reading is all a WebSocket client needs to answer the server's pings, exactly as
+    /// the phone's library does on its own. Panics if the server closes the connection.
+    async fn answer_pings_until(
+        client: &mut ClientStream,
+        limit: Duration,
+        done: impl Fn() -> bool,
+    ) -> usize {
+        let deadline = Instant::now() + limit;
+        let mut pings = 0;
+        while Instant::now() < deadline && !done() {
+            match tokio::time::timeout(Duration::from_millis(10), client.next()).await {
+                Err(_) => {}
+                Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+                Ok(Some(Ok(_))) => {}
+                Ok(other) => {
+                    panic!("the server closed a connection that answers its pings: {other:?}")
+                }
+            }
+        }
+        pings
+    }
+
+    /// A phone that drops off Wi-Fi never closes its socket and never answers a ping again; a
+    /// client that stops reading behaves the same. Its connection is closed once nothing has
+    /// arrived for the dead-after window, so the IP has no control connection left and the target's
+    /// grace period starts.
+    #[tokio::test]
+    async fn a_client_that_stops_answering_the_heartbeat_is_dropped_and_marked_disconnected() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+        let (address, stopped, server) =
+            start_server(Arc::clone(&targets), Arc::clone(&peers), TEST_HEARTBEAT);
+        let ip: IpAddr = "127.0.0.1".parse().expect("loopback IP");
+
+        let mut client = connect_client(address).await;
+        let last_sent = Instant::now();
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        assert_eq!(control_connections(&peers, ip), 1);
+        assert!(!marked_disconnected(&targets, ip));
+
+        // From here on the client is never read again, so it answers no ping.
+        assert!(
+            wait_until(|| control_connections(&peers, ip) == 0).await,
+            "the silent connection should be closed"
+        );
+        assert!(
+            last_sent.elapsed() >= TEST_HEARTBEAT.dead_after,
+            "closed only once the dead-after window passed, after {:?}",
+            last_sent.elapsed()
+        );
+        assert!(
+            marked_disconnected(&targets, ip),
+            "closing the last connection starts the grace period"
+        );
+
+        drop(client);
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A client that keeps reading answers every ping by itself, so its connection stays open
+    /// across many ping intervals and several dead-after windows while it sends no message at all.
+    /// This is how a phone build that knows nothing of the heartbeat keeps working.
+    #[tokio::test]
+    async fn a_client_that_answers_the_heartbeat_stays_connected() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+        let (address, stopped, server) =
+            start_server(Arc::clone(&targets), Arc::clone(&peers), TEST_HEARTBEAT);
+        let ip: IpAddr = "127.0.0.1".parse().expect("loopback IP");
+        let mut client = connect_client(address).await;
+        send_then_sync(&mut client, REGISTER_ANA).await;
+
+        let pings = answer_pings_until(&mut client, TEST_HEARTBEAT.dead_after * 3, || false).await;
+
+        assert!(pings >= 5, "the server pings every interval, got {pings}");
+        assert_eq!(control_connections(&peers, ip), 1, "it stays connected");
+        assert!(!marked_disconnected(&targets, ip));
+        // The connection still carries messages as before.
+        send_then_sync(&mut client, CLEAN_STATS).await;
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The live scenario: a phone drops off Wi-Fi, leaving its first connection half-open, comes
+    /// back on a second connection from the same IP, and then the app is closed, which resets the
+    /// second one without a closing handshake. The heartbeat closes the silent first connection
+    /// while the second keeps the musician connected, so the reset leaves the IP with no control
+    /// connection and the grace period starts.
+    #[tokio::test]
+    async fn a_half_open_connection_left_by_a_reconnect_does_not_keep_the_musician_connected() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+        let (address, stopped, server) =
+            start_server(Arc::clone(&targets), Arc::clone(&peers), TEST_HEARTBEAT);
+        let ip: IpAddr = "127.0.0.1".parse().expect("loopback IP");
+
+        let mut older = connect_client(address).await;
+        let older_last_sent = Instant::now();
+        send_then_sync(&mut older, REGISTER_ANA).await;
+        // The older connection goes silent: it is never read again.
+        let mut newer = connect_client(address).await;
+        send_then_sync(&mut newer, REGISTER_ANA).await;
+        assert_eq!(control_connections(&peers, ip), 2);
+
+        // The newer connection keeps answering pings while the heartbeat closes the older one.
+        answer_pings_until(&mut newer, Duration::from_secs(5), || {
+            control_connections(&peers, ip) < 2
+        })
+        .await;
+        assert_eq!(
+            control_connections(&peers, ip),
+            1,
+            "only the silent connection is closed"
+        );
+        assert!(older_last_sent.elapsed() >= TEST_HEARTBEAT.dead_after);
+        assert!(
+            !marked_disconnected(&targets, ip),
+            "the newer connection keeps the musician connected"
+        );
+
+        // Closing the app resets the newer connection.
+        drop(newer);
+        assert!(
+            wait_until(|| control_connections(&peers, ip) == 0).await,
+            "no control connection is left for the IP"
+        );
+        assert!(
+            marked_disconnected(&targets, ip),
+            "closing the last connection starts the grace period"
+        );
+
+        drop(older);
         stop_server(address, &stopped, server).await;
     }
 }

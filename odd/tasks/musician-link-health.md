@@ -43,7 +43,8 @@ never counted. Reporting those numbers as they are would make the traffic light 
 ## Scope
 
 - Server: parse and route `stats`, keep the latest report per musician, classify, expose it in the
-  engine status.
+  engine status; a control-channel heartbeat that closes a vanished phone's half-open connection
+  (T4).
 - Desktop: a health column with a coloured dot and the numbers on hover.
 - Android: an accurate sequence tracker, counted receive timeouts, and a 1 s stats report sent over
   the control channel.
@@ -74,12 +75,16 @@ never counted. Reporting those numbers as they are would make the traffic light 
   timeouts, a pure stats accumulator and message builder, and the 1 s report sent through
   `ControlChannel`. JVM tests for each pure helper. Evidence: `6c93b9f`, refined by the slice 4
   commit that stops counting timeouts before the first packet (see Progress and Verification).
+- [x] T4 (server): control-channel heartbeat so a vanished phone's half-open connection is closed.
+  Evidence: the T4 commit in slice 4; RED 3 failed, GREEN 159 passed (see Progress and
+  Verification). A live recheck on a device is still pending.
 
 ## Acceptance criteria
 
 - A phone that streams cleanly shows green within ~2 s of connecting.
-- Pulling the phone off Wi-Fi turns its dot red once its last report is older than 3 s, and grey
-  once its control channel closes.
+- Pulling the phone off Wi-Fi turns its dot red ("lost") once its last report is older than 3 s,
+  then grey about 10 s after the phone vanished, when the heartbeat closes its control connection.
+- Closing the app turns its dot grey right away (the server sees the socket close).
 - A phone whose control channel works but that receives no audio at all shows red, with
   `No audio received` on hover; it is never green.
 - A phone build without stats support shows grey and keeps working.
@@ -98,6 +103,8 @@ never counted. Reporting those numbers as they are would make the traffic light 
 
 - T1 and T2: delegated direct, one writer (2+ non-trivial files across server and desktop).
 - T3: delegated direct, one writer (Android, 2+ non-trivial files).
+- T4: delegated direct, one writer (found in a live test; one server file plus this document, with
+  loopback socket tests to write first).
 
 ## Delivery forecast
 
@@ -117,7 +124,7 @@ each slice lands on `main` on its own (until T3 ships, the light simply stays gr
 | 1 | Health model: `health.rs` and the `stats` parser (500 lines, mostly tests) | `e50b8bc` |
 | 2 | Server wiring: routing, per-target storage, engine status (~310 lines), plus the lost-link fix (a stale report while connected is bad) | `71d02d7`, `4692544` |
 | 3 | Desktop health column (T2) | `90f7a33` |
-| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001) |
+| 4 | New-session fix (a new control session starts with no link report; review 2 R3-001), then the Android sequence tracker and stats report (T3) | `cb1923c`, `6c93b9f`, `d46402c` (timeouts before the first packet), `7b7e194` (no audio received is bad), `9fbbd13` (reports held until the audio starts or a startup grace passes; review 3 R3-001), the T4 commit (control-channel heartbeat; found in the live test) |
 
 Slice 1 stays above the budget after one honest slicing pass; it is about 380 lines of tests, so a
 `size:exception` is recommended for it rather than splitting the tests from the code they verify.
@@ -125,8 +132,8 @@ Slice 1 stays above the budget after one honest slicing pass; it is about 380 li
 Slice 4 also lands above the budget: the new-session fix is about 170 authored lines (about 140 of
 them tests) and T3 about 480 (about 220 production with doc comments, about 260 tests), plus about
 50 for the timeouts-before-the-first-packet fix, about 100 for the no-audio fix (about 70 of
-them tests) and about 145 for the startup-grace fix (about 90 of them tests), so about 950 in all,
-not counting this document.
+them tests), about 145 for the startup-grace fix (about 90 of them tests) and about 295 for the
+T4 heartbeat (about 205 of them tests), so about 1245 in all, not counting this document.
 Its commits are separate work units, so it can be split into pull requests at those commit
 boundaries if a smaller review is wanted.
 
@@ -275,16 +282,51 @@ boundaries if a smaller review is wanted.
 - A separate review of the whole unpushed range (`origin/main` `f231dad`..`90f7a33`, lineage
   `review-67dd43fed2154ac3`) was approved; its findings are all in earlier, unrelated commits (the
   audio panel, ASIO buffer defaults, the playback cushion) and are tracked outside this feature.
+- Live test with a Galaxy S23 and the desktop: green on clean Wi-Fi, red ("lost") with the phone's
+  Wi-Fi off, and green again after it reconnected, all as expected. Closing the app afterwards
+  stayed red instead of turning grey. The desktop log showed registrations from two sockets of the
+  phone's IP, and only the later one logged `Connection reset without closing handshake` when the
+  app closed: turning Wi-Fi off had left the first control connection half-open, nothing on the
+  server detects a dead peer, and that zombie kept the IP's control connection count at 1, so the
+  musician stayed "control connected" with a stale report (red "lost") instead of grey.
+- T4 done (this commit, slice 4; route: delegated direct, one writer): a server-side heartbeat on
+  the control channel, in `control.rs` only.
+  - Each connection's read loop sends a WebSocket ping every `CONTROL_PING_INTERVAL` (2 s) and
+    closes the connection when no frame of any kind (pong, text, ping, close) has arrived for
+    `CONTROL_DEAD_AFTER` (10 s). Closing it drops the connection's `PeerGuard`, which marks the
+    target disconnected and starts the grace period as before. Clients answer pings on their own
+    (OkHttp does), so older phone builds keep working unchanged.
+  - The read, the deadline and the ping timer are raced in one biased `select!`, so a frame that
+    already arrived counts before the deadline is judged. A ping write is bounded by the same
+    deadline, so a write stalled on a vanished peer cannot keep the connection alive.
+  - One log line per heartbeat close:
+    `control connection <peer> closed: nothing received for 10s, heartbeat missed`.
+  - The durations are a private `Heartbeat` value (`Default` gives the production constants)
+    passed to `run_control_server`; `spawn_control_thread` passes the default, so its signature,
+    `engine.rs` and `cli.rs` are unchanged. The `register`, `mix` and `stats` handling, the peer
+    lock and the audio path are untouched.
+  - Test helper fix: `start_registration_server` now goes through a new `start_server` that sets
+    the listener non-blocking, as `spawn_control_thread` does. On Windows an accepted socket
+    inherits the listener's blocking mode, and with a blocking socket the connection task sits
+    inside its read where no timer can wake it, so the heartbeat never ran in the tests until then.
+  - Resulting behaviour: closing the app gives grey right away (the reset is seen); Wi-Fi off gives
+    red "lost" once the last report is older than 3 s and grey about 10 s after the phone vanished,
+    when the heartbeat closes its control connection; after the registration grace period (15 s)
+    the row disappears as before.
 
 ## Status and next steps
 
-- Code complete: T1, T2 and T3 are done and every slice range has an approved native review.
-- Final checks: `cargo test -p personal-monitoring` 156 passed, `cargo test -p mixlink-desktop` 21
-  passed, Android JVM tests 81 passed with the debug APK assembled.
-- Pending: the acceptance criteria have not been verified on a device. Live check with the S23 and
-  the desktop: green within ~2 s on clean Wi-Fi; red ("silent") ~3 s after connecting with UDP
-  blocked; red once reports stop while connected (Wi-Fi off); grey once the app closes its control
-  channel; grey for an older build that never reports.
+- Code complete: T1 to T4 are done. Every slice range up to `9fbbd13` has an approved native
+  review; the T4 commit has not been reviewed yet.
+- Final checks: `cargo test -p personal-monitoring` 159 passed, `cargo test -p mixlink-desktop` 21
+  passed, Android JVM tests 81 passed with the debug APK assembled (no Android change since).
+- Verified live on the S23 with the desktop: green on clean Wi-Fi, red ("lost") with Wi-Fi off,
+  green again after reconnecting. Closing the app after that stayed red because of the half-open
+  connection, which T4 fixes.
+- Pending: a live recheck of T4 on the S23: Wi-Fi off turns red ~3 s later and grey ~10 s after
+  the phone vanished; closing the app turns grey right away, also after a Wi-Fi off and reconnect;
+  the row disappears after the grace period. The UDP-blocked (red "silent") and older-build (grey)
+  checks were not reported from the first live test and are still open.
 - Pending (user decision): push and the stacked-to-main pull requests, one per slice.
 - Known gaps: no JS test runner for `describeLink` (review 2 R3-002); the `PmonPlayer` receive loop
   is only covered through its pure helpers (review 3 R3-002); the startup-grace boundary test
@@ -405,3 +447,19 @@ boundaries if a smaller review is wanted.
     Studio's JBR and the local SDK, as for T3): BUILD SUCCESSFUL, 81 tests, 0 failures; the debug
     APK assembled with no Kotlin warnings.
   - `cargo fmt --all -- --check`: exit 0 (no Rust changes).
+- T4 RED (the `Heartbeat` parameter threaded through but unused; tests use a 50 ms ping and a
+  500 ms dead-after window): `cargo test -p personal-monitoring -- heartbeat half_open` gave 3
+  failed:
+  `a_client_that_stops_answering_the_heartbeat_is_dropped_and_marked_disconnected` ("the silent
+  connection should be closed"), `a_client_that_answers_the_heartbeat_stays_connected` ("the
+  server pings every interval, got 0") and
+  `a_half_open_connection_left_by_a_reconnect_does_not_keep_the_musician_connected` (2 connections
+  left where 1 was expected). The first GREEN attempt still failed the same way, which exposed the
+  blocking test listener; with the helper fixed, RED was observed again with the heartbeat
+  disabled (same 3 failures), so the failures come from the missing heartbeat alone.
+- T4 GREEN:
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo test -p personal-monitoring`: 159 passed, 0 failed (baseline 156).
+  - `cargo test -p mixlink-desktop`: 21 passed, 0 failed.
+  - `cargo check --workspace --all-targets`: finished, no errors or warnings.
+  - The three heartbeat tests passed in five repeated runs (about 1.5 s each).

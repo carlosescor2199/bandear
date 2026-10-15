@@ -71,8 +71,9 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
   fader, group chip, mute and solo buttons, primary and secondary buttons, bottom tab bar; previews;
   JVM tests for the pure logic (fader value mapping, state to pill and label mapping). The app
   still runs the XML screen. Commit: this commit.
-- [ ] T2 (state): `MonitorViewModel` holding connection, discovered servers, mix, saved mixes and
-  diagnostics; pure reducers with JVM tests; `MainActivity` logic moved behind it.
+- [x] T2 (state): `MonitorViewModel` holding connection, discovered servers, mix, saved mixes and
+  diagnostics; pure reducers with JVM tests; `MainActivity` logic moved behind it (the Activity
+  itself switches in T4). Commit: this commit.
 - [ ] T3 (screens): Connect, Mix, Saved mixes and Settings composed from the atoms, with previews.
 - [ ] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
   state fixed; live check on the S23.
@@ -144,6 +145,55 @@ features.
     these sources, and not verified on the base.
   - About 1,480 authored added lines, well over the ~400 heuristic: eight atoms with previews and
     KDoc, the theme, and 24 tests, which only make sense together as the base.
+- T2 done (route: delegated direct, one writer; trigger: 2+ non-trivial new files). What landed, all
+  new files under `ui/state`; `MainActivity`, the XML layout and T1's `ui/theme` and
+  `ui/components` are untouched, and the app still runs the XML screen:
+  - `MonitorUiState` (public, immutable): name; `ConnectionUiState` (pill, session running, server,
+    who holds the mix, the existing status words, why a Connect was refused, the manual form);
+    found servers as `ServerEndpoint`; `MixUiState` kept like the snapshot (levels, pans, mutes,
+    solos, group levels, master, level cap) with derived `channels` (label "CH n", group tag) and
+    `groups`; `MoreOfMeUiState` with a `MoreOfMeNotice`; `SavedMixesUiState` whose empty message is
+    derived from the list, so it cannot show beside a saved mix; `DiagnosticsUiState`; the tab.
+  - `MonitorEvent` and the pure `reduce(state, event)`, following `MainActivity`'s rules: config
+    resizing as `applySourceChannels`, group levels kept by position, a musician channel the config
+    drops is forgotten (More of me off with a notice), More of me needs a channel, recall applies
+    the saved arrays and keeps what the server announced.
+  - `phoneLinkHealth`: the phone judges its own link report with the server's thresholds
+    (`health.rs`): nothing received is Silent, a timeout, 2 underruns/s or 2 % loss is Bad, any
+    underrun or 0.5 % loss is a Warning.
+  - `MonitorCollaborators`: seams `AudioReceiver`, `ServerScanner` and `MonitorStore` with private
+    production adapters over `PmonPlayer`, `ServerDiscovery` and `MixBankStore`; the client id as
+    `() -> String` from `ClientIdentity`; the real `ControlChannel` on its existing
+    `ControlTransport` and `ControlScheduler` seams. No existing class changed.
+  - `MonitorViewModel` (`ViewModel`, `Factory` from the application): `StateFlow<MonitorUiState>`,
+    intents for connect (found server or manual address), disconnect, channel level, pan, mute and
+    solo, group level, master volume, mute and level cap, More of me and the musician channel,
+    save, recall, rename and delete a mix, the manual form, the name and the tab. Callbacks from the
+    receiver, control and discovery threads become events applied by compare-and-set; session start
+    and end are serialised by one lock, as the UI thread did. `onCleared` tears down like
+    `onDestroy`. Only the master values are mirrored into `ClientMixState`, the one thing the
+    receive thread reads; the control channel reads the mix from the state at send time.
+- T2 deviations and notes:
+  - Discovery also restarts when the receiver ends on its own; `MainActivity` restarted it only on
+    Stop, which would leave the Connect screen's list frozen after a failed session.
+  - Rename is new (the store has none): save under the new name, then delete the old one, so the
+    renamed mix moves to the end of the list; a name another mix already has is refused, so a
+    rename never overwrites a mix.
+  - A control change that changes nothing (the same value, a channel that does not exist) sends no
+    mix, as a SeekBar that did not move never did; levels and pans are clamped to 0..100.
+  - A control callback that arrives after the session ended cannot raise the pill again.
+  - "Active" saved mix: the one last saved or recalled, while it is still saved; moving a fader
+    afterwards does not clear it.
+  - Copy: notices say "mix", not "bank"; the More of me notices are reworded; the Connect
+    validation messages are kept word for word.
+  - Stats still arrive per packet (about 100/s), as the old text did. T3 should pass sub-states
+    (`mix`, `connection`) to the screens: an unchanged sub-state keeps its instance across a stats
+    update, so strong skipping skips those screens.
+  - The new state layer is public where T3's composables need it; events, the reducer and the
+    ViewModel are internal because they use internal types (`ControlState`, the seams).
+  - About 2,550 authored added lines (1,210 main, 1,350 tests), far over the ~400 heuristic: one
+    state layer, its reducer and its ViewModel only make sense together, and the 82 tests are most
+    of it.
 
 ## Verification
 
@@ -154,3 +204,11 @@ features.
   files): 139 tests, that is 115 before plus the 24 new ones. The writer's report of 155 (131 + 24)
   was a miscount.
 - T1 `cargo fmt --all -- --check`: clean (no Rust changes).
+- T2 RED: the 82 new tests (49 reducer, 6 link health, 27 ViewModel) against `TODO` stubs of
+  `reduce`, `phoneLinkHealth` and the ViewModel intents: 82 run, 81 failed with
+  `NotImplementedError`; the one pass reads a derived default (`lossPercent` of the empty state).
+- T2 GREEN: the same 82 pass.
+- T2 `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD SUCCESSFUL,
+  41 tasks executed; 24 result files, 221 tests (139 before plus 82), 0 failures, 0 errors; no
+  Kotlin warnings.
+- T2 `cargo fmt --all -- --check`: clean (no Rust changes).

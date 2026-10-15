@@ -74,6 +74,30 @@ fun SecondaryButton(
     }
 }
 
+/**
+ * The confirming action of something that cannot be undone, such as deleting a saved mix: red,
+ * 44 dp tall. Its words say what it does; red only adds to them.
+ */
+@Composable
+fun DangerButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = MixLinkTheme.colors
+    Box(
+        modifier = modifier
+            .heightIn(min = 44.dp)
+            .clip(MixLinkShapes.Control)
+            .background(colors.red)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 16.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text = text, style = MaterialTheme.typography.labelLarge, color = colors.onAccent)
+    }
+}
+
 @Preview(showBackground = true, backgroundColor = 0xFF0D1117)
 @Composable
 private fun ButtonsPreview() {
@@ -87,6 +111,7 @@ private fun ButtonsPreview() {
             PrimaryButton("Connect", onClick = {}, enabled = false)
             SecondaryButton("Recall", onClick = {})
             SecondaryButton("Disconnect", onClick = {}, enabled = false)
+            DangerButton("Delete", onClick = {})
         }
     }
 }

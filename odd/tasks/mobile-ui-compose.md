@@ -74,7 +74,9 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (system fo
 - [x] T2 (state): `MonitorViewModel` holding connection, discovered servers, mix, saved mixes and
   diagnostics; pure reducers with JVM tests; `MainActivity` logic moved behind it (the Activity
   itself switches in T4). Commit: this commit.
-- [ ] T3 (screens): Connect, Mix, Saved mixes and Settings composed from the atoms, with previews.
+- [x] T3 (screens): Connect, Mix, Saved mixes and Settings composed from the atoms, with previews;
+  `MonitorApp(state, actions)` as the root; the T1 review's fader follow-ups. The app still runs
+  the XML screen. Commits: `a17522b` (fader fixes) and this commit (screens).
 - [ ] T4 (switch): `MainActivity` hosts Compose; `activity_main.xml` deleted; the saved-banks empty
   state fixed; live check on the S23.
 - [ ] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
@@ -194,8 +196,57 @@ features.
   - About 2,550 authored added lines (1,210 main, 1,350 tests), far over the ~400 heuristic: one
     state layer, its reducer and its ViewModel only make sense together, and the 82 tests are most
     of it.
-
-## Verification
+- T3 done (route: delegated direct, one writer; trigger: 2+ non-trivial new files). Two work-unit
+  commits; `MainActivity`, the XML layout, `ui/state` and `ui/theme` are untouched:
+  - `a17522b` fixes the T1 review's follow-ups (lineage `review-940bed3578872332`): the gesture
+    arithmetic of `VerticalFader` (thumb-centre offset, drag seed from the current level,
+    de-duplicated reports, step rounding and clamping) moved into the pure `FaderGesture`, and a
+    fader with no travel (laid out no taller than its thumb, or not laid out) now ignores taps,
+    drags and screen-reader steps instead of reporting 0, so input can never silently drop a level
+    to silence.
+  - Screens (`ui/screens`), presentational, each taking only the sub-states it shows plus
+    callbacks: `ConnectScreen` (name, found servers as one-tap cards, Searching, the refusal, the
+    manual address link), `MixScreen` (header, pill, connection banner, More of me with the "My
+    channel" menu, a sideways row of 104 dp channel strips or group strips, the Master card with
+    level, Mute and level cap), `SavedMixesScreen` (save, Recall, a ⋮ menu with Rename and a
+    confirmed Delete, the empty state), `SettingsScreen` (server card with Disconnect, name, manual
+    form, compact diagnostics with the phone's link health, an expander with every counter and
+    the recent errors; with `onBack` it is the manual address form opened from Connect).
+  - `MonitorApp(state, actions)`: Connect without a session, the three tabs with `BottomTabBar`
+    with one; system back closes the manual form or returns to Mix; safe-drawing insets applied
+    (they take effect once T4 makes the Activity edge to edge). `MonitorActions` groups every
+    callback with the ViewModel's intent names and parameters, so T4 can bind it by adding the
+    interface to `MonitorViewModel`.
+  - New atoms (`ui/components`): `HorizontalFader` (master and level cap, on the same
+    `FaderGesture`), `MixLinkTextField` and `FieldLabel` (the field keeps what is typed and ignores
+    lagging echoes while focused), `StatusBanner`, `SegmentedChoice`, `DangerButton`, and
+    `LineIcons` (the tab bar's private icon builder moved there to be shared).
+  - Pure logic with JVM tests: `appScreenFor`, strip value, fill and description, group members,
+    section and master texts, the "My channel" words, header texts, `connectionBanner`, the
+    diagnostics readings and formatting (fixed `Locale.ROOT`, so a Spanish phone still shows
+    "0.02 %"), server card texts, saved mixes title, detail and rename check, `adoptOutsideText`.
+  - Previews for every screen at 390 x 844 dp from `PreviewSamples`: connected, More of me off, no
+    channel chosen, reconnecting, lost the server, groups view, waiting for channels; Connect
+    found, searching and refused; mixes filled and empty; Settings connected, all counters, and the
+    manual form refused; the app on each tab.
+- T3 deviations and notes:
+  - The level cap gets its own slider in the Master card: the artboard showed it as text only,
+    but it must stay adjustable. On a 390 x 844 dp screen the header, More of me and the full
+    channel strips (Mute and Solo included) fit without scrolling, also with the reconnecting
+    banner; the page scrolls a little to reach the level cap slider.
+  - The pill also has a banner for a session whose control channel gave up ("Lost the server",
+    with who holds the mix and how to reconnect), not only for reconnecting. The artboard's "Next
+    try in 2 s" is left out: the state has no retry time.
+  - Server cards read "MixLink server" with the address and port: beacons carry no server name
+    or sample rate. Saved mixes show "Active now" only; the store keeps no dates.
+  - No pan control: the old screen had none either; pans are kept in the mix and saved mixes as
+    before.
+  - The Channels and Groups toggle keys are 44 dp tall (36 on the artboard), for the touch target
+    rule; the "My channel" caps are tighter (0.08 em) so they fit the 104 dp button.
+  - The Channels or Groups choice and the manual form flag are screen state
+    (`rememberSaveable`), not `MonitorUiState`.
+  - About 3,400 authored added lines in the screens commit (about 3,000 main, 360 tests), far over
+    the ~400 heuristic: four screens, their previews and the root only make sense together.
 
 - T1 RED: the 24 new tests against `TODO` stubs: 24 run, 24 failed with `NotImplementedError`.
 - T1 GREEN: the same 24 pass.
@@ -212,3 +263,16 @@ features.
   41 tasks executed; 24 result files, 221 tests (139 before plus 82), 0 failures, 0 errors; no
   Kotlin warnings.
 - T2 `cargo fmt --all -- --check`: clean (no Rust changes).
+- T3 fader fixes RED: the 14 new `FaderGestureTest` tests against `TODO` stubs: 14 run, 14 failed
+  with `NotImplementedError`. GREEN: the same 14 pass. Then `gradle -p apps/android
+  :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD SUCCESSFUL, 41 tasks executed; 235
+  tests (221 plus 14), 0 failures, 0 errors; no Kotlin warnings.
+- T3 screens RED: the 36 new tests (6 screen choice, 16 Mix texts, 8 Settings texts, 3 saved
+  mixes texts, 3 text field sync) against `TODO` stubs: 36 run, 36 failed (35 with
+  `NotImplementedError`, 1 assertion on the stubbed tab-bar flags). GREEN: the same 36 pass.
+- T3 `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD SUCCESSFUL,
+  41 tasks executed; 30 result files, 271 tests (235 plus 36), 0 failures, 0 errors; no Kotlin
+  warnings. Debug APK 26,284,322 bytes.
+- T3 `cargo fmt --all -- --check`: clean (no Rust changes).
+- T3 has no Compose UI tests (they need instrumentation): the screens are checked by compiling
+  their previews and by the pure tests; the live check is T4's.

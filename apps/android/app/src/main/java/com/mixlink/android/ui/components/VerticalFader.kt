@@ -37,7 +37,6 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.mixlink.android.ui.theme.MixLinkColors
 import com.mixlink.android.ui.theme.MixLinkTheme
-import kotlin.math.roundToInt
 
 private val FaderWidth = 44.dp
 private val FaderHeight = 236.dp
@@ -48,15 +47,6 @@ private val ThumbRadius = 6.dp
 private const val DisabledAlpha = 0.4f
 
 /**
- * Where the fader's track is, kept out of composition: it changes with layout and drags, and
- * neither should recompose the fader.
- */
-private class FaderTrack {
-    var heightPx = 0f
-    var dragCenterPx = 0f
-}
-
-/**
  * A vertical channel fader from 0 at the bottom to 100 at the top.
  *
  * A drag moves the thumb with the finger from wherever it is, so touching the strip never makes the
@@ -65,8 +55,9 @@ private class FaderTrack {
  * level as a percentage and adjusts it in steps.
  *
  * Stateless: it shows [value] and reports a new level through [onValueChange], only when the level
- * actually changes. The fill uses [accent], so the caller decides what the colour means (the
- * musician's own channel, a muted one).
+ * actually changes. A fader laid out no taller than its thumb ignores input rather than report
+ * silence (see [FaderGesture]). The fill uses [accent], so the caller decides what the colour
+ * means (the musician's own channel, a muted one).
  */
 @Composable
 fun VerticalFader(
@@ -81,52 +72,42 @@ fun VerticalFader(
     val currentValue by rememberUpdatedState(value)
     val currentOnValueChange by rememberUpdatedState(onValueChange)
     val thumbHeightPx = with(LocalDensity.current) { ThumbHeight.toPx() }
-    val track = remember { FaderTrack() }
+    // Kept out of composition: layout and drags change it, and neither should recompose the fader.
+    // Positions from the top are positions from the loud end, as the gesture expects.
+    val gesture = remember(thumbHeightPx) { FaderGesture(thumbHeightPx) }
 
-    // The thumb travels the track minus its own height, so it never leaves the track.
-    fun travelPx(): Float = (track.heightPx - thumbHeightPx).coerceAtLeast(0f)
-
-    fun report(next: Int) {
-        if (next != currentValue) currentOnValueChange(next)
+    fun report(next: Int?) {
+        if (next != null) currentOnValueChange(next)
     }
 
-    fun moveThumbCenterTo(centerY: Float) {
-        report(faderValueAt(centerY - thumbHeightPx / 2f, travelPx()))
-    }
-
-    val dragState = rememberDraggableState { delta ->
-        track.dragCenterPx += delta
-        moveThumbCenterTo(track.dragCenterPx)
-    }
+    val dragState = rememberDraggableState { delta -> report(gesture.drag(delta, currentValue)) }
 
     Box(
         modifier = modifier
             .width(FaderWidth)
             .height(FaderHeight)
             .alpha(if (enabled) 1f else DisabledAlpha)
-            .onSizeChanged { track.heightPx = it.height.toFloat() }
+            .onSizeChanged { gesture.lengthPx = it.height.toFloat() }
             .progressSemantics(value.toFloat(), 0f..FADER_MAX.toFloat())
             .semantics {
                 this.contentDescription = contentDescription
                 if (enabled) {
                     setProgress { target ->
-                        report(target.roundToInt().coerceIn(0, FADER_MAX))
-                        true
+                        report(gesture.step(target, currentValue))
+                        gesture.acceptsInput
                     }
                 } else {
                     disabled()
                 }
             }
-            .pointerInput(enabled, thumbHeightPx) {
-                if (enabled) detectTapGestures(onTap = { moveThumbCenterTo(it.y) })
+            .pointerInput(enabled, gesture) {
+                if (enabled) detectTapGestures(onTap = { report(gesture.tap(it.y, currentValue)) })
             }
             .draggable(
                 state = dragState,
                 orientation = Orientation.Vertical,
                 enabled = enabled,
-                onDragStarted = {
-                    track.dragCenterPx = faderOffsetOf(currentValue, travelPx()) + thumbHeightPx / 2f
-                },
+                onDragStarted = { gesture.startDrag(currentValue) },
             )
             .drawBehind { drawFader(value, accent, colors) },
     )

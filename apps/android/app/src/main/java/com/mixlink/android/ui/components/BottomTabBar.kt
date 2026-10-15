@@ -24,11 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
@@ -110,42 +106,22 @@ private fun tabIcon(tab: MainTab): ImageVector = when (tab) {
 
 /** Three faders at different heights. */
 private val MixIcon: ImageVector by lazy {
-    strokeIcon("Mix", "M6 4v16M12 4v16M18 4v16", "M4 14h4M10 8h4M16 12h4")
+    lineIcon("Mix", "M6 4v16M12 4v16M18 4v16", "M4 14h4M10 8h4M16 12h4")
 }
 
 /** A storage card: a saved mix. */
 private val MixesIcon: ImageVector by lazy {
-    strokeIcon("Mixes", "M5 4h11l3 3v13H5z", "M8 4v5h7V4M8 20v-6h8v6")
+    lineIcon("Mixes", "M5 4h11l3 3v13H5z", "M8 4v5h7V4M8 20v-6h8v6")
 }
 
 /** A hub with spokes: settings. */
 private val SettingsIcon: ImageVector by lazy {
-    strokeIcon(
+    lineIcon(
         "Settings",
         "M15 12a3 3 0 1 1-6 0a3 3 0 1 1 6 0",
         "M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1",
     )
 }
-
-/** A 24-unit line icon drawn with round two-unit strokes; [Icon] tints it. */
-private fun strokeIcon(name: String, vararg paths: String): ImageVector =
-    ImageVector.Builder(
-        name = name,
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f,
-    ).apply {
-        paths.forEach { path ->
-            addPath(
-                pathData = addPathNodes(path),
-                stroke = SolidColor(Color.Black),
-                strokeLineWidth = 2f,
-                strokeLineCap = StrokeCap.Round,
-                strokeLineJoin = StrokeJoin.Round,
-            )
-        }
-    }.build()
 
 @Preview(showBackground = true, backgroundColor = 0xFF0D1117)
 @Composable

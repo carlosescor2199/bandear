@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The MixLink mark for the launcher icon's foreground layer, on the 108 dp adaptive-icon canvas:
+    the amber rounded square of the desktop wordmark (corners a quarter of its side, as there) with
+    two arcs of signal leaving it, the mix reaching the musician's ears. Everything stays inside the
+    66 dp safe circle around the centre, so no launcher mask cuts it.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- The square: 28 wide, x 28 to 56, y 40 to 68, corners of 7. -->
+    <path
+        android:fillColor="@color/mixlink_accent"
+        android:pathData="M35,40 H49 A7,7 0 0,1 56,47 V61 A7,7 0 0,1 49,68 H35 A7,7 0 0,1 28,61 V47 A7,7 0 0,1 35,40 Z" />
+    <!-- The signal: quarter arcs of radius 10 and 20 around the middle of the square's right edge. -->
+    <path
+        android:strokeColor="@color/mixlink_text"
+        android:strokeWidth="5.5"
+        android:strokeLineCap="round"
+        android:pathData="M63.07,46.93 A10,10 0 0,1 63.07,61.07 M70.14,39.86 A20,20 0 0,1 70.14,68.14" />
+</vector>

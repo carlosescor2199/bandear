@@ -51,7 +51,8 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (bundled i
 ## Scope
 
 - Compose setup, theme and atoms; the ViewModel; the four screens; switching `MainActivity` to
-  Compose and deleting the XML layout; the saved-banks empty-state bug; bundling the two fonts.
+  Compose and deleting the XML layout; the saved-banks empty-state bug; bundling the two fonts;
+  the MixLink launcher icon (added by the parent for T6).
 
 ## Out of scope
 
@@ -99,7 +100,9 @@ for connecting; IBM Plex Sans for text and JetBrains Mono for numbers (bundled i
     again.
 - [x] T5 (fonts): bundle IBM Plex Sans and JetBrains Mono (OFL), after the user approves the
   download. The user approved it; see Progress. Commit: this commit.
-- [ ] Live check of the bundled fonts on the S23 (parent).
+- [x] T6 (launcher icon): the app still showed the default Android robot; an adaptive MixLink icon
+  drawn in-house as vectors. Commit: this commit.
+- [ ] Live check of the bundled fonts and the launcher icon on the S23 (parent).
 
 ## Acceptance criteria
 
@@ -539,3 +542,20 @@ features.
     the resource shrinker keep both fonts (in the APK as `res/f1.ttf`, 537,244 bytes, and
     `res/Mb.ttf`, 187,208 bytes: release builds shorten resource paths) and both licenses.
     Unsigned release APK 2,888,008 bytes (was 2,390,604). `cargo fmt --all -- --check`: clean.
+  - `e116aa3` is the commit above. The launcher icon (T6), this commit:
+    - Adaptive icon, own artwork, vectors only: `mipmap-anydpi-v26/ic_launcher.xml` and
+      `ic_launcher_round.xml` (the launcher applies the mask) with the background in the ground
+      colour (`@color/mixlink_ground`), the foreground `drawable/ic_launcher_foreground.xml` and
+      the monochrome layer `drawable/ic_launcher_monochrome.xml` for themed icons (Android 13 and
+      later). The mark: the desktop wordmark's amber (`#f5a524`) rounded square, corners a quarter
+      of its side as on the desktop, with two arcs of signal in the light text colour (`#e6edf3`,
+      new `@color/mixlink_text`) leaving its right edge. On the 108 dp canvas it spans x 28 to
+      78.75 and y 37.1 to 70.9, so its farthest point is about 25 dp from the centre, inside the
+      33 dp safe radius. The manifest sets `android:icon` and `android:roundIcon`.
+    - No pure logic, so no test. Checked: an SVG copy of the layers rendered in headless Chrome
+      (full canvas with the safe circle, a round mask at 144 and 48 px, a themed tint) shows the
+      mark whole inside the safe circle; `aapt2 dump badging` of the debug APK reads
+      `application: label='MixLink' icon='res/mipmap-anydpi-v26/ic_launcher.xml'`.
+    - `gradle -p apps/android :app:testDebugUnitTest assembleDebug --rerun-tasks`: BUILD
+      SUCCESSFUL, 41 tasks executed; 35 result files, 338 tests, 0 failures, 0 errors; no Kotlin
+      warnings. Debug APK 26,752,765 bytes. `cargo fmt --all -- --check`: clean.

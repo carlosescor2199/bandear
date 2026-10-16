@@ -13,9 +13,9 @@ pub mod sessions;
 use commands::DesktopState;
 use dto::{
     AudioSettingsRequest, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
-    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MirrorRequest,
-    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, SessionLoadedDto,
-    SessionSavedDto, StartRequest, StartSummary,
+    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, LocalOutputRequestDto,
+    LocalOutputSetDto, MirrorRequest, MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto,
+    OutputDeviceDto, PresetsDto, SessionLoadedDto, SessionSavedDto, StartRequest, StartSummary,
 };
 use events::EventPump;
 use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
@@ -79,6 +79,35 @@ async fn set_mix(
     mix: MixUpdateRequest,
 ) -> Result<MixDto, String> {
     commands::set_mix(state.inner(), address, mix)
+}
+
+/// Changes the engineer's local mix (`mix` as for `set_mix`, without `maxLevelPercent`: the local
+/// mix has no level cap) and answers the whole mix now applied; it is kept in the session for the
+/// next start (see [commands::local::set_local_mix]).
+#[tauri::command]
+async fn set_local_mix(
+    state: State<'_, DesktopState>,
+    mix: MixUpdateRequest,
+) -> Result<MixDto, String> {
+    commands::local::set_local_mix(state.inner(), mix)
+}
+
+/// The output devices the running driver offers for the local mix, `[{ name, channels }]` (see
+/// [commands::local::output_devices]).
+#[tauri::command]
+async fn output_devices(state: State<'_, DesktopState>) -> Result<Vec<OutputDeviceDto>, String> {
+    commands::local::output_devices(state.inner())
+}
+
+/// Plays the local mix on `output` (`{ device, firstChannel }`, the pair's first output 0-based) or
+/// turns it off with null, and answers `{ output, localOutput, applied, saved, saveError }` (see
+/// [commands::local::set_local_output]).
+#[tauri::command]
+async fn set_local_output(
+    state: State<'_, DesktopState>,
+    output: Option<LocalOutputRequestDto>,
+) -> Result<LocalOutputSetDto, String> {
+    commands::local::set_local_output(state.inner(), output)
 }
 
 #[tauri::command]
@@ -278,7 +307,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             // The session (musician labels, the engineer's channel details, groups and controls,
-            // and the audio input) is a desktop-app concern and
+            // the audio input, and the local mix and its output) is a desktop-app concern and
             // lives in the app's config directory, so it survives a restart without touching the
             // engine or any client protocol. Opening it never fails: a damaged file is set aside
             // and logged. The engineer's named sessions live beside it, in `sessions`.
@@ -304,6 +333,9 @@ pub fn run() {
             add_target,
             remove_target,
             set_mix,
+            set_local_mix,
+            output_devices,
+            set_local_output,
             set_musician_name,
             set_groups,
             set_channels,

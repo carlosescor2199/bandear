@@ -2,7 +2,10 @@
 //!
 //! They live apart from the `#[tauri::command]` wrappers in the crate root so that an example
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
-//! what these functions return.
+//! what these functions return. The engineer's local mix and its output have their own module,
+//! [local].
+
+pub mod local;
 
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
@@ -17,6 +20,7 @@ use personal_monitoring::{
     MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus, PresetChannel,
 };
 
+use self::local::{apply_kept_local, LocalEngine};
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
@@ -27,7 +31,8 @@ use crate::dto::{
 use crate::events::EventPump;
 use crate::session::{
     address_key, client_key, Session, SessionAudio, SessionChannel, SessionEngineer, SessionGroup,
-    SessionMirror, SessionPreset, SessionPresetChannel, SessionPresetMix, SessionStore,
+    SessionLocal, SessionMirror, SessionPreset, SessionPresetChannel, SessionPresetMix,
+    SessionStore,
 };
 use crate::sessions::{
     SessionMix, SnapshotRead, SnapshotStore, SnapshotSummary, SESSIONS_DIRECTORY,
@@ -60,6 +65,9 @@ pub struct DesktopState {
     /// The engineer's named sessions, in the `sessions` folder beside the session file (see
     /// [crate::sessions]).
     snapshots: SnapshotStore,
+    /// Why the local output the session keeps was not opened by the running engine (see
+    /// [local]), for the status to say; taken inside the engine lock, never the other way round.
+    local_notice: Mutex<Option<String>>,
 }
 
 impl DesktopState {
@@ -73,7 +81,19 @@ impl DesktopState {
             start_pump: None,
             session,
             snapshots,
+            local_notice: Mutex::new(None),
         }
+    }
+
+    /// Keeps `notice` as what the status says about the kept local output, or clears it.
+    fn set_local_notice(&self, notice: Option<String>) {
+        if let Ok(mut kept) = self.local_notice.lock() {
+            *kept = notice;
+        }
+    }
+
+    fn local_notice(&self) -> Option<String> {
+        self.local_notice.lock().ok().and_then(|kept| kept.clone())
     }
 
     /// Streams every engine started from now on through a pump that `start_pump` builds, given the
@@ -357,7 +377,10 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 /// ([session_engineer_controls]): a configured target has them at once, and a phone gets them when
 /// it registers, from whatever IP, before its first mix is handled. The mirrors the session keeps
 /// follow the same way ([session_mirrors]); one the engine refuses (a circle in a hand-edited
-/// session) is logged and left out.
+/// session) is logged and left out. Last, the engineer's local mix and its output the session
+/// keeps ([local::apply_kept_local]): the mix through the desk's path, then the output, opened only
+/// when the running driver offers it; one it does not offer, or that cannot be opened, leaves the
+/// local output off, never on another device, and the status says why (`localOutput.notice`).
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let mut pump = state
         .pump
@@ -374,6 +397,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_channels = session_channels(&state.session);
     let saved_controls = session_engineer_controls(&state.session);
     let saved_mirrors = session_mirrors(&state.session);
+    let saved_local = state.session.local();
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
@@ -397,6 +421,17 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
             for refused in hand_kept_mirrors(&handle, saved_mirrors) {
                 eprintln!("[mixlink-desktop] start_engine: {refused}");
             }
+            let local = saved_local.map(|kept| apply_kept_local(&mut handle, &kept));
+            let notice = local.and_then(|applied| {
+                if let Some(refused) = applied.refused {
+                    eprintln!("[mixlink-desktop] start_engine: {refused}");
+                }
+                applied.notice
+            });
+            if let Some(notice) = &notice {
+                eprintln!("[mixlink-desktop] start_engine: {notice}");
+            }
+            state.set_local_notice(notice);
             let summary = StartSummary {
                 run,
                 device_name: handle.device_name().to_owned(),
@@ -487,6 +522,7 @@ fn status_of(state: &DesktopState, handle: &EngineHandle) -> EngineStatusDto {
     let mut status = EngineStatusDto::from(&handle.status());
     status.run = state.run();
     apply_names(&mut status, &state.session);
+    status.local_output.notice = state.local_notice();
     status
 }
 
@@ -511,6 +547,17 @@ pub fn engine_meters(state: &DesktopState) -> Result<MetersDto, String> {
 /// `None` when no engine runs or that IP is no musician. The `mix-changed` event's lookup.
 pub fn musician_mix(state: &DesktopState, address: SocketAddr) -> Option<(SocketAddr, MixValues)> {
     state.engine.lock().ok()?.as_ref()?.musician_mix(address)
+}
+
+/// The engineer's local mix now; `None` when no engine runs. The `mix-changed` event's read for a
+/// change of the local mix.
+pub fn local_mix(state: &DesktopState) -> Option<MixValues> {
+    state
+        .engine
+        .lock()
+        .ok()?
+        .as_ref()
+        .map(EngineHandle::local_mix)
 }
 
 /// Fills each musician row's displayed name from the session's local labels: the label kept for
@@ -1826,12 +1873,14 @@ pub fn sessions(state: &DesktopState) -> Result<Vec<SnapshotSummary>, String> {
 }
 
 /// What a session save or load reads of the running engine: the device's input count, the ids of
-/// the live groups in their order (every musician's group levels are placed by them) and every
-/// musician the engine lists, with their mix, their phone's client id and whom they follow.
+/// the live groups in their order (every musician's group levels are placed by them), every
+/// musician the engine lists, with their mix, their phone's client id and whom they follow, and the
+/// engineer's local mix.
 struct DeskView {
     inputs: usize,
     groups: Vec<String>,
     musicians: Vec<MusicianStatus>,
+    local: MixValues,
 }
 
 /// Reads the running engine for a session save or load: the engine in the app, a stand-in in the
@@ -1847,13 +1896,14 @@ impl DeskReader for EngineHandle {
             inputs: usize::from(status.source_channels),
             groups: status.groups.into_iter().map(|group| group.id).collect(),
             musicians: status.musicians,
+            local: status.local_mix,
         }
     }
 }
 
-/// What loading a session needs from the running engine, besides the group and channel edits every
-/// other command uses.
-trait SessionEngine: DeskReader + GroupEngine + ChannelEngine {
+/// What loading a session needs from the running engine, besides the group, channel and local mix
+/// edits every other command uses.
+trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine {
     /// Replaces every control and mirror the engine keeps ([EngineHandle::replace_kept]); answers
     /// the mirrors it refused.
     fn replace_kept(
@@ -1896,30 +1946,33 @@ fn row_key(row: &MusicianStatus) -> String {
 fn saved_mixes(desk: &DeskView) -> BTreeMap<String, SessionMix> {
     desk.musicians
         .iter()
-        .map(|row| {
-            let mix = &row.mix;
-            let inputs = desk.inputs.min(mix.channel_gains.len());
-            let saved = SessionMix {
-                channels: (0..inputs)
-                    .map(|channel| SessionPresetChannel {
-                        gain: mix.channel_gains[channel],
-                        pan: mix.pans[channel],
-                        muted: mix.channel_muted[channel],
-                        solo: mix.channel_solo[channel],
-                    })
-                    .collect(),
-                groups: desk
-                    .groups
-                    .iter()
-                    .zip(mix.group_levels)
-                    .map(|(id, level)| (id.clone(), level))
-                    .collect(),
-                volume_percent: mix.volume_percent,
-                muted: mix.muted,
-            };
-            (row_key(row), saved)
-        })
+        .map(|row| (row_key(row), session_mix_of(&row.mix, desk)))
         .collect()
+}
+
+/// `mix` as the desk keeps a whole mix ([SessionMix]): the level, pan, mute and solo of the inputs
+/// the device has, the group levels by the ids of the live groups, the master volume and the master
+/// mute. Never the phone's own level cap or the engineer's controls.
+fn session_mix_of(mix: &MixValues, desk: &DeskView) -> SessionMix {
+    let inputs = desk.inputs.min(mix.channel_gains.len());
+    SessionMix {
+        channels: (0..inputs)
+            .map(|channel| SessionPresetChannel {
+                gain: mix.channel_gains[channel],
+                pan: mix.pans[channel],
+                muted: mix.channel_muted[channel],
+                solo: mix.channel_solo[channel],
+            })
+            .collect(),
+        groups: desk
+            .groups
+            .iter()
+            .zip(mix.group_levels)
+            .map(|(id, level)| (id.clone(), level))
+            .collect(),
+        volume_percent: mix.volume_percent,
+        muted: mix.muted,
+    }
 }
 
 /// Saves the desk's whole session as a named session called `name` (trimmed, at most 40
@@ -1927,9 +1980,11 @@ fn saved_mixes(desk: &DeskView) -> BTreeMap<String, SessionMix> {
 /// engine runs, and answers what was saved ([SessionSavedDto]).
 ///
 /// The session is everything the desk keeps (labels, the engineer's controls and mirrors, channel
-/// details, groups, presets and the audio input); each musician's mix is read from the running
-/// engine under the key the desk keeps them by (see [saved_mixes]). With no engine running the
-/// session is saved without mixes. A refused name, or a save that fails, saves nothing.
+/// details, groups, presets, the audio input, and the local mix and its output); each musician's
+/// mix is read from the running engine under the key the desk keeps them by (see [saved_mixes]),
+/// and so is the local mix the engine plays. With no engine running the session is saved without
+/// mixes, with the local mix as the desk keeps it. A refused name, or a save that fails, saves
+/// nothing.
 pub fn save_session(state: &DesktopState, name: String) -> Result<SessionSavedDto, String> {
     let outcome = save_session_with(&state.engine, &state.session, &state.snapshots, &name)?;
     println!(
@@ -1953,7 +2008,17 @@ fn save_session_with<E: DeskReader>(
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
     let desk = guard.as_ref().map(DeskReader::desk);
     let mixes = desk.as_ref().map(saved_mixes).unwrap_or_default();
-    let saved = snapshots.save(name, session.current(), mixes, |taken| new_id('s', taken))?;
+    let mut current = session.current();
+    if let Some(desk) = &desk {
+        // The local mix the engine plays: an edit whose save failed, or levels a group or channel
+        // change moved, are the engine's, not yet the session's.
+        let kept = current.local.take().unwrap_or_default();
+        current.local = Some(SessionLocal {
+            mix: Some(session_mix_of(&desk.local, desk)),
+            ..kept
+        });
+    }
+    let saved = snapshots.save(name, current, mixes, |taken| new_id('s', taken))?;
     Ok(SessionSavedDto {
         session: saved,
         engine_running: desk.is_some(),
@@ -2012,11 +2077,20 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   never restarted. It is taken only as the engineer could choose it (a known driver, and ASIO
 ///   only with the ASIO driver the engineer picked); one that is not is skipped and said, and the
 ///   desk keeps its own, as it does when the saved session has none.
+/// - The saved local mix and its output replace the desk's (`localLoaded`); a saved session from
+///   before the local mix leaves the desk's own as they are. With an engine running, after the
+///   musicians' mixes, the local mix is pushed through the desk's path (`localMix`) and the output
+///   is put in force as a start does it ([local::apply_kept_local]): none turns the local output
+///   off, and one the running driver does not offer, or that cannot be opened, leaves it off and is
+///   said (`localOutputNotice`), never replaced by another device.
 ///
 /// The load is one step under the engine lock, with the session's inside it. A save that fails
 /// after the engine took the session is reported in the answer, not as an error.
 pub fn load_session(state: &DesktopState, id: String) -> Result<SessionLoadedDto, String> {
     let outcome = load_session_with(&state.engine, &state.session, &state.snapshots, &id)?;
+    if outcome.applied && outcome.local_loaded {
+        state.set_local_notice(outcome.local_output_notice.clone());
+    }
     println!(
         "[mixlink-desktop] load_session: \"{}\" ({id}) applied={} saved={} pushed={} skipped={} refused={}",
         outcome.session.name,
@@ -2115,8 +2189,11 @@ fn load_session_with<E: SessionEngine>(
     let previous = session.current();
     let (audio, audio_loaded, audio_skipped) =
         loaded_audio(snapshot.session.audio.clone(), previous.audio.clone());
+    // A saved session from before the local mix leaves the desk's own local mix and output.
+    let saved_local = snapshot.session.local.clone();
     let next = Session {
         audio: audio.clone(),
+        local: saved_local.clone().or(previous.local),
         ..snapshot.session.clone()
     };
     let live = match guard.as_mut() {
@@ -2127,6 +2204,7 @@ fn load_session_with<E: SessionEngine>(
             definitions,
             details,
             &snapshot.mixes,
+            saved_local.as_ref(),
         )?),
         None => None,
     };
@@ -2142,8 +2220,8 @@ fn load_session_with<E: SessionEngine>(
         // Nothing took it, so nothing changed.
         Err(error) => return Err(error),
     };
-    let (mixes, skipped, refused) = match live {
-        Some(live) => (live.pushed, live.skipped, live.refused),
+    let (mixes, skipped, refused, local) = match live {
+        Some(live) => (live.pushed, live.skipped, live.refused, live.local),
         None => (
             Vec::new(),
             snapshot
@@ -2152,7 +2230,12 @@ fn load_session_with<E: SessionEngine>(
                 .map(|key| skipped_mix(&next, key, "notRunning", None))
                 .collect(),
             Vec::new(),
+            None,
         ),
+    };
+    let (local_mix, local_output_notice) = match local {
+        Some(local) => (local.mix.as_ref().map(MixDto::from), local.notice),
+        None => (None, None),
     };
     Ok(SessionLoadedDto {
         session: summary,
@@ -2167,6 +2250,9 @@ fn load_session_with<E: SessionEngine>(
         audio_loaded,
         audio_skipped,
         presets: next.presets,
+        local_loaded: saved_local.is_some(),
+        local_mix,
+        local_output_notice,
     })
 }
 
@@ -2175,6 +2261,8 @@ struct LiveLoad {
     pushed: Vec<LoadedMixDto>,
     skipped: Vec<SkippedMixDto>,
     refused: Vec<String>,
+    /// What it did with the saved local section; `None` when the saved session had none.
+    local: Option<local::LocalApplied>,
 }
 
 /// A saved mix that went to nobody, named by the musician's key and the label `session` keeps for
@@ -2197,13 +2285,15 @@ fn skipped_mix(
 }
 
 /// Applies the session `next` to a running engine, in the order [load_session] gives: groups and
-/// channel details, the engineer's controls and the mirrors, then the saved mixes.
+/// channel details, the engineer's controls and the mirrors, the saved mixes, then the saved
+/// `local` mix and output when the saved session has them.
 fn apply_session<E: SessionEngine>(
     engine: &mut E,
     next: &Session,
     definitions: Vec<GroupDefinition>,
     details: Vec<ChannelMeta>,
     mixes: &BTreeMap<String, SessionMix>,
+    local: Option<&SessionLocal>,
 ) -> Result<LiveLoad, String> {
     // In the order a start applies them. Both were checked already, so only an engine that is
     // stopping refuses them, and then the first refusal changed nothing.
@@ -2211,7 +2301,8 @@ fn apply_session<E: SessionEngine>(
     engine.set_channels(details)?;
     // The loaded session's controls and mirrors replace the engine's whole, so one it dropped
     // never comes back, also for a musician who is not here and registers later.
-    let refused = match engine.replace_kept(&controls_of(next), &mirrors_of(next)) {
+    let mut refused: Vec<String> = match engine.replace_kept(&controls_of(next), &mirrors_of(next))
+    {
         Ok(refused) => refused
             .into_iter()
             .map(|error| format!("a saved mirror was not applied: {error}"))
@@ -2222,10 +2313,13 @@ fn apply_session<E: SessionEngine>(
     };
     let desk = engine.desk();
     let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
+    let local = local.map(|kept| apply_kept_local(engine, kept));
+    refused.extend(local.as_ref().and_then(|local| local.refused.clone()));
     Ok(LiveLoad {
         pushed,
         skipped,
         refused,
+        local,
     })
 }
 
@@ -2367,6 +2461,10 @@ mod tests {
                     mirror: None,
                 })
                 .collect(),
+            local_mix: MixDto::from(&personal_monitoring::MixValues::default()),
+            local_output: crate::dto::LocalOutputDto::from(
+                &personal_monitoring::LocalOutputStatus::default(),
+            ),
         }
     }
 
@@ -2565,6 +2663,10 @@ mod tests {
             &self,
             _: std::net::SocketAddr,
         ) -> Option<(std::net::SocketAddr, personal_monitoring::MixValues)> {
+            None
+        }
+
+        fn local_mix(&self) -> Option<personal_monitoring::MixValues> {
             None
         }
     }
@@ -2808,6 +2910,13 @@ mod tests {
         refuses_kept: Option<String>,
         /// The musician whose mix it refuses to change, when it does.
         refuses_push_to: Option<String>,
+        /// The engineer's local mix as a session save or load reads it.
+        local: MixValues,
+        /// The local mix changes it took, in order.
+        local_pushed: Vec<MixUpdate>,
+        /// The outputs its driver offers, and where the local mix plays.
+        outputs: Vec<personal_monitoring::OutputDevice>,
+        output: personal_monitoring::LocalOutputStatus,
     }
 
     /// The engineer's controls and the mirrors an engine keeps, as a load hands them over.
@@ -3007,7 +3116,53 @@ mod tests {
                     |groups| groups.iter().map(|group| group.id.clone()).collect(),
                 ),
                 musicians: self.here.lock().expect("rows lock").clone(),
+                local: self.local,
             }
+        }
+    }
+
+    impl LocalEngine for StandInEngine {
+        fn set_local_mix(&mut self, update: &MixUpdate) -> Result<MixValues, String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            self.note("set_local_mix".to_owned());
+            self.local_pushed.push(update.clone());
+            Ok(MixValues {
+                revision: 12,
+                volume_percent: update.volume_percent.map_or(100, |volume| volume as u8),
+                ..MixValues::default()
+            })
+        }
+
+        fn output_devices(&self) -> Result<Vec<personal_monitoring::OutputDevice>, String> {
+            Ok(self.outputs.clone())
+        }
+
+        fn set_local_output(
+            &mut self,
+            request: Option<personal_monitoring::LocalOutputRequest>,
+        ) -> Result<personal_monitoring::LocalOutputStatus, String> {
+            self.note(format!(
+                "set_local_output {}",
+                request
+                    .as_ref()
+                    .map_or("none", |request| request.device.as_str())
+            ));
+            self.output = personal_monitoring::LocalOutputStatus {
+                state: if request.is_some() {
+                    personal_monitoring::LocalOutputState::Running
+                } else {
+                    personal_monitoring::LocalOutputState::Off
+                },
+                output: request,
+                ..personal_monitoring::LocalOutputStatus::default()
+            };
+            Ok(self.output.clone())
+        }
+
+        fn local_output(&self) -> personal_monitoring::LocalOutputStatus {
+            self.output.clone()
         }
     }
 
@@ -5216,10 +5371,18 @@ mod tests {
                         mix_of(&[100, 90], &[100, 55], 60, true, 100),
                     ),
                 ]),
+                local: mix_of(&[30, 20, 10], &[40, 50], 75, false, 100),
                 ..StandInEngine::default()
             }),
         );
         working_session(&session);
+        let speakers = crate::session::SessionOutput {
+            device: "Speakers (Realtek Audio)".to_owned(),
+            first_channel: 0,
+        };
+        session
+            .set_local_output(Some(speakers.clone()))
+            .expect("kept");
 
         let saved = save_session_with(&engine, &session, &snapshots, " Show ").expect("saved");
 
@@ -5229,8 +5392,14 @@ mod tests {
         let read = snapshots.read(&saved.session.id).expect("readable");
         assert_eq!(
             read.snapshot.session,
-            session.current(),
-            "every section the desk keeps"
+            Session {
+                local: Some(SessionLocal {
+                    mix: Some(saved_mix(&[30, 20], &[("kit", 40), ("vox", 50)], 75, false)),
+                    output: Some(speakers),
+                }),
+                ..session.current()
+            },
+            "every section the desk keeps, with the local mix the engine plays"
         );
         assert_eq!(
             read.snapshot.mixes,
@@ -5578,6 +5747,199 @@ mod tests {
             "the groups apply at the next start"
         );
         assert_eq!(outcome.session.name, "Show");
+    }
+
+    fn local_section(output: Option<(&str, u16)>) -> SessionLocal {
+        SessionLocal {
+            mix: Some(saved_mix(&[40], &[("kit", 25)], 65, false)),
+            output: output.map(|(device, first_channel)| crate::session::SessionOutput {
+                device: device.to_owned(),
+                first_channel,
+            }),
+        }
+    }
+
+    fn offering(outputs: &[(&str, u16)]) -> Vec<personal_monitoring::OutputDevice> {
+        outputs
+            .iter()
+            .map(|(name, channels)| personal_monitoring::OutputDevice {
+                name: (*name).to_owned(),
+                channels: *channels,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_load_pushes_the_saved_local_mix_after_the_musicians_and_opens_its_output_when_offered() {
+        let test = "session-load-local";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 1,
+                live_groups: vec!["kit".to_owned()],
+                here: Mutex::new(vec![here(ANA, Some(PHONE), true, MixValues::default())]),
+                outputs: offering(&[("Speakers (Realtek Audio)", 2), ("Volt 4", 4)]),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[("kit", &[1])], 1);
+        loaded.local = Some(local_section(Some(("Volt 4", 2))));
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                loaded.clone(),
+                &[(
+                    &client_key(PHONE),
+                    saved_mix(&[80], &[("kit", 70)], 85, false),
+                )],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert!(outcome.applied && outcome.saved, "{outcome:?}");
+        assert!(outcome.local_loaded);
+        assert_eq!(outcome.local_output_notice, None);
+        assert_eq!(
+            outcome.local_mix.as_ref().map(|mix| mix.volume_percent),
+            Some(65)
+        );
+        let log = log_of(&engine);
+        let at = |step: &str| {
+            log.iter()
+                .position(|line| line.starts_with(step))
+                .unwrap_or_else(|| panic!("no {step} in {log:?}"))
+        };
+        assert!(at("push_mix") < at("set_local_mix"), "{log:?}");
+        assert!(
+            at("set_local_mix") < at("set_local_output Volt 4"),
+            "{log:?}"
+        );
+        let pushed = engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .map(|engine| engine.local_pushed.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            pushed,
+            vec![MixUpdate {
+                channel_gains: Some(vec![40]),
+                pans: Some(vec![50]),
+                channel_muted: Some(vec![false]),
+                channel_solo: Some(vec![false]),
+                group_levels: Some(vec![25]),
+                volume_percent: Some(65),
+                max_level_percent: None,
+                muted: Some(false),
+            }]
+        );
+        assert_eq!(
+            session.local(),
+            loaded.local,
+            "the desk keeps the loaded one"
+        );
+    }
+
+    #[test]
+    fn a_loaded_output_the_running_driver_does_not_offer_is_left_off_and_said() {
+        let test = "session-load-local-unoffered";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 1,
+                // Under ASIO only the capture driver's own outputs are offered.
+                outputs: offering(&[("Volt 4 ASIO", 4)]),
+                output: personal_monitoring::LocalOutputStatus {
+                    output: Some(personal_monitoring::LocalOutputRequest {
+                        device: "Volt 4 ASIO".to_owned(),
+                        first_channel: 0,
+                    }),
+                    state: personal_monitoring::LocalOutputState::Running,
+                    ..personal_monitoring::LocalOutputStatus::default()
+                },
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[], 1);
+        loaded.local = Some(local_section(Some(("OUTPUT 1/2 (Volt 4)", 0))));
+        saved_session(test, "show", &snapshot(loaded.clone(), &[]));
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        let notice = outcome.local_output_notice.expect("said");
+        assert!(
+            notice.contains("OUTPUT 1/2 (Volt 4) · outputs 1/2"),
+            "{notice}"
+        );
+        let log = log_of(&engine);
+        assert!(
+            !log.iter()
+                .any(|line| line == "set_local_output OUTPUT 1/2 (Volt 4)"),
+            "{log:?}"
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .map(|engine| engine.output.output.clone()),
+            Some(None),
+            "the output that played stops: never another device in its place"
+        );
+        assert_eq!(
+            session.local(),
+            loaded.local,
+            "the choice is kept for a driver that offers it"
+        );
+    }
+
+    #[test]
+    fn a_saved_session_from_before_the_local_mix_leaves_the_desks_own() {
+        let test = "session-load-no-local";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 1,
+                ..StandInEngine::default()
+            }),
+        );
+        let own = local_section(Some(("Speakers (Realtek Audio)", 0)));
+        session
+            .set_local_mix(own.mix.clone().expect("a mix"))
+            .expect("kept");
+        session.set_local_output(own.output.clone()).expect("kept");
+        saved_session(test, "show", &snapshot(layout_session(&[], 1), &[]));
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert!(!outcome.local_loaded);
+        assert!(outcome.local_mix.is_none());
+        assert_eq!(session.local(), Some(own), "the desk's own stays");
+        let log = log_of(&engine);
+        assert!(
+            !log.iter().any(|line| line.contains("local")),
+            "the engine's local mix and output are left alone: {log:?}"
+        );
+
+        let (idle_session, idle_snapshots, idle) = desk("session-load-local-idle", None);
+        let mut loaded = layout_session(&[], 1);
+        loaded.local = Some(local_section(None));
+        saved_session(
+            "session-load-local-idle",
+            "show",
+            &snapshot(loaded.clone(), &[]),
+        );
+        let outcome =
+            load_session_with(&idle, &idle_session, &idle_snapshots, "show").expect("loaded");
+        assert!(outcome.local_loaded && !outcome.applied);
+        assert!(outcome.local_mix.is_none(), "nothing plays it yet");
+        assert_eq!(
+            idle_session.local(),
+            loaded.local,
+            "kept for the next start"
+        );
     }
 
     #[test]

@@ -41,14 +41,37 @@ data class ChannelInfo(
 )
 
 /**
+ * What the engineer set for this musician, as `mix_ack` and `mix_state` report it. The phone shows
+ * it and never sends it back.
+ *
+ * [limitPercent] caps what the musician hears, apart from the phone's own level cap: the server
+ * plays at most the lower of the two. [lockedChannels] are the 0-based channels whose level, pan,
+ * mute and solo the server keeps whatever the phone sends. The defaults (no limit, nothing locked)
+ * are what an older server, which reports neither, means.
+ */
+data class EngineerControls(val limitPercent: Int = 100, val lockedChannels: Set<Int> = emptySet()) {
+    /** True when the engineer set a limit below full scale. */
+    val limited: Boolean
+        get() = limitPercent < 100
+
+    fun isLocked(channel: Int): Boolean = channel in lockedChannels
+}
+
+/** A whole mix as the server reports it (`mix_ack`, `mix_state`), with the engineer's controls. */
+data class MixReport(val mix: MixSnapshot, val engineer: EngineerControls = EngineerControls())
+
+/**
  * The `More of me` rule ([MixSnapshot.moreOfMe]) for a musician whose channel is [channels]: one
  * input, or both sides of a stereo pair, so both sides are lifted alike and the server, which keeps
- * a pair's sides equal, plays exactly what was sent. Null when no valid channel is given.
+ * a pair's sides equal, plays exactly what was sent. A channel in [locked] is neither lifted nor
+ * lowered: the server keeps it as the engineer left it, so it is sent as it is stored. Null when no
+ * valid channel is given.
  */
-internal fun MixSnapshot.moreOfMeFor(channels: List<Int>): MixSnapshot? {
+internal fun MixSnapshot.moreOfMeFor(channels: List<Int>, locked: Set<Int> = emptySet()): MixSnapshot? {
     val lifted = moreOfMe(channels.firstOrNull()) ?: return null
     val gains = lifted.channelGains.copyOf()
     channels.drop(1).filter { it in gains.indices }.forEach { gains[it] = MixSnapshot.MORE_OF_ME_CHANNEL_GAIN }
+    locked.filter { it in gains.indices }.forEach { gains[it] = channelGains[it] }
     return lifted.copy(channelGains = gains)
 }
 

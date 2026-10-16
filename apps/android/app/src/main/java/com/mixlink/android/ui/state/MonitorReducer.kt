@@ -2,6 +2,7 @@ package com.mixlink.android.ui.state
 
 import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ControlState
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.MixSnapshot
 import com.mixlink.android.controlStatusLabel
@@ -66,8 +67,10 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
                 audioPort = event.audioPort.toString(),
             ),
         ).showing(ControlState.CONNECTING, mixAcknowledged = false),
-        // Counters and errors describe one session, so a new one starts them again.
+        // Counters and errors describe one session, so a new one starts them again. So does what the
+        // engineer set: this server reports its own (an older one never does, and leaves all open).
         diagnostics = DiagnosticsUiState(),
+        mix = state.mix.copy(engineer = EngineerControls()),
         tab = MainTab.MIX,
     )
     SessionEnded -> state.copy(
@@ -113,11 +116,14 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
     is MasterVolumeChanged -> state.copy(mix = state.mix.copy(masterVolume = event.level.coerceIn(PERCENT)))
     is MasterMuteChanged -> state.copy(mix = state.mix.copy(masterMuted = event.muted))
     is LevelCapChanged -> state.copy(mix = state.mix.copy(levelCap = event.level.coerceIn(PERCENT)))
-    // A push while a change of the phone's is on its way is overtaken by that change's answer.
-    is MixPushed -> if (state.mixSync.settled) applyServerMix(state, event.snapshot) else state
-    is MixAnswered -> answerMix(state, event.seq, event.applied)
+    // A push while a change of the phone's is on its way is overtaken by that change's answer; the
+    // engineer's controls it carries hold at once (see [withEngineer]).
+    is MixPushed -> state.withEngineer(event.engineer).let { reported ->
+        if (reported.mixSync.settled) applyServerMix(reported, event.snapshot) else reported
+    }
+    is MixAnswered -> answerMix(state, event.seq, event.applied, event.engineer)
 
-    is MoreOfMeToggled -> state.copy(moreOfMe = toggleMoreOfMe(state.moreOfMe, event.on))
+    is MoreOfMeToggled -> state.copy(moreOfMe = toggleMoreOfMe(state, event.on))
     is MusicianChannelChosen -> chooseMusicianChannel(state, event.channel)
 
     is MixesLoaded -> state.copy(savedMixes = state.savedMixes.listing(event.names))
@@ -221,7 +227,29 @@ private fun applyConfig(
         groupLevels = List(groups.size) { mix.groupLevels.getOrElse(it) { NEUTRAL } },
         channelDetails = details,
     )
-    return state.copy(mix = announced, moreOfMe = state.moreOfMe.fittedTo(announced))
+    return state.copy(mix = announced, moreOfMe = state.moreOfMe.fittedTo(announced).offIfLocked(announced))
+}
+
+/**
+ * The engineer's [controls] as the server reported them with a mix. They hold at once, even when the
+ * mix they came with is overtaken by a change of the phone's still on its way: the phone never sends
+ * them, so nothing of its own can overtake them, and the server reports them in order. A report
+ * belongs to a session, so a late one changes nothing once the session ended. More of me goes off
+ * when the musician's channel is now locked.
+ */
+private fun MonitorUiState.withEngineer(controls: EngineerControls): MonitorUiState {
+    if (!connection.sessionRunning || mix.engineer == controls) return this
+    val held = mix.copy(engineer = controls)
+    return copy(mix = held, moreOfMe = moreOfMe.offIfLocked(held))
+}
+
+/**
+ * More of me off, saying why, when it is on and the engineer locked the musician's channel: the
+ * server keeps that channel as the engineer left it, so it cannot be lifted.
+ */
+private fun MoreOfMeUiState.offIfLocked(mix: MixUiState): MoreOfMeUiState {
+    val channel = musicianChannel ?: return this
+    return if (enabled && mix.stripLocked(channel)) copy(enabled = false, notice = MoreOfMeNotice.CHANNEL_LOCKED) else this
 }
 
 /**
@@ -245,12 +273,16 @@ private fun MoreOfMeUiState.fittedTo(mix: MixUiState): MoreOfMeUiState {
 /**
  * Applies [change] to the mix when [channel] has an entry, with the channels the edit writes: both
  * sides when [channel]'s strip is a stereo pair, otherwise [channel] alone. Any other channel changes
- * nothing.
+ * nothing, and neither does a strip the engineer locked (a pair when either side is): the server
+ * would keep its values anyway, so the phone's whole mix never carries a changed locked value.
  */
 private inline fun MonitorUiState.withStrip(
     channel: Int,
     change: (mix: MixUiState, sides: List<Int>) -> MixUiState,
-): MonitorUiState = if (channel in mix.levels.indices) copy(mix = change(mix, mix.stripSides(channel))) else this
+): MonitorUiState {
+    if (channel !in mix.levels.indices || mix.stripLocked(channel)) return this
+    return copy(mix = change(mix, mix.stripSides(channel)))
+}
 
 /**
  * The pans with [pan] written for [sides]: a single channel takes it as it is, and a stereo pair
@@ -278,18 +310,25 @@ private fun setGroupLevel(state: MonitorUiState, group: Int, level: Int): Monito
     return state.copy(mix = mix.copy(groupLevels = levels))
 }
 
-/** More of me turns on only with a channel to lift; asking without one leaves it off and says why. */
-private fun toggleMoreOfMe(moreOfMe: MoreOfMeUiState, on: Boolean): MoreOfMeUiState =
-    if (on && moreOfMe.musicianChannel == null) {
-        moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.NEEDS_CHANNEL)
-    } else {
-        moreOfMe.copy(enabled = on, notice = null)
+/**
+ * More of me turns on only with a channel to lift: asking without one, or while the engineer locked
+ * it, leaves it off and says why.
+ */
+private fun toggleMoreOfMe(state: MonitorUiState, on: Boolean): MoreOfMeUiState {
+    val moreOfMe = state.moreOfMe
+    val channel = moreOfMe.musicianChannel
+    return when {
+        on && channel == null -> moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.NEEDS_CHANNEL)
+        on && state.mix.stripLocked(channel!!) -> moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.CHANNEL_LOCKED)
+        else -> moreOfMe.copy(enabled = on, notice = null)
     }
+}
 
 /**
  * Takes [channel] as the musician's, or none. Only a channel the picker offers can be chosen: one
  * the server announced, shown, and known by its strip (a stereo pair by its first channel). Choosing
- * none while More of me is on turns it off, since there is nothing left to lift.
+ * none while More of me is on turns it off, since there is nothing left to lift; so does choosing a
+ * channel the engineer locked. The musician can still call a locked channel theirs.
  */
 private fun chooseMusicianChannel(state: MonitorUiState, channel: Int?): MonitorUiState {
     if (channel != null && channel !in state.musicianChannelChoices) return state
@@ -297,7 +336,7 @@ private fun chooseMusicianChannel(state: MonitorUiState, channel: Int?): Monitor
     val next = if (channel == null && moreOfMe.enabled) {
         moreOfMe.copy(musicianChannel = null, enabled = false, notice = MoreOfMeNotice.NO_CHANNEL_SELECTED)
     } else {
-        moreOfMe.copy(musicianChannel = channel, notice = null)
+        moreOfMe.copy(musicianChannel = channel, notice = null).offIfLocked(state.mix)
     }
     return state.copy(moreOfMe = next)
 }
@@ -305,15 +344,20 @@ private fun chooseMusicianChannel(state: MonitorUiState, channel: Int?): Monitor
 /**
  * The mix with a saved [snapshot] applied, as if every control had been moved by hand. What the
  * server announced (the channel count and the groups) is kept; the strips take the saved mix's size
- * until the server announces again, as the old screen did.
+ * until the server announces again, as the old screen did. A channel the engineer locked keeps the
+ * level, pan, mute and solo it has, as a moved control on it would; a pair is locked as one strip
+ * ([MixUiState.lockedSides]), so neither side takes the saved values when either is locked.
  */
 private fun MixUiState.recalled(snapshot: MixSnapshot): MixUiState {
     val count = snapshot.channelGains.size
+    val locked = lockedSides
+    fun <T> kept(index: Int, current: List<T>, saved: () -> T): T =
+        if (index in locked && index in current.indices) current[index] else saved()
     return copy(
-        levels = snapshot.channelGains.toList(),
-        pans = List(count) { snapshot.channelPans.getOrElse(it) { defaultPan(it) } },
-        mutes = List(count) { snapshot.channelMutes.getOrElse(it) { false } },
-        solos = List(count) { snapshot.channelSolos.getOrElse(it) { false } },
+        levels = List(count) { kept(it, levels) { snapshot.channelGains[it] } },
+        pans = List(count) { kept(it, pans) { snapshot.channelPans.getOrElse(it) { defaultPan(it) } } },
+        mutes = List(count) { kept(it, mutes) { snapshot.channelMutes.getOrElse(it) { false } } },
+        solos = List(count) { kept(it, solos) { snapshot.channelSolos.getOrElse(it) { false } } },
         groupLevels = snapshot.groupLevels.toList(),
         masterVolume = snapshot.volumePercent,
         levelCap = snapshot.maxLevelPercent,
@@ -325,11 +369,18 @@ private fun MixUiState.recalled(snapshot: MixSnapshot): MixUiState {
  * The server answered the phone's change number [seq], with the whole mix it now plays ([applied])
  * or with nothing (it refused the mix). The server answers in order, so every older change is
  * answered too. Only the answer to the newest change is shown: an older one's mix is overtaken by
- * a change still on its way, whose own answer follows.
+ * a change still on its way, whose own answer follows. The engineer's [engineer] controls of any
+ * readable answer hold at once ([withEngineer]); a refusal carries none and leaves them as they were.
  */
-private fun answerMix(state: MonitorUiState, seq: Long, applied: MixSnapshot?): MonitorUiState {
-    val answered = state.copy(mixSync = state.mixSync.answeredUpTo(seq))
-    return if (applied != null && seq == state.mixSync.latest) applyServerMix(answered, applied) else answered
+private fun answerMix(
+    state: MonitorUiState,
+    seq: Long,
+    applied: MixSnapshot?,
+    engineer: EngineerControls,
+): MonitorUiState {
+    if (applied == null) return state.copy(mixSync = state.mixSync.answeredUpTo(seq))
+    val answered = state.copy(mixSync = state.mixSync.answeredUpTo(seq)).withEngineer(engineer)
+    return if (seq == state.mixSync.latest) applyServerMix(answered, applied) else answered
 }
 
 /**
@@ -382,12 +433,13 @@ private fun IntArray.percentAt(index: Int): Int? = getOrNull(index)?.coerceIn(PE
 
 /**
  * The mix as the phone sends it: with More of me on, its channel lifted (both sides of a stereo
- * pair) and the others lowered.
+ * pair) and the others lowered, except the channels the engineer locked, which stay as they are (a
+ * pair whole when either side is locked, as the channel sends it).
  */
 private fun MixUiState.asPlayed(moreOfMe: MoreOfMeUiState): MixUiState {
     if (!moreOfMe.enabled) return this
     val channel = moreOfMe.musicianChannel ?: return this
-    val lifted = toSnapshot().moreOfMeFor(stripSides(channel)) ?: return this
+    val lifted = toSnapshot().moreOfMeFor(stripSides(channel), lockedSides) ?: return this
     return copy(levels = lifted.channelGains.toList())
 }
 

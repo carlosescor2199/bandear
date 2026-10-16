@@ -23,4 +23,10 @@ class KindIconsTest {
         assertTrue(LineIcons.Stereo !in ChannelKind.entries.map(::kindIcon))
         assertTrue(LineIcons.Stereo.root.size > 0)
     }
+
+    @Test
+    fun theLockDrawsAPadlock() {
+        assertEquals("Locked", LineIcons.Lock.name)
+        assertEquals(2, LineIcons.Lock.root.size)
+    }
 }

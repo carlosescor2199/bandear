@@ -25,6 +25,7 @@ const LAYOUT = `
     screen, or choose a driver below.
   </p>
   <p class="mix-message mix-message--error" role="alert" data-command hidden></p>
+  <p class="mix-message" role="status" data-audio hidden></p>
   <div class="network-body">
     <section class="network-musicians" aria-label="Musicians">
       <ml-musicians-table></ml-musicians-table>
@@ -44,6 +45,7 @@ export function mountNetworkScreen(main, app) {
   const parts = {
     note: screen.querySelector("[data-note]"),
     command: screen.querySelector("[data-command]"),
+    audioMessage: screen.querySelector("[data-audio]"),
     table: screen.querySelector("ml-musicians-table"),
     audio: screen.querySelector("ml-audio-setup"),
   };
@@ -60,9 +62,11 @@ export function mountNetworkScreen(main, app) {
   function render() {
     const state = app.store.getState();
     parts.note.hidden = state.engine.status !== null;
-    const { command } = mixMessages(state);
+    const { command, audio } = mixMessages(state);
     parts.command.hidden = command === null;
     parts.command.textContent = command ?? "";
+    parts.audioMessage.hidden = audio === null;
+    parts.audioMessage.textContent = audio ?? "";
     parts.table.data = {
       rows: musicianRows(state),
       addError: local.addError,

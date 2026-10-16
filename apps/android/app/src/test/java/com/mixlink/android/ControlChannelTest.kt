@@ -167,6 +167,59 @@ class ControlChannelTest {
         )
     }
 
+    // The engineer's limit and locks a mix report carries.
+
+    /** [report] with the engineer's fields set to [limit] and [locked], as a server since T5a writes them. */
+    private fun withEngineer(report: String, limit: Any?, locked: Any?): String =
+        JSONObject(report).put("engineer_limit_percent", limit).put("locked", locked).toString()
+
+    @Test
+    fun aPushAndAnAckCarryTheEngineersLimitAndLocks() {
+        val socket = openChannel()
+
+        socket.receive(withEngineer(mixReport("mix_state"), 60, JSONArray(List(32) { it == 0 || it == 3 })))
+        socket.receive(withEngineer(mixReport("mix_ack", seq = 12), 75, JSONArray(List(32) { it == 1 })))
+
+        assertEquals(listOf(EngineerControls(60, setOf(0, 3)), EngineerControls(75, setOf(1))), events.engineer)
+        assertEquals(10, events.pushed.single().channelGains[0])
+    }
+
+    @Test
+    fun aReportFromAnOlderServerHasNoLimitAndNothingLocked() {
+        val socket = openChannel()
+
+        socket.receive(mixReport("mix_state"))
+
+        assertEquals(listOf(EngineerControls()), events.engineer)
+        assertFalse(EngineerControls().limited)
+    }
+
+    @Test
+    fun theEngineersControlsAreReadLeniently() {
+        fun read(limit: Any?, locked: Any?) = parseEngineerControls(JSONObject(withEngineer(mixReport("mix_state"), limit, locked)))
+
+        // A short list leaves the rest open; an entry that is not a boolean is open.
+        assertEquals(EngineerControls(100, setOf(0, 2)), read(null, JSONArray("""[true, false, true]""")))
+        assertEquals(EngineerControls(100, setOf(2)), read(null, JSONArray("""[1, null, true, "true"]""")))
+        // A limit that is not a number is no limit; one out of range is held to 0-100.
+        assertEquals(EngineerControls(), read("high", "all"))
+        assertEquals(EngineerControls(100), read(140, null))
+        assertEquals(EngineerControls(0), read(-5, null))
+        assertTrue(EngineerControls(60).limited)
+    }
+
+    @Test
+    fun aMixNeverCarriesTheEngineersControls() {
+        val socket = openChannel()
+        socket.receive(withEngineer(mixReport("mix_state"), 60, JSONArray(List(32) { it == 0 })))
+
+        channel.sendMixControl()
+
+        val mix = socket.sentOfType("mix").last()
+        assertFalse(mix.has("engineer_limit_percent"))
+        assertFalse(mix.has("locked"))
+    }
+
     // The numbers that match the server's answers to the phone's mixes.
 
     @Test
@@ -297,6 +350,9 @@ class ControlChannelTest {
     private class RecordingListener : ControlChannel.Listener {
         val pushed = mutableListOf<MixSnapshot>()
         val answers = mutableListOf<Pair<Long, MixSnapshot?>>()
+
+        /** The engineer's controls of every readable report, pushed or answering, in order. */
+        val engineer = mutableListOf<EngineerControls>()
         val errors = mutableListOf<String>()
         val details = mutableListOf<List<ChannelInfo>?>()
         var acknowledged = 0
@@ -311,12 +367,14 @@ class ControlChannelTest {
             acknowledged++
         }
 
-        override fun onMixPushed(mix: MixSnapshot) {
-            pushed += mix
+        override fun onMixPushed(report: MixReport) {
+            pushed += report.mix
+            engineer += report.engineer
         }
 
-        override fun onMixAnswered(seq: Long, applied: MixSnapshot?) {
-            answers += seq to applied
+        override fun onMixAnswered(seq: Long, applied: MixReport?) {
+            answers += seq to applied?.mix
+            applied?.let { engineer += it.engineer }
         }
 
         override fun onClosed() = Unit

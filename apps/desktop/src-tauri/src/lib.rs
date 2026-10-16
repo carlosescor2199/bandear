@@ -11,12 +11,12 @@ pub mod session;
 
 use commands::DesktopState;
 use dto::{
-    ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
+    AudioSettingsRequest, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
     EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MixDto, MixUpdateRequest,
     StartRequest, StartSummary,
 };
 use events::EventPump;
-use session::{SessionChannel, SessionStore};
+use session::{SessionAudio, SessionChannel, SessionStore};
 use tauri::{Manager, State};
 
 /// Fails to compile rather than at runtime if the shared state ever gains a non-`Send` field,
@@ -131,12 +131,31 @@ async fn channel_table(state: State<'_, DesktopState>) -> Result<Vec<SessionChan
     commands::channel_table(state.inner())
 }
 
+/// The audio input the desk last ran with (`{ host, device, bufferFrames, asioDriver }`, or null
+/// before any was kept), which the window reads when it opens and builds every start from (see
+/// [commands::audio_settings]).
+#[tauri::command]
+async fn audio_settings(state: State<'_, DesktopState>) -> Result<Option<SessionAudio>, String> {
+    Ok(commands::audio_settings(state.inner()))
+}
+
+/// Keeps the audio input the running engine started or switched with (`{ host, device,
+/// bufferFrames, asioDriver }`) for every later start, and answers it as kept (see
+/// [commands::set_audio_settings]).
+#[tauri::command]
+async fn set_audio_settings(
+    state: State<'_, DesktopState>,
+    settings: AudioSettingsRequest,
+) -> Result<SessionAudio, String> {
+    commands::set_audio_settings(state.inner(), settings)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // The session (musician labels, the engineer's channel details and groups) is a
-            // desktop-app concern and
+            // The session (musician labels, the engineer's channel details, groups and controls,
+            // and the audio input) is a desktop-app concern and
             // lives in the app's config directory, so it survives a restart without touching the
             // engine or any client protocol. Opening it never fails: a damaged file is set aside
             // and logged.
@@ -166,7 +185,9 @@ pub fn run() {
             set_groups,
             set_channels,
             channel_table,
-            set_engineer_controls
+            set_engineer_controls,
+            audio_settings,
+            set_audio_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

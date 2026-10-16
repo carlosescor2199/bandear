@@ -218,7 +218,9 @@ const COMMAND_FAILURES = Object.freeze({
  * The sentences above the strips: `departed` when the open musician was removed and another one
  * opened, `error` when a change was refused, `controls` when the engineer's limit and locks did not
  * both apply and save (formatEngineerControlsSet), `command` when the engine refused a stop or a
- * device switch while it went on running. Each is null when there is nothing to say.
+ * device switch while it went on running, `audio` when the engine runs on the default input because
+ * the saved one was missing, or the audio choices run but were not saved. Each is null when there
+ * is nothing to say.
  */
 export function mixMessages(state) {
   let command = null;
@@ -226,7 +228,7 @@ export function mixMessages(state) {
     const { action, message } = state.commandError;
     command = `${COMMAND_FAILURES[action] ?? `The engine refused to ${action}`}: ${message}.`;
   }
-  return { ...musicianMessages(state), command };
+  return { ...musicianMessages(state), command, audio: state.audioNotice?.message ?? null };
 }
 
 function musicianMessages(state) {

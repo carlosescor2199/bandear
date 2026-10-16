@@ -14,12 +14,14 @@ fun sheetChannelFor(channels: List<ChannelUiState>, openChannel: Int?): ChannelU
 
 /**
  * What a screen reader calls a strip's label button, which opens that channel's sheet: the channel
- * by its name ("Channel 3" when it has none) and, for a stereo pair, that it is one.
+ * by its name ("Channel 3" when it has none), for a stereo pair that it is one, and whether the
+ * engineer locked it.
  */
 fun channelSettingsLabel(channel: ChannelUiState): String = buildString {
     append(if (channel.label == channelName(channel.index)) "Channel ${channel.index + 1}" else channel.label)
     if (channel.stereo) append(" stereo pair")
     append(" settings")
+    if (channel.locked) append(", locked by the engineer")
 }
 
 /**
@@ -37,6 +39,9 @@ fun channelPanDescription(label: String, stereo: Boolean = false): String = "$la
 
 /** The words that mark a stereo pair in its sheet, so it is not told by an icon alone. */
 const val STEREO_TAG = "Stereo pair"
+
+/** The words a locked channel's sheet shows over its disabled controls. */
+const val LOCKED_NOTE = "Locked by the engineer"
 
 /** The words on the sheet's Mute key, which change with it so its state is not told by colour alone. */
 fun muteKeyText(muted: Boolean): String = if (muted) "Muted" else "Mute"

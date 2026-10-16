@@ -658,12 +658,151 @@ slice. Push and PRs are the user's decision.
   - Commits: 57dd604 `fix(engine): give a new phone at a reused address its own engineer
     controls`; this commit (`fix(desktop): keep idle engineer edits under the musician's strongest
     key`).
-- [ ] T5b (engineer limit and locks, Android): read `engineer_limit_percent` and `locked` from
+- [x] T5b (engineer limit and locks, Android): read `engineer_limit_percent` and `locked` from
   `mix_ack` and `mix_state` (lenient: absent on older servers means no limit, nothing locked);
   show the engineer's limit apart from the phone's level cap and say the lower one wins; show a
   locked channel's controls disabled with the state in words (a pair as one strip); keep sending
   whole mixes (the server keeps the locked values and the ack carries them). Route: delegated
-  writer.
+  writer (trigger: 2+ non-trivial files across the control channel, the UI state and the screens).
+  - Parsing: `EngineerControls { limitPercent = 100, lockedChannels: Set<Int> = {} }` and
+    `MixReport(mix, engineer)` next to `ChannelInfo`; `parseMixReport` returns a `MixReport` and
+    `parseEngineerControls` reads leniently (a limit that is not a number is no limit, out of range
+    is held to 0-100; `locked` absent or not an array is none, a short list leaves the rest open, a
+    non-boolean entry is open). `Listener.onMixPushed(report)` / `onMixAnswered(seq, report?)`;
+    `MixPushed`/`MixAnswered` gain `engineer` (default: open). The `mix` message never carries them.
+  - State: `MixUiState.engineer` (never sent, never saved), `effectiveCap` = min(level cap, limit),
+    `stripLocked(channel)` (a pair when either side is), `ChannelUiState.locked`. The controls of any
+    readable report hold at once (`withEngineer`), even from a push a pending change overtakes: the
+    phone never sends them and the server reports them in order; the values settle through the
+    existing `seq` rules (the answer to the newest change carries the kept values). A refusal
+    carries none; a report outside a session changes nothing; `SessionStarted` resets them to open
+    (a new server reports its own, an older one never does).
+  - Locks in the reducer: `withStrip` refuses any edit (level, pan/balance, mute, solo) of a locked
+    strip, so a whole-mix send never carries a changed locked value and nothing is sent; a recalled
+    saved mix keeps a locked channel's level, pan, mute and solo (`recalled`).
+  - More of me (decided): a locked channel is neither lifted nor lowered (`moreOfMeFor(channels,
+    locked)`, used at send time through the channel's new `lockedChannels` and by the echo check, so
+    the server's kept values do not turn it off); when the musician's own channel is locked More of
+    me goes off with "More of me is off: the engineer locked your channel" (`CHANNEL_LOCKED`), turning
+    it on is refused with that notice while it stays locked, and choosing a locked channel while it
+    is on turns it off (My channel can still be a locked channel). When the lock comes in a report,
+    nothing is sent and the mix stays as the server plays it, as for any desktop change.
+  - Playback: the receiver's local ceiling is `effectiveCap`; the phone sends its own cap.
+  - UI: a locked strip shows a "Locked" tag with a padlock (`LineIcons.Lock`) where its group chip
+    was, its fader and Mute/Solo keys fade and take no input, and TalkBack hears "Vox level, locked
+    by the engineer", "Mute Vox, locked by the engineer" and "Vox settings, locked by the engineer".
+    The sheet shows "Locked by the engineer" with the padlock over its disabled pan/balance, level and
+    keys. The Master card keeps the phone's Level cap and adds "Limited to 60% by the engineer · at
+    most 60%" (the lower of the two) when the engineer set a limit; the cap control is described
+    with it. Previews: drums locked and a 60% limit under an 80% cap; a locked channel's sheet.
+  - RED: (a) against stubs (controls never read or adopted, edits and recall unaware of locks, the
+    lift ignoring them, the effective cap the phone's cap), 13 of 421 failed: parsing 2 of 4 (the
+    older-server and never-sent guards passed), reducer 9 of 11 (the older-server and session-reset
+    tests passed vacuously), ViewModel 2 of 2. (b) against stub wording, 4 of 425 failed (three
+    Mix-screen text tests and the locked label button).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 426 tests, 0 failures, 0 errors
+    (404 before: 22 new); no compiler warnings.
+  - Size: about 485 authored changed lines in the first commit (about 260 of them tests) and 185 in
+    the second plus this document.
+  - Commits: 2c01a83 `feat(android): read the engineer's limit and locks`; this commit
+    (`feat(android): show locked channels and the engineer's limit`).
+- [x] T5b-fix (review fixes for T5b, review `review-34d9af3b149c510c`). Route: inline writer of the
+  delegated T5b worker (bounded fixes in three UI-state files and their tests).
+  - R3-recall-and-lift-split-half-locked-pair: `MixUiState.lockedSides` applies the strip rule
+    (each locked channel, and both sides of a pair when either side is locked), and recall, the More
+    of me lift and lower (the channel's `lockedChannels` now reads it) and the reducer's echo check
+    all use it, as edits already did through `stripLocked`, so a half-locked pair is never split.
+  - R3-limit-only-push-playback-unproved: the report path already republished the receive thread's
+    ceiling because the engineer's controls are part of `mix`, which `serverMixReported` compares;
+    the rule is now documented there and tested: a `mix_state` that only sets the limit to 60, then a
+    `mix_ack` that only lowers it to 45, move `maxLevelPercent` with no master edit.
+  - RED: 3 of 430 failed against the per-channel rule (`recallKeepsAPairWholeWhenOnlyOneSideIsLocked`:
+    the open side took the saved values; `moreOfMeLeavesAPairWholeWhenOnlyOneSideIsLocked`: the open
+    side was lowered and the echo turned More of me off; the ViewModel's half-locked send was
+    `[50, 100, 100]`). The limit-only test passed against the T5b code (characterisation); a mutant
+    that ignores the engineer's controls when deciding to republish fails it.
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 430 tests, 0 failures, 0 errors
+    (426 before: 4 new); no compiler warnings.
+  - Commit: this commit (`fix(android): treat a half-locked pair as locked and follow a new limit
+    at once`).
+- [x] T5c (the audio input the engineer chose is reopened and remembered; bug from the live test
+  on 2026-10-15): the engineer switched the input live under WASAPI to "INPUT 1/2 (Volt 4)" and a
+  later Start reopened the Windows default ("Varios micrófonos (Realtek)"). The live switch
+  (`switchDevice` in `console-app.js`) never recorded the device in the applied audio choices, so
+  the only start path (`startRequest`, phase 1's T7b) asked for none; and the choices lived only in
+  memory, lost when the app closed. Route: delegated writer (trigger: 2+ non-trivial files across
+  the desktop Rust and the UI).
+  - Choices: `{ host, device, bufferFrames, asioDriver }`: `device` is the input picked under auto
+    or WASAPI (null for the system's default), `asioDriver` the one picked under ASIO. A plain start
+    opens `rememberedDevice` (ASIO: the picked driver; else `device`). A successful live switch
+    records `device`; a restart on a named device (auto) records it too; a change of driver that
+    names no input starts on the new driver's default (`audioChoice`); a buffer restart still
+    reopens the running device. A refused switch or a failed start changes nothing.
+  - Session (`session.rs`): optional `audio` section `{ host, device, bufferFrames, asioDriver }`,
+    every field optional, read on its own (a damaged one is set aside as
+    `session.json.audio-damaged-<ms>`, the rest kept); version stays 1 (an earlier build drops it
+    when it saves). Exposed by a read command rather than the status, because the window needs it
+    before any engine runs: `audio_settings` (null before any) and `set_audio_settings` (kept only
+    while an engine runs, for a known driver, never ASIO without a picked driver; names trimmed; a
+    refusal or a failed save changes nothing). The fake bridge mirrors both (`savedAudio` option and
+    accessor) and now fails a start on an input it lacks, as the engine does (a part of the name, in
+    any case).
+  - Window: reads the choices once, before the automatic start (`restoredAudio`: none gives the
+    defaults; ASIO without a driver, from an older or odd file, is the system's own driver). They
+    are saved only once an engine started or switched with them (`applyAudio`, a live switch, or the
+    next start of a choice kept while nothing ran, `setAudio`); a failed save is said ("The audio
+    input runs but was not saved for the next start: ...") and tried again at the next start.
+  - Missing input: a plain start (Start, Try again, the automatic start, a start after a stop) that
+    fails while its input is no longer listed for its driver (matched as the engine matches)
+    starts on `fallbackAudio`: the same driver's default input, or the system's own driver when the
+    choice was ASIO, so never ASIO. It says "The saved input ... was not found, so the engine
+    started on the system's default input. The saved input is kept and tried again at the next
+    start." (Mix and Network screens, `role="status"`, for that run), saves nothing, and the next
+    start tries the saved input again. A failure while the input is listed is shown as before; a
+    default input that fails too is said with both. While a run is on the default input a buffer
+    change waits for the next start instead of restarting it.
+  - Network screen: the driver and buffer selects show the remembered choice; the device select
+    shows the running input, or with no engine the one the next start opens.
+  - RED: (a) Rust against stubs (`audio()` none, `set_audio` a no-op, `keep_audio_settings`
+    accepting anything and keeping nothing, `audio` not read on its own) 8 of 121 failed (4 session,
+    4 command; the damaged-section test lost the labels as the whole file was moved aside). (b) UI
+    against stub exports and the old controller 26 of 286 failed: the 21 new tests and 5
+    expectations that gained `device` or `audio` (the live-switch test: `audio.device` undefined and
+    the next start on the default). The test for a default input that fails too, added after that
+    run, failed with the old controller (10 of 287 then; the refused-switch test passed there as a
+    guard, since nothing was ever recorded).
+  - GREEN: `cargo test -p mixlink-desktop` 121 passed (8 new); UI 287 passed (22 new, 5
+    expectations updated); `cargo fmt` clean; clippy: no warnings in the desktop crate; `cargo build
+    -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok. Preview (`index.html?fake`):
+    WASAPI, a live switch to "Microphone (USB audio)" (confirmed), Stop and Start: the engine
+    reopened it, and the selects show WASAPI and that input.
+  - Follow-ups: live check with the Volt (switch, restart the app, then start with it unplugged); a
+    missing saved input is not offered in the device list; after an ASIO fallback the driver select
+    shows ASIO while the default input runs (the notice says why); a driver change drops the saved
+    input, as the old restart on the driver's default did.
+  - Size: about 450 authored changed lines in the desktop commit and 870 in the UI commit (about 460
+    of them tests) plus this document; above the 400-line heuristic mostly in tests; not split
+    artificially.
+  - Commits: 32b1eaf `feat(desktop): keep the audio input in the session for the next start`; this
+    commit (`fix(desktop-ui): reopen the input the engineer chose, also after a restart`).
+- [x] T5c-fix (review fix for T5c, review `review-a8a8d8e4b1bf18da`,
+  R3-read-choice-latched-on-failure): the window marked the kept audio choices read before
+  `audio_settings` answered, so after a failed read a reconnect never read them again and the
+  automatic start opened the defaults. Now the choices are known only once a read succeeded (or
+  once the engineer made a choice, which a later read never replaces); a failed read is tried again
+  by the next connect, Try again or Start. While they are unknown nothing starts on its own: the
+  console shows the connection error "The saved audio input could not be read, so nothing was
+  started: ..." with Try again, and Start says the same without starting. Route: inline writer of
+  the delegated T5c worker (one file and its tests).
+  - RED: 2 of 290 UI tests failed (`a kept input that could not be read is read again on
+    reconnect, and the start opens it`: no start after the reconnect read nothing;
+    `while the kept input cannot be read nothing starts, and the console says why`: the default
+    input started). The third new test (`a choice the engineer makes while the kept one is unread is
+    not replaced by a later read`) passed against the old code as a guard, since nothing was read
+    again.
+  - GREEN: UI 290 passed (3 new); preview (`index.html?fake`): the automatic start still runs.
+  - Commit: this commit (`fix(desktop-ui): retry reading the kept input instead of starting the
+    default`).
 - [ ] T6 (presets, copy and mirror): presets in the session; apply to a musician; copy; one-way
   mirror with the follower locked; the Mix screen's controls. Route: delegated writer.
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
@@ -781,6 +920,28 @@ slice. Push and PRs are the user's decision.
   address while the desktop keys `Some("")` under the phone; make the desktop treat an empty
   client id as none and make the fake validate exactly like the desktop.
 
+- T5b done (engineer limit and locks on Android); see its entry for evidence. Follow-ups: live
+  check on the Galaxy S23 against the engine (lock and limit from the desktop while the phone moves
+  the locked fader, the registration `mix_state`, the Locked tag and the limit line on the 390 dp
+  Master card); with the musician's channel locked More of me stays off and the levels it lowered
+  stay as the server plays them until the musician moves them back (as after a desktop change).
+- Review `review-34d9af3b149c510c` over c248e3b..71b9aff (T5b) approved and acknowledged; both
+  WARNINGs (R3-recall-and-lift-split-half-locked-pair, R3-limit-only-push-playback-unproved) are
+  fixed by T5b-fix.
+
+- T5c done (the audio input reopened and remembered); see its entry for evidence and follow-ups.
+- Review `review-a8a8d8e4b1bf18da` over 71b9aff..d379367 (T5c) approved and acknowledged; next
+  review base d379367. Its WARNING (R3-read-choice-latched-on-failure) is fixed by T5c-fix.
+
+- Review `review-04bcc805c7f78bcf` over d379367..39f4b32 (T5c-fix and T5b-fix) approved and
+  acknowledged; next review base 39f4b32. Folded into T6:
+  - WARNING R3-persistent-unreadable-choice-blocks-start: if `audio_settings` fails on every read,
+    Start, Try again and the automatic start all refuse with "could not be read" and nothing tells
+    the engineer that choosing an input in Network and system gets past it. Say so in the message,
+    offer the way out, and test a read that never succeeds.
+  - SUGGESTION R3-running-engine-read-failure-untested: test that a failed read with an engine
+    already running leaves it running and shows the command error as intended.
+
 ## Next step
 
-T5b (engineer limit and locks on Android).
+T6 (presets, copy and mirror).

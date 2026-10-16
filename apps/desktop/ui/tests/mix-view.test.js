@@ -261,6 +261,7 @@ test("the console says who was removed, and which musician's change was refused"
     error: null,
     controls: null,
     command: null,
+    audio: null,
   });
 
   const refused = reduce(
@@ -275,6 +276,7 @@ test("the console says who was removed, and which musician's change was refused"
     error: "A change to Lead vocal's mix was not applied: the engine is not running.",
     controls: null,
     command: null,
+    audio: null,
   });
 
   const unstopped = reduce(
@@ -285,4 +287,12 @@ test("the console says who was removed, and which musician's change was refused"
     mixMessages(unstopped).command,
     "The engine could not be stopped: could not stop the capture.",
   );
+});
+
+test("the console says when the engine runs on another input than the saved one", () => {
+  const message = "The saved input Volt was not found, so the engine started on the default.";
+  const fellBack = reduce([actions.audioNotice({ kind: "fallback", message })], running);
+
+  assert.equal(mixMessages(fellBack).audio, message);
+  assert.equal(mixMessages(running).audio, null);
 });

@@ -435,6 +435,16 @@ private fun MixMoreOfMeOffPreview() = MixPreview(PreviewSamples.moreOfMeOff)
 private fun MixOlderServerPreview() = MixPreview(PreviewSamples.olderServer)
 
 @Preview(
+    name = "Mix · drums locked, limited by the engineer",
+    widthDp = PREVIEW_WIDTH_DP,
+    heightDp = PREVIEW_HEIGHT_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun MixEngineerControlsPreview() = MixPreview(PreviewSamples.engineerControls)
+
+@Preview(
     name = "Mix · no channel chosen",
     widthDp = PREVIEW_WIDTH_DP,
     heightDp = PREVIEW_HEIGHT_DP,

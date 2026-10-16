@@ -41,6 +41,9 @@ object LineIcons {
     /** A tick: the chosen item of a list. */
     val Check: ImageVector by lazy { lineIcon("Check", "M5 12l5 5L20 7") }
 
+    /** A closed padlock: locked by the engineer. */
+    val Lock: ImageVector by lazy { lineIcon("Locked", "M6 11h12v9H6z", "M8.5 11V8a3.5 3.5 0 0 1 7 0v3") }
+
     /** Two overlapping rings, left and right: a stereo pair. */
     val Stereo: ImageVector by lazy {
         lineIcon("Stereo", "M3 12a5 5 0 1 0 10 0a5 5 0 1 0-10 0", "M11 12a5 5 0 1 0 10 0a5 5 0 1 0-10 0")

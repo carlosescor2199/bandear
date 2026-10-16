@@ -30,6 +30,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -146,11 +147,13 @@ private fun ChannelStrip(
         top = ChannelStripTopPadding,
     ) {
         StripLabelButton(channel = channel, onOpen = onOpen)
+        // A locked strip says so where its group shows (the sheet still names the group), and its
+        // controls fade and take no input.
         val group = channel.group
-        if (group != null) {
-            GroupChip(group.name, groupToneFor(group.index))
-        } else {
-            Text(
+        when {
+            channel.locked -> LockedTag()
+            group != null -> GroupChip(group.name, groupToneFor(group.index))
+            else -> Text(
                 text = "No group",
                 modifier = Modifier.padding(vertical = 2.dp),
                 style = MaterialTheme.typography.labelSmall,
@@ -161,7 +164,8 @@ private fun ChannelStrip(
             value = channel.level,
             onValueChange = onLevel,
             accent = stripColor(stripFillFor(channel.muted, mine, moreOfMeOn)),
-            contentDescription = stripFaderDescription(channel.label, mine, channel.muted),
+            contentDescription = stripFaderDescription(channel.label, mine, channel.muted, channel.locked),
+            enabled = !channel.locked,
             height = ChannelFaderHeight,
         )
         Text(
@@ -174,8 +178,25 @@ private fun ChannelStrip(
             soloed = channel.soloed,
             onMute = onMuted,
             onSolo = onSoloed,
-            channelLabel = channel.label,
+            channelLabel = lockedLabel(channel.label, channel.locked),
+            enabled = !channel.locked,
         )
+    }
+}
+
+/** The lock and "Locked" in words: a strip the engineer locked, never told by its fade alone. */
+@Composable
+private fun LockedTag() {
+    val colors = MixLinkTheme.colors
+    Row(
+        modifier = Modifier
+            .border(1.dp, colors.border, MixLinkShapes.Tag)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(LineIcons.Lock, contentDescription = null, tint = colors.text, modifier = Modifier.size(12.dp))
+        Text(LOCKED_TAG, style = MaterialTheme.typography.labelSmall, color = colors.text)
     }
 }
 
@@ -339,9 +360,18 @@ internal fun MasterCard(
             value = mix.levelCap,
             onValueChange = onLevelCap,
             accent = colors.faderIdle,
-            contentDescription = "Level cap, the loudest this phone plays",
+            contentDescription = levelCapDescription(mix.levelCap, mix.engineer.limitPercent),
             modifier = Modifier.fillMaxWidth(),
         )
+        // The engineer's limit sits apart from the phone's cap, which still works: the musician hears
+        // the lower of the two, and the line says how much that is.
+        val limit = engineerLimitText(mix.levelCap, mix.engineer.limitPercent)
+        if (limit != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(LineIcons.Lock, contentDescription = null, tint = colors.textSecondary, modifier = Modifier.size(14.dp))
+                Text(limit, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium), color = colors.text)
+            }
+        }
     }
 }
 

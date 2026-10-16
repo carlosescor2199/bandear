@@ -12,6 +12,7 @@ import {
   keepPairsEqual,
   lockPairs,
 } from "./channels.js";
+import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { clampLevel } from "./values.js";
 
@@ -365,14 +366,19 @@ function withPort(address) {
  * lockedChannels, keptFor, applied, saved, saveError, mix }`; a phone cannot change a locked
  * channel, the desk can; the limit caps the musician's meter with the phone's cap, the lower
  * winning; with the engine stopped they are kept for the address, and every start gives each
- * musician the controls kept for them. Besides `invoke` and `listen` it offers
+ * musician the controls kept for them. A start asks for its input as the engine does (the first
+ * device whose name contains the one asked for, in any case) and fails when none does, as with an
+ * interface left unplugged. The audio input is kept as the desktop's session keeps it:
+ * `audio_settings` reads it (null before any; `savedAudio` seeds it, as a session kept before) and
+ * `set_audio_settings` keeps it only while an engine runs, refusing an unknown driver and ASIO
+ * without a picked driver. Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
  * (timers until the returned stop function is called), `holdAnswers(command)` and
  * `releaseAnswers()` (answers that arrive late), `failNext(command, message)` (one failed call),
- * `failStart(message)`, `engineerKeys()` (the keys the engineer's controls are kept under) and
- * `calls`, every `{ command, args }` invoked.
+ * `failStart(message)`, `engineerKeys()` (the keys the engineer's controls are kept under),
+ * `savedAudio()` (the audio input kept) and `calls`, every `{ command, args }` invoked.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -381,6 +387,7 @@ export function createFakeBridge({
   failStart = null,
   answersFirst = false,
   statusOnStart = true,
+  savedAudio = null,
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
@@ -411,6 +418,9 @@ export function createFakeBridge({
   // The engineer's controls as the desk's session keeps them, `{ engineerLimitPercent,
   // lockedChannels }` by labelKey: for the phone's client id when it has one, else the address.
   const engineerBook = new Map();
+  // The audio input as the desk's session keeps it, `{ host, device, bufferFrames, asioDriver }`,
+  // or null before any was kept.
+  let keptAudio = savedAudio ? clone(savedAudio) : null;
 
   // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
   // and names are trimmed.
@@ -575,14 +585,25 @@ export function createFakeBridge({
       if (startError) {
         throw startError;
       }
+      // As the engine does: the first device whose name contains the one asked for, in any case,
+      // and no start when none does (an interface left unplugged); with none asked for, the
+      // driver's first one when a driver is named.
+      const offered = config?.host === "asio" ? sampleAsioDrivers() : devices;
+      const filter = config?.deviceFilter ?? null;
+      let wanted = null;
+      if (filter !== null) {
+        const sought = filter.toLowerCase();
+        wanted = offered.find((device) => device.name.toLowerCase().includes(sought));
+        if (!wanted) {
+          throw `no input device name contains "${sought}".`;
+        }
+      } else if (config?.host) {
+        wanted = offered[0];
+      }
       // As the desktop does: a start that names no groups takes the kept ones; one that names
       // some runs with those and keeps nothing.
       const named = config?.groups ?? [];
       runningGroups = named.length > 0 ? withIds(named) : savedGroups;
-      // As the engine does: the named device, else the driver's first one when a driver is named.
-      const offered = config?.host === "asio" ? sampleAsioDrivers() : devices;
-      const chosen = offered.find((device) => device.name === config?.deviceFilter);
-      const wanted = chosen ?? (config?.host && !config?.deviceFilter ? offered[0] : null);
       if (wanted) {
         useDevice(wanted);
       }
@@ -606,6 +627,32 @@ export function createFakeBridge({
     },
     list_input_devices({ host } = {}) {
       return clone(host === "asio" ? sampleAsioDrivers() : devices);
+    },
+    audio_settings() {
+      return keptAudio ? clone(keptAudio) : null;
+    },
+    set_audio_settings({ settings = {} } = {}) {
+      // As the desktop does: only while an engine runs, a driver it knows, never ASIO without the
+      // driver the engineer picked; names trimmed, an empty one none.
+      if (!isRunning) {
+        throw "the engine is not running: only the audio input an engine runs with is kept";
+      }
+      const host = String(settings.host ?? "auto").trim().toLowerCase();
+      if (!HOSTS.includes(host)) {
+        throw `the audio driver \`${settings.host}\` is none of auto, wasapi, asio`;
+      }
+      const named = (name) => (typeof name === "string" && name.trim() ? name.trim() : null);
+      const asioDriver = named(settings.asioDriver);
+      if (host === "asio" && !asioDriver) {
+        throw "ASIO is kept only with the ASIO driver the engineer picked, and none is named";
+      }
+      keptAudio = {
+        host,
+        device: named(settings.device),
+        bufferFrames: settings.bufferFrames ?? null,
+        asioDriver,
+      };
+      return clone(keptAudio);
     },
     switch_device({ device }) {
       requireRunning();
@@ -874,6 +921,10 @@ export function createFakeBridge({
     /** The keys the engineer's controls are kept under, as the desktop's session keys them. */
     engineerKeys() {
       return [...engineerBook.keys()];
+    },
+    /** The audio input the session keeps, as `audio_settings` reads it: null before any. */
+    savedAudio() {
+      return keptAudio ? clone(keptAudio) : null;
     },
     /** From now on the answers to `command` wait for `releaseAnswers`, as a slow link would. */
     holdAnswers(command) {

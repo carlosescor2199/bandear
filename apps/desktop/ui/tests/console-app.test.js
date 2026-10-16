@@ -11,6 +11,7 @@ import {
 import { createConsoleApp } from "../app/lib/console-app.js";
 import { musicianByAddress, pendingEdits, viewMix } from "../app/lib/console-state.js";
 import { createFakeBridge, sampleStatus } from "../app/lib/fake-bridge.js";
+import { mixMessages } from "../app/lib/mix-view.js";
 
 const LEAD = "192.168.1.3:50000";
 const BASS = "192.168.1.12:50000";
@@ -441,10 +442,20 @@ test("a failed ASIO start keeps the settings that were applied; a successful one
   const failed = await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO });
 
   assert.deepEqual(failed, { ok: false, error: "the driver did not load" });
-  assert.deepEqual(app.store.getState().audio, { host: "auto", bufferFrames: 256, asioDriver: null });
+  assert.deepEqual(app.store.getState().audio, {
+    host: "auto",
+    device: null,
+    bufferFrames: 256,
+    asioDriver: null,
+  });
   fake.failStart(null);
   assert.deepEqual(await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO }), { ok: true });
-  assert.deepEqual(app.store.getState().audio, { host: "asio", bufferFrames: 256, asioDriver: ASIO });
+  assert.deepEqual(app.store.getState().audio, {
+    host: "asio",
+    device: null,
+    bufferFrames: 256,
+    asioDriver: ASIO,
+  });
   app.dispose();
 });
 
@@ -486,6 +497,305 @@ test("a switch that works clears the refusal of an earlier one", async () => {
 
   assert.equal(app.store.getState().commandError, null);
   assert.equal(app.store.getState().engine.status.deviceName, "Microphone (USB audio)");
+  app.dispose();
+});
+
+// An input the fake's machine has, and one it does not (an interface left unplugged).
+const USB = "Microphone (USB audio)";
+const VOLT = "INPUT 1/2 (Volt 4)";
+
+function audioSaves(fake) {
+  return commands(fake, "set_audio_settings");
+}
+
+function startsOn(fake) {
+  return startConfigs(fake).map(({ host, deviceFilter }) => [host, deviceFilter]);
+}
+
+async function opened(savedAudio, options = {}) {
+  const fake = createFakeBridge({ savedAudio, ...options });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  return { fake, app };
+}
+
+test("a live switch is remembered: Start, a start after a stop and a buffer change reopen it", async () => {
+  const { fake, app } = await connected();
+  await app.applyAudio({ host: "wasapi" });
+
+  await app.switchDevice(USB);
+
+  assert.equal(app.store.getState().audio.device, USB);
+  assert.deepEqual(fake.savedAudio(), {
+    host: "wasapi",
+    device: USB,
+    bufferFrames: 256,
+    asioDriver: null,
+  });
+  await app.stop();
+  await app.start();
+  assert.deepEqual(lastStart(fake), ["wasapi", USB], "not the system's default");
+  assert.equal(app.store.getState().engine.status.deviceName, USB);
+  await app.applyAudio({ bufferFrames: 512 }, { keepDevice: true });
+  assert.deepEqual(lastStart(fake), ["wasapi", USB]);
+  assert.deepEqual(fake.savedAudio(), {
+    host: "wasapi",
+    device: USB,
+    bufferFrames: 512,
+    asioDriver: null,
+  });
+  app.dispose();
+});
+
+test("a refused live switch remembers nothing", async () => {
+  const { fake, app } = await connected();
+  await app.applyAudio({ host: "wasapi" });
+  const saves = audioSaves(fake).length;
+  fake.failNext("switch_device", "the device is busy");
+
+  await app.switchDevice(USB);
+
+  assert.equal(app.store.getState().audio.device, null);
+  assert.equal(audioSaves(fake).length, saves, "nothing saved");
+  await app.stop();
+  await app.start();
+  assert.deepEqual(lastStart(fake), ["wasapi", null]);
+  app.dispose();
+});
+
+test("the remembered input is read before the automatic start, which reopens it", async () => {
+  const saved = { host: "wasapi", device: USB, bufferFrames: 512, asioDriver: null };
+  const { fake, app } = await opened(saved);
+
+  const order = fake.calls.map(({ command }) => command);
+  assert.ok(order.indexOf("audio_settings") < order.indexOf("start_engine"), order.join(", "));
+  assert.deepEqual(startConfigs(fake), [
+    {
+      deviceFilter: USB,
+      targets: [],
+      controlPort: 50001,
+      groups: [],
+      host: "wasapi",
+      bufferFrames: 512,
+    },
+  ]);
+  const state = app.store.getState();
+  assert.equal(state.engine.status.deviceName, USB);
+  assert.deepEqual(state.audio, saved, "the Network screen shows the remembered choice");
+  assert.equal(audioSaves(fake).length, 0, "a choice already kept is not saved again");
+  app.dispose();
+});
+
+test("a remembered input that is gone gives way to the default on its driver, said and kept", async () => {
+  const saved = { host: "wasapi", device: VOLT, bufferFrames: 256, asioDriver: null };
+  const { fake, app } = await opened(saved);
+
+  assert.deepEqual(startsOn(fake), [
+    ["wasapi", VOLT],
+    ["wasapi", null],
+  ]);
+  const state = app.store.getState();
+  assert.equal(state.engine.phase, "running");
+  assert.equal(state.engine.status.deviceName, "Demo interface");
+  assert.match(mixMessages(state).audio, /The saved input INPUT 1\/2 \(Volt 4\) was not found/);
+  assert.equal(state.audio.device, VOLT, "the choice stays");
+  assert.deepEqual(fake.savedAudio(), saved, "the default never replaces the saved input");
+  assert.equal(audioSaves(fake).length, 0);
+
+  // Meanwhile a buffer change waits for the next start instead of restarting the default.
+  await app.applyAudio({ bufferFrames: 512 }, { keepDevice: true });
+  assert.equal(startConfigs(fake).length, 2);
+  assert.equal(app.store.getState().audio.bufferFrames, 512);
+  assert.match(mixMessages(app.store.getState()).audio, /was not found/);
+
+  await app.stop();
+  assert.equal(mixMessages(app.store.getState()).audio, null, "said for its run only");
+  await app.start();
+  assert.deepEqual(startsOn(fake).slice(2), [
+    ["wasapi", VOLT],
+    ["wasapi", null],
+  ]);
+  assert.equal(startConfigs(fake).at(-1).bufferFrames, 512);
+  assert.deepEqual(fake.savedAudio(), saved, "still the engineer's choice");
+  app.dispose();
+});
+
+test("when the default input does not start either, both are said", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: VOLT, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("start_engine", "the driver did not load", { times: 2 });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  assert.deepEqual(startsOn(fake), [
+    ["wasapi", VOLT],
+    ["wasapi", null],
+  ]);
+  const { engine } = app.store.getState();
+  assert.equal(engine.phase, "error");
+  assert.equal(
+    engine.error,
+    `${VOLT} was not found, and the system's default input did not start either: ` +
+      "the driver did not load.",
+  );
+  app.dispose();
+});
+
+test("a remembered ASIO driver that is gone never gives way to another ASIO driver", async () => {
+  const saved = { host: "asio", device: null, bufferFrames: 128, asioDriver: "Gone ASIO" };
+  const { fake, app } = await opened(saved);
+
+  assert.deepEqual(startsOn(fake), [
+    ["asio", "Gone ASIO"],
+    ["auto", null],
+  ]);
+  const state = app.store.getState();
+  assert.equal(state.engine.phase, "running");
+  assert.match(mixMessages(state).audio, /The saved ASIO driver Gone ASIO was not found/);
+  assert.deepEqual(fake.savedAudio(), saved);
+  app.dispose();
+});
+
+test("a kept ASIO choice starts only on its driver, and one without a driver is no ASIO", async () => {
+  const picked = await opened({ host: "asio", device: null, bufferFrames: 256, asioDriver: ASIO });
+  assert.deepEqual(startsOn(picked.fake), [["asio", ASIO]]);
+  picked.app.dispose();
+
+  const odd = await opened({ host: "asio", device: null, bufferFrames: 256, asioDriver: null });
+  assert.deepEqual(startsOn(odd.fake), [["auto", null]], "no ASIO driver is loaded");
+  assert.equal(odd.app.store.getState().engine.phase, "running");
+  assert.equal(odd.app.store.getState().audio.host, "auto");
+  odd.app.dispose();
+});
+
+test("a start that fails while the remembered input is there shows its error, with no fallback", async () => {
+  const { fake, app } = await opened(
+    { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+    { failStart: "the device is busy" },
+  );
+
+  assert.deepEqual(startsOn(fake), [["wasapi", USB]]);
+  assert.equal(app.store.getState().engine.phase, "error");
+  assert.equal(app.store.getState().engine.error, "the device is busy");
+  fake.failStart(null);
+  await app.start();
+  assert.deepEqual(lastStart(fake), ["wasapi", USB], "Try again reopens it");
+  app.dispose();
+});
+
+test("applied audio choices are saved once the engine runs with them, never after a failed start", async () => {
+  const { fake, app } = await connected();
+  fake.failStart("the driver did not load");
+
+  await app.applyAudio({ host: "wasapi" });
+  assert.equal(fake.savedAudio(), null);
+
+  fake.failStart(null);
+  await app.applyAudio({ host: "wasapi" });
+  assert.deepEqual(fake.savedAudio(), {
+    host: "wasapi",
+    device: null,
+    bufferFrames: 256,
+    asioDriver: null,
+  });
+  await app.applyAudio({ host: "asio" }, { deviceFilter: ASIO });
+  assert.deepEqual(fake.savedAudio(), {
+    host: "asio",
+    device: null,
+    bufferFrames: 256,
+    asioDriver: ASIO,
+  });
+  app.dispose();
+});
+
+test("a choice kept while nothing ran is saved once a start runs it", async () => {
+  const fake = createFakeBridge();
+  const app = createConsoleApp({ bridge: fake, autoStart: false });
+  await app.ready;
+
+  app.setAudio({ bufferFrames: 512 });
+  assert.equal(fake.savedAudio(), null);
+  await app.start();
+
+  assert.equal(fake.savedAudio()?.bufferFrames, 512);
+  app.dispose();
+});
+
+test("a kept input that could not be read is read again on reconnect, and the start opens it", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session is busy");
+  fake.failNext("engine_status", "the engine is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  assert.equal(app.store.getState().connection.status, "failed");
+  assert.equal(commands(fake, "start_engine").length, 0);
+
+  await app.reconnect();
+
+  assert.deepEqual(startsOn(fake), [["wasapi", USB]], "never the default in its place");
+  assert.equal(app.store.getState().engine.status.deviceName, USB);
+  app.dispose();
+});
+
+test("while the kept input cannot be read nothing starts, and the console says why", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  assert.equal(commands(fake, "start_engine").length, 0);
+  assert.deepEqual(app.store.getState().connection, {
+    status: "failed",
+    error: "The saved audio input could not be read, so nothing was started: the session is busy.",
+  });
+
+  fake.failNext("audio_settings", "the session is still busy");
+  await app.start();
+  assert.equal(commands(fake, "start_engine").length, 0, "Start does not guess either");
+  assert.match(app.store.getState().engine.error, /could not be read.*still busy/);
+
+  await app.start();
+  assert.deepEqual(startsOn(fake), [["wasapi", USB]]);
+  app.dispose();
+});
+
+test("a choice the engineer makes while the kept one is unread is not replaced by a later read", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  await app.applyAudio({ host: "auto" });
+  const reads = commands(fake, "audio_settings").length;
+  await app.reconnect();
+
+  assert.equal(commands(fake, "audio_settings").length, reads, "nothing to read any more");
+  assert.equal(app.store.getState().audio.host, "auto");
+  assert.equal(fake.savedAudio().host, "auto");
+  app.dispose();
+});
+
+test("a choice the session could not keep is said, and the next start keeps it", async () => {
+  const { fake, app } = await connected();
+  fake.failNext("set_audio_settings", "could not save session.json");
+
+  await app.applyAudio({ host: "wasapi" });
+
+  assert.match(
+    mixMessages(app.store.getState()).audio,
+    /not saved for the next start: could not save session\.json/,
+  );
+  await app.stop();
+  await app.start();
+  assert.equal(fake.savedAudio()?.host, "wasapi");
+  assert.equal(mixMessages(app.store.getState()).audio, null);
   app.dispose();
 });
 

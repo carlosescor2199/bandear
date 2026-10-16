@@ -2,6 +2,7 @@ package com.mixlink.android.ui.state
 
 import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ChannelKind
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.MixSnapshot
 import com.mixlink.android.defaultPan
@@ -135,7 +136,27 @@ data class MixUiState(
      * one per source channel; null when its `config` carried none, as an older server's does.
      */
     val channelDetails: List<ChannelInfo>? = null,
+    /**
+     * What the engineer set for this musician (a limit and locked channels), as the server last
+     * reported it in this session. Never sent and never saved: the server alone sets it.
+     */
+    val engineer: EngineerControls = EngineerControls(),
 ) {
+    /** The loudest the musician hears: the lower of the phone's [levelCap] and the engineer's limit. */
+    val effectiveCap: Int
+        get() = minOf(levelCap, engineer.limitPercent)
+
+    /** True when the engineer locked [channel]'s strip: a pair is locked when either side is. */
+    fun stripLocked(channel: Int): Boolean = stripSides(channel).any(engineer::isLocked)
+
+    /**
+     * Every channel the phone must leave as it is, by the strip rule: each channel the engineer
+     * locked, and both sides of a pair when either side is, so a pair is never split by an edit, a
+     * recalled mix or More of me. The server keeps a pair's sides equal and locks them together.
+     */
+    val lockedSides: Set<Int>
+        get() = engineer.lockedChannels + layout.filter { strip -> strip.sides.any(engineer::isLocked) }.flatMap { it.sides }
+
     /** Which channels each strip controls, left to right. */
     val layout: List<StripChannels>
         get() = stripLayout(levels.size, channelDetails)
@@ -193,6 +214,7 @@ data class MixUiState(
             soloed = solos.getOrElse(index) { false },
             kind = channelDetails?.let { it.getOrNull(index)?.kind ?: ChannelKind.OTHER },
             pairedWith = second,
+            locked = strip.sides.any(engineer::isLocked),
         )
     }
 
@@ -257,6 +279,11 @@ data class ChannelUiState(
     val kind: ChannelKind? = null,
     /** The pair's second channel when the strip is a stereo pair; null for a single channel. */
     val pairedWith: Int? = null,
+    /**
+     * True when the engineer locked the strip (a pair when either side is): its level, pan, mute
+     * and solo cannot be changed from the phone.
+     */
+    val locked: Boolean = false,
 ) {
     /** True when the strip is a stereo pair, whose pan is a balance. */
     val stereo: Boolean
@@ -289,6 +316,9 @@ enum class MoreOfMeNotice(val message: String) {
 
     /** The server pushed a mix changed elsewhere; the phone shows it as played, so nothing is lifted. */
     MIX_CHANGED_ELSEWHERE("More of me is off: your mix was changed from the desktop"),
+
+    /** The engineer locked the musician's channel, so the phone cannot lift it. */
+    CHANNEL_LOCKED("More of me is off: the engineer locked your channel"),
 }
 
 /**

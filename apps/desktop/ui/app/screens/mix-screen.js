@@ -47,6 +47,7 @@ const LAYOUT = `
   <p class="mix-message mix-message--error" role="alert" data-error hidden></p>
   <p class="mix-message" role="status" data-controls hidden></p>
   <p class="mix-message mix-message--error" role="alert" data-command hidden></p>
+  <p class="mix-message" role="status" data-audio hidden></p>
   <div class="mix-notice" data-notice hidden>
     <h2 data-notice-title></h2>
     <p data-notice-text></p>
@@ -103,6 +104,7 @@ export function mountMixScreen(main, app) {
     error: screen.querySelector("[data-error]"),
     controls: screen.querySelector("[data-controls]"),
     command: screen.querySelector("[data-command]"),
+    audio: screen.querySelector("[data-audio]"),
     notice: screen.querySelector("[data-notice]"),
     noticeTitle: screen.querySelector("[data-notice-title]"),
     noticeText: screen.querySelector("[data-notice-text]"),
@@ -140,7 +142,7 @@ export function mountMixScreen(main, app) {
     parts.tabs.data = musicianTabs(state);
 
     const messages = mixMessages(state);
-    for (const name of ["departed", "error", "controls", "command"]) {
+    for (const name of ["departed", "error", "controls", "command", "audio"]) {
       parts[name].hidden = messages[name] === null;
       parts[name].textContent = messages[name] ?? "";
     }

@@ -18,12 +18,12 @@ use personal_monitoring::{
 };
 
 use crate::dto::{
-    locked_table, CaptureFormatDto, ChannelRequest, ChannelsSetDto, EngineStateDto,
-    EngineStatusDto, EngineerControlsRequest, EngineerControlsSetDto, GroupRequest, GroupsSetDto,
-    InputDeviceDto, MetersDto, MixDto, MixUpdateRequest, StartRequest, StartSummary,
+    locked_table, AudioSettingsRequest, CaptureFormatDto, ChannelRequest, ChannelsSetDto,
+    EngineStateDto, EngineStatusDto, EngineerControlsRequest, EngineerControlsSetDto, GroupRequest,
+    GroupsSetDto, InputDeviceDto, MetersDto, MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
-use crate::session::{SessionChannel, SessionEngineer, SessionGroup, SessionStore};
+use crate::session::{SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionStore};
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
@@ -995,6 +995,82 @@ pub fn switch_device(state: &DesktopState, device: String) -> Result<StartSummar
         run: state.run(),
         device_name: handle.device_name().to_owned(),
         capture_format: format,
+    })
+}
+
+/// The audio input the desk last ran with, as the window starts every engine from it (see
+/// [crate::session::SessionAudio]): `None` until one was kept. It is read as kept; the window
+/// treats a choice that names ASIO without a driver as no ASIO.
+pub fn audio_settings(state: &DesktopState) -> Option<SessionAudio> {
+    state.session.audio()
+}
+
+/// Keeps the audio input the running engine runs with for every later start, and answers it as
+/// kept. The window calls it only once an engine started or switched with the choice, never for the
+/// system's default input it fell back to when the kept input was missing, so a missing interface
+/// never replaces the engineer's choice.
+///
+/// The driver must be `auto`, `wasapi` or `asio` (kept by its own lowercase name), and `asio` needs
+/// the ASIO driver the engineer picked: ASIO is never kept without one. Names are trimmed and an
+/// empty one is none. With no engine running nothing is kept: only settings an engine runs with
+/// are. A refused choice, or a save that fails, changes nothing.
+pub fn set_audio_settings(
+    state: &DesktopState,
+    settings: AudioSettingsRequest,
+) -> Result<SessionAudio, String> {
+    let kept = keep_audio_settings(&state.engine, &state.session, settings)?;
+    println!(
+        "[mixlink-desktop] set_audio_settings: host={} device={:?} buffer={:?} asio_driver={:?}",
+        kept.host, kept.device, kept.buffer_frames, kept.asio_driver
+    );
+    Ok(kept)
+}
+
+/// [set_audio_settings] over any engine slot and session.
+fn keep_audio_settings<E>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    settings: AudioSettingsRequest,
+) -> Result<SessionAudio, String> {
+    let kept = session_audio(settings)?;
+    // The lock order every command that holds both follows: the engine's, then the session's.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    if guard.is_none() {
+        return Err(
+            "the engine is not running: only the audio input an engine runs with is kept"
+                .to_owned(),
+        );
+    }
+    session.set_audio(kept.clone())?;
+    Ok(kept)
+}
+
+/// The window's audio input as the session keeps it, or why it cannot be kept.
+fn session_audio(settings: AudioSettingsRequest) -> Result<SessionAudio, String> {
+    let named = |name: Option<String>| {
+        name.map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    };
+    let host = AudioHost::parse(settings.host.trim()).map_err(|_| {
+        format!(
+            "the audio driver `{}` is none of auto, wasapi, asio",
+            settings.host
+        )
+    })?;
+    let asio_driver = named(settings.asio_driver);
+    if host == AudioHost::Asio && asio_driver.is_none() {
+        return Err(
+            "ASIO is kept only with the ASIO driver the engineer picked, and none is named"
+                .to_owned(),
+        );
+    }
+    Ok(SessionAudio {
+        host: host.as_str().to_owned(),
+        device: named(settings.device),
+        buffer_frames: settings.buffer_frames,
+        asio_driver,
     })
 }
 
@@ -2388,6 +2464,131 @@ mod tests {
                     locked: 0b10,
                 }
             )]
+        );
+    }
+
+    fn audio_request(
+        host: &str,
+        device: Option<&str>,
+        asio_driver: Option<&str>,
+    ) -> AudioSettingsRequest {
+        AudioSettingsRequest {
+            host: host.to_owned(),
+            device: device.map(str::to_owned),
+            buffer_frames: Some(256),
+            asio_driver: asio_driver.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_audio_input_an_engine_runs_with_is_kept_for_the_next_start() {
+        let directory = session_directory("audio-running");
+        let session = SessionStore::open(&directory);
+        let engine = running(StandInEngine::default());
+
+        let kept = keep_audio_settings(
+            &engine,
+            &session,
+            audio_request("WASAPI", Some(" INPUT 1/2 (Volt 4) "), None),
+        )
+        .expect("kept");
+
+        let volt = SessionAudio {
+            host: "wasapi".to_owned(),
+            device: Some("INPUT 1/2 (Volt 4)".to_owned()),
+            buffer_frames: Some(256),
+            asio_driver: None,
+        };
+        assert_eq!(kept, volt, "the driver's own name, the device trimmed");
+        assert_eq!(session.audio(), Some(volt.clone()));
+        assert_eq!(
+            SessionStore::open(&directory).audio(),
+            Some(volt),
+            "and after a restart"
+        );
+    }
+
+    #[test]
+    fn with_no_engine_running_no_audio_input_is_kept() {
+        let session = SessionStore::open(&session_directory("audio-idle"));
+        let engine: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        let error = keep_audio_settings(
+            &engine,
+            &session,
+            audio_request("wasapi", Some("INPUT 1/2 (Volt 4)"), None),
+        )
+        .expect_err("only settings an engine runs with are kept");
+
+        assert!(error.contains("not running"), "{error}");
+        assert_eq!(session.audio(), None, "nothing is kept");
+    }
+
+    #[test]
+    fn asio_is_kept_only_with_the_driver_the_engineer_picked_and_an_unknown_driver_never() {
+        let session = SessionStore::open(&session_directory("audio-asio"));
+        let engine = running(StandInEngine::default());
+
+        for refused in [
+            audio_request("asio", None, None),
+            audio_request("asio", Some("INPUT 1/2 (Volt 4)"), Some("  ")),
+            audio_request("kernel", None, None),
+        ] {
+            let error =
+                keep_audio_settings(&engine, &session, refused.clone()).expect_err("refused");
+            assert!(
+                error.contains("ASIO") || error.contains("kernel"),
+                "{refused:?}: {error}"
+            );
+        }
+        assert_eq!(session.audio(), None, "nothing is kept");
+
+        let kept = keep_audio_settings(
+            &engine,
+            &session,
+            audio_request("asio", Some(""), Some("Volt ASIO")),
+        )
+        .expect("an ASIO driver the engineer picked is kept");
+        assert_eq!(kept.host, "asio");
+        assert_eq!(kept.asio_driver.as_deref(), Some("Volt ASIO"));
+        assert_eq!(kept.device, None, "an empty name is none");
+    }
+
+    #[test]
+    fn the_window_sends_and_reads_the_audio_input_in_its_own_words() {
+        let request: AudioSettingsRequest = serde_json::from_value(serde_json::json!({
+            "host": "wasapi",
+            "device": "INPUT 1/2 (Volt 4)",
+            "bufferFrames": 512,
+            "asioDriver": null
+        }))
+        .expect("the window's request reads");
+        assert_eq!(request.buffer_frames, Some(512));
+        assert!(
+            serde_json::from_value::<AudioSettingsRequest>(serde_json::json!({ "driver": "asio" }))
+                .is_err(),
+            "a field the desk does not know is refused"
+        );
+
+        let state = DesktopState::new(SessionStore::open(&session_directory("audio-read")));
+        assert_eq!(audio_settings(&state), None, "nothing kept yet");
+        state
+            .session
+            .set_audio(SessionAudio {
+                host: "asio".to_owned(),
+                device: None,
+                buffer_frames: Some(128),
+                asio_driver: Some("Volt ASIO".to_owned()),
+            })
+            .expect("saved");
+        assert_eq!(
+            serde_json::to_value(audio_settings(&state)).expect("serializes"),
+            serde_json::json!({
+                "host": "asio",
+                "device": null,
+                "bufferFrames": 128,
+                "asioDriver": "Volt ASIO"
+            })
         );
     }
 }

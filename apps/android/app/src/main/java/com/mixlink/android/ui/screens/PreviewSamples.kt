@@ -2,6 +2,7 @@ package com.mixlink.android.ui.screens
 
 import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ChannelKind
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.ui.components.LinkHealth
 import com.mixlink.android.ui.components.MainTab
@@ -92,6 +93,11 @@ internal object PreviewSamples {
 
     /** A server that announces no channel details: every input by number, no icons, nothing joined. */
     val olderServer = connected.copy(mix = mix.copy(channelDetails = null))
+
+    /** The engineer locked the drums and limits this musician to 60%, under the phone's cap of 80%. */
+    val engineerControls = moreOfMeOff.copy(
+        mix = mix.copy(levelCap = 80, engineer = EngineerControls(limitPercent = 60, lockedChannels = setOf(0, 1))),
+    )
 
     /** More of me asked for before a channel was chosen. */
     val noChannelChosen = connected.copy(

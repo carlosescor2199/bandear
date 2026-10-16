@@ -1,11 +1,19 @@
 // The console's controller: the one place that talks to the engine through a bridge and keeps
 // the store. It lives as long as the window; screens come and go and use it. No DOM.
 //
-// - On creation it listens to the engine's events, then asks for the engine's state. When the
-//   answer is that no engine runs (`state: "notRunning"`, an answer and not an error) it starts
-//   one with the start request the old window sent (see engine-config.js), unless `autoStart` is
-//   false. A failed read, and a failed listen, is the console's connection error; `reconnect`
-//   tries again, one attempt at a time.
+// - On creation it listens to the engine's events, reads the audio choices the desk's session
+//   keeps (`audio_settings`, until a read succeeds), then asks for the engine's state. When the
+//   answer is that no engine runs (`state: "notRunning"`, an answer and not an error) it starts one
+//   with the start request the old window sent, built on those choices (see engine-config.js),
+//   unless `autoStart` is false. A failed read of the state, and a failed listen, is the console's
+//   connection error, and so is a failed read of the choices when it would start: nothing starts
+//   on the defaults in place of a kept input. `reconnect` tries again, one attempt at a time.
+// - The audio choices (driver, input, buffer, picked ASIO driver) are applied only once an engine
+//   started or switched with them, and only then kept in the session (`set_audio_settings`), so
+//   every later start reopens them: Start, Try again, the automatic start, a start after a stop
+//   and a buffer change. A plain start whose input is gone (an interface left unplugged: not listed
+//   for its driver any more) starts on the default input instead, never on ASIO, says so, and keeps
+//   the choices for the next start; it saves nothing.
 // - `start` and `stop` drive the engine and its phase. A start, a failed start and a confirmed
 //   stop end the current run, so late events of an ended engine are ignored (see
 //   console-state.js). A refused stop or an unreadable status after a start ends nothing: the
@@ -38,7 +46,15 @@ import {
   pendingEdits,
 } from "./console-state.js";
 import { groupDefinitions, groupDefinitionsOf } from "./channels-view.js";
-import { ASIO_NEEDS_DRIVER, audioChoice, startRequest } from "./engine-config.js";
+import {
+  ASIO_NEEDS_DRIVER,
+  audioChoice,
+  fallbackAudio,
+  fallbackNotice,
+  rememberedDevice,
+  restoredAudio,
+  startRequest,
+} from "./engine-config.js";
 import { formatChannelsSet, formatGroupsSet, sentenceWithReason } from "./format.js";
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { switchMethod, windowTitle } from "./network-view.js";
@@ -150,10 +166,94 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     timer.unref?.();
   }
 
+  // The audio choices are known once read from the session, or once the engineer made one (which
+  // a later read must not replace).
+  let choiceKnown = false;
+  // The applied choices differ from what the session keeps: kept for the next start while nothing
+  // ran them, or not saved when they ran. The next start that runs them saves them.
+  let choiceUnsaved = false;
+
+  // Reads the audio choices the desk's session keeps, until a read succeeds: every start builds on
+  // them. Resolves to null once they are known, or to the error of a failed read, which the next
+  // connect or start tries again. While they are unknown nothing starts on the defaults, so a
+  // passing failure never opens the default input in place of the kept one.
+  async function readChoice() {
+    if (choiceKnown) {
+      return null;
+    }
+    try {
+      const saved = await api.audioSettings();
+      if (!choiceKnown) {
+        store.dispatch(actions.audio(restoredAudio(saved)));
+        choiceKnown = true;
+      }
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Why nothing started while the kept choices could not be read, as a sentence.
+  function choiceUnread(error) {
+    return sentenceWithReason(
+      "The saved audio input could not be read, so nothing was started",
+      message(error),
+    );
+  }
+
+  // Keeps the applied choices, which an engine now runs with, in the session for every later
+  // start. A failure is said, and the next start that runs them tries again.
+  async function keepChoice() {
+    choiceKnown = true;
+    try {
+      await api.setAudioSettings(store.getState().audio);
+      choiceUnsaved = false;
+      if (store.getState().audioNotice?.kind === "unsaved") {
+        store.dispatch(actions.audioNotice(null));
+      }
+    } catch (error) {
+      choiceUnsaved = true;
+      store.dispatch(
+        actions.audioNotice({
+          kind: "unsaved",
+          message: sentenceWithReason(
+            "The audio input runs but was not saved for the next start",
+            message(error),
+          ),
+        }),
+      );
+    }
+  }
+
+  // The start request on the default input (fallbackAudio: never ASIO) when the input `request`
+  // asked for is no longer listed for its driver, matched as the engine matches it; null when it
+  // is listed (the start failed for another reason), when none was asked for, or when the devices
+  // cannot be listed.
+  async function defaultInputRequest(audio, request) {
+    if (request.deviceFilter === null) {
+      return null;
+    }
+    let listed;
+    try {
+      listed = await api.listInputDevices(request.host);
+    } catch {
+      return null;
+    }
+    const sought = request.deviceFilter.toLowerCase();
+    const present = listed.some((device) => device.name.toLowerCase().includes(sought));
+    return present ? null : startRequest(fallbackAudio(audio));
+  }
+
   // Starts (or restarts) the engine with `audio`, the applied choices unless given, on
-  // `deviceFilter` when named. Every start is built by startRequest, which never builds an ASIO
-  // start without a picked driver. Answers `{ ok: true }` or `{ ok: false, error }`.
-  async function start({ deviceFilter = null, audio = store.getState().audio } = {}) {
+  // `deviceFilter` when named, else on the input the choices name. Every start is built by
+  // startRequest, which never builds an ASIO start without a picked driver. With `orDefault`, a
+  // start whose input is gone starts on the default input instead and says so (`audioNotice`
+  // "fallback"); the choices stay as they are. Answers `{ ok: true }` or `{ ok: false, error }`.
+  async function start({
+    deviceFilter = null,
+    audio = store.getState().audio,
+    orDefault = false,
+  } = {}) {
     const request = startRequest(audio, { deviceFilter });
     if (!request) {
       // Nothing reaches the engine, so an engine that runs keeps running.
@@ -166,12 +266,31 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       return { ok: false, error: ASIO_NEEDS_DRIVER };
     }
     store.dispatch(actions.engine("starting"));
+    let fellBack = false;
     try {
       await api.start(request);
     } catch (error) {
       // A failed start has stopped the engine it replaced and started none.
-      store.dispatch(actions.engine("error", message(error)));
-      return { ok: false, error: message(error) };
+      const fallback = orDefault ? await defaultInputRequest(audio, request) : null;
+      if (!fallback) {
+        store.dispatch(actions.engine("error", message(error)));
+        return { ok: false, error: message(error) };
+      }
+      try {
+        await api.start(fallback);
+      } catch (fallbackError) {
+        const reason = sentenceWithReason(
+          `${rememberedDevice(audio)} was not found, and the system's default input did not ` +
+            "start either",
+          message(fallbackError),
+        );
+        store.dispatch(actions.engine("error", reason));
+        return { ok: false, error: reason };
+      }
+      fellBack = true;
+    }
+    if (fellBack) {
+      store.dispatch(actions.audioNotice({ kind: "fallback", message: fallbackNotice(audio) }));
     }
     // The engine runs now: failing to read its status must not end its run.
     const error = await readStatus();
@@ -179,6 +298,30 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       fillAfterStart(error);
     }
     return { ok: true };
+  }
+
+  // A start of the applied choices as they are (Start, Try again, the automatic start): a missing
+  // input gives way to the default input, and choices not saved yet are saved once they run.
+  // Choices that could not be read yet are read first; while that fails nothing starts.
+  async function startChoice() {
+    const unread = await readChoice();
+    if (unread) {
+      const reason = choiceUnread(unread);
+      // Nothing reaches the engine, so an engine that runs keeps running.
+      const running = store.getState().engine.status !== null;
+      store.dispatch(
+        running
+          ? actions.commandFailed("start", reason.replace(/\.$/, ""))
+          : actions.engine("error", reason),
+      );
+      return { ok: false, error: reason };
+    }
+    const result = await start({ orDefault: true });
+    const fellBack = store.getState().audioNotice?.kind === "fallback";
+    if (result.ok && choiceUnsaved && !fellBack) {
+      await keepChoice();
+    }
+    return result;
   }
 
   async function stop() {
@@ -244,6 +387,8 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     if (disposed) {
       return;
     }
+    // Before any start, so the automatic start reopens the input the engineer chose last.
+    const unread = await readChoice();
     let answer;
     try {
       answer = await api.status();
@@ -253,7 +398,13 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
     store.dispatch(actions.connected());
     if (answer.state === "notRunning" && autoStart) {
-      await start();
+      if (unread) {
+        // Never the defaults in place of a kept input that could not be read: Try again reads it
+        // again and starts.
+        store.dispatch(actions.connectionFailed(choiceUnread(unread)));
+        return;
+      }
+      await startChoice();
     } else {
       takeEngineState(answer);
     }
@@ -268,26 +419,39 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   }
 
   // Applies a driver or buffer change by restarting the engine, as a DAW does: on the device in
-  // use with `keepDevice`, on `deviceFilter` when named, else on the driver's first device. ASIO
-  // loads a kernel-mode driver, so it only ever starts on a driver the engineer picked, which
-  // stays the applied driver for every later start. The choices are applied only once the engine
-  // started with them: a failed start keeps the previous ones. Answers like `start`.
+  // use with `keepDevice`, on `deviceFilter` when named, else on the input the choices name for
+  // the driver (a new driver: its default input). ASIO loads a kernel-mode driver, so it only ever
+  // starts on a driver the engineer picked, which stays the applied driver for every later start;
+  // a device named under another driver becomes the applied input. The choices are applied, and
+  // kept in the session, only once the engine started with them: a failed start keeps the previous
+  // ones. While the engine runs on the default input because the saved one is missing, a buffer
+  // change (`keepDevice`) is kept for the next start instead, which tries the saved input again.
+  // Answers like `start`.
   async function applyAudio(change, { deviceFilter = null, keepDevice = false } = {}) {
     const state = store.getState();
+    if (keepDevice && state.audioNotice?.kind === "fallback") {
+      store.dispatch(actions.audio(change));
+      choiceUnsaved = true;
+      return { ok: true };
+    }
     const device = keepDevice ? (state.engine.status?.deviceName ?? null) : deviceFilter;
     let next = audioChoice(state.audio, change);
     if (next.host === "asio" && device) {
-      next = { ...next, asioDriver: device };
+      next = audioChoice(next, { asioDriver: device });
+    } else if (deviceFilter) {
+      next = audioChoice(next, { device: deviceFilter });
     }
     const result = await start({ deviceFilter: device, audio: next });
     if (result.ok) {
       store.dispatch(actions.audio(next));
+      await keepChoice();
     }
     return result;
   }
 
   // Switches the input device: live under WASAPI, by a restart on that device otherwise (under
-  // ASIO the device picked becomes the applied driver).
+  // ASIO the device picked becomes the applied driver). The input switched to becomes the applied
+  // one, kept for every later start; a refused switch changes nothing.
   async function switchDevice(name) {
     if (switchMethod(store.getState().audio) === "restart") {
       await applyAudio({}, { deviceFilter: name });
@@ -295,11 +459,19 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
     try {
       await api.switchDevice(name);
-      store.dispatch(actions.commandDone("switch"));
     } catch (error) {
-      // The engine keeps the device it had.
+      // The engine keeps the device it had, and the choices stay as they were.
       store.dispatch(actions.commandFailed("switch", message(error)));
+      await readStatus();
+      return;
     }
+    store.dispatch(actions.commandDone("switch"));
+    store.dispatch(actions.audio({ device: name }));
+    if (store.getState().audioNotice?.kind === "fallback") {
+      // The engine runs on an input the engineer chose now.
+      store.dispatch(actions.audioNotice(null));
+    }
+    await keepChoice();
     await readStatus();
   }
 
@@ -398,13 +570,19 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     ready,
     /** Connects again after a failure: listens if it does not yet, and reloads the status. */
     reconnect: connect,
-    start: () => start(),
+    /** Starts the engine on the applied choices (Start, Try again); see startChoice. */
+    start: startChoice,
     stop,
     loadDevices,
     applyAudio,
-    /** Keeps an audio choice for the next start without restarting anything. */
+    /**
+     * Keeps an audio choice for the next start without restarting anything; the session keeps it
+     * once a start runs it.
+     */
     setAudio(change) {
       store.dispatch(actions.audio(change));
+      choiceKnown = true;
+      choiceUnsaved = true;
     },
     switchDevice,
     addTarget: (address) => musicianCommand(() => api.addTarget(address)),

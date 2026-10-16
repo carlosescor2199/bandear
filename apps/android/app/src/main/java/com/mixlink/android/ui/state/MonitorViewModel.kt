@@ -9,9 +9,10 @@ import com.mixlink.android.ClientMixState
 import com.mixlink.android.ControlChannel
 import com.mixlink.android.ControlState
 import com.mixlink.android.DiscoveredServer
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
-import com.mixlink.android.MixSnapshot
+import com.mixlink.android.MixReport
 import com.mixlink.android.PmonPlayer
 import com.mixlink.android.ServerDiscovery
 import com.mixlink.android.ui.components.MainTab
@@ -166,9 +167,10 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             dispatch(MixAcknowledged(control.controlState))
         }
 
-        override fun onMixPushed(mix: MixSnapshot) = serverMixReported(MixPushed(mix))
+        override fun onMixPushed(report: MixReport) = serverMixReported(MixPushed(report.mix, report.engineer))
 
-        override fun onMixAnswered(seq: Long, applied: MixSnapshot?) = serverMixReported(MixAnswered(seq, applied))
+        override fun onMixAnswered(seq: Long, applied: MixReport?) =
+            serverMixReported(MixAnswered(seq, applied?.mix, applied?.engineer ?: EngineerControls()))
 
         override fun onClosed() = publishControlState()
 
@@ -194,6 +196,8 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         mixSequence = { _state.value.mixSync.latest },
         transport = collaborators.controlTransport,
         scheduler = collaborators.controlScheduler,
+        // A pair whole when either side is locked, as the reducer's echo check reads it.
+        lockedChannels = { _state.value.mix.lockedSides },
     )
     private val receiver: AudioReceiver = collaborators.receiverFactory(receiverEvents, running, playerMix)
     private val scanner: ServerScanner = collaborators.scannerFactory(scannerEvents)
@@ -356,6 +360,9 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
      * A fader the musician is still moving is not held back: a push lands at once, and the next
      * step of the gesture sends its own value with the pushed mix around it. The server keeps
      * whichever whole mix it got last, and its answer to the phone's last mix brings the screen to it.
+     *
+     * The engineer's controls are part of the mix state, so a report that only moves the engineer's
+     * limit republishes the receive thread's ceiling ([MixUiState.effectiveCap]) at once too.
      */
     private fun serverMixReported(event: MonitorEvent) {
         val (before, after) = dispatch(event)
@@ -371,7 +378,8 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         synchronized(playerMixLock) {
             val mix = _state.value.mix
             playerMix.volumePercent = mix.masterVolume
-            playerMix.maxLevelPercent = mix.levelCap
+            // The lower of the phone's cap and the engineer's limit, as the server plays it.
+            playerMix.maxLevelPercent = mix.effectiveCap
             playerMix.muted = mix.masterMuted
         }
     }

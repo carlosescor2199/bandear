@@ -49,6 +49,13 @@ class ChannelSheetTextTest {
     }
 
     @Test
+    fun aLockedChannelsLabelButtonSaysTheEngineerLockedIt() {
+        assertEquals("Channel 3 settings, locked by the engineer", channelSettingsLabel(channel(2).copy(locked = true)))
+        assertEquals("Keys stereo pair settings, locked by the engineer", channelSettingsLabel(channel(3).copy(label = "Keys", pairedWith = 4, locked = true)))
+        assertEquals("Locked by the engineer", LOCKED_NOTE)
+    }
+
+    @Test
     fun aStereoPairsLabelButtonSaysItIsAPair() {
         assertEquals("Keys stereo pair settings", channelSettingsLabel(channel(3).copy(label = "Keys", pairedWith = 4)))
         assertEquals("Channel 4 stereo pair settings", channelSettingsLabel(channel(3).copy(pairedWith = 4)))

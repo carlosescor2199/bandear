@@ -24,6 +24,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
@@ -54,6 +55,9 @@ import kotlinx.coroutines.launch
 
 /** The sheet's top corners; its bottom sits on the screen's edge. */
 private val SheetShape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
+
+/** A locked channel's keys fade as the strip's do. */
+private const val DISABLED_KEY_ALPHA = 0.4f
 
 /**
  * One channel's sheet, opened from its strip's label: the pan, which the strips have no room for,
@@ -127,14 +131,18 @@ internal fun ChannelSheetContent(
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         SheetHeader(channel, mine)
+        // A locked channel's controls fade and take no input; the note says why in words.
+        val open = !channel.locked
+        if (channel.locked) LockedNote()
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             // A stereo pair's pan is its balance: the same control, written as both pans.
             ValueRow(title = panTitle(channel.stereo), value = panText(channel.pan), dim = false)
             PanControl(
                 pan = channel.pan,
                 onPanChange = onPan,
-                contentDescription = channelPanDescription(channel.label, channel.stereo),
+                contentDescription = lockedLabel(channelPanDescription(channel.label, channel.stereo), channel.locked),
                 modifier = Modifier.fillMaxWidth(),
+                enabled = open,
             )
         }
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -143,25 +151,28 @@ internal fun ChannelSheetContent(
                 value = channel.level,
                 onValueChange = onLevel,
                 accent = stripColor(stripFillFor(channel.muted, mine, moreOfMeOn)),
-                contentDescription = stripFaderDescription(channel.label, mine, channel.muted),
+                contentDescription = stripFaderDescription(channel.label, mine, channel.muted, channel.locked),
                 modifier = Modifier.fillMaxWidth(),
+                enabled = open,
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             SheetToggleKey(
                 text = muteKeyText(channel.muted),
-                description = "Mute ${channel.label}",
+                description = "Mute ${lockedLabel(channel.label, channel.locked)}",
                 on = channel.muted,
                 onColor = colors.red,
                 onToggle = onMuted,
+                enabled = open,
                 modifier = Modifier.weight(1f),
             )
             SheetToggleKey(
                 text = soloKeyText(channel.soloed),
-                description = "Solo ${channel.label}",
+                description = "Solo ${lockedLabel(channel.label, channel.locked)}",
                 on = channel.soloed,
                 onColor = colors.accent,
                 onToggle = onSoloed,
+                enabled = open,
                 modifier = Modifier.weight(1f),
             )
         }
@@ -233,7 +244,20 @@ private fun ValueRow(title: String, value: String, dim: Boolean) {
     }
 }
 
-/** A wide Mute or Solo key: filled and reading "Muted" or "Soloed" while on, not only coloured. */
+/** The lock and "Locked by the engineer" over a locked channel's controls. */
+@Composable
+private fun LockedNote() {
+    val colors = MixLinkTheme.colors
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(LineIcons.Lock, contentDescription = null, tint = colors.text, modifier = Modifier.size(18.dp))
+        Text(LOCKED_NOTE, style = MaterialTheme.typography.labelLarge, color = colors.text)
+    }
+}
+
+/**
+ * A wide Mute or Solo key: filled and reading "Muted" or "Soloed" while on, not only coloured. A
+ * disabled key fades but keeps its colours, so it still shows whether it is on.
+ */
 @Composable
 private fun SheetToggleKey(
     text: String,
@@ -242,15 +266,17 @@ private fun SheetToggleKey(
     onColor: Color,
     onToggle: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val colors = MixLinkTheme.colors
     Box(
         modifier = modifier
             .height(48.dp)
+            .alpha(if (enabled) 1f else DISABLED_KEY_ALPHA)
             .clip(MixLinkShapes.Control)
             .background(if (on) onColor else colors.surfaceRaised)
             .border(1.dp, if (on) onColor else colors.border, MixLinkShapes.Control)
-            .toggleable(value = on, role = Role.Switch, onValueChange = onToggle)
+            .toggleable(value = on, enabled = enabled, role = Role.Switch, onValueChange = onToggle)
             .semantics { contentDescription = description },
         contentAlignment = Alignment.Center,
     ) {
@@ -329,3 +355,13 @@ private fun ChannelSheetHardLeftPreview() = SheetPreview(PreviewSamples.connecte
 )
 @Composable
 private fun ChannelSheetHardRightPreview() = SheetPreview(PreviewSamples.connected.mix.channels[3].copy(pan = PAN_RIGHT))
+
+@Preview(
+    name = "Channel sheet · locked by the engineer",
+    widthDp = PREVIEW_WIDTH_DP,
+    heightDp = SHEET_PREVIEW_HEIGHT_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun ChannelSheetLockedPreview() = SheetPreview(PreviewSamples.engineerControls.mix.channels[0])

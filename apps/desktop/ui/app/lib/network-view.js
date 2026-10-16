@@ -7,6 +7,7 @@
 //   chosen device (ASIO holds one driver at a time, so a live switch there always fails).
 // - A switch that would leave configured groups without their inputs asks first.
 
+import { rememberedDevice } from "./engine-config.js";
 import { formatCaptureFormat, formatPercent, linkState } from "./format.js";
 
 const DASH = "—";
@@ -117,7 +118,8 @@ export function switchMethod(audio) {
 
 /**
  * The audio setup: the driver shown (an ASIO choice still waiting for its driver, or the applied
- * one), its devices, the device shown, the buffer and the engine's numbers. `local` is the
+ * one, which the desk remembers between runs), its devices, the device shown (the running one, or
+ * with no engine the one the next start opens), the buffer and the engine's numbers. `local` is the
  * screen's own `{ draftHost, draftDevice, pendingSwitch }`. Devices listed for another driver are
  * never offered: until the shown driver's list arrives, `listing` is true and nothing is offered.
  */
@@ -127,7 +129,7 @@ export function audioSetupView(state, local) {
   const listing = state.devices.host !== host;
   const devices = listing ? [] : state.devices.list;
   const asioPending = local.draftHost === "asio";
-  let device = status?.deviceName ?? "";
+  let device = status?.deviceName ?? rememberedDevice(state.audio) ?? "";
   if (asioPending) {
     device = local.draftDevice ?? "";
   }

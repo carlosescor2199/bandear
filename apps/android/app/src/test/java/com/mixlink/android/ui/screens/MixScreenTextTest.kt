@@ -44,6 +44,31 @@ class MixScreenTextTest {
     }
 
     @Test
+    fun aLockedStripSaysSoInWords() {
+        assertEquals("Vox level, locked by the engineer", stripFaderDescription("Vox", mine = false, muted = false, locked = true))
+        assertEquals("Vox level, your channel, muted, locked by the engineer", stripFaderDescription("Vox", mine = true, muted = true, locked = true))
+        assertEquals("Vox, locked by the engineer", lockedLabel("Vox", locked = true))
+        assertEquals("Vox", lockedLabel("Vox", locked = false))
+        assertEquals("Locked", LOCKED_TAG)
+    }
+
+    @Test
+    fun theEngineersLimitIsShownApartFromTheCapWithWhatTheMusicianGets() {
+        assertNull(engineerLimitText(cap = 90, limit = 100))
+        assertEquals("Limited to 60% by the engineer · at most 60%", engineerLimitText(cap = 100, limit = 60))
+        assertEquals("Limited to 60% by the engineer · at most 50%", engineerLimitText(cap = 50, limit = 60))
+    }
+
+    @Test
+    fun theCapControlSaysTheEngineersLimitAlsoApplies() {
+        assertEquals("Level cap, the loudest this phone plays", levelCapDescription(cap = 90, limit = 100))
+        assertEquals(
+            "Level cap, the loudest this phone plays. The engineer's limit of 60% also applies: at most 60%",
+            levelCapDescription(cap = 90, limit = 60),
+        )
+    }
+
+    @Test
     fun aGroupStripListsItsChannelsAsTheirStripsNameThem() {
         assertEquals("CH 1 · CH 2", groupMembersText(listOf("CH 1", "CH 2")))
         assertEquals("Vox · Keys", groupMembersText(listOf("Vox", "Keys")))

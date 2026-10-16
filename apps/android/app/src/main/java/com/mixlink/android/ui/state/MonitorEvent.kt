@@ -2,6 +2,7 @@ package com.mixlink.android.ui.state
 
 import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ControlState
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
 import com.mixlink.android.MixSnapshot
@@ -77,14 +78,23 @@ internal sealed interface MonitorEvent {
     /**
      * The server pushed the musician's whole mix (`mix_state`) because it changed elsewhere, such as
      * on the desktop. [snapshot] holds the server's full tables; the reducer keeps what the phone knows.
+     * [engineer] is what the engineer set for the musician (an older server reports the defaults).
      */
-    data class MixPushed(val snapshot: MixSnapshot) : MonitorEvent
+    data class MixPushed(
+        val snapshot: MixSnapshot,
+        val engineer: EngineerControls = EngineerControls(),
+    ) : MonitorEvent
 
     /**
      * The server answered the phone's change number [seq]: [applied] is the whole mix it now plays
      * (its `mix_ack`), or null when it refused the mix (an `error`) or its ack had no readable mix.
+     * [engineer] is what the engineer set for the musician, read only with an [applied] mix.
      */
-    data class MixAnswered(val seq: Long, val applied: MixSnapshot?) : MonitorEvent
+    data class MixAnswered(
+        val seq: Long,
+        val applied: MixSnapshot?,
+        val engineer: EngineerControls = EngineerControls(),
+    ) : MonitorEvent
 
     // More of me.
 

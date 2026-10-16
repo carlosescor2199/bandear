@@ -5,6 +5,7 @@
 // start, even a failed one, begins a new engine run, and every payload names its run.
 
 import {
+  CHANNEL_KINDS,
   checkChannels,
   defaultChannel,
   fitChannels,
@@ -55,7 +56,8 @@ function clone(value) {
 }
 
 // The status's channels on a device with `count` inputs: each with the engineer's `details` (fitted
-// to the device, see fitChannels) and its group.
+// to the device, see fitChannels; a kind this build does not know shown as it applies, `other`)
+// and its group.
 function channelRows(count, groups, details = []) {
   const fitted = fitChannels(details, count);
   return Array.from({ length: count }, (_, index) => {
@@ -63,9 +65,11 @@ function channelRows(count, groups, details = []) {
     const group = groups.find(
       (candidate) => !candidate.invalid && candidate.channels.includes(index),
     );
+    const kind = CHANNEL_KINDS.includes(fitted[index].kind) ? fitted[index].kind : "other";
     return {
       number: index + 1,
       ...fitted[index],
+      kind,
       group: group?.name ?? null,
       groupId: group?.id ?? null,
       level: 0,
@@ -1172,7 +1176,8 @@ export function createFakeBridge({
     set_channels({ channels } = {}) {
       const next = channelRequests(channels ?? []);
       try {
-        checkChannels(next);
+        // As the desktop does: a kind it does not know only where the session keeps that kind.
+        checkChannels(next, savedChannels);
       } catch (error) {
         throw error.message;
       }
@@ -1459,7 +1464,9 @@ export function createFakeBridge({
         throw `the saved groups cannot be used: ${error}`;
       }
       try {
-        checkChannels(channelRequests(session.channels ?? []));
+        // A kind a newer build wrote loads as written and applies as `other`, as in the desktop.
+        const loaded = channelRequests(session.channels ?? []);
+        checkChannels(loaded, loaded);
       } catch (error) {
         throw `the saved channel details cannot be used: ${error.message ?? error}`;
       }
@@ -1492,6 +1499,8 @@ export function createFakeBridge({
         // In the desktop's order: groups and details (each status before the mixes they move),
         // then limits, locks and mirrors, then the saved mixes.
         commands.set_groups({ groups: session.groups ?? [] });
+        // The loaded details are the session's first, so a kind a newer build wrote is taken.
+        savedChannels = channelRequests(session.channels ?? []);
         commands.set_channels({ channels: session.channels ?? [] });
         engine.musicians.forEach(showLabel);
         giveKeptControls();

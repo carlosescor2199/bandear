@@ -80,18 +80,55 @@ shown; group cards) and the Mix board's "Copy mix to…", "Mirror" and "Presets"
 
 ## Acceptance criteria
 
+Status at the close of phase 2 (T7b): every criterion is verified by automated tests; each still
+awaits the live test with the Volt and the Galaxy S23.
+
 - Renaming a channel, changing its icon, hiding it or linking a pair shows on the desktop and on
   every phone at once; a hidden channel is silent in every mix.
+  Verified by tests: engine `after_linking_a_pair_the_phone_gets_the_channel_details_before_its_moved_pans`
+  (real socket), the hidden-silence mixer and every-mix tests, `a_device_switch_restores_the_details_of_inputs_that_come_back`
+  (T3a, T3a-fix); desktop `set_channels` and status-on-`ChannelsChanged` tests and the Channels
+  screen UI tests (T3a, T4); Android `announcedDetailsNameTheStripsShowTheirKindsAndJoinPairs`,
+  `aNewConfigMidSessionRebuildsTheStripsAndKeepsTheMix`, `aPairsPanIsABalanceWrittenAsBothPansAndReadBackAsTheirMean`
+  (T3b). Pending: live test.
 - Creating, renaming, reassigning and deleting groups while running updates every phone, and no
   musician's group levels move to another group.
+  Verified by tests: engine `after_a_group_edit_the_phone_gets_the_new_config_before_its_moved_levels`
+  (real socket) and the remap and regroup tests (T2); desktop `set_groups` and edit-order tests
+  (T2, T2b); Android `announcedGroupsTagTheirChannelsAndKeepTheirLevels`. Pending: live test.
 - After a device switch, phones and newly registered phones get the live groups.
+  Verified by tests: `after_a_device_switch_a_connected_phone_is_sent_the_live_groups` and
+  `a_phone_registering_after_a_device_switch_mixes_with_the_live_groups` (T2). Pending: live test.
 - A musician keeps their label after their phone's IP changes.
+  Verified by tests: `a_musician_keeps_their_label_after_their_phones_ip_changes` (command layer),
+  `a_phone_keeps_its_label_when_its_ip_changes` (session) and the UI's "a musician's label stays on
+  screen when their phone comes back from a new IP" (T1). Pending: live test.
 - An engineer limit caps what the phone can reach; a locked channel cannot be changed from the
   phone and shows as locked there.
+  Verified by tests: engine `a_locked_channel_and_the_engineers_limit_hold_against_the_phones_whole_mix`
+  and `a_registering_phone_is_told_the_engineers_controls_before_it_sends_a_mix` (real socket,
+  T5a, T5a-fix); desktop and UI master-limit and lock tests (T5a, T5a-fix); Android
+  `aLockedChannelCannotBeChangedFromThePhone`, `aPairIsLockedAsOneStripWhenEitherSideIs`,
+  `theMusicianHearsTheLowerOfTheirCapAndTheEngineersLimit`,
+  `aLimitOnlyReportMovesThePhonesOwnCeilingWithNoMasterEdit` and the locked-label text tests (T5b,
+  T5b-fix). Pending: live test.
 - A preset can be saved from one musician and applied to another; copy and mirror behave as
   decided above.
+  Verified by tests: engine preset, copy and mirror tests with
+  `a_followers_phone_is_told_whom_it_follows_and_cannot_move_its_channels` and
+  `a_leaders_phone_change_reaches_its_follower_at_once` (real socket, T6a, T6a-fix); desktop preset,
+  copy and circle tests and the mix-tools UI tests (T6a-T6a-fix2); Android
+  `whileFollowingChannelAndGroupEditsChangeNothing`,
+  `whileFollowingOnlyTheMasterMovesAndTheAnswerBringsTheLeadersChannels` and
+  `whenFollowingStopsTheControlsAreTheMusiciansAgainAndTheMixStaysAsItWas` (T6b). Pending: live test.
 - Saving and loading a session restores channels, groups, presets and labels, and pushes the
   saved mixes to connected phones.
+  Verified by tests: the snapshot-store, save and load command tests (pushes, skipped and refused
+  musicians, controls and mirrors replaced whole) and the session-panel UI tests (T7a-T7a-fix2);
+  Android shows a pushed mix (`aPushedMixTakesTheServersValuesForTheAnnouncedChannelsAndGroups`)
+  and, on a first connect, the mix the server holds
+  (`aConfigArrivingBeforeTheOpeningMixIsSentLeavesTheServersMixAloneAndThePhoneTakesIt`, T7b).
+  Pending: live test.
 
 ## Checks
 
@@ -1142,19 +1179,171 @@ slice. Push and PRs are the user's decision.
   - Size: about 1,390 changed lines in the save commit, 1,240 in the load commit, 1,970 in the UI
     commit (about 600 of them tests) and 520 in the fix commit plus this document; above the
     400-line heuristic mostly in tests, split by work unit under the 2,000-line review budget.
-  - Follow-ups: a control or mirror the loaded session drops for a musician who is not here stays in
-    the running engine's book until the next start (the engine has no way to forget one; a mirror the
-    loaded session adds that would close a circle with such a stale one is refused and named, and the
-    next start applies the session); a load replaces the labels too, so a label set after the snapshot
-    is gone; export and import to arbitrary files is phase 4; live check with the desktop app and the
-    phones (a load while a phone moves a fader: the later writer wins).
+  - Follow-ups: a load replaces the labels too, so a label set after the snapshot is gone; export
+    and import to arbitrary files is phase 4; live check with the desktop app and the phones (a load
+    while a phone moves a fader: the later writer wins). Resolved by T7a-fix: a control or mirror the
+    loaded session dropped for a musician who was not here stayed in the running engine's book until
+    the next start (the engine could not forget one); the engine now replaces its books whole.
   - Commits: c5eacf2 `feat(desktop): save named sessions with every musician's mix`; abcea45
     `feat(desktop): load a named session and push its mixes to the phones`; 196a5a1
-    `feat(desktop-ui): save and load sessions from the console`; this commit (`fix(desktop): keep
-    unknown kinds through edits and test the screen's held boxes`).
-- [ ] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
+    `feat(desktop-ui): save and load sessions from the console`; 34012d6 `fix(desktop): keep
+    unknown kinds through edits and test the screen's held boxes`.
+- [x] T7a-fix (review fixes for T7a, reviews `review-0c47b67a0faa9250` and
+  `review-65ac6b51cab567d0`, and the reported engine gap). Route: inline writer of the delegated
+  T7a worker (bounded fixes in the engine, the desktop commands and the UI, one commit each).
+  - Engine gap (T7a follow-up): `EngineHandle::replace_kept(controls, mirrors)` replaces both books
+    whole under the registry's locks (table read lock held throughout; the controls book, then the
+    mirror book, each released before any mix writer lock): `TargetRegistry::replace_kept_controls`
+    clears and refills the controls book and resolves every musician here again to the kept controls
+    or the defaults; `replace_mirrors` clears the mirror book, admits each mirror in order as
+    `keep_mirror` does (shared `admitted`: never on oneself, never a circle with those admitted
+    before; a refusal is returned) and puts every musician here on their mirror or frees them
+    (shared `restore_mirrors`); each changed mix is announced as an engine change, the controls'
+    first. `load_session` hands it the loaded session's controls and mirrors in place of the per-key
+    keep and stop calls, so a lock, limit or mirror the loaded session dropped never comes back when
+    a musician who was away registers.
+  - R3-refused-mix-untested: the test stand-in can refuse the hand-over of the controls and mirrors
+    and a push; tests pin a refused hand-over (named, the mixes still pushed, the session saved), a
+    refused mirror (named) and a refused push (`SkippedMixDto { reason: "refused", error }`, the
+    other mixes pushed).
+  - R3-refused-load-drops-waiting-edits: the console no longer drops waiting edits when a load is
+    asked for; while it loads the mix and engineer coalescers send nothing (the edits stay pending),
+    a successful load drops them (`sessionLoaded`) and a refused one sends them as usual
+    (`sendWaiting`). The `dropEdits` action is gone.
+  - R3-explicit-other-cannot-clear-unknown-kind: `channel_table` reads a kind this build does not
+    know as written (the session's; with an engine running, where the engine's table has `other`
+    and the session keeps an unknown kind for that input), so the window sends it back untouched;
+    `channel_details` takes an unknown kind only where the session keeps exactly that kind for that
+    input (kept as written, applied as `other`), and an explicit `other` replaces it. The UI's
+    `checkChannels(channels, kept)` passes such a kind where the table read has it, the edit
+    functions check against the table they were given, and the fake keeps the same rule (its status
+    shows the kind as it applies).
+  - RED: engine 3 of 3 new tests failed against insert-only books (the dropped lock and mirror came
+    back on registration, the rack's limit and mirror stayed); desktop 3 of 166 failed against
+    mutants that drop refusals (the refused hand-over, mirror and push went unnamed); the kind tests
+    2 of 166 failed against the T7a code (the table read `other`); UI 2 of 10 session-console tests
+    failed against the committed console (the edits were dropped before the answer and lost on a
+    refusal), and the two kind tests 2 of 350 against the T7a channel code.
+  - GREEN: `cargo test -p personal-monitoring` 299 passed (3 new), control tests 39 passed in three
+    runs; `cargo test -p mixlink-desktop` 166 passed (3 new, 1 replaced, 2 updated); UI 350 passed (3
+    new, 1 replaced); `cargo fmt` clean; clippy: no new warnings; `cargo build -p mixlink-desktop`
+    after `cargo clean -p mixlink-desktop` ok.
+  - Commits: 44be346 `fix(engine): let a loaded session replace kept controls and mirrors` (about
+    760 changed lines); 2b4ba22 `fix(desktop): keep waiting edits when a load is refused and
+    round-trip unknown kinds` (about 420).
+- [x] T7a-fix2 (review fixes for T7a-fix, review `review-386947d3e30791b9`). Route: inline writer of
+  the delegated T7a worker (one engine fix, one desktop fix).
+  - R3-replace-kept-not-atomic: `TargetRegistry::replace_kept(controls, mirrors)` holds one read of
+    the table from the controls' replacement through the last musician resolved for the mirrors
+    (the books' locks taken and released inside it, before any mix writer lock, as before), so a
+    registration meets both old books or both new ones; `replace_target_kept` makes one call and
+    announces the controls' changes, then the mirrors'. A test hook (`between_replacements`) tries
+    a registration between the two steps.
+  - R3-channel-table-stale-session-kind: `SessionStore::channels_behind` (set when a running engine
+    took channel details, or a loaded session, whose save then failed; cleared by every save of the
+    details and by a start, whose engine takes the session's) gates the raw kind: with an engine
+    running and the session behind, `read_channel_table` reads the engine's kinds and
+    `channel_details` takes no unknown kind as untouched, so an explicit `other` the engine took is
+    not undone by the stale kind on the next edit. With no engine the session is the truth.
+  - RED: the hooked test failed against a mutant that releases the table between the two steps (the
+    registration got in and met the dropped mirror); the failed-save test failed against a mutant
+    that ignores the flag (`"theremin"` read back instead of `"other"`).
+  - GREEN: `cargo test -p personal-monitoring` 300 passed (1 new), control tests 39 passed in three
+    runs; `cargo test -p mixlink-desktop` 167 passed (1 new); `cargo fmt` clean; clippy: no new
+    warnings; `cargo build -p mixlink-desktop` ok. The desktop crate's incremental cache hit a rustc
+    panic once (`dep_graph` `try_mark_green`, index out of bounds); `cargo clean -p
+    mixlink-desktop` cleared it (likely the transient build failure seen in T7a-fix too).
+  - Commits: 4a688ca `fix(engine): replace kept controls and mirrors in one step` (about 170 changed
+    lines); 262942b `fix(desktop): read a stored unknown kind only while the session matches the
+    engine` (about 150).
+- [x] T7a-fix3 (tests; review `review-c9bf544c067c5dbb` over 2b4ba22..05f3a6a, two SUGGESTIONs on
+  T7a-fix2). Route: inline writer of the delegated T7a worker (one desktop file).
+  - R3-channels-behind-load-and-start-untested: the start's hand-over of the session's groups and
+    details moved to `hand_session_layout` (generic over the group and channel stand-ins) and is
+    tested to clear the flag; a load the engine took but the desk could not save is tested to set it
+    (and the next save that works to clear it).
+  - R3-behind-drops-unrelated-unknown-kinds: decided to pin the current behaviour. A per-input
+    comparison cannot tell an untouched unknown kind from the explicit `other` the earlier WARNING
+    was about (the engine reports both as `other`, every other field equal), so while the session is
+    behind every input reads as the engine applies it; a one-line comment in `read_channel_table`
+    says so and a test pins it (an unedited unknown kind reads, and is saved next, as `other`).
+  - Evidence: `cargo test -p mixlink-desktop` 170 passed (3 new); against a mutant that neither sets
+    the flag on a failed load save nor clears it at start, the two flag tests fail (2 of 170); the
+    pinned test passes against the T7a-fix2 code by design; `cargo fmt -p mixlink-desktop --
+    --check` clean.
+  - Commit: this commit (`test(desktop): cover the session-behind flag on load and start`).
+- [x] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
   answer after `config`, R3-config-pairs-musician-channel-moreofme-on-unsent) and whatever the
-  phone needs to show a loaded session's pushed mix; docs. Route: delegated writer.
+  phone needs to show a loaded session's pushed mix; docs. Route: delegated writer (two bounded
+  fixes in the control channel, the reducer and the ViewModel). A loaded session's pushed mix
+  needed nothing new: it is a `mix_state`, shown through the push path since phase 1.
+  - First connect (desktop-console T3c follow-up). Found: the opening mix was read when the
+    control thread got to it, and the server's `config` follows the open at once; when `config` was
+    handled first, the opening mix carried the neutral strips `config` had just made over the
+    server's channels and groups. (With the opening mix sent first, it already carried empty lists,
+    the server kept its mix and its answer, which follows `config`, was shown.) Decided: the opening
+    mix is read on the socket's thread when the connection opens, before any of its messages is
+    handled, and only sent on the control scheduler (`ControlChannel.sendOpeningMix`, sharing
+    `outgoingMixMessage` with every other send). A phone with no channels yet sends no channel
+    values and no group levels, so the server keeps what it holds and its answer gives it to the
+    phone; the master volume, level cap and mute are the phone's own and are sent as always. A
+    reconnect still sends the phone's own mix (the phone's mix wins, as decided). The `seq` rules,
+    More of me, locks and following are unchanged (the same message builder and answer path). Known
+    window: a change the musician makes between `config` and the server's first answer (a few
+    milliseconds) is sent whole, as any change is.
+  - R3-config-pairs-musician-channel-moreofme-on-unsent. Decided: with More of me on, a `config`
+    that makes the musician's channel part of a new stereo pair (on the second side, where My channel
+    moves to the first, or on the first) turns More of me off with "More of me is off: your channel
+    is now part of a stereo pair" (`CHANNEL_PAIRED`, `offIfNewlyPaired` beside `offIfHeld`), and
+    nothing is sent: the link's own `mix_state` follows with the pans it moved, which a send would
+    overwrite with the phone's old ones, and it is then taken as the server plays it. Turned on
+    again, More of me lifts both sides. A pair the strip already was, or one elsewhere, changes
+    nothing; a `config` that drops or hides the channel still resends as before.
+  - RED: 3 of 454 failed against the T6b code: the held-scheduler first connect (the opening mix
+    was `[100, 100, 100]`, not `[]`), and the pairing tests in the reducer (More of me stayed on)
+    and the ViewModel. The plain first-connect ordering and the reconnect tests passed (they pin
+    behaviour that held). A mutant that resends when the pairing turned More of me off fails the
+    ViewModel test (one more `mix`).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 454 tests, 0 failures, 0 errors
+    (449 before: 5 new; the T3b test that expected More of me to stay on now pins the move alone);
+    no compiler warnings.
+  - Size: about 115 authored changed lines in the first commit and 90 in the second plus this
+    document.
+  - Commits: 2520b56 `fix(android): take the server's mix after the first config`; 05f3a6a
+    `fix(android): keep More of me consistent when a link moves my channel`.
+- [x] T7b-fix (review fix for T7b, review `review-c9bf544c067c5dbb`). Route: inline writer of the
+  delegated T7b worker (the reducer, the ViewModel and their tests).
+  - R3-paired-moreofme-off-keeps-server-lift: when a link turned More of me off, the server still
+    played the lift the phone had sent, and the link's `mix_state` (taken as the server plays it)
+    baked that lift into the phone's own mix, so the musician heard a lift the screen said was off
+    and a new lift went on top of it. Now the `config` keeps the musician's own levels
+    (`MonitorUiState.ownLevelsToRestore`; the lift is applied at send time and never stored); the
+    first report after it (the link's `mix_state`, or the answer to a change made meanwhile) is
+    taken with those levels put back on every channel the lift touched (`dropLinkedLift`: not a
+    locked channel; a pair's second side at its first side's level, as the link sets it; nothing
+    while following) and its pans as the link moved them, and is numbered as the phone's newest mix
+    when it differs, so the ViewModel sends it once through the `seq` path (`serverMixReported`). A
+    new session clears it. The T7b decision (off with a notice, nothing sent on the `config`) stands.
+  - RED: 2 of 455 failed against the T7b code with non-neutral levels: the reducer kept the lifted
+    `[40, 30, 30, 35, 45]` instead of `[80, 60, 60, 70, 90]`, and the ViewModel sent nothing after
+    the link's push (8 mixes, not 9).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 455 tests, 0 failures, 0 errors
+    (454 before: 1 new; the T7b ViewModel test, which used neutral levels, now checks the restored
+    levels, the moved pans and a single lift afterwards); no compiler warnings.
+  - Commit: c91d0d2 `fix(android): drop the More of me lift when a link turns it off`.
+- [x] T7b-fix2 (review fix for T7b-fix, review `review-4c6fd738e50cbb30`). Route: inline writer of
+  the delegated T7b worker (the reducer and its tests).
+  - R3-own-levels-stale-after-meanwhile-edit: a change the musician makes while a lift restore
+    waits is sent with their own unlifted levels (More of me is off), so every sent change now
+    clears `ownLevelsToRestore` in the same step that numbers it (`reduceChange`), and the report
+    that follows settles through the `seq` rules; before, the levels kept at the `config` were
+    written over the newer change and sent.
+  - RED: 1 of 456 failed against the T7b-fix code (`anEditMadeBeforeTheLinksMixArrivesStandsAndNoOlderLevelsAreRestored`:
+    the restore was still waiting after the edit; with that check set aside, the answer to the edit
+    came back as `[80, 60, 60, 70, 90]`, the edit to 55 undone, and was numbered to be sent).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 456 tests, 0 failures, 0 errors
+    (455 before: 1 new); no compiler warnings.
+  - Commit: this commit (`fix(android): let a new edit cancel a pending lift restore`).
 
 ## Progress
 
@@ -1327,9 +1516,40 @@ slice. Push and PRs are the user's decision.
   R3-idle-channel-edit-rewrites-unknown-kinds, SUGGESTION R3-screen-pending-hold-wiring-untested,
   the session notice shown in the UI, and the fake's offline mirror check comparing keys as the
   desktop does. Still open for T7b: R3-config-pairs-musician-channel-moreofme-on-unsent (Android).
-  Review base f7cc192; the T7a slice is four commits of about 1,390, 1,240, 1,970 and 520 changed
+  Review base f7cc192; the T7a slice is four commits of about 1,390, 1,240, 1,970 and 640 changed
   lines, so it is reviewed commit by commit.
+- T7a was reviewed in two parts because the whole slice exceeded the reviewer's lens context
+  budget: the backend f7cc192..abcea45 (`review-0c47b67a0faa9250`) and the UI and fixes
+  abcea45..34012d6 (`review-65ac6b51cab567d0`), both approved and acknowledged; next review base
+  34012d6. Their findings (R3-refused-mix-untested, R3-refused-load-drops-waiting-edits,
+  R3-explicit-other-cannot-clear-unknown-kind) and the engine gap reported with T7a (no way to
+  forget kept controls or mirrors) are fixed by T7a-fix.
+- Review `review-386947d3e30791b9` over 34012d6..2b4ba22 (T7a-fix) approved and acknowledged; next
+  review base 2b4ba22. Both WARNINGs (R3-replace-kept-not-atomic,
+  R3-channel-table-stale-session-kind) are fixed by T7a-fix2.
+
+- T7b done (the phone takes the server's mix after the first `config`; More of me goes off when a
+  link pairs the musician's channel); see its entry for evidence. Phase 2's tasks are all done and
+  every acceptance criterion is verified by tests (see Acceptance criteria); the live test with
+  the Volt and the Galaxy S23 is pending for all of them. Live checklist from the follow-ups: channel
+  names, icons, hidden inputs and pairs on the phone; group edits; limits, locks and mirrors set
+  and stopped from the desk; a session saved and loaded with phones connected; a first connect to
+  a server that already holds the musician's mix (the phone shows it, no neutral strips).
+- Review `review-c9bf544c067c5dbb` over 2b4ba22..05f3a6a (T7a-fix2 and T7b) approved and
+  acknowledged; next review base 05f3a6a. Its WARNING (R3-paired-moreofme-off-keeps-server-lift)
+  is fixed by T7b-fix; its two desktop SUGGESTIONs go to a desktop follow-up commit.
+- Review `review-4c6fd738e50cbb30` over 05f3a6a..44b5572 approved and acknowledged; next review
+  base 44b5572. Its WARNING (R3-own-levels-stale-after-meanwhile-edit) is fixed by T7b-fix2.
+
+- Review `review-c0bc7cb0513ac7d0` over 44b5572..ff2b413 (T7b-fix2) approved with no findings and
+  acknowledged. Every commit of phase 2 is now reviewed (last reviewed boundary ff2b413).
+
+- Live test (2026-10-16): the desktop app (built with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`
+  after two system crashes during heavier builds) and the Galaxy S23 with the phase 2 app; the
+  user tested the phase 2 features and reported "está excelente y funciona bien". ASIO was not
+  exercised.
 
 ## Next step
 
-T7b (session save and load, Android).
+Phase 2 is complete, reviewed and live-tested. Next: pull requests (stacked-to-main) on the
+user's approval, then phase 3 (local mix and multitrack recording).

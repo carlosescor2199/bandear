@@ -421,14 +421,126 @@ class MonitorReducerTest {
 
     @Test
     fun theMusiciansChannelOnAPairsSecondSideMovesToThePair() {
-        val on = withChannels(5).after(MusicianChannelChosen(2), MoreOfMeToggled(true))
+        val remembered = withChannels(5).after(MusicianChannelChosen(2))
+
+        val paired = remembered.after(ConfigReceived(5, emptyList(), band))
+
+        assertEquals(1, paired.moreOfMe.musicianChannel)
+        assertNull(paired.moreOfMe.notice)
+        assertEquals(listOf(1, 2), paired.moreOfMeChannels)
+    }
+
+    @Test
+    fun aConfigThatPairsTheMusiciansChannelTurnsMoreOfMeOffAndSaysWhy() {
+        // My channel on what becomes the pair's second side: it moves to the first, and the lift the
+        // server plays (one side) no longer matches the strip's (both sides).
+        val second = withChannels(5).after(MusicianChannelChosen(2), MoreOfMeToggled(true)).after(ConfigReceived(5, emptyList(), band))
+
+        assertEquals(1, second.moreOfMe.musicianChannel)
+        assertFalse(second.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, second.moreOfMe.notice)
+
+        // My channel on what becomes the pair's first side: the same.
+        val first = withChannels(5).after(MusicianChannelChosen(1), MoreOfMeToggled(true)).after(ConfigReceived(5, emptyList(), band))
+
+        assertEquals(1, first.moreOfMe.musicianChannel)
+        assertFalse(first.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, first.moreOfMe.notice)
+
+        // Turned on again it lifts the pair, and a config that keeps the pair as it is leaves it on.
+        val again = second.after(MoreOfMeToggled(true), ConfigReceived(5, emptyList(), band))
+
+        assertTrue(again.moreOfMe.enabled)
+        assertEquals(listOf(1, 2), again.moreOfMeChannels)
+        // A pair elsewhere leaves it alone.
+        val elsewhere = withChannels(5).after(MusicianChannelChosen(0), MoreOfMeToggled(true)).after(ConfigReceived(5, emptyList(), band))
+
+        assertTrue(elsewhere.moreOfMe.enabled)
+        assertNull(elsewhere.moreOfMe.notice)
+    }
+
+    @Test
+    fun afterALinkTurnsMoreOfMeOffTheMusiciansOwnLevelsGoBackWithTheMovedPans() {
+        val on = running().after(
+            ConfigReceived(5, emptyList()),
+            ChannelLevelChanged(0, 80),
+            ChannelLevelChanged(1, 60),
+            ChannelLevelChanged(2, 40),
+            ChannelLevelChanged(3, 70),
+            ChannelLevelChanged(4, 90),
+            MusicianChannelChosen(2),
+            MoreOfMeToggled(true),
+        )
+        // The server plays the lift the phone sent: CH 3 at 100, the rest halved.
+        assertEquals(listOf(40, 30, 100, 35, 45), on.mix.toSnapshot().moreOfMeFor(listOf(2))!!.channelGains.toList())
 
         val paired = on.after(ConfigReceived(5, emptyList(), band))
 
-        assertEquals(1, paired.moreOfMe.musicianChannel)
-        assertTrue(paired.moreOfMe.enabled)
-        assertNull(paired.moreOfMe.notice)
-        assertEquals(listOf(1, 2), paired.moreOfMeChannels)
+        assertFalse(paired.moreOfMe.enabled)
+        assertEquals(on.mixSync, paired.mixSync)
+
+        // The link's `mix_state`: the pair's second side took the first's (lifted) level, and its
+        // pans moved apart. The phone keeps those pans and puts its own levels back, once.
+        val linked = MixSnapshot(
+            channelGains = intArrayOf(40, 30, 30, 35, 45),
+            channelPans = intArrayOf(0, 0, 100, 100, 0),
+            channelMutes = BooleanArray(5),
+            channelSolos = BooleanArray(5),
+        )
+        val restored = paired.after(MixPushed(linked))
+
+        assertEquals(listOf(80, 60, 60, 70, 90), restored.mix.levels)
+        assertEquals(listOf(0, 0, 100, 100, 0), restored.mix.pans)
+        assertFalse(restored.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, restored.moreOfMe.notice)
+        assertEquals(paired.mixSync.latest + 1, restored.mixSync.latest)
+
+        // Its answer changes nothing more, and More of me turned on again lifts once.
+        val answered = restored.after(MixAnswered(restored.mixSync.latest, restored.mix.toSnapshot()))
+        assertEquals(restored.mix, answered.mix)
+        assertTrue(answered.mixSync.settled)
+        val again = answered.after(MoreOfMeToggled(true))
+        val played = again.mix.toSnapshot().moreOfMeFor(again.moreOfMeChannels, again.mix.lockedSides)!!
+        assertEquals(listOf(40, 100, 100, 35, 45), played.channelGains.toList())
+    }
+
+    @Test
+    fun anEditMadeBeforeTheLinksMixArrivesStandsAndNoOlderLevelsAreRestored() {
+        val paired = running().after(
+            ConfigReceived(5, emptyList()),
+            ChannelLevelChanged(0, 80),
+            ChannelLevelChanged(1, 60),
+            ChannelLevelChanged(2, 40),
+            ChannelLevelChanged(3, 70),
+            ChannelLevelChanged(4, 90),
+            MusicianChannelChosen(2),
+            MoreOfMeToggled(true),
+            ConfigReceived(5, emptyList(), band),
+        )
+
+        // The musician moves a fader before the link's `mix_state` arrives: that send carries their
+        // own levels (More of me is off), so nothing waits to be put back any more.
+        val edited = paired.sent(ChannelLevelChanged(0, 55))
+        assertNull(edited.ownLevelsToRestore)
+
+        val linked = MixSnapshot(
+            channelGains = intArrayOf(40, 30, 30, 35, 45),
+            channelPans = intArrayOf(0, 0, 100, 100, 0),
+            channelMutes = BooleanArray(5),
+            channelSolos = BooleanArray(5),
+        )
+        // The server took that whole mix (the pair's sides made equal, the first winning).
+        val answer = MixSnapshot(
+            channelGains = intArrayOf(55, 60, 60, 70, 90),
+            channelPans = intArrayOf(0, 100, 0, 100, 0),
+            channelMutes = BooleanArray(5),
+            channelSolos = BooleanArray(5),
+        )
+        val answered = edited.after(MixPushed(linked), MixAnswered(edited.mixSync.latest, answer))
+
+        assertEquals(listOf(55, 60, 60, 70, 90), answered.mix.levels)
+        assertEquals(edited.mixSync.latest, answered.mixSync.latest)
+        assertTrue(answered.mixSync.settled)
     }
 
     @Test

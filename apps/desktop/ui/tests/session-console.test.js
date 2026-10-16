@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { addGroup } from "../app/lib/channels-view.js";
+import { addGroup, renameChannel, setChannelKind } from "../app/lib/channels-view.js";
 import { createConsoleApp } from "../app/lib/console-app.js";
 import { musicianByAddress, pendingEdits } from "../app/lib/console-state.js";
 import { startRequest } from "../app/lib/engine-config.js";
@@ -152,22 +152,47 @@ test("after a load the next group edit builds on the loaded groups, not the last
   app.dispose();
 });
 
-test("a load drops the edits still waiting, and says how many it would drop before", async () => {
+test("a load drops the edits still waiting once it loaded, and none goes out over it", async () => {
   const { fake, app } = await connected({ savedSessions: [savedSession("s9")] });
   fake.holdAnswers("set_mix");
+  fake.holdAnswers("load_session");
   app.edit(BASS, { "channelGains.0": 70 });
   app.edit(BASS, { "channelGains.1": 60 });
   assert.equal(app.unsavedEdits(), 2);
 
   const loading = app.loadSession("s9");
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(pendingEdits(app.store.getState(), BASS), {}, "dropped once the load is on its way");
+  assert.equal(app.unsavedEdits(), 2, "kept while the desk has not answered");
   fake.releaseAnswers();
-  await loading;
+  const result = await loading;
   await new Promise((resolve) => setImmediate(resolve));
 
+  assert.equal(result.ok, true, result.message);
   assert.equal(app.unsavedEdits(), 0);
-  assert.equal(commands(fake, "set_mix").length, 1, "the waiting edits never went out over the load");
+  assert.deepEqual(pendingEdits(app.store.getState(), BASS), {});
+  assert.equal(commands(fake, "set_mix").length, 1, "the waiting edit never went out over the load");
+  app.dispose();
+});
+
+test("a refused load keeps the edits still waiting, and they go out", async () => {
+  const { fake, app } = await connected({ savedSessions: [savedSession("s9")] });
+  fake.holdAnswers("set_mix");
+  app.edit(BASS, { "channelGains.0": 70 });
+  app.edit(BASS, { "channelGains.1": 60 });
+  fake.failNext("load_session", "the disk is gone");
+
+  const result = await app.loadSession("s9");
+
+  assert.deepEqual(result, { ok: false, message: '"Sunday" was not loaded: the disk is gone.' });
+  assert.equal(app.unsavedEdits(), 2, "the engineer's edits are not lost for nothing");
+  fake.releaseAnswers();
+  await new Promise((resolve) => setImmediate(resolve));
+  fake.releaseAnswers();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(commands(fake, "set_mix").length, 2, "the waiting edit went out after the refusal");
+  assert.equal(app.unsavedEdits(), 0);
+  const bass = musicianByAddress(app.store.getState(), BASS).mix;
+  assert.deepEqual([bass.channelGains[0], bass.channelGains[1]], [70, 60]);
   app.dispose();
 });
 
@@ -242,6 +267,32 @@ test("with the engine stopped a load applies at the next start and pushes no mix
     ["kit"],
     "the next start takes the loaded groups",
   );
+  app.dispose();
+});
+
+test("a kind a newer build wrote survives an edit of another input, and an explicit Other replaces it", async () => {
+  const { fake, app } = await connected({
+    savedSessions: [
+      savedSession("s9", {
+        session: {
+          channels: [
+            { name: "Kick", kind: "drums", hidden: false, link: false },
+            { name: "Theremin", kind: "theremin", hidden: false, link: false },
+          ],
+        },
+      }),
+    ],
+  });
+  await app.loadSession("s9");
+  assert.equal(app.store.getState().engine.status.channels[1].kind, "other", "it applies as other");
+
+  const renamed = await app.editChannels((table, count = 6) => renameChannel(table, 0, "Kick in", count));
+
+  assert.equal(renamed.ok, true, renamed.message);
+  assert.equal((await fake.invoke("channel_table"))[1].kind, "theremin");
+  const other = await app.editChannels((table) => setChannelKind(table, 1, "other", 6));
+  assert.equal(other.ok, true, other.message);
+  assert.equal((await fake.invoke("channel_table"))[1].kind, "other");
   app.dispose();
 });
 

@@ -294,11 +294,13 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
     /**
      * A `config`. When it moves the musician's channel (dropped, hidden, or now the second side of a
      * stereo pair, which is known by its first) the phone remembers the new one, and it resends the
-     * mix only if More of me went off.
+     * mix only if More of me went off, so the server stops lifting. It does not when More of me went
+     * off because the musician's channel became part of a pair: the link's own `mix_state` follows
+     * with the pans it moved, and a send now would put the phone's old pans back over them.
      */
     private fun configReceived(config: ConfigReceived) {
         val (before, after) = change(config) { before, after ->
-            before.moreOfMe.enabled && !after.moreOfMe.enabled
+            before.moreOfMe.enabled && !after.moreOfMe.enabled && after.moreOfMe.notice != MoreOfMeNotice.CHANNEL_PAIRED
         }
         if (before.moreOfMe.musicianChannel != after.moreOfMe.musicianChannel) {
             store.setMusicianChannel(after.moreOfMe.musicianChannel)
@@ -363,10 +365,15 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
      *
      * The engineer's controls are part of the mix state, so a report that only moves the engineer's
      * limit republishes the receive thread's ceiling ([MixUiState.effectiveCap]) at once too.
+     *
+     * One report is answered with a send: the first after a link turned More of me off, which the
+     * reducer takes with the musician's own levels put back over the lift the server still plays and
+     * numbers as the phone's newest mix; it is sent once, with the pans the link moved.
      */
     private fun serverMixReported(event: MonitorEvent) {
         val (before, after) = dispatch(event)
         if (before.mix != after.mix) syncPlayerMix()
+        if (after.mixSync.latest != before.mixSync.latest) control.sendMixControl()
     }
 
     /**

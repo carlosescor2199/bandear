@@ -636,6 +636,23 @@ pub(crate) fn keep_target_controls(
     }
 }
 
+/// Replaces every control and mirror the engine keeps with a loaded session's in one step, as
+/// [EngineHandle::replace_kept] does (see [TargetRegistry::replace_kept]): each mix that changed is
+/// announced as a change made through the engine, those the controls moved first. Returns the
+/// mirrors refused.
+pub(crate) fn replace_target_kept(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    controls: &[(MusicianKey, EngineerControls)],
+    mirrors: &[(MusicianKey, MusicianKey, String)],
+) -> Vec<String> {
+    let (by_controls, by_mirrors, refused) = targets.replace_kept(controls, mirrors);
+    for address in by_controls.into_iter().chain(by_mirrors) {
+        announce_engine_change(events, address);
+    }
+    refused
+}
+
 /// What a musician's phone announced about itself when it registered.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Announced {
@@ -1756,6 +1773,34 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Replaces every engineer's control and every mirror the engine keeps with `controls` and
+    /// `mirrors` (keys as [Self::keep_engineer_controls] and [Self::keep_mirror] take them), as a
+    /// desk does when it loads a saved session: what was kept before and is not in them is
+    /// forgotten, for musicians who are here and for those who are not, so a lock, a limit or a
+    /// mirror the loaded session dropped never comes back when a musician registers.
+    ///
+    /// The controls are replaced first: every musician here takes those now kept for them (client
+    /// id first, then IP) or the defaults. Then the mirrors: each is admitted in order as
+    /// [Self::keep_mirror] admits one (a mirror on oneself, or one closing a circle with those
+    /// admitted before it, is left out and its refusal returned), and every musician here is put on
+    /// their mirror or freed from the one they lost. Each mix that changed is announced as
+    /// [EngineEvent::MixChanged] from [MixOrigin::Engine], so its phone is told.
+    pub fn replace_kept(
+        &self,
+        controls: &[(MusicianKey, EngineerControls)],
+        mirrors: &[(MusicianKey, MusicianKey, String)],
+    ) -> Result<Vec<String>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(replace_target_kept(
+            &self.targets,
+            &self.events,
+            controls,
+            mirrors,
+        ))
+    }
+
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
@@ -2402,6 +2447,72 @@ mod tests {
             mix_of("192.168.1.4").engineer,
             locked,
             "the phone gets its controls when it registers"
+        );
+    }
+
+    #[test]
+    fn replacing_the_kept_controls_and_mirrors_announces_each_change_and_reaches_later_phones() {
+        let layout = GroupLayout::default();
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+            ],
+            &layout,
+        )
+        .expect("registry should build");
+        let events = EventBus::default();
+        let rack = MusicianKey::Address("192.168.1.3:50000".parse().unwrap());
+        let keys = MusicianKey::Address("192.168.1.4:50000".parse().unwrap());
+        let locked = EngineerControls {
+            limit_percent: 100,
+            locked: 0b1,
+        };
+        keep_target_controls(
+            &registry,
+            &events,
+            &rack,
+            EngineerControls {
+                limit_percent: 50,
+                locked: 0,
+            },
+        );
+        keep_target_mirror(&registry, &events, &rack, &keys, "Keys").expect("the rack follows");
+        let observed = events.subscribe();
+
+        let refused = replace_target_kept(
+            &registry,
+            &events,
+            &[(MusicianKey::Client(PHONE_ID.to_owned()), locked)],
+            &[(keys.clone(), keys.clone(), "Keys".to_owned())],
+        );
+
+        assert_eq!(
+            refused.len(),
+            1,
+            "a mirror on oneself is refused: {refused:?}"
+        );
+        let rack_changed = EngineEvent::MixChanged {
+            address: "192.168.1.3:50000".parse().unwrap(),
+            origin: MixOrigin::Engine,
+        };
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [rack_changed.clone(), rack_changed],
+            "the rack's limit is lifted, then its mirror"
+        );
+        let rack_mix = registry.mix_state(ip("192.168.1.3")).expect("the rack");
+        assert_eq!(rack_mix.current().engineer, EngineerControls::default());
+        assert_eq!(rack_mix.following(), None);
+        registry.register(ip("192.168.1.5"), 50000, None, Some(PHONE_ID), &layout);
+        assert_eq!(
+            registry
+                .mix_state(ip("192.168.1.5"))
+                .expect("the phone")
+                .current()
+                .engineer,
+            locked,
+            "a phone that registers later gets the loaded controls"
         );
     }
 

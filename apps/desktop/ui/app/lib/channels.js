@@ -93,9 +93,11 @@ export function pansToBalance(first, second) {
 /**
  * Refuses the details the engine refuses (its `check_channels`), with an Error naming the input: a
  * kind it does not know, more than 32 entries, a name longer than 32 characters, a pair whose
- * second side is not listed, an input in two pairs, a pair with one side hidden.
+ * second side is not listed, an input in two pairs, a pair with one side hidden. A kind this build
+ * does not know passes where `kept` (the table the desk keeps, as it was read) has exactly that
+ * kind for that input: a newer build wrote it, and the desk keeps it while no one changes it.
  */
-export function checkChannels(channels) {
+export function checkChannels(channels, kept = []) {
   if (channels.length > MAX_CHANNELS) {
     throw new Error(
       `channel details are supported for at most ${MAX_CHANNELS} channels, received ${channels.length}`,
@@ -105,7 +107,7 @@ export function checkChannels(channels) {
     const number = index + 1;
     // Every field may be left out, as in what the desk sends: no name, kind "other".
     const kind = channel.kind ?? "other";
-    if (!CHANNEL_KINDS.includes(kind)) {
+    if (!CHANNEL_KINDS.includes(kind) && kept[index]?.kind !== kind) {
       throw new Error(`CH ${number} has the instrument kind \`${kind}\`, which is none of ${CHANNEL_KINDS.join(", ")}`);
     }
     if ([...String(channel.name ?? "")].length > MAX_CHANNEL_NAME_LENGTH) {

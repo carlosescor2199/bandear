@@ -490,6 +490,54 @@ class MonitorViewModelTest {
             .toString()
 
     @Test
+    fun aConfigThatPairsTheMusiciansChannelWithMoreOfMeOnDropsTheLiftOnceTheLinksMixArrives() {
+        connected(channels = 3)
+        viewModel.setChannelLevel(0, 80)
+        viewModel.setChannelLevel(1, 60)
+        viewModel.setChannelLevel(2, 40)
+        viewModel.setChannelPan(0, 30)
+        viewModel.setChannelPan(1, 70)
+        viewModel.setChannelPan(2, 50)
+        viewModel.setMusicianChannel(1)
+        viewModel.setMoreOfMe(true)
+        assertEquals(listOf(40, 100, 20), lastMix().ints("channels"))
+        answerMixes()
+        val sent = socket().sentOfType("mix").size
+
+        announcePair()
+
+        assertEquals(0, state.moreOfMe.musicianChannel)
+        assertEquals(0, store.channel)
+        assertFalse(state.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, state.moreOfMe.notice)
+        // The link's own `mix_state` follows with the pans it moved; a send now would put the phone's
+        // old pans back over them.
+        assertEquals(sent, socket().sentOfType("mix").size)
+
+        // That push still carries the lift (the second side took the first's lifted level) and the
+        // pans the link moved apart.
+        socket().receive(
+            JSONObject(mixState(levels = listOf(40, 40, 20)))
+                .put("pans", JSONArray(List(32) { if (it == 1) 100 else if (it == 2) 50 else 0 }))
+                .toString(),
+        )
+
+        // One whole mix goes out: the musician's own levels (the pair's at its first side's) with the
+        // moved pans, and the phone keeps the same.
+        assertEquals(sent + 1, socket().sentOfType("mix").size)
+        assertEquals(listOf(80, 80, 40), lastMix().ints("channels"))
+        assertEquals(listOf(0, 100, 50), lastMix().ints("pans"))
+        assertEquals(listOf(80, 80, 40), state.mix.levels)
+        assertEquals(listOf(0, 100, 50), state.mix.pans)
+        assertFalse(state.moreOfMe.enabled)
+
+        answerMixes()
+        viewModel.setMoreOfMe(true)
+
+        assertEquals(listOf(100, 100, 20), lastMix().ints("channels"))
+    }
+
+    @Test
     fun theEngineersLimitHoldsThePhonesOwnPlaybackAndIsNeverSent() {
         connected(channels = 3)
         answerMixes()
@@ -618,6 +666,72 @@ class MonitorViewModelTest {
         assertEquals(sent, socket().sentOfType("mix").size)
         assertEquals("\"Verse\" was not recalled: your mix follows Ana's", state.savedMixes.notice)
         assertEquals(listOf(70, 70, 70), state.mix.levels)
+    }
+
+    /**
+     * The server's answer to the phone's [sent] mix when it kept its own channels and groups: every
+     * channel from [levels] on and the first group at [groupLevel].
+     */
+    private fun answerKeepingTheServersMix(sent: JSONObject, levels: List<Int>, groupLevel: Int): String =
+        JSONObject(mixState(levels = levels, type = "mix_ack", seq = sent.getLong("seq")))
+            .put("group_levels", JSONArray(List(16) { if (it == 0) groupLevel else 100 }))
+            .toString()
+
+    private val bandConfig = """{"type":"config","source_channels":3,"groups":[{"name":"Band","channels":[0,1]}]}"""
+
+    @Test
+    fun aConfigArrivingBeforeTheOpeningMixIsSentLeavesTheServersMixAloneAndThePhoneTakesIt() {
+        scheduler.holding = true
+        viewModel.connect(SERVER)
+        scheduler.runHeld()
+        socket().open()
+        // The server's `config` follows the open at once; here it lands before the control thread
+        // gets to the opening mix.
+        socket().receive(bandConfig)
+        scheduler.runHeld()
+        scheduler.holding = false
+
+        val opening = socket().sentOfType("mix").single()
+        assertEquals(emptyList<Int>(), opening.ints("channels"))
+        assertEquals(emptyList<Int>(), opening.ints("pans"))
+        assertEquals(0, opening.getJSONArray("mutes").length())
+        assertEquals(0, opening.getJSONArray("solos").length())
+        assertEquals(emptyList<Int>(), opening.ints("group_levels"))
+
+        socket().receive(answerKeepingTheServersMix(opening, listOf(40, 50, 60), groupLevel = 70))
+
+        assertEquals(listOf(40, 50, 60), state.mix.levels)
+        assertEquals(listOf(70), state.mix.groupLevels)
+        assertEquals(1, socket().sentOfType("mix").size)
+    }
+
+    @Test
+    fun onTheFirstConnectThePhoneShowsTheMixTheServerAlreadyHolds() {
+        viewModel.connect(SERVER)
+        socket().open()
+        socket().receive(bandConfig)
+
+        val opening = socket().sentOfType("mix").single()
+        assertEquals(emptyList<Int>(), opening.ints("channels"))
+
+        socket().receive(answerKeepingTheServersMix(opening, listOf(40, 50, 60), groupLevel = 70))
+
+        assertEquals(listOf(40, 50, 60), state.mix.levels)
+        assertEquals(listOf(70), state.mix.groupLevels)
+        assertEquals(1, socket().sentOfType("mix").size)
+    }
+
+    @Test
+    fun aReconnectStillSendsThePhonesOwnMix() {
+        connected(channels = 3)
+        viewModel.setChannelLevel(1, 30)
+        answerMixes()
+
+        socket().fail("Wi-Fi dropped")
+        scheduler.runDelayed()
+        socket().open()
+
+        assertEquals(listOf(100, 30, 100), socket().sentOfType("mix").single().ints("channels"))
     }
 
     @Test

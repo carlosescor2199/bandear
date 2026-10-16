@@ -197,12 +197,14 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
   }
 
-  // Why nothing started while the kept choices could not be read, as a sentence.
+  // Why nothing started while the kept choices could not be read, and the way past it: an input
+  // the engineer chooses in Network and system starts without them (and is kept from then on).
   function choiceUnread(error) {
-    return sentenceWithReason(
+    const why = sentenceWithReason(
       "The saved audio input could not be read, so nothing was started",
       message(error),
     );
+    return `${why} Choose an input in Network and system to start without it.`;
   }
 
   // Keeps the applied choices, which an engine now runs with, in the session for every later

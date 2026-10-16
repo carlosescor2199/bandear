@@ -993,13 +993,15 @@ export function createFakeBridge({
         }
       };
       if (!isRunning) {
-        // As the desktop does with no engine: the address must be a musician's, and the controls
-        // are merged into those kept for the musician and kept under the strongest key the window
-        // gave, the phone's (dropping the address's) else the address, for the next start.
-        if (!/:\d+$/.test(String(address ?? ""))) {
+        // As the desktop does with no engine: the address must read as a musician's (an IP and a
+        // port, never a host name), an empty client id names no phone, and the controls are merged
+        // into those kept for the musician and kept under the strongest key the window gave, the
+        // phone's (dropping the address's) else the address, for the next start.
+        if (!isSocketAddress(address)) {
           throw `invalid musician address \`${address}\``;
         }
-        const phoneKey = clientId ? `client:${clientId}` : null;
+        const phone = typeof clientId === "string" && clientId.trim() ? clientId : null;
+        const phoneKey = phone ? `client:${phone}` : null;
         const addressKey = `address:${address}`;
         const kept = merge(
           (phoneKey && engineerBook.get(phoneKey)) ?? engineerBook.get(addressKey) ?? defaultMix(),

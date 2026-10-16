@@ -751,7 +751,9 @@ test("while the kept input cannot be read nothing starts, and the console says w
   assert.equal(commands(fake, "start_engine").length, 0);
   assert.deepEqual(app.store.getState().connection, {
     status: "failed",
-    error: "The saved audio input could not be read, so nothing was started: the session is busy.",
+    error:
+      "The saved audio input could not be read, so nothing was started: the session is busy. " +
+      "Choose an input in Network and system to start without it.",
   });
 
   fake.failNext("audio_settings", "the session is still busy");
@@ -761,6 +763,56 @@ test("while the kept input cannot be read nothing starts, and the console says w
 
   await app.start();
   assert.deepEqual(startsOn(fake), [["wasapi", USB]]);
+  app.dispose();
+});
+
+test("when the kept input can never be read, choosing an input in Network and system starts the engine", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session file is locked", { times: 100 });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  await app.reconnect();
+  await app.start();
+
+  assert.equal(commands(fake, "start_engine").length, 0, "nothing starts on a guess");
+  assert.match(app.store.getState().engine.error, /Choose an input in Network and system/);
+
+  await app.switchDevice("Demo interface");
+
+  assert.deepEqual(
+    startsOn(fake).map(([, device]) => device),
+    ["Demo interface"],
+    "the engineer's choice gets past it",
+  );
+  assert.equal(app.store.getState().engine.phase, "running");
+  assert.equal(fake.savedAudio()?.device, "Demo interface", "and is kept for the next start");
+  app.dispose();
+});
+
+test("a kept input that cannot be read leaves a running engine running and says why Start did nothing", async () => {
+  const fake = createFakeBridge({
+    running: true,
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session file is locked", { times: 100 });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  assert.equal(app.store.getState().engine.phase, "running", "a running engine is shown as it is");
+  const running = app.store.getState().engine.run;
+
+  const result = await app.start();
+
+  assert.equal(result.ok, false);
+  assert.equal(commands(fake, "start_engine").length, 0);
+  const state = app.store.getState();
+  assert.equal(state.engine.phase, "running", "the engine runs on");
+  assert.equal(state.engine.run, running);
+  assert.match(
+    mixMessages(state).command,
+    /^The engine could not be started: The saved audio input could not be read, so nothing was started: the session file is locked\. Choose an input in Network and system to start without it\.$/,
+  );
   app.dispose();
 });
 

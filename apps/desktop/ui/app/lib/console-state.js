@@ -27,6 +27,8 @@
 //   commandError { action, message }: a stop or a device switch the engine refused while its
 //              run went on; cleared by the next start or stop, or when that command works.
 //   devices    { host, list, error }: the input devices `list_input_devices` gave for `host`.
+//   presets    the engineer's mix presets as the desk keeps them (see mixes.js), or null until
+//              they were read. They live in the desk's session, so a run's end keeps them.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
 // never jumps back to an older value while its change is on the way. Each copy of a musician's mix
@@ -67,6 +69,7 @@ export const initialState = Object.freeze({
   connection: Object.freeze({ status: "connecting", error: null }),
   commandError: null,
   devices: Object.freeze({ host: null, list: Object.freeze([]), error: null }),
+  presets: null,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -109,6 +112,8 @@ export const actions = Object.freeze({
   audioNotice: (notice) => ({ type: "audio-notice", notice }),
   /** The input devices listed for `host`, or the reason they could not be listed. */
   devices: (host, list, error = null) => ({ type: "devices", devices: { host, list, error } }),
+  /** The engineer's mix presets as the desk answered them. */
+  presets: (presets) => ({ type: "presets", presets }),
   /**
    * The engine refused `action` ("stop" or "switch") but its run goes on: the phase goes back to
    * what the last status said, and the refusal is kept to be shown.
@@ -428,6 +433,8 @@ export function consoleReducer(state, action) {
       return { ...state, connection: action.connection };
     case "devices":
       return { ...state, devices: action.devices };
+    case "presets":
+      return { ...state, presets: action.presets };
     default:
       return state;
   }

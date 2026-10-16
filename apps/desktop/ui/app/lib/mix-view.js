@@ -66,9 +66,18 @@ function groupsWithTones(state) {
 }
 
 /**
+ * The name of the musician whose mix `address`'s follows (a mirror), or null: while it follows,
+ * its channels and groups move with the leader's, so the strips show it and take no move.
+ */
+export function followingOf(state, address) {
+  return musicianByAddress(state, address)?.mirror?.name ?? null;
+}
+
+/**
  * One strip per shown input of the device, left to right, for `address`'s mix as it shows (with
  * local edits): `{ index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone,
- * readout, locked, lockText }`. A hidden input has no strip. A stereo pair is one strip (`stereo`,
+ * readout, locked, lockText, following }`. `following` is the name of the musician whose mix this
+ * one follows (followingOf), or null. A hidden input has no strip. A stereo pair is one strip (`stereo`,
  * `sides` both inputs, `index` the first): its level, mute and solo are its first side's, which the
  * engine keeps equal to the second's, and its pan is the balance the two pans make
  * (pansToBalance). A strip is called by its input's name, or its number when it has none
@@ -85,6 +94,7 @@ export function channelStrips(state, address) {
   }
   const groups = groupsWithTones(state);
   const channels = status.channels.slice(0, status.sourceChannels);
+  const following = followingOf(state, address);
   return pairUnits(channels)
     .filter(([first]) => !channels[first].hidden)
     .map((sides) => {
@@ -113,6 +123,7 @@ export function channelStrips(state, address) {
         readout: muted ? "muted" : formatPercent(mix.channelGains[index]),
         locked,
         lockText: locked ? "Locked" : "Unlocked",
+        following,
       };
     });
 }
@@ -137,14 +148,16 @@ export function stripLevel(sides, levels) {
 }
 
 /**
- * One strip per configured group: `{ index, id, name, tone, invalid, level, readout }`. `index` is
- * the group's position, which is where its level is in the mix.
+ * One strip per configured group: `{ index, id, name, tone, invalid, level, readout, following }`.
+ * `index` is the group's position, which is where its level is in the mix; `following` is as on a
+ * channel strip.
  */
 export function groupStrips(state, address) {
   const mix = viewMix(state, address);
   if (!mix) {
     return [];
   }
+  const following = followingOf(state, address);
   return groupsWithTones(state).map(({ index, id, name, tone, invalid }) => ({
     index,
     id,
@@ -153,6 +166,7 @@ export function groupStrips(state, address) {
     invalid,
     level: mix.groupLevels[index],
     readout: formatPercent(mix.groupLevels[index]),
+    following,
   }));
 }
 

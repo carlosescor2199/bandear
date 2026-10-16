@@ -13,7 +13,9 @@ use personal_monitoring::{
     LinkHealth, MirrorStatus, MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus,
 };
 
-use crate::session::{address_key, client_key, SessionChannel, SessionGroup, SessionPreset};
+use crate::session::{
+    address_key, client_key, SessionAudio, SessionChannel, SessionGroup, SessionPreset,
+};
 use crate::sessions::SnapshotSummary;
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
@@ -336,6 +338,60 @@ pub struct MirrorSetDto {
 pub struct SessionSavedDto {
     pub session: SnapshotSummary,
     pub engine_running: bool,
+}
+
+/// What [crate::commands::load_session] did with a saved session.
+///
+/// `applied` says whether a running engine took it (every phone has its channels and groups now);
+/// `saved` whether the desk's session is now the loaded one, and `saveError` why not. `mixes` are
+/// the saved mixes pushed to musicians, `skipped` those that went to nobody, `refused` the
+/// controls or mirrors the engine refused, `damaged` the parts of the saved session that could not
+/// be read and were left out. `audio` is the audio input the next start opens: the saved
+/// session's when `audioLoaded`, else the desk's own, with `audioSkipped` saying why the saved one
+/// was not taken. `presets` are the engineer's presets now.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLoadedDto {
+    pub session: SnapshotSummary,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    pub mixes: Vec<LoadedMixDto>,
+    pub skipped: Vec<SkippedMixDto>,
+    pub refused: Vec<String>,
+    pub damaged: Vec<String>,
+    pub audio: Option<SessionAudio>,
+    pub audio_loaded: bool,
+    pub audio_skipped: Option<String>,
+    pub presets: Vec<SessionPreset>,
+}
+
+/// A saved mix a loaded session pushed to a musician.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadedMixDto {
+    /// The musician's address as the status rows show it.
+    pub address: String,
+    /// The name of the musician whose mix theirs follows, when it follows one: then only their
+    /// master volume and mute were pushed.
+    pub follows: Option<String>,
+    /// Their whole mix now stored.
+    pub mix: MixDto,
+}
+
+/// A saved mix a loaded session pushed to nobody.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedMixDto {
+    /// The musician's key: `client:<id>` or `address:<ip:port>`.
+    pub key: String,
+    /// The label the loaded session keeps for them, if any.
+    pub label: Option<String>,
+    /// "notHere" (no musician here under that key), "notConnected" (their phone's control channel
+    /// is down: its own mix wins when it connects), "notRunning" (no engine runs) or "refused" (the
+    /// engine refused the change, `error` says why).
+    pub reason: &'static str,
+    pub error: Option<String>,
 }
 
 /// One musician's whole mix.

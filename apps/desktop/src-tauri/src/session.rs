@@ -117,7 +117,8 @@
 //! file is left in place untouched, and once the session exists it is no longer read.
 //!
 //! The engineer's named sessions are snapshots of this session, with each musician's mix, kept in
-//! the `sessions` folder beside it (see [crate::sessions]).
+//! the `sessions` folder beside it (see [crate::sessions]); loading one replaces this session whole
+//! ([SessionStore::replace]).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -468,6 +469,34 @@ impl SessionStore {
     /// [crate::sessions]).
     pub fn current(&self) -> Session {
         self.lock().session.clone()
+    }
+
+    /// `Ok` when a change may be saved, else why the session file must not be replaced (one
+    /// written by a newer version, or one that could not be set aside), so a change that touches
+    /// more than the session can be refused before anything else changes.
+    pub fn check_saves(&self) -> Result<(), String> {
+        match &self.lock().refusal {
+            Some(refusal) => Err(refusal.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Replaces the whole session with `session` (a named snapshot loaded, see
+    /// [crate::commands::load_session]), at this build's version. The file is written before
+    /// success is reported; a save that fails, or is refused over a session this build must not
+    /// replace, changes nothing.
+    pub fn replace(&self, session: Session) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            version: SESSION_VERSION,
+            ..session
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
     }
 
     /// The local label of the musician with this client id at this address: the one kept for the

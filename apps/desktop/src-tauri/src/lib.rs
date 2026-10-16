@@ -14,8 +14,8 @@ use commands::DesktopState;
 use dto::{
     AudioSettingsRequest, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
     EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MirrorRequest,
-    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, SessionSavedDto, StartRequest,
-    StartSummary,
+    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, SessionLoadedDto,
+    SessionSavedDto, StartRequest, StartSummary,
 };
 use events::EventPump;
 use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
@@ -262,6 +262,17 @@ async fn delete_session(state: State<'_, DesktopState>, id: String) -> Result<()
     commands::delete_session(state.inner(), id)
 }
 
+/// Loads the saved session `id` in place of the desk's and, with an engine running, applies it
+/// live; answers `{ session, applied, saved, saveError, mixes, skipped, refused, damaged, audio,
+/// audioLoaded, audioSkipped, presets }` (see [commands::load_session]).
+#[tauri::command]
+async fn load_session(
+    state: State<'_, DesktopState>,
+    id: String,
+) -> Result<SessionLoadedDto, String> {
+    commands::load_session(state.inner(), id)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -311,7 +322,8 @@ pub fn run() {
             sessions,
             save_session,
             rename_session,
-            delete_session
+            delete_session,
+            load_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

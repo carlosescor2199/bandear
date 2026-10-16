@@ -1,5 +1,5 @@
 //! Named sessions: snapshots of the desk's session the engineer saves with "Save session as…" and
-//! loads later (see [crate::commands::save_session]).
+//! loads later (see [crate::commands::save_session] and [crate::commands::load_session]).
 //!
 //! Each snapshot is one JSON file in the `sessions` folder of the app's config directory,
 //! `sessions/<id>.json`, written atomically as the session itself is (a temporary file flushed to

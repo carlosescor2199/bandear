@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
 pub(crate) const MAX_GROUPS: usize = 16;
@@ -238,11 +238,126 @@ fn lock_pairs(locked: u32, linked: u32) -> u32 {
     })
 }
 
-/// Who writes a mix: the desk may change any value, the musician's phone none the engineer locked.
+/// Who writes a mix: the desk may change any value, the musician's phone none the engineer locked
+/// and, while their mix follows another musician's, no channel and no group level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Writer {
     Desk,
     Phone,
+}
+
+/// One channel of a mix as a preset keeps it and a copy carries it: its level, pan, mute and solo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresetChannel {
+    pub gain: u8,
+    pub pan: u8,
+    pub muted: bool,
+    pub solo: bool,
+}
+
+/// What of a musician's mix the engineer can hand to other musicians: every channel's level, pan,
+/// mute and solo and the group levels, as a preset keeps it. It never holds what is the musician's
+/// own (the master volume, the phone's level cap and the master mute) nor the engineer's controls.
+///
+/// `channels` is in channel order, the first entry CH 1; entries past the mixer's 32 channels are
+/// kept but never applied. `groups` names each group level by the group's stable id (see
+/// [crate::GroupDefinition]), so a preset still fits after the groups were renamed, reordered or
+/// given other channels: applied, a level goes to the live group with its id, a live group it does
+/// not name keeps the musician's level, and an id no live group has is ignored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MixPreset {
+    pub channels: Vec<PresetChannel>,
+    pub groups: Vec<(String, u8)>,
+}
+
+impl MixPreset {
+    /// The first `channels` channels of `values` (at most the mixer's 32) and its group levels by
+    /// the ids of `layout`, the groups the mix is placed for.
+    pub(crate) fn of(values: &MixValues, layout: &GroupLayout, channels: usize) -> Self {
+        Self {
+            channels: (0..channels.min(MAX_MIX_CHANNELS))
+                .map(|channel| PresetChannel {
+                    gain: values.channel_gains[channel],
+                    pan: values.pans[channel],
+                    muted: values.channel_muted[channel],
+                    solo: values.channel_solo[channel],
+                })
+                .collect(),
+            groups: layout
+                .groups()
+                .iter()
+                .zip(values.group_levels)
+                .map(|(group, level)| (group.id.clone(), level))
+                .collect(),
+        }
+    }
+
+    /// The desk's update that puts this preset on `current`, a mix placed for `layout` with the
+    /// pairs `linked`: each listed channel up to the mixer's 32, and the level of every live group
+    /// the preset names; every other value keeps its own. A pair's second side takes the first
+    /// side's level, mute and solo, so the first side wins where the preset holds them apart.
+    fn update_for(&self, current: &MixValues, layout: &GroupLayout, linked: u32) -> MixUpdate {
+        let mut channels: Vec<PresetChannel> = self
+            .channels
+            .iter()
+            .take(MAX_MIX_CHANNELS)
+            .copied()
+            .collect();
+        for first in pairs(linked) {
+            if let Some(&side) = channels.get(first) {
+                if let Some(second) = channels.get_mut(first + 1) {
+                    *second = PresetChannel {
+                        pan: second.pan,
+                        ..side
+                    };
+                }
+            }
+        }
+        let mut group_levels = current.group_levels;
+        for (slot, group) in group_levels.iter_mut().zip(layout.groups()) {
+            if let Some((_, level)) = self.groups.iter().find(|(id, _)| *id == group.id) {
+                *slot = *level;
+            }
+        }
+        MixUpdate {
+            channel_gains: Some(channels.iter().map(|side| i32::from(side.gain)).collect()),
+            pans: Some(channels.iter().map(|side| i32::from(side.pan)).collect()),
+            channel_muted: Some(channels.iter().map(|side| side.muted).collect()),
+            channel_solo: Some(channels.iter().map(|side| side.solo).collect()),
+            group_levels: Some(group_levels.iter().copied().map(i32::from).collect()),
+            ..MixUpdate::default()
+        }
+    }
+}
+
+/// The desk's update that gives a mix every channel value and group level of `values`, in place:
+/// what a copy and a mirror carry from one musician's mix to another's, both placed for the same
+/// groups.
+fn shared_update(values: &MixValues) -> MixUpdate {
+    MixUpdate {
+        channel_gains: Some(
+            values
+                .channel_gains
+                .iter()
+                .copied()
+                .map(i32::from)
+                .collect(),
+        ),
+        pans: Some(values.pans.iter().copied().map(i32::from).collect()),
+        channel_muted: Some(values.channel_muted.to_vec()),
+        channel_solo: Some(values.channel_solo.to_vec()),
+        group_levels: Some(values.group_levels.iter().copied().map(i32::from).collect()),
+        ..MixUpdate::default()
+    }
+}
+
+/// Whether two mixes hold the same channel values and group levels: what a copy and a mirror carry.
+fn same_shared(one: &MixValues, other: &MixValues) -> bool {
+    one.channel_gains == other.channel_gains
+        && one.pans == other.pans
+        && one.channel_muted == other.channel_muted
+        && one.channel_solo == other.channel_solo
+        && one.group_levels == other.group_levels
 }
 
 pub(crate) struct MixState {
@@ -279,6 +394,9 @@ pub(crate) struct MixState {
     /// The revision for the lock-free [MixState::snapshot], set after each store. A snapshot taken
     /// during a store may pair it with values of the change before; [MixState::current] never does.
     published: AtomicU64,
+    /// The name of the musician whose mix this one follows (see [MixState::set_following]), or
+    /// `None`. Changed and read by writers under the writer lock; never read by the audio path.
+    following: Mutex<Option<Arc<str>>>,
 }
 
 /// A partial change to one client's mix: every absent field keeps its current value.
@@ -402,6 +520,7 @@ impl Default for MixState {
             muted: AtomicBool::new(false),
             writer: Mutex::new(revision),
             published: AtomicU64::new(revision),
+            following: Mutex::new(None),
         }
     }
 }
@@ -570,19 +689,98 @@ impl MixState {
 
     /// Applies a `mix` from the musician's phone as [MixState::apply] does, except that the level,
     /// pan, mute and solo of every channel the engineer locked keep their stored values: the phone
-    /// sends its whole mix, and everything else in it applies. The mix returned, which the phone is
-    /// acknowledged with, carries the kept values.
+    /// sends its whole mix, and everything else in it applies. While the mix follows another
+    /// musician's ([MixState::set_following]) every channel value and group level keeps its stored
+    /// value too, and only the master volume, the phone's level cap and the master mute apply. The
+    /// mix returned, which the phone is acknowledged with, carries the kept values.
     pub(crate) fn apply_from_phone(&self, update: &MixUpdate) -> Result<MixValues, String> {
         let mut revision = self.writer.lock().expect("mix writer lock poisoned");
         self.apply_locked(update, &mut revision, Writer::Phone)
     }
 
+    /// Puts `preset` on this mix from the desk, as [MixState::apply] does: the preset's channels
+    /// and the levels of the live groups it names (by id, see [MixPreset]), locked channels
+    /// included, with both sides of a pair kept equal (the first side wins when the preset holds
+    /// them apart). The master volume, the phone's level cap, the master mute and the engineer's
+    /// controls keep their values. Returns the mix now stored, under a new revision.
+    pub(crate) fn apply_preset(&self, preset: &MixPreset, layout: &GroupLayout) -> MixValues {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        let update = preset.update_for(
+            &self.snapshot(),
+            layout,
+            self.linked.load(Ordering::Relaxed),
+        );
+        self.apply_locked(&update, &mut revision, Writer::Desk)
+            .expect("a preset never holds more than the mix")
+    }
+
+    /// Makes this mix sound like `leader`'s, from the desk, as a copy and a mirror do: every channel
+    /// value and group level in place (both mixes are placed for the same groups), locked channels
+    /// included. The master volume, the phone's level cap, the master mute and the engineer's
+    /// controls keep their values. Returns the mix now stored, under a new revision, or `None` when
+    /// it already held the leader's values, and then nothing changes.
+    pub(crate) fn follow(&self, leader: &MixValues) -> Option<MixValues> {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        if same_shared(&self.snapshot(), leader) {
+            return None;
+        }
+        Some(
+            self.apply_locked(&shared_update(leader), &mut revision, Writer::Desk)
+                .expect("whole tables always fit the mix"),
+        )
+    }
+
+    /// Starts or stops this mix following another musician's: `name` is the leader the musician's
+    /// phone is told it follows, `None` to stop. While it follows, the phone's `mix` changes no
+    /// channel and no group level (see [MixState::apply_from_phone]). No value of the mix moves:
+    /// starting takes the leader's values through [MixState::follow], and stopping leaves the mix
+    /// as it is. Returns the mix now stored, under a new revision so the phone is told, or `None`
+    /// when the mix already followed under that name.
+    pub(crate) fn set_following(&self, name: Option<Arc<str>>) -> Option<MixValues> {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        {
+            let mut following = self.following.lock().expect("mix following lock poisoned");
+            if *following == name {
+                return None;
+            }
+            *following = name;
+        }
+        self.publish_revision(&mut revision);
+        Some(MixValues {
+            revision: *revision,
+            ..self.snapshot()
+        })
+    }
+
+    /// The name of the musician whose mix this one follows, or `None`.
+    pub(crate) fn following(&self) -> Option<Arc<str>> {
+        self.following
+            .lock()
+            .expect("mix following lock poisoned")
+            .clone()
+    }
+
+    /// The stored mix with exactly its revision and the name of the musician it follows, read
+    /// together under the writer lock: what a report to the phone carries.
+    pub(crate) fn report(&self) -> (MixValues, Option<Arc<str>>) {
+        let revision = self.writer.lock().expect("mix writer lock poisoned");
+        (
+            MixValues {
+                revision: *revision,
+                ..self.snapshot()
+            },
+            self.following(),
+        )
+    }
+
     /// [MixState::apply] for a caller that holds the writer lock and passes its revision.
     ///
-    /// A phone's change to a locked channel is undone first (see [keep_locked]); then every linked
-    /// pair is left with both sides equal (see [keep_pairs_equal]). A pair is always locked whole,
-    /// so the two rules never pull a pair apart. The pairs and the locks are read under the lock,
-    /// so a writer never merges against pairs or locks an edit is replacing.
+    /// A phone's change to a locked channel is undone first (see [keep_locked]), and while the mix
+    /// follows another musician's every channel and group change of the phone is (see
+    /// [keep_followed]); then every linked pair is left with both sides equal (see
+    /// [keep_pairs_equal]). A pair is always locked whole, so the rules never pull a pair apart.
+    /// The pairs and the locks are read under the lock, so a writer never merges against pairs or
+    /// locks an edit is replacing.
     fn apply_locked(
         &self,
         update: &MixUpdate,
@@ -592,6 +790,9 @@ impl MixState {
         let current = self.snapshot();
         let mut merged = update.merge_into(current)?;
         if writer == Writer::Phone {
+            if self.following().is_some() {
+                keep_followed(&current, &mut merged);
+            }
             keep_locked(&current, &mut merged);
         }
         keep_pairs_equal(&current, &mut merged, self.linked.load(Ordering::Relaxed));
@@ -791,6 +992,17 @@ pub(crate) fn keep_locked(before: &MixValues, merged: &mut MixValues) {
         merged.channel_muted[channel] = before.channel_muted[channel];
         merged.channel_solo[channel] = before.channel_solo[channel];
     }
+}
+
+/// Puts back every channel's level, pan, mute and solo and every group level after a phone's merge
+/// from `before` to `merged`, for a musician whose mix follows another musician's: only the master
+/// volume, the phone's level cap and the master mute are theirs to change.
+pub(crate) fn keep_followed(before: &MixValues, merged: &mut MixValues) {
+    merged.channel_gains = before.channel_gains;
+    merged.pans = before.pans;
+    merged.channel_muted = before.channel_muted;
+    merged.channel_solo = before.channel_solo;
+    merged.group_levels = before.group_levels;
 }
 
 /// Makes the pair at `first` equal in one table: the second side's new value when only the second
@@ -2170,5 +2382,233 @@ mod tests {
             })
             .expect("other controls");
         assert_eq!(capped.engineer.limit_percent, 100);
+    }
+
+    fn channel(gain: u8, pan: u8, muted: bool, solo: bool) -> PresetChannel {
+        PresetChannel {
+            gain,
+            pan,
+            muted,
+            solo,
+        }
+    }
+
+    /// A mix with its own master, cap and engineer's limit, for the copy and preset tests: they
+    /// must never move those.
+    fn own_master(layout: &GroupLayout) -> MixState {
+        let state = MixState::new(layout);
+        state
+            .apply(&MixUpdate {
+                group_levels: Some(vec![70, 80, 90]),
+                volume_percent: Some(60),
+                max_level_percent: Some(80),
+                muted: Some(true),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        state
+            .apply_engineer(&EngineerUpdate {
+                limit_percent: Some(50),
+                locked: Some(vec![true]),
+            })
+            .expect("valid controls apply");
+        state
+    }
+
+    fn assert_own_master_kept(values: &MixValues) {
+        assert_eq!(
+            values.volume_percent, 60,
+            "the master volume is the musician's"
+        );
+        assert_eq!(values.max_level_percent, 80, "so is the phone's cap");
+        assert!(values.muted, "and the master mute");
+        assert_eq!(
+            values.engineer,
+            EngineerControls {
+                limit_percent: 50,
+                locked: 0b1,
+            },
+            "the engineer's controls are never carried"
+        );
+    }
+
+    #[test]
+    fn a_preset_holds_each_inputs_values_and_the_group_levels_by_id_and_nothing_else() {
+        let state = MixState::new(&trio());
+        state
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![40, 50, 60]),
+                pans: Some(vec![10, 90, 50]),
+                channel_muted: Some(vec![false, true, false]),
+                channel_solo: Some(vec![false, false, true]),
+                group_levels: Some(vec![10, 20, 30]),
+                volume_percent: Some(55),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        let preset = MixPreset::of(&state.current(), &trio(), 3);
+
+        assert_eq!(
+            preset,
+            MixPreset {
+                channels: vec![
+                    channel(40, 10, false, false),
+                    channel(50, 90, true, false),
+                    channel(60, 50, false, true),
+                ],
+                groups: vec![
+                    ("drums".to_owned(), 10),
+                    ("bass".to_owned(), 20),
+                    ("keys".to_owned(), 30),
+                ],
+            },
+            "one entry per input of the device, the groups by id"
+        );
+        assert_eq!(
+            MixPreset::of(&state.current(), &trio(), 40).channels.len(),
+            MAX_MIX_CHANNELS,
+            "never more than the mixer holds"
+        );
+    }
+
+    #[test]
+    fn a_preset_lands_on_the_live_groups_by_id_after_they_moved_and_keeps_the_musicians_own() {
+        // Saved for Drums, Bass and Keys; the groups are now Keys, a new Horns, then Drums.
+        let preset = MixPreset {
+            channels: vec![channel(40, 10, true, false), channel(50, 90, false, true)],
+            groups: vec![
+                ("drums".to_owned(), 10),
+                ("bass".to_owned(), 20),
+                ("keys".to_owned(), 30),
+            ],
+        };
+        let live = GroupLayout::new(vec![
+            group("keys", "Keys", &[2]),
+            group("horns", "Horns", &[3]),
+            group("drums", "Drums", &[0]),
+        ]);
+        let state = own_master(&live);
+        let before = state.current();
+
+        let applied = state.apply_preset(&preset, &live);
+
+        assert_eq!(applied, state.current());
+        assert!(applied.revision > before.revision);
+        assert_eq!(
+            &applied.group_levels[..3],
+            &[30, 80, 10],
+            "Keys, Horns kept, Drums"
+        );
+        assert_eq!(&applied.channel_gains[..3], &[40, 50, 100]);
+        assert_eq!(&applied.pans[..2], &[10, 90]);
+        assert!(
+            applied.channel_muted[0],
+            "the desk sets a locked channel too"
+        );
+        assert!(applied.channel_solo[1]);
+        assert_eq!(
+            applied.pans[2], before.pans[2],
+            "an input the preset lacks keeps its own"
+        );
+        assert_own_master_kept(&applied);
+    }
+
+    #[test]
+    fn a_preset_keeps_a_pairs_sides_equal() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[0], &[]));
+        let preset = MixPreset {
+            channels: vec![channel(40, 0, false, false), channel(70, 100, true, false)],
+            groups: Vec::new(),
+        };
+
+        let applied = state.apply_preset(&preset, &GroupLayout::default());
+
+        assert_eq!(
+            &applied.channel_gains[..2],
+            &[40, 40],
+            "the first side wins"
+        );
+        assert_eq!(&applied.channel_muted[..2], &[false, false]);
+        assert_eq!(&applied.pans[..2], &[0, 100], "the balance is the preset's");
+    }
+
+    #[test]
+    fn following_a_mix_copies_its_channels_and_groups_never_the_master_or_controls() {
+        let leader = MixState::new(&trio());
+        leader
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![30, 40, 50]),
+                pans: Some(vec![20, 80]),
+                channel_muted: Some(vec![false, false, true]),
+                channel_solo: Some(vec![true]),
+                group_levels: Some(vec![15, 25, 35]),
+                volume_percent: Some(90),
+                max_level_percent: Some(95),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let follower = own_master(&trio());
+        let before = follower.current();
+        let led = leader.current();
+
+        let followed = follower.follow(&led).expect("the mixes differed");
+
+        assert_eq!(followed, follower.current());
+        assert!(followed.revision > before.revision);
+        assert_eq!(followed.channel_gains, led.channel_gains);
+        assert_eq!(followed.pans, led.pans);
+        assert_eq!(followed.channel_muted, led.channel_muted);
+        assert_eq!(followed.channel_solo, led.channel_solo);
+        assert_eq!(followed.group_levels, led.group_levels);
+        assert_own_master_kept(&followed);
+        assert_eq!(
+            follower.follow(&led),
+            None,
+            "already the leader's: no new revision"
+        );
+        assert_eq!(follower.current().revision, followed.revision);
+    }
+
+    #[test]
+    fn a_followers_phone_keeps_its_master_but_cannot_move_a_channel_or_group() {
+        let state = MixState::new(&trio());
+        let before = state.current();
+
+        let started = state
+            .set_following(Some(Arc::from("Bass")))
+            .expect("it followed nobody");
+
+        assert!(started.revision > before.revision, "the phone is told");
+        assert_eq!(state.following().as_deref(), Some("Bass"));
+        assert_eq!(state.report(), (state.current(), Some(Arc::from("Bass"))));
+        assert_eq!(state.set_following(Some(Arc::from("Bass"))), None);
+        let applied = state
+            .apply_from_phone(&MixUpdate {
+                group_levels: Some(vec![5, 5, 5]),
+                ..whole_phone_mix(&[10, 20], &[30, 40], &[true, true], &[true, false])
+            })
+            .expect("a valid mix applies");
+        assert_eq!(applied.channel_gains, before.channel_gains, "levels kept");
+        assert_eq!(applied.pans, before.pans, "pans kept");
+        assert_eq!(applied.channel_muted, before.channel_muted, "mutes kept");
+        assert_eq!(applied.channel_solo, before.channel_solo, "solos kept");
+        assert_eq!(
+            applied.group_levels, before.group_levels,
+            "group levels kept"
+        );
+        assert_eq!(applied.volume_percent, 70, "the master is the phone's");
+        assert_eq!(applied.max_level_percent, 90, "and its cap");
+
+        let stopped = state.set_following(None).expect("it followed Bass");
+        assert_eq!(
+            stopped.channel_gains, applied.channel_gains,
+            "stopping moves nothing"
+        );
+        assert_eq!(state.report().1, None);
+        let free = state
+            .apply_from_phone(&whole_phone_mix(&[10], &[30], &[true], &[false]))
+            .expect("a valid mix applies");
+        assert_eq!(free.channel_gains[0], 10, "the phone is free again");
     }
 }

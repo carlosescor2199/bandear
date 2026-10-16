@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
@@ -34,6 +34,136 @@ impl From<&MusicianKey> for BookKey {
             MusicianKey::Address(address) => BookKey::Ip(address.ip()),
         }
     }
+}
+
+/// The key a musician's row is known by: their phone's client id when it announced one, else their
+/// address.
+fn musician_key(entry: &TargetEntry) -> MusicianKey {
+    match entry.origin.client_id() {
+        Some(id) => MusicianKey::Client(id.to_owned()),
+        None => MusicianKey::Address(entry.address),
+    }
+}
+
+/// Whether `key` names the musician of `entry`: by their phone's client id, or an address by IP.
+fn names(key: &MusicianKey, entry: &TargetEntry) -> bool {
+    match key {
+        MusicianKey::Client(id) => entry.origin.client_id() == Some(id.as_str()),
+        MusicianKey::Address(address) => entry.address.ip() == address.ip(),
+    }
+}
+
+/// A mirror the engine keeps for a follower: the musician whose mix theirs follows, and the name
+/// their phone is told it follows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Mirror {
+    pub(crate) leader: MusicianKey,
+    pub(crate) name: Arc<str>,
+}
+
+/// Whom a musician's mix follows, as the status reports it (see
+/// [crate::EngineHandle::set_mirror]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorStatus {
+    /// The leader as the engine keeps the mirror: their phone's client id, else their address.
+    pub leader: MusicianKey,
+    /// The name the follower's phone is told it follows.
+    pub name: String,
+    /// Where the leader is now, as the status reports their row; `None` while they are not here,
+    /// and then the follower keeps the last mix they took and stays held to it.
+    pub leader_address: Option<SocketAddr>,
+}
+
+/// What [TargetRegistry::set_mirror] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MirrorSet {
+    /// The key the mirror is kept under: the follower's client id, else their address.
+    pub(crate) follower: MusicianKey,
+    /// The leader the follower now follows, by the key the mirror keeps; `None` once stopped.
+    pub(crate) leader: Option<MusicianKey>,
+    /// The name the follower's phone is told, when it follows.
+    pub(crate) name: Option<Arc<str>>,
+    /// The follower's mix now stored.
+    pub(crate) mix: MixValues,
+    /// Every musician whose stored mix changed, the follower first, then those who follow them.
+    pub(crate) changed: Vec<SocketAddr>,
+}
+
+/// The mirror kept for the musician with this client id at this IP: the one kept for the phone
+/// first, then the one kept for the IP.
+fn kept_in(book: &HashMap<BookKey, Mirror>, client_id: Option<&str>, ip: IpAddr) -> Option<Mirror> {
+    client_id
+        .and_then(|id| book.get(&BookKey::Client(id.to_owned())).cloned())
+        .or_else(|| book.get(&BookKey::Ip(ip)).cloned())
+}
+
+/// Whether following mirrors from the musician `from`, leader after leader, reaches `target`
+/// (named by `target_key`, and by `target_entry` when they are here): then `target` following
+/// `from` would close a circle. A chain longer than the book can only go round in a circle already,
+/// and counts as one.
+fn reaches(
+    book: &HashMap<BookKey, Mirror>,
+    entries: &[TargetEntry],
+    from: &MusicianKey,
+    target_key: &MusicianKey,
+    target_entry: Option<&TargetEntry>,
+) -> bool {
+    let mut key = from.clone();
+    for _ in 0..=book.len() {
+        if target_entry.is_some_and(|target| names(&key, target))
+            || BookKey::from(&key) == BookKey::from(target_key)
+        {
+            return true;
+        }
+        // A leader who is here is resolved as a registration resolves them (client id, then IP).
+        let next = match entries.iter().find(|entry| names(&key, entry)) {
+            Some(entry) => kept_in(book, entry.origin.client_id(), entry.address.ip()),
+            None => book.get(&BookKey::from(&key)).cloned(),
+        };
+        match next {
+            Some(mirror) => key = mirror.leader,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The name a follower's phone is told for `leader`: `name` trimmed, else the name their phone
+/// announced, else their IP.
+fn mirror_name(leader: &TargetEntry, name: &str) -> Arc<str> {
+    let name = name.trim();
+    if !name.is_empty() {
+        return Arc::from(name);
+    }
+    match leader.origin.name() {
+        Some(announced) => Arc::from(announced),
+        None => Arc::from(leader.address.ip().to_string()),
+    }
+}
+
+/// A musician's key in words, for an error.
+fn describe_key(key: &MusicianKey) -> String {
+    match key {
+        MusicianKey::Client(id) => format!("the phone {id}"),
+        MusicianKey::Address(address) => address.to_string(),
+    }
+}
+
+/// Why `follower` cannot follow `leader`: the leader already follows them.
+fn circle_error(leader: &MusicianKey, follower: &MusicianKey) -> String {
+    format!(
+        "{} already follows {}'s mix, directly or through another musician: a mirror cannot go \
+         round in a circle",
+        describe_key(leader),
+        describe_key(follower)
+    )
+}
+
+/// An address the desk or a phone named, or the error naming it.
+fn parse_address(value: &str) -> Result<SocketAddr, String> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid target `{value}`: {error}"))
 }
 
 /// How long a registered target survives after its last control channel closes.
@@ -79,13 +209,16 @@ impl TargetOrigin {
 }
 
 /// What a registration did: the address the target now has, when a known client came back from
-/// another IP the address its entry moved from, and whether the registration changed the
-/// engineer's controls on the musician's mix (see [TargetRegistry::register]).
+/// another IP the address its entry moved from, whether the registration changed the engineer's
+/// controls or mirror on the musician's mix, and whether the musician's mix took the mix of the
+/// leader they follow, which those who follow them in turn must then take too (see
+/// [TargetRegistry::register] and [TargetRegistry::propagate]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Registration {
     pub(crate) address: SocketAddr,
     pub(crate) moved_from: Option<SocketAddr>,
     pub(crate) controls_changed: bool,
+    pub(crate) followed: bool,
 }
 
 /// One configured musician destination: the UDP address plus the state that belongs to it.
@@ -119,9 +252,15 @@ pub(crate) struct TargetEntry {
 /// back the moment they register, before their phone's first `mix` is handled. The table's lock is
 /// always taken before the controls' lock, and the controls' lock is never held while a mix's
 /// writer lock is taken.
+///
+/// It keeps the engineer's mirrors the same way ([Mirror], by the follower's [MusicianKey]): a
+/// follower's mix takes their leader's channels and groups, and their phone is held off them,
+/// whenever they register. The mirrors' lock follows the same rules as the controls' and is never
+/// held together with it.
 pub(crate) struct TargetRegistry {
     entries: RwLock<Vec<TargetEntry>>,
     controls: Mutex<HashMap<BookKey, EngineerControls>>,
+    mirrors: Mutex<HashMap<BookKey, Mirror>>,
 }
 
 impl TargetRegistry {
@@ -152,7 +291,259 @@ impl TargetRegistry {
         Ok(Self {
             entries: RwLock::new(entries),
             controls: Mutex::new(HashMap::new()),
+            mirrors: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn mirror_book(&self) -> std::sync::MutexGuard<'_, HashMap<BookKey, Mirror>> {
+        self.mirrors.lock().expect("mirrors lock poisoned")
+    }
+
+    /// Puts the mirror kept for `entry`'s musician in force on its mix, or none when none is kept:
+    /// while it follows, its phone is held off every channel and group level and is told whom it
+    /// follows, and its mix takes the leader's at once when the leader is among `entries` (an absent
+    /// leader leaves it on the last mix it took). `entry` may be a row about to join `entries`.
+    /// Returns whether its stored mix changed, and whether it took the leader's values.
+    fn restore_mirror(&self, entries: &[TargetEntry], entry: &TargetEntry) -> (bool, bool) {
+        let kept = kept_in(
+            &self.mirror_book(),
+            entry.origin.client_id(),
+            entry.address.ip(),
+        );
+        let named = entry
+            .mix_state
+            .set_following(kept.as_ref().map(|mirror| Arc::clone(&mirror.name)))
+            .is_some();
+        let leader = kept.and_then(|mirror| {
+            entries
+                .iter()
+                .find(|other| !std::ptr::eq(*other, entry) && names(&mirror.leader, other))
+        });
+        let followed = leader.is_some_and(|leader| {
+            entry
+                .mix_state
+                .follow(&leader.mix_state.current())
+                .is_some()
+        });
+        (named || followed, followed)
+    }
+
+    /// The positions in `entries` of the musicians whose mirror follows `leader`'s mix.
+    fn followers_of(&self, entries: &[TargetEntry], leader: &TargetEntry) -> Vec<usize> {
+        let book = self.mirror_book();
+        if book.is_empty() {
+            return Vec::new();
+        }
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !std::ptr::eq(*entry, leader))
+            .filter(|(_, entry)| {
+                kept_in(&book, entry.origin.client_id(), entry.address.ip())
+                    .is_some_and(|mirror| names(&mirror.leader, leader))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Makes every musician who follows `entries[start]`'s mix, and those who follow them in turn,
+    /// take it now. Returns those whose stored mix changed, in the order they took it. Each mix is
+    /// visited once, so even a book that went round in a circle could not loop.
+    fn propagate_from(&self, entries: &[TargetEntry], start: usize) -> Vec<SocketAddr> {
+        let mut changed = Vec::new();
+        let mut visited = vec![start];
+        let mut leaders = VecDeque::from([start]);
+        while let Some(leader) = leaders.pop_front() {
+            let followers = self.followers_of(entries, &entries[leader]);
+            if followers.is_empty() {
+                continue;
+            }
+            let values = entries[leader].mix_state.current();
+            for index in followers {
+                if visited.contains(&index) {
+                    continue;
+                }
+                visited.push(index);
+                if entries[index].mix_state.follow(&values).is_some() {
+                    changed.push(entries[index].address);
+                }
+                leaders.push_back(index);
+            }
+        }
+        changed
+    }
+
+    /// Makes every musician who follows the mix of the musician at `ip` take it now, as it changed
+    /// (from their phone, the desk, a preset or a copy), and those who follow them in turn. Returns
+    /// the musicians whose stored mix changed, for the caller to announce.
+    pub(crate) fn propagate(&self, ip: IpAddr) -> Vec<SocketAddr> {
+        if self.mirror_book().is_empty() {
+            return Vec::new();
+        }
+        let entries = self.read();
+        match entries.iter().position(|entry| entry.address.ip() == ip) {
+            Some(start) => self.propagate_from(&entries, start),
+            None => Vec::new(),
+        }
+    }
+
+    /// Starts, changes or stops the mirror of the musician at `follower`'s IP, as
+    /// [crate::EngineHandle::set_mirror] does: with `leader` (their address and the name the
+    /// follower's phone is told), the follower's mix takes the leader's at once and from then on
+    /// follows it, and the follower's phone is held off every channel and group level; with `None`
+    /// the follower's mix stays as it is and their phone is free again. The mirror is kept under
+    /// the follower's client id when they announced one (dropping any kept for their IP), else
+    /// their address, so it is put in force again whenever they register.
+    ///
+    /// A musician cannot follow their own mix, nor a leader who already follows them, directly or
+    /// through others: a mirror never goes round in a circle. An address that does not parse or is
+    /// no musician here is an error naming it. Nothing changes on an error.
+    pub(crate) fn set_mirror(
+        &self,
+        follower: &str,
+        leader: Option<(&str, &str)>,
+    ) -> Result<MirrorSet, String> {
+        let requested = parse_address(follower)?;
+        let entries = self.read();
+        let index = entries
+            .iter()
+            .position(|entry| entry.address.ip() == requested.ip())
+            .ok_or_else(|| format!("target `{follower}` is not configured"))?;
+        let entry = &entries[index];
+        let follower_key = musician_key(entry);
+        let mirror = match leader {
+            None => None,
+            Some((value, name)) => {
+                let wanted = parse_address(value)?;
+                let leading = entries
+                    .iter()
+                    .find(|other| other.address.ip() == wanted.ip())
+                    .ok_or_else(|| format!("target `{value}` is not configured"))?;
+                if std::ptr::eq(leading, entry) {
+                    return Err(format!("{follower} cannot follow their own mix"));
+                }
+                Some(Mirror {
+                    leader: musician_key(leading),
+                    name: mirror_name(leading, name),
+                })
+            }
+        };
+        {
+            let mut book = self.mirror_book();
+            if let Some(mirror) = &mirror {
+                if reaches(&book, &entries, &mirror.leader, &follower_key, Some(entry)) {
+                    return Err(circle_error(&mirror.leader, &follower_key));
+                }
+            }
+            // Under the follower's strongest key, as their controls are: a phone's drops any
+            // mirror kept for its IP, so nothing kept there stands in for this one.
+            book.remove(&BookKey::Ip(entry.address.ip()));
+            book.remove(&BookKey::from(&follower_key));
+            if let Some(mirror) = &mirror {
+                book.insert(BookKey::from(&follower_key), mirror.clone());
+            }
+        }
+        let (moved, copied) = self.restore_mirror(&entries, entry);
+        let mut changed = if moved {
+            vec![entry.address]
+        } else {
+            Vec::new()
+        };
+        if copied {
+            changed.extend(self.propagate_from(&entries, index));
+        }
+        Ok(MirrorSet {
+            follower: follower_key,
+            leader: mirror.as_ref().map(|mirror| mirror.leader.clone()),
+            name: mirror.map(|mirror| mirror.name),
+            mix: entry.mix_state.current(),
+            changed,
+        })
+    }
+
+    /// Keeps the mirror of the musician `follower` names on the leader `leader` names, as the
+    /// desk's saved session does at start, and puts it in force for every musician here. Returns
+    /// the musicians whose stored mix changed. A mirror on oneself, or one that would go round in a
+    /// circle with those kept, is refused and nothing changes.
+    pub(crate) fn keep_mirror(
+        &self,
+        follower: &MusicianKey,
+        leader: &MusicianKey,
+        name: &str,
+    ) -> Result<Vec<SocketAddr>, String> {
+        let entries = self.read();
+        {
+            let mut book = self.mirror_book();
+            let follower_entry = entries.iter().find(|entry| names(follower, entry));
+            if BookKey::from(follower) == BookKey::from(leader)
+                || follower_entry.is_some_and(|entry| names(leader, entry))
+            {
+                return Err(format!(
+                    "{} cannot follow their own mix",
+                    describe_key(follower)
+                ));
+            }
+            if reaches(&book, &entries, leader, follower, follower_entry) {
+                return Err(circle_error(leader, follower));
+            }
+            let name = name.trim();
+            book.insert(
+                BookKey::from(follower),
+                Mirror {
+                    leader: leader.clone(),
+                    name: Arc::from(if name.is_empty() {
+                        "another musician"
+                    } else {
+                        name
+                    }),
+                },
+            );
+        }
+        // Every musician is resolved again, client id first, as a registration resolves them.
+        let mut changed: Vec<SocketAddr> = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let (moved, copied) = self.restore_mirror(&entries, entry);
+            let mut moved_now = if moved {
+                vec![entry.address]
+            } else {
+                Vec::new()
+            };
+            if copied {
+                moved_now.extend(self.propagate_from(&entries, index));
+            }
+            for address in moved_now {
+                if !changed.contains(&address) {
+                    changed.push(address);
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Whom each musician of `entries` follows, by IP, for those who follow anyone.
+    pub(crate) fn mirror_statuses(&self, entries: &[TargetEntry]) -> HashMap<IpAddr, MirrorStatus> {
+        let book = self.mirror_book();
+        if book.is_empty() {
+            return HashMap::new();
+        }
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let mirror = kept_in(&book, entry.origin.client_id(), entry.address.ip())?;
+                let leader_address = entries
+                    .iter()
+                    .find(|other| !std::ptr::eq(*other, entry) && names(&mirror.leader, other))
+                    .map(|leader| leader.address);
+                Some((
+                    entry.address.ip(),
+                    MirrorStatus {
+                        leader: mirror.leader,
+                        name: mirror.name.to_string(),
+                        leader_address,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// The controls kept for a musician: those kept for their phone's client id first, then those
@@ -266,8 +657,13 @@ impl TargetRegistry {
     /// the mix under the same write lock, so the phone's first `mix` after it registers already
     /// meets its locks and limit. A row another musician takes over (a different client id, or
     /// none where there was one, or the other way round) gets that musician's kept controls or the
-    /// defaults, never the previous occupant's. [Registration::controls_changed] says whether the
-    /// mix changed, so the caller can tell the phone.
+    /// defaults, never the previous occupant's. The mirror kept for the musician is put in force the
+    /// same way (see [Self::set_mirror]): a follower's phone is held off their channels and groups
+    /// before its first `mix`, and their mix takes their leader's when the leader is here. A leader
+    /// who registers changes nobody's mix: their followers take their mix when it next changes.
+    /// [Registration::controls_changed] says whether the mix changed, so the caller can tell the
+    /// phone, and [Registration::followed] whether it took the leader's, so the caller can carry it
+    /// on to those who follow this musician ([Self::propagate]).
     pub(crate) fn register(
         &self,
         peer: IpAddr,
@@ -300,16 +696,20 @@ impl TargetRegistry {
             entry.address = address;
             entry.origin = origin;
             let controls_changed = self.restore_kept_controls(entry);
+            let (mirror_changed, followed) = self.restore_mirror(&entries, &entries[index]);
             return Registration {
                 address,
                 moved_from: Some(moved_from),
-                controls_changed,
+                controls_changed: controls_changed || mirror_changed,
+                followed,
             };
         }
-        if let Some(existing) = entries.iter_mut().find(|entry| entry.address.ip() == peer) {
+        if let Some(index) = entries.iter().position(|entry| entry.address.ip() == peer) {
             // The row is reused by whoever registers from its IP. Someone else (another phone, or
             // one that announces no id where a phone was) gets the controls kept for them, or none:
-            // never the previous occupant's.
+            // never the previous occupant's. The mirror is always the one kept for whoever is
+            // there now, or none.
+            let existing = &mut entries[index];
             let same_musician = existing.origin.client_id() == client_id;
             existing.address = address;
             existing.origin = origin;
@@ -318,10 +718,12 @@ impl TargetRegistry {
             } else {
                 self.replace_controls(existing)
             };
+            let (mirror_changed, followed) = self.restore_mirror(&entries, &entries[index]);
             return Registration {
                 address,
                 moved_from: None,
-                controls_changed,
+                controls_changed: controls_changed || mirror_changed,
+                followed,
             };
         }
         let entry = TargetEntry {
@@ -335,11 +737,13 @@ impl TargetRegistry {
             origin,
         };
         let controls_changed = self.restore_kept_controls(&entry);
+        let (mirror_changed, followed) = self.restore_mirror(&entries, &entry);
         entries.push(entry);
         Registration {
             address,
             moved_from: None,
-            controls_changed,
+            controls_changed: controls_changed || mirror_changed,
+            followed,
         }
     }
 
@@ -394,9 +798,10 @@ impl TargetRegistry {
     /// Resolves and validates `value`, then adds it as a new target.
     ///
     /// The new entry starts with a neutral mix carrying the group membership in force (see
-    /// [Membership]) and the engineer's controls kept for its IP, and zero counters. A value that
-    /// cannot be resolved, or whose IP is already configured, is rejected with an error naming the
-    /// value; the table is left exactly as it was.
+    /// [Membership]), the engineer's controls and the mirror kept for its IP (a follower takes their
+    /// leader's mix at once when the leader is here), and zero counters. A value that cannot be
+    /// resolved, or whose IP is already configured, is rejected with an error naming the value; the
+    /// table is left exactly as it was.
     pub(crate) fn add(
         &self,
         value: &str,
@@ -423,6 +828,7 @@ impl TargetRegistry {
             origin: TargetOrigin::Configured,
         };
         self.restore_kept_controls(&entry);
+        self.restore_mirror(&entries, &entry);
         entries.push(entry);
         Ok(address)
     }
@@ -1203,6 +1609,7 @@ mod tests {
                 address: address("192.168.1.3:50001"),
                 moved_from: Some(address("192.168.1.10:50000")),
                 controls_changed: false,
+                followed: false,
             }
         );
         assert_eq!(addresses(&registry), vec![address("192.168.1.3:50001")]);
@@ -1329,6 +1736,7 @@ mod tests {
                 address: address("192.168.1.3:50001"),
                 moved_from: Some(address("192.168.1.10:50000")),
                 controls_changed: false,
+                followed: false,
             }
         );
         assert_eq!(addresses(&registry), vec![address("192.168.1.3:50001")]);
@@ -1363,5 +1771,243 @@ mod tests {
             registered_name(&registry, ip("192.168.1.10")).as_deref(),
             Some("Eva")
         );
+    }
+
+    /// Three configured racks, A, B and C, for the mirror tests.
+    fn racks() -> TargetRegistry {
+        TargetRegistry::new(
+            &[
+                address("192.168.1.3:50000"),
+                address("192.168.1.4:50000"),
+                address("192.168.1.5:50000"),
+            ],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build")
+    }
+
+    const A: &str = "192.168.1.3:50000";
+    const B: &str = "192.168.1.4:50000";
+    const C: &str = "192.168.1.5:50000";
+
+    fn mix_at(registry: &TargetRegistry, at: &str) -> Arc<MixState> {
+        registry
+            .mix_state(address(at).ip())
+            .expect("a musician is there")
+    }
+
+    /// Moves the first channels of the musician at `at` from the desk.
+    fn desk_gains(registry: &TargetRegistry, at: &str, gains: &[i32]) {
+        mix_at(registry, at)
+            .apply(&crate::mix::MixUpdate {
+                channel_gains: Some(gains.to_vec()),
+                group_levels: Some(vec![gains[0]]),
+                ..crate::mix::MixUpdate::default()
+            })
+            .expect("a valid update applies");
+    }
+
+    fn gains_at(registry: &TargetRegistry, at: &str, count: usize) -> Vec<u8> {
+        mix_at(registry, at).current().channel_gains[..count].to_vec()
+    }
+
+    #[test]
+    fn starting_a_mirror_copies_the_leaders_mix_and_names_the_leader_to_the_follower() {
+        let registry = racks();
+        desk_gains(&registry, B, &[30, 40]);
+
+        let set = registry
+            .set_mirror(A, Some((B, "Bass")))
+            .expect("A can follow B");
+
+        assert_eq!(set.follower, MusicianKey::Address(address(A)));
+        assert_eq!(set.leader, Some(MusicianKey::Address(address(B))));
+        assert_eq!(set.name.as_deref(), Some("Bass"));
+        assert_eq!(set.changed, vec![address(A)]);
+        assert_eq!(set.mix, mix_at(&registry, A).current());
+        assert_eq!(gains_at(&registry, A, 2), [30, 40]);
+        assert_eq!(set.mix.group_levels[0], 30, "the group levels too");
+        assert_eq!(mix_at(&registry, A).following().as_deref(), Some("Bass"));
+        let statuses = registry.mirror_statuses(&registry.read());
+        assert_eq!(
+            statuses.get(&ip("192.168.1.3")),
+            Some(&MirrorStatus {
+                leader: MusicianKey::Address(address(B)),
+                name: "Bass".to_owned(),
+                leader_address: Some(address(B)),
+            })
+        );
+        assert_eq!(statuses.len(), 1, "only the follower follows anyone");
+    }
+
+    #[test]
+    fn a_mirror_never_goes_round_in_a_circle() {
+        let registry = racks();
+        registry.set_mirror(A, Some((B, "B"))).expect("A follows B");
+        registry.set_mirror(B, Some((C, "C"))).expect("B follows C");
+
+        for (follower, leader) in [(B, A), (C, A), (C, B), (A, A)] {
+            let refused = registry
+                .set_mirror(follower, Some((leader, "x")))
+                .expect_err("a circle is refused");
+            assert!(
+                refused.contains("circle") || refused.contains("own"),
+                "{follower} following {leader}: {refused}"
+            );
+        }
+        let unknown = registry
+            .set_mirror(A, Some(("192.168.1.9:50000", "x")))
+            .expect_err("an unknown leader is refused");
+        assert!(unknown.contains("not configured"), "{unknown}");
+        assert_eq!(
+            mix_at(&registry, A).following().as_deref(),
+            Some("B"),
+            "a refusal changes nothing"
+        );
+        assert_eq!(mix_at(&registry, C).following(), None);
+    }
+
+    #[test]
+    fn every_change_of_a_leaders_mix_reaches_its_followers_and_theirs() {
+        let registry = racks();
+        registry.set_mirror(A, Some((B, "B"))).expect("A follows B");
+        registry.set_mirror(C, Some((A, "A"))).expect("C follows A");
+
+        desk_gains(&registry, B, &[11, 22]);
+        let moved = registry.propagate(ip("192.168.1.4"));
+
+        assert_eq!(moved, vec![address(A), address(C)]);
+        assert_eq!(gains_at(&registry, A, 2), [11, 22]);
+        assert_eq!(
+            gains_at(&registry, C, 2),
+            [11, 22],
+            "a follower of a follower too"
+        );
+        assert!(
+            registry.propagate(ip("192.168.1.4")).is_empty(),
+            "nothing left to take"
+        );
+    }
+
+    #[test]
+    fn stopping_a_mirror_leaves_the_followers_mix_as_it_is_and_frees_it() {
+        let registry = racks();
+        desk_gains(&registry, B, &[30, 40]);
+        registry.set_mirror(A, Some((B, "B"))).expect("A follows B");
+
+        let stopped = registry.set_mirror(A, None).expect("A stops following");
+
+        assert_eq!(stopped.leader, None);
+        assert_eq!(stopped.name, None);
+        assert_eq!(stopped.changed, vec![address(A)], "the phone is told");
+        assert_eq!(
+            gains_at(&registry, A, 2),
+            [30, 40],
+            "the mix stays as it was"
+        );
+        assert_eq!(mix_at(&registry, A).following(), None);
+        desk_gains(&registry, B, &[50, 60]);
+        assert!(registry.propagate(ip("192.168.1.4")).is_empty());
+        assert_eq!(gains_at(&registry, A, 2), [30, 40]);
+        assert!(registry.mirror_statuses(&registry.read()).is_empty());
+    }
+
+    #[test]
+    fn a_followers_mirror_is_kept_for_its_phone_and_put_in_force_when_it_registers() {
+        let registry = racks();
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        let set = registry
+            .set_mirror("192.168.1.10:50000", Some((B, "Bass")))
+            .expect("Ana follows B");
+        assert_eq!(set.follower, MusicianKey::Client(PHONE_A.to_owned()));
+        let gone = Instant::now();
+        registry.mark_disconnected(ip("192.168.1.10"), gone);
+        registry.sweep_expired(gone + REGISTRATION_GRACE_PERIOD * 2);
+        desk_gains(&registry, B, &[25, 35]);
+
+        let back = register_phone(&registry, "192.168.1.11", 50000, "Ana", Some(PHONE_A));
+
+        assert!(back.controls_changed, "the phone is told whom it follows");
+        assert!(back.followed, "its mix took the leader's");
+        let mix = mix_at(&registry, "192.168.1.11:50000");
+        assert_eq!(mix.following().as_deref(), Some("Bass"));
+        assert_eq!(gains_at(&registry, "192.168.1.11:50000", 2), [25, 35]);
+        let held = mix
+            .apply_from_phone(&crate::mix::MixUpdate {
+                channel_gains: Some(vec![90, 90]),
+                volume_percent: Some(40),
+                ..crate::mix::MixUpdate::default()
+            })
+            .expect("a valid mix applies");
+        assert_eq!(
+            &held.channel_gains[..2],
+            &[25, 35],
+            "its phone cannot move them"
+        );
+        assert_eq!(held.volume_percent, 40);
+    }
+
+    #[test]
+    fn an_absent_leader_keeps_its_follower_on_the_last_mix_and_its_return_changes_nothing() {
+        let registry = racks();
+        register_phone(&registry, "192.168.1.20", 50000, "Bass", Some(PHONE_B));
+        desk_gains(&registry, "192.168.1.20:50000", &[30, 40]);
+        registry
+            .set_mirror(A, Some(("192.168.1.20:50000", "")))
+            .expect("A follows the bass player");
+        let gone = Instant::now();
+        registry.mark_disconnected(ip("192.168.1.20"), gone);
+        registry.sweep_expired(gone + REGISTRATION_GRACE_PERIOD * 2);
+
+        assert_eq!(
+            registry
+                .mirror_statuses(&registry.read())
+                .get(&ip("192.168.1.3")),
+            Some(&MirrorStatus {
+                leader: MusicianKey::Client(PHONE_B.to_owned()),
+                name: "Bass".to_owned(),
+                leader_address: None,
+            }),
+            "named as the phone announced itself, and away"
+        );
+        assert_eq!(gains_at(&registry, A, 2), [30, 40]);
+        assert_eq!(mix_at(&registry, A).following().as_deref(), Some("Bass"));
+
+        let back = register_phone(&registry, "192.168.1.21", 50000, "Bass", Some(PHONE_B));
+        assert!(!back.followed);
+        assert_eq!(
+            gains_at(&registry, A, 2),
+            [30, 40],
+            "a new mix is not copied"
+        );
+        desk_gains(&registry, "192.168.1.21:50000", &[70, 80]);
+        assert_eq!(registry.propagate(ip("192.168.1.21")), vec![address(A)]);
+        assert_eq!(gains_at(&registry, A, 2), [70, 80]);
+    }
+
+    #[test]
+    fn kept_mirrors_reach_the_followers_here_and_refuse_a_circle() {
+        let registry = racks();
+        desk_gains(&registry, B, &[30, 40]);
+        let key = |at: &str| MusicianKey::Address(address(at));
+
+        let moved = registry
+            .keep_mirror(&key(A), &key(B), "Bass")
+            .expect("A follows B");
+
+        assert_eq!(moved, vec![address(A)]);
+        assert_eq!(gains_at(&registry, A, 2), [30, 40]);
+        assert_eq!(mix_at(&registry, A).following().as_deref(), Some("Bass"));
+        assert!(registry.keep_mirror(&key(B), &key(A), "A").is_err());
+        assert!(registry.keep_mirror(&key(C), &key(C), "C").is_err());
+        assert_eq!(mix_at(&registry, B).following(), None);
+        let later = MusicianKey::Client(PHONE_A.to_owned());
+        assert_eq!(
+            registry.keep_mirror(&later, &key(A), "A"),
+            Ok(Vec::new()),
+            "kept for a phone that is not here yet"
+        );
+        register_phone(&registry, "192.168.1.30", 50000, "Eva", Some(PHONE_A));
+        assert_eq!(gains_at(&registry, "192.168.1.30:50000", 2), [30, 40]);
     }
 }

@@ -1142,6 +1142,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            mirror: None,
         }
     }
 

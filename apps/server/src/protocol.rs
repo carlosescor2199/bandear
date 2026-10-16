@@ -241,6 +241,13 @@ pub(crate) fn control_message_type(json: &str) -> Result<String, String> {
 ///
 /// Both were added after the rest: a phone that predates them ignores them, as it ignores every
 /// field it does not know.
+///
+/// `following` is the name of the musician whose mix the engineer made this one follow (a
+/// mirror), or `null` when it follows nobody. While it is set, the server keeps every channel's
+/// level, pan, mute and solo and every group level whatever the phone's `mix` says (they follow
+/// the leader's), while the phone's master volume, level cap and mute still apply; a phone should
+/// say "Following <name>'s mix" and show the channel and group controls disabled. It was added
+/// after the engineer's controls, and a phone that predates it ignores it.
 #[derive(Serialize)]
 struct MixReport {
     #[serde(rename = "type")]
@@ -257,6 +264,7 @@ struct MixReport {
     group_levels: Vec<u8>,
     engineer_limit_percent: u8,
     locked: Vec<bool>,
+    following: Option<String>,
 }
 
 /// One group as it appears in the `config` message: its stable id, a name and 0-based source
@@ -339,20 +347,29 @@ pub(crate) fn serialize_packet(packet: &AudioPacket) -> Vec<u8> {
 }
 
 /// The `mix_ack` message: the whole mix now applied, answering a phone's `mix`, with that mix's
-/// number when it had one (see [mix_sequence]).
-pub(crate) fn mix_ack(values: MixValues, seq: Option<u64>) -> Result<String, serde_json::Error> {
-    mix_report("mix_ack", values, seq)
+/// number when it had one (see [mix_sequence]) and the name of the musician it follows, if any.
+pub(crate) fn mix_ack(
+    values: MixValues,
+    following: Option<&str>,
+    seq: Option<u64>,
+) -> Result<String, serde_json::Error> {
+    mix_report("mix_ack", values, following, seq)
 }
 
 /// The `mix_state` message: the musician's whole current mix, pushed when it changed without the
-/// phone asking, so the phone's screen can follow without sending the change back.
-pub(crate) fn mix_state_message(values: MixValues) -> Result<String, serde_json::Error> {
-    mix_report("mix_state", values, None)
+/// phone asking, so the phone's screen can follow without sending the change back, with the name of
+/// the musician it follows, if any.
+pub(crate) fn mix_state_message(
+    values: MixValues,
+    following: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    mix_report("mix_state", values, following, None)
 }
 
 fn mix_report(
     message_type: &'static str,
     values: MixValues,
+    following: Option<&str>,
     seq: Option<u64>,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string(&MixReport {
@@ -370,6 +387,7 @@ fn mix_report(
         locked: (0..MAX_MIX_CHANNELS)
             .map(|channel| values.engineer.is_locked(channel))
             .collect(),
+        following: following.map(str::to_owned),
     })
 }
 
@@ -422,7 +440,7 @@ mod tests {
         )
         .unwrap();
 
-        let ack = mix_ack(values, None).unwrap();
+        let ack = mix_ack(values, None, None).unwrap();
 
         assert!(ack.contains(r#""type":"mix_ack""#));
         assert!(ack.contains(r#""channels":[100,40,100"#));
@@ -436,7 +454,7 @@ mod tests {
         )
         .unwrap();
 
-        let ack = mix_ack(values, None).unwrap();
+        let ack = mix_ack(values, None, None).unwrap();
 
         assert!(ack.contains(r#""group_levels":[80,"#));
     }
@@ -463,7 +481,7 @@ mod tests {
     fn answers_to_a_mix_echo_its_sequence_and_nothing_else_carries_one() {
         let parse = |json: String| serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
-        let ack = parse(mix_ack(MixValues::default(), Some(7)).unwrap());
+        let ack = parse(mix_ack(MixValues::default(), None, Some(7)).unwrap());
         let refused = parse(mix_error("too many channels".to_owned(), Some(8)).unwrap());
 
         assert_eq!(ack["type"], "mix_ack");
@@ -472,10 +490,10 @@ mod tests {
         assert_eq!(refused["message"], "too many channels");
         assert_eq!(refused["seq"], 8);
         for unnumbered in [
-            parse(mix_ack(MixValues::default(), None).unwrap()),
+            parse(mix_ack(MixValues::default(), None, None).unwrap()),
             parse(mix_error("too many channels".to_owned(), None).unwrap()),
             parse(control_error("no UDP target configured for client IP".to_owned()).unwrap()),
-            parse(mix_state_message(MixValues::default()).unwrap()),
+            parse(mix_state_message(MixValues::default(), None).unwrap()),
         ] {
             assert!(unnumbered.get("seq").is_none(), "{unnumbered}");
         }
@@ -496,7 +514,7 @@ mod tests {
         values.group_levels[0] = 70;
 
         let json: serde_json::Value =
-            serde_json::from_str(&mix_state_message(values).unwrap()).unwrap();
+            serde_json::from_str(&mix_state_message(values, None).unwrap()).unwrap();
 
         assert_eq!(json["type"], "mix_state");
         assert_eq!(json["volume_percent"], 42);
@@ -523,8 +541,8 @@ mod tests {
         };
 
         for message in [
-            mix_ack(values, Some(3)).unwrap(),
-            mix_state_message(values).unwrap(),
+            mix_ack(values, None, Some(3)).unwrap(),
+            mix_state_message(values, None).unwrap(),
         ] {
             let json: serde_json::Value = serde_json::from_str(&message).unwrap();
             assert_eq!(json["engineer_limit_percent"], 60, "{message}");
@@ -537,9 +555,30 @@ mod tests {
             assert_eq!(&locked[..4], &[true, false, true, false]);
         }
         let open: serde_json::Value =
-            serde_json::from_str(&mix_state_message(MixValues::default()).unwrap()).unwrap();
+            serde_json::from_str(&mix_state_message(MixValues::default(), None).unwrap()).unwrap();
         assert_eq!(open["engineer_limit_percent"], 100);
         assert_eq!(open["locked"][0], false);
+    }
+
+    #[test]
+    fn mix_reports_name_the_musician_a_followers_mix_follows_and_null_otherwise() {
+        for message in [
+            mix_ack(MixValues::default(), Some("Bass"), Some(4)).unwrap(),
+            mix_state_message(MixValues::default(), Some("Bass")).unwrap(),
+        ] {
+            let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+            assert_eq!(json["following"], "Bass", "{message}");
+        }
+        for message in [
+            mix_ack(MixValues::default(), None, None).unwrap(),
+            mix_state_message(MixValues::default(), None).unwrap(),
+        ] {
+            let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+            assert!(
+                json.as_object().unwrap().contains_key("following") && json["following"].is_null(),
+                "always there, null while following nobody: {message}"
+            );
+        }
     }
 
     /// The engineer's controls are not phone input: a `mix` that carries them, as a phone echoing a

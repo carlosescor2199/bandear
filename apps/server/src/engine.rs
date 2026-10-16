@@ -18,11 +18,12 @@ use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlP
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
 use crate::mix::{
-    group_sources, ChannelFlags, Group, GroupLayout, MixUpdate, MixValues, MAX_MIX_CHANNELS,
+    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, MixUpdate,
+    MixValues, MAX_MIX_CHANNELS,
 };
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
-use crate::targets::{TargetEntry, TargetRegistry};
+use crate::targets::{MusicianKey, TargetEntry, TargetRegistry};
 
 const CHANNEL_CAPACITY: usize = 8;
 
@@ -424,6 +425,44 @@ pub(crate) fn set_target_mix(
         origin: MixOrigin::Engine,
     });
     Ok(applied)
+}
+
+/// Changes the engineer's controls for the musician whose IP `value` names, keeps them for that
+/// musician (see [TargetRegistry::set_controls]) and announces the change as one made through the
+/// engine, so the phone is sent its mix with the new limit and locks. Returns the key the controls
+/// are kept under and the mix now stored.
+///
+/// An invalid address, an unknown musician or a lock list longer than the mix is an error naming the
+/// problem, and then nothing changes and nothing is announced.
+pub(crate) fn set_target_controls(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    value: &str,
+    update: &EngineerUpdate,
+) -> Result<(MusicianKey, MixValues), String> {
+    let (key, address, applied) = targets.set_controls(value, update)?;
+    events.emit(EngineEvent::MixChanged {
+        address,
+        origin: MixOrigin::Engine,
+    });
+    Ok((key, applied))
+}
+
+/// Keeps `controls` for the musician `key` names and puts them in force if they are here, as
+/// [EngineHandle::keep_engineer_controls] does; each mix that changed is announced as a change made
+/// through the engine.
+pub(crate) fn keep_target_controls(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    key: &MusicianKey,
+    controls: EngineerControls,
+) {
+    for address in targets.keep_controls(key, controls) {
+        events.emit(EngineEvent::MixChanged {
+            address,
+            origin: MixOrigin::Engine,
+        });
+    }
 }
 
 /// What a musician's phone announced about itself when it registered.
@@ -1368,6 +1407,57 @@ impl EngineHandle {
             .map_err(|error| -> Box<dyn Error> { error.into() })
     }
 
+    /// Sets what the engineer allows one musician, beyond their mix: a limit on what they hear and
+    /// the channels their phone cannot change (see [EngineerControls]). Only this engine path sets
+    /// them; a phone's `mix` never can.
+    ///
+    /// `value` is the musician's address as [Self::status] reports it; the musician is found by IP.
+    /// The update is partial (see [EngineerUpdate]): an absent field keeps its value, `locked`
+    /// replaces each channel's lock from CH 1 on, and both sides of a stereo pair lock together.
+    ///
+    /// - The limit caps the musician's output at once: the mixer's ceiling is the lower of it and
+    ///   the phone's own level cap (`max_level_percent`), which the phone keeps setting.
+    /// - From the phone's next `mix` on, a locked channel's level, pan, mute and solo keep their
+    ///   stored values while the rest of that mix applies, and its `mix_ack` carries the kept
+    ///   values. [Self::set_mix] still changes locked channels.
+    ///
+    /// The change takes a new revision, is announced as [EngineEvent::MixChanged] from
+    /// [MixOrigin::Engine] and is pushed to the phone as `mix_state`, which carries the limit and the
+    /// locks. The engine keeps the controls for the musician (under their phone's client id when it
+    /// announced one, else their address, the key it returns), so a musician whose mix is created
+    /// again, back after the grace period or from a new IP, gets them back when they register.
+    ///
+    /// An address that does not parse, a musician that is not here, or a lock list longer than the
+    /// mix is an error naming the problem, and nothing changes.
+    pub fn set_engineer_controls(
+        &self,
+        value: &str,
+        update: &EngineerUpdate,
+    ) -> Result<(MusicianKey, MixValues), Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        set_target_controls(&self.targets, &self.events, value, update)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Keeps the engineer's `controls` for the musician `key` names, whether or not they are here,
+    /// as a desk does with the controls it saved: a musician with that key who is here gets them at
+    /// once (announced as [EngineEvent::MixChanged] from [MixOrigin::Engine] when their mix changed),
+    /// and one who registers later gets them when they do. Controls kept for a phone's client id
+    /// win over controls kept for its IP.
+    pub fn keep_engineer_controls(
+        &self,
+        key: &MusicianKey,
+        controls: EngineerControls,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        keep_target_controls(&self.targets, &self.events, key, controls);
+        Ok(())
+    }
+
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
@@ -1850,6 +1940,162 @@ mod tests {
             "the error names the value: {invalid}"
         );
         assert!(observed.try_recv().is_err(), "nothing changed");
+    }
+
+    #[test]
+    fn the_engineers_controls_are_kept_for_the_musician_and_announced_as_an_engine_change() {
+        let layout = GroupLayout::default();
+        let registry = TargetRegistry::new(&["192.168.1.3:50000".parse().unwrap()], &layout)
+            .expect("registry should build");
+        registry.register(ip("192.168.1.4"), 50000, None, Some(PHONE_ID), &layout);
+        let events = EventBus::default();
+        let observed = events.subscribe();
+
+        let (rack, rack_mix) = set_target_controls(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &EngineerUpdate {
+                limit_percent: Some(70),
+                ..EngineerUpdate::default()
+            },
+        )
+        .expect("a configured target's controls are set");
+        let (phone, phone_mix) = set_target_controls(
+            &registry,
+            &events,
+            "192.168.1.4:50000",
+            &EngineerUpdate {
+                locked: Some(vec![false, true]),
+                ..EngineerUpdate::default()
+            },
+        )
+        .expect("a registered phone's controls are set");
+
+        assert_eq!(
+            rack,
+            MusicianKey::Address("192.168.1.3:50000".parse().unwrap())
+        );
+        assert_eq!(phone, MusicianKey::Client(PHONE_ID.to_owned()));
+        assert_eq!(rack_mix.engineer.limit_percent, 70);
+        assert_eq!(
+            rack_mix,
+            registry
+                .mix_state(ip("192.168.1.3"))
+                .expect("configured")
+                .current()
+        );
+        assert_eq!(phone_mix.engineer.locked, 0b10);
+        assert_eq!(phone_mix.engineer.limit_percent, 100);
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            ["192.168.1.3:50000", "192.168.1.4:50000"].map(|address| EngineEvent::MixChanged {
+                address: address.parse().unwrap(),
+                origin: MixOrigin::Engine,
+            })
+        );
+    }
+
+    #[test]
+    fn engineer_controls_for_an_unknown_musician_or_too_many_channels_change_nothing() {
+        let registry = TargetRegistry::new(
+            &["192.168.1.3:50000".parse().unwrap()],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let before = registry
+            .mix_state(ip("192.168.1.3"))
+            .expect("configured")
+            .current();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+
+        let unknown = set_target_controls(
+            &registry,
+            &events,
+            "192.168.1.9:50000",
+            &EngineerUpdate::default(),
+        )
+        .expect_err("an unknown musician is rejected");
+        let oversized = set_target_controls(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &EngineerUpdate {
+                limit_percent: Some(10),
+                locked: Some(vec![true; MAX_MIX_CHANNELS + 1]),
+            },
+        )
+        .expect_err("a list longer than the mix is rejected");
+
+        assert!(unknown.contains("not configured"), "{unknown}");
+        assert!(oversized.contains("locked"), "{oversized}");
+        assert_eq!(
+            registry
+                .mix_state(ip("192.168.1.3"))
+                .expect("configured")
+                .current(),
+            before
+        );
+        assert!(observed.try_recv().is_err(), "nothing changed");
+    }
+
+    #[test]
+    fn kept_controls_reach_a_musician_here_now_and_one_who_registers_later() {
+        let layout = GroupLayout::default();
+        let registry = TargetRegistry::new(&["192.168.1.3:50000".parse().unwrap()], &layout)
+            .expect("registry should build");
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let limited = EngineerControls {
+            limit_percent: 50,
+            locked: 0,
+        };
+        let locked = EngineerControls {
+            limit_percent: 100,
+            locked: 0b1,
+        };
+
+        keep_target_controls(
+            &registry,
+            &events,
+            &MusicianKey::Address("192.168.1.3:50000".parse().unwrap()),
+            limited,
+        );
+        keep_target_controls(
+            &registry,
+            &events,
+            &MusicianKey::Client(PHONE_ID.to_owned()),
+            locked,
+        );
+        keep_target_controls(
+            &registry,
+            &events,
+            &MusicianKey::Address("192.168.1.3:50000".parse().unwrap()),
+            limited,
+        );
+
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [EngineEvent::MixChanged {
+                address: "192.168.1.3:50000".parse().unwrap(),
+                origin: MixOrigin::Engine,
+            }],
+            "only the musician here changed, and only once"
+        );
+        let mix_of = |musician: &str| {
+            registry
+                .mix_state(ip(musician))
+                .expect("a musician")
+                .current()
+        };
+        assert_eq!(mix_of("192.168.1.3").engineer, limited);
+        registry.register(ip("192.168.1.4"), 50000, None, Some(PHONE_ID), &layout);
+        assert_eq!(
+            mix_of("192.168.1.4").engineer,
+            locked,
+            "the phone gets its controls when it registers"
+        );
     }
 
     #[test]

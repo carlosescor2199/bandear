@@ -13,16 +13,17 @@ use std::sync::Mutex;
 
 use personal_monitoring::{
     check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
-    EngineEvent, EngineHandle, GroupDefinition, MixValues, MusicianStatus,
+    EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition, MixValues,
+    MusicianKey, MusicianStatus,
 };
 
 use crate::dto::{
-    CaptureFormatDto, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineStatusDto,
-    GroupRequest, GroupsSetDto, InputDeviceDto, MetersDto, MixDto, MixUpdateRequest, StartRequest,
-    StartSummary,
+    locked_table, CaptureFormatDto, ChannelRequest, ChannelsSetDto, EngineStateDto,
+    EngineStatusDto, EngineerControlsRequest, EngineerControlsSetDto, GroupRequest, GroupsSetDto,
+    InputDeviceDto, MetersDto, MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
-use crate::session::{SessionChannel, SessionGroup, SessionStore};
+use crate::session::{SessionChannel, SessionEngineer, SessionGroup, SessionStore};
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
@@ -179,6 +180,57 @@ fn session_channels(session: &SessionStore) -> Vec<ChannelMeta> {
         .collect()
 }
 
+/// The engineer's controls the session keeps, as the engine takes them at start (see
+/// [EngineHandle::keep_engineer_controls]): each under the key it is kept for, a `client:` key as
+/// the phone's client id and an `address:` key as that address. A limit above 100 reads as 100 and
+/// a channel number outside 1-32 is left out; a key this build cannot read is skipped and logged.
+fn session_engineer_controls(session: &SessionStore) -> Vec<(MusicianKey, EngineerControls)> {
+    session
+        .engineer_controls()
+        .into_iter()
+        .filter_map(|(key, kept)| {
+            let musician = if let Some(id) = key.strip_prefix("client:") {
+                MusicianKey::Client(id.to_owned())
+            } else if let Some(address) = key
+                .strip_prefix("address:")
+                .and_then(|address| address.parse().ok())
+            {
+                MusicianKey::Address(address)
+            } else {
+                eprintln!(
+                    "[mixlink-desktop] the engineer's controls kept for `{key}` are skipped: it names no phone or address"
+                );
+                return None;
+            };
+            Some((musician, engineer_controls(&kept)))
+        })
+        .collect()
+}
+
+/// The controls the session keeps, as the engine takes them.
+fn engineer_controls(kept: &SessionEngineer) -> EngineerControls {
+    EngineerControls {
+        limit_percent: kept.limit_percent.min(100),
+        locked: kept
+            .locked_channels
+            .iter()
+            .filter(|&&number| (1..=32).contains(&number))
+            .fold(0, |mask, &number| mask | 1 << (number - 1)),
+    }
+}
+
+/// The controls the engine has, as the session keeps them: locked channels by their 1-based
+/// numbers.
+fn session_engineer(controls: &EngineerControls) -> SessionEngineer {
+    SessionEngineer {
+        limit_percent: controls.limit_percent,
+        locked_channels: (0..32)
+            .filter(|&channel| controls.is_locked(channel))
+            .map(|channel| channel + 1)
+            .collect(),
+    }
+}
+
 /// Maps a window value to a backend. An unknown or absent value falls back to `auto`, which is what
 /// the window sends until the engineer picks something.
 fn parse_host(value: Option<&str>) -> AudioHost {
@@ -200,7 +252,10 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 /// none) gets the session's groups applied as soon as the engine runs (see [session_groups_for]).
 /// The session's channel details are applied the same way to every start ([session_channels]).
 /// Groups or details the engine refuses there (a hand-edited session) are logged and the engine
-/// runs without them: they are a convenience and must not stop the server.
+/// runs without them: they are a convenience and must not stop the server. The engineer's controls
+/// the session keeps for each musician are given to the engine after them
+/// ([session_engineer_controls]): a configured target has them at once, and a phone gets them when
+/// it registers, from whatever IP, before its first mix is handled.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let mut pump = state
         .pump
@@ -215,6 +270,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     // between this read and the new engine taking them.
     let saved_groups = session_groups_for(&request, &state.session);
     let saved_channels = session_channels(&state.session);
+    let saved_controls = session_engineer_controls(&state.session);
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
@@ -247,6 +303,13 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                     Err(error) => eprintln!(
                         "[mixlink-desktop] start_engine: the saved channel details were not applied: {error}"
                     ),
+                }
+            }
+            for (key, controls) in saved_controls {
+                if let Err(error) = handle.keep_engineer_controls(&key, controls) {
+                    eprintln!(
+                        "[mixlink-desktop] start_engine: the saved controls for {key:?} were not applied: {error}"
+                    );
                 }
             }
             let summary = StartSummary {
@@ -424,6 +487,176 @@ pub fn set_mix(
         .set_mix(&address, &mix.into())
         .map_err(|error| error.to_string())?;
     Ok(MixDto::from(&applied))
+}
+
+/// Sets what the engineer allows one musician beyond their mix: a limit on what they hear and the
+/// channels their phone cannot change. Returns what was done ([EngineerControlsSetDto]).
+///
+/// `address` is the row's address as the status reports it, `client_id` the client id the row
+/// carries when the window knows one, and `controls` is partial (see [EngineerControlsRequest]).
+/// Then, as for the groups ([set_groups]):
+///
+/// - With an engine running, the engine takes them first (the limit caps the musician's output at
+///   once, the phone is told, and from its next mix on it cannot change a locked channel, see
+///   [EngineHandle::set_engineer_controls]) and only then are they saved: for the musician's phone
+///   when it announced a client id (any kept for the address go), else for the address. A save
+///   that fails then is reported in the answer, not as an error.
+/// - An engine that is stopping, a musician it does not list or a lock list longer than the mix
+///   is refused: an error, and nothing changed.
+/// - With no engine, they are merged into those kept for the musician and saved under the
+///   strongest key the desk knows, the one the next engine resolves first: the phone's when the
+///   window gave its client id (any kept for the address go, so none stands in for the edit), else
+///   the address, which must be a musician address. They apply at the next start (`applied:
+///   false`). The engine locks both sides of a pair when it applies them. A running engine decides
+///   the key itself, so `client_id` only matters here.
+///
+/// Each change is one step under the engine lock, with the session's inside it.
+pub fn set_engineer_controls(
+    state: &DesktopState,
+    address: String,
+    client_id: Option<String>,
+    controls: EngineerControlsRequest,
+) -> Result<EngineerControlsSetDto, String> {
+    let outcome = edit_engineer_controls(
+        &state.engine,
+        &state.session,
+        &address,
+        client_id.as_deref(),
+        controls,
+    )?;
+    println!(
+        "[mixlink-desktop] set_engineer_controls: {} limit={} locked={:?} kept_for={} applied={} saved={}",
+        outcome.address,
+        outcome.limit_percent,
+        outcome
+            .locked_channels
+            .iter()
+            .enumerate()
+            .filter(|(_, &locked)| locked)
+            .map(|(channel, _)| channel + 1)
+            .collect::<Vec<_>>(),
+        outcome.kept_for,
+        outcome.applied,
+        outcome.saved
+    );
+    Ok(outcome)
+}
+
+/// What a change of the engineer's controls needs from the running engine, as [GroupEngine] is for
+/// a group edit.
+trait ControlsEngine {
+    /// Applies the change to the musician at `address`; answers the key the engine keeps the
+    /// controls under and the mix now stored.
+    fn set_engineer_controls(
+        &mut self,
+        address: &str,
+        update: &EngineerUpdate,
+    ) -> Result<(MusicianKey, MixValues), String>;
+}
+
+impl ControlsEngine for EngineHandle {
+    fn set_engineer_controls(
+        &mut self,
+        address: &str,
+        update: &EngineerUpdate,
+    ) -> Result<(MusicianKey, MixValues), String> {
+        EngineHandle::set_engineer_controls(self, address, update)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// `update` merged into the controls `kept`, as the engine merges it, for a desk with no engine: the
+/// limit clamped to 0-100, each listed lock replacing the channel's from CH 1 on, and a list
+/// longer than the mix refused.
+fn merge_kept(kept: EngineerControls, update: &EngineerUpdate) -> Result<EngineerControls, String> {
+    let mut locked = kept.locked;
+    if let Some(list) = &update.locked {
+        if list.len() > 32 {
+            return Err(format!(
+                "locked accepts at most 32 flags, received {}",
+                list.len()
+            ));
+        }
+        for (channel, &lock) in list.iter().enumerate() {
+            if lock {
+                locked |= 1 << channel;
+            } else {
+                locked &= !(1 << channel);
+            }
+        }
+    }
+    Ok(EngineerControls {
+        limit_percent: update
+            .limit_percent
+            .map_or(kept.limit_percent, |limit| limit.clamp(0, 100) as u8),
+        locked,
+    })
+}
+
+/// [set_engineer_controls] over any engine slot and session.
+fn edit_engineer_controls<E: ControlsEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    address: &str,
+    client_id: Option<&str>,
+    request: EngineerControlsRequest,
+) -> Result<EngineerControlsSetDto, String> {
+    let update = EngineerUpdate::from(request);
+    // One step per change, in the lock order every command that holds both follows (see
+    // [edit_groups]).
+    let mut guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let Some(engine) = guard.as_mut() else {
+        // Kept under the strongest key the desk knows for the musician, the one the next engine
+        // resolves first: the phone's, which also drops those kept for the address, so nothing at
+        // start stands in for this edit.
+        let at = address
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid musician address `{address}`: {error}"))?
+            .to_string();
+        let kept = session
+            .engineer_for(client_id, &at)
+            .map(|kept| engineer_controls(&kept))
+            .unwrap_or_default();
+        let controls = merge_kept(kept, &update)?;
+        // Nothing took them, so a save that fails changes nothing and is the answer.
+        session.set_engineer(client_id, &at, session_engineer(&controls))?;
+        return Ok(EngineerControlsSetDto {
+            address: address.to_owned(),
+            limit_percent: controls.limit_percent,
+            locked_channels: locked_table(&controls, 32),
+            kept_for: if client_id.is_some() {
+                "phone"
+            } else {
+                "address"
+            },
+            applied: false,
+            saved: true,
+            save_error: None,
+            mix: None,
+        });
+    };
+    // A refusal (an engine that is stopping, an unknown musician) returns here, before anything is
+    // saved.
+    let (key, mix) = engine.set_engineer_controls(address, &update)?;
+    let kept = session_engineer(&mix.engineer);
+    let (saved, kept_for) = match &key {
+        MusicianKey::Client(id) => (session.set_engineer(Some(id), address, kept), "phone"),
+        MusicianKey::Address(at) => (session.set_engineer(None, &at.to_string(), kept), "address"),
+    };
+    // The phone already has the controls: say that they were not kept.
+    let save_error = saved.err();
+    Ok(EngineerControlsSetDto {
+        address: address.to_owned(),
+        limit_percent: mix.engineer.limit_percent,
+        locked_channels: locked_table(&mix.engineer, mix.channel_gains.len()),
+        kept_for,
+        applied: true,
+        saved: save_error.is_none(),
+        save_error,
+        mix: Some(MixDto::from(&mix)),
+    })
 }
 
 /// Sets or clears a musician's label. The label never reaches the engine or any client, and it is
@@ -1222,6 +1455,42 @@ mod tests {
         applied_channels: Option<Vec<ChannelMeta>>,
         stopping: bool,
         park: Option<Park>,
+        /// The musicians it lists, by address, with their phones' client ids.
+        rows: Vec<(String, Option<String>)>,
+        /// The engineer's controls it took last.
+        controls: Option<EngineerControls>,
+    }
+
+    impl ControlsEngine for StandInEngine {
+        fn set_engineer_controls(
+            &mut self,
+            address: &str,
+            update: &EngineerUpdate,
+        ) -> Result<(MusicianKey, MixValues), String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            let (at, client_id) = self
+                .rows
+                .iter()
+                .find(|(at, _)| at == address)
+                .cloned()
+                .ok_or_else(|| format!("target `{address}` is not configured"))?;
+            let controls = merge_kept(self.controls.unwrap_or_default(), update)?;
+            self.controls = Some(controls);
+            let key = match client_id {
+                Some(id) => MusicianKey::Client(id),
+                None => MusicianKey::Address(at.parse().expect("a test address")),
+            };
+            Ok((
+                key,
+                MixValues {
+                    engineer: controls,
+                    revision: 7,
+                    ..MixValues::default()
+                },
+            ))
+        }
     }
 
     /// Holds one group edit between its apply and its save while another edit runs: the edit
@@ -1800,5 +2069,325 @@ mod tests {
             Some(vec!["Drums".to_owned(), "Voices".to_owned()])
         );
         assert_eq!(session.groups(), second.groups);
+    }
+
+    /// The rows a stand-in engine lists for the engineer's controls: its addresses with the client
+    /// ids their phones announced.
+    fn listing(rows: &[(&str, Option<&str>)]) -> StandInEngine {
+        StandInEngine {
+            rows: rows
+                .iter()
+                .map(|(address, id)| ((*address).to_owned(), id.map(str::to_owned)))
+                .collect(),
+            ..StandInEngine::default()
+        }
+    }
+
+    fn controls_request(limit: Option<i32>, locked: Option<&[bool]>) -> EngineerControlsRequest {
+        EngineerControlsRequest {
+            limit_percent: limit,
+            locked_channels: locked.map(<[bool]>::to_vec),
+        }
+    }
+
+    fn kept_controls(limit_percent: u8, locked_channels: &[usize]) -> SessionEngineer {
+        SessionEngineer {
+            limit_percent,
+            locked_channels: locked_channels.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_running_engine_takes_the_controls_and_they_are_saved_for_the_phone() {
+        let test = "controls-phone";
+        let session = SessionStore::open(&session_directory(test));
+        session
+            .set_engineer(None, "192.168.1.10:50000", kept_controls(40, &[]))
+            .expect("kept for the address");
+        let engine = running(listing(&[("192.168.1.10:50000", Some(PHONE))]));
+
+        let outcome = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.10:50000",
+            Some(PHONE),
+            controls_request(Some(60), Some(&[true, true])),
+        )
+        .expect("the controls are taken");
+
+        assert!(outcome.applied && outcome.saved, "{outcome:?}");
+        assert_eq!(outcome.kept_for, "phone");
+        assert_eq!(outcome.limit_percent, 60);
+        assert_eq!(outcome.locked_channels.len(), 32);
+        assert_eq!(&outcome.locked_channels[..3], &[true, true, false]);
+        let mix = outcome.mix.expect("the mix the engine stored");
+        assert_eq!(mix.engineer_limit_percent, 60);
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .and_then(|engine| engine.controls),
+            Some(EngineerControls {
+                limit_percent: 60,
+                locked: 0b11,
+            }),
+            "the engine took them"
+        );
+        assert_eq!(
+            saved_musicians(test),
+            serde_json::json!({
+                format!("client:{PHONE}"): {
+                    "engineer": { "limitPercent": 60, "lockedChannels": [1, 2] }
+                }
+            }),
+            "kept for the phone, and those kept for its address are gone"
+        );
+    }
+
+    #[test]
+    fn a_configured_targets_controls_are_saved_for_its_address() {
+        let test = "controls-address";
+        let session = SessionStore::open(&session_directory(test));
+        let engine = running(listing(&[("192.168.1.40:50000", None)]));
+
+        let outcome = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.40:50000",
+            None,
+            controls_request(None, Some(&[false, false, true])),
+        )
+        .expect("the controls are taken");
+
+        assert_eq!(outcome.kept_for, "address");
+        assert_eq!(
+            saved_musicians(test),
+            serde_json::json!({
+                "address:192.168.1.40:50000": {
+                    "engineer": { "limitPercent": 100, "lockedChannels": [3] }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn an_engine_that_is_stopping_refuses_the_controls_and_nothing_is_saved() {
+        let session = SessionStore::open(&session_directory("controls-stopping"));
+        let engine = running(StandInEngine {
+            stopping: true,
+            ..listing(&[("192.168.1.10:50000", Some(PHONE))])
+        });
+
+        let error = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.10:50000",
+            Some(PHONE),
+            controls_request(Some(60), None),
+        )
+        .expect_err("a stopping engine refuses");
+
+        assert!(error.contains("stopping"), "{error}");
+        assert_eq!(session.engineer_controls(), Vec::new());
+    }
+
+    #[test]
+    fn controls_a_running_engine_took_but_the_session_could_not_keep_say_so() {
+        let directory = session_directory("controls-unsaved");
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(
+            directory.join(crate::session::SESSION_FILE),
+            r#"{"version":99}"#,
+        )
+        .expect("a newer session");
+        let session = SessionStore::open(&directory);
+        let engine = running(listing(&[("192.168.1.10:50000", Some(PHONE))]));
+
+        let outcome = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.10:50000",
+            Some(PHONE),
+            controls_request(Some(60), None),
+        )
+        .expect("the engine took them");
+
+        assert!(outcome.applied);
+        assert!(!outcome.saved);
+        assert!(
+            outcome
+                .save_error
+                .as_deref()
+                .is_some_and(|error| error.contains("newer")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn controls_set_without_an_engine_join_those_kept_for_the_address() {
+        let session = SessionStore::open(&session_directory("controls-idle"));
+        session
+            .set_engineer(None, "192.168.1.40:50000", kept_controls(50, &[2]))
+            .expect("kept");
+        let engine: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        let outcome = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.40:50000",
+            None,
+            controls_request(None, Some(&[true])),
+        )
+        .expect("kept for the next start");
+
+        assert!(!outcome.applied && outcome.saved, "{outcome:?}");
+        assert_eq!(outcome.limit_percent, 50, "the kept limit stays");
+        assert_eq!(&outcome.locked_channels[..3], &[true, true, false]);
+        assert!(outcome.mix.is_none());
+        assert_eq!(
+            session.engineer_for(None, "192.168.1.40:50000"),
+            Some(kept_controls(50, &[1, 2]))
+        );
+        let error = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.40:50000",
+            None,
+            controls_request(Some(10), Some(&[true; 33])),
+        )
+        .expect_err("a list longer than the mix is refused");
+        assert!(error.contains("locked"), "{error}");
+        assert_eq!(
+            session.engineer_for(None, "192.168.1.40:50000"),
+            Some(kept_controls(50, &[1, 2])),
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn a_start_gives_the_engine_the_controls_kept_for_each_phone_and_address() {
+        let directory = session_directory("controls-start");
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(
+            directory.join(crate::session::SESSION_FILE),
+            format!(
+                r#"{{"version":1,"musicians":{{
+                    "client:{PHONE}":{{"engineer":{{"limitPercent":250,"lockedChannels":[1,33,0,32]}}}},
+                    "address:192.168.1.40:50000":{{"label":"Rack","engineer":{{"limitPercent":70}}}},
+                    "address:somewhere":{{"engineer":{{"limitPercent":10}}}},
+                    "address:192.168.1.41:50000":{{"label":"Monitor"}}
+                }}}}"#
+            ),
+        )
+        .expect("a session");
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session_engineer_controls(&session),
+            vec![
+                (
+                    MusicianKey::Address("192.168.1.40:50000".parse().unwrap()),
+                    EngineerControls {
+                        limit_percent: 70,
+                        locked: 0,
+                    }
+                ),
+                (
+                    MusicianKey::Client(PHONE.to_owned()),
+                    EngineerControls {
+                        limit_percent: 100,
+                        locked: 1 | 1 << 31,
+                    }
+                ),
+            ],
+            "a limit above 100 reads as 100, numbers outside 1-32 and unreadable keys are skipped"
+        );
+    }
+
+    /// With no engine, an edit for a phone the window knows by its client id builds on the
+    /// controls kept for that phone and is kept under its key, the key the next engine resolves
+    /// first; those kept for its address go, so nothing at start stands in for the edit.
+    #[test]
+    fn idle_controls_for_a_known_phone_are_kept_under_its_client_id_for_the_next_start() {
+        let session = SessionStore::open(&session_directory("controls-idle-phone"));
+        session
+            .set_engineer(Some(PHONE), "192.168.1.10:50000", kept_controls(40, &[3]))
+            .expect("kept for the phone");
+        session
+            .set_engineer(None, "192.168.1.10:50000", kept_controls(70, &[]))
+            .expect("kept for the address");
+        let engine: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        let outcome = edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.10:50000",
+            Some(PHONE),
+            controls_request(None, Some(&[true])),
+        )
+        .expect("kept for the next start");
+
+        assert!(!outcome.applied && outcome.saved, "{outcome:?}");
+        assert_eq!(outcome.kept_for, "phone");
+        assert_eq!(outcome.limit_percent, 40, "the phone's own limit stays");
+        assert_eq!(&outcome.locked_channels[..3], &[true, false, true]);
+        assert_eq!(
+            session_engineer_controls(&session),
+            vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                EngineerControls {
+                    limit_percent: 40,
+                    locked: 0b101,
+                }
+            )],
+            "the next engine gets exactly the edit, and nothing kept for the address"
+        );
+    }
+
+    #[test]
+    fn an_idle_edit_must_name_a_musician_address() {
+        let session = SessionStore::open(&session_directory("controls-idle-bad-address"));
+        let engine: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        let error = edit_engineer_controls(
+            &engine,
+            &session,
+            "somewhere",
+            None,
+            controls_request(Some(50), None),
+        )
+        .expect_err("an address that does not parse is refused");
+
+        assert!(error.contains("somewhere"), "{error}");
+        assert_eq!(session.engineer_controls(), Vec::new(), "nothing is kept");
+    }
+
+    /// The desk's half of a phone keeping its controls when DHCP gives it another IP: they are
+    /// saved for its client id, so the next start hands the engine that key, and the engine puts
+    /// them in force when the phone registers from any address.
+    #[test]
+    fn controls_kept_for_a_phone_are_handed_to_the_next_engine_by_its_client_id() {
+        let session = SessionStore::open(&session_directory("controls-ip-change"));
+        let engine = running(listing(&[("192.168.1.10:50000", Some(PHONE))]));
+        edit_engineer_controls(
+            &engine,
+            &session,
+            "192.168.1.10:50000",
+            Some(PHONE),
+            controls_request(Some(55), Some(&[false, true])),
+        )
+        .expect("the controls are taken");
+
+        assert_eq!(
+            session_engineer_controls(&session),
+            vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                EngineerControls {
+                    limit_percent: 55,
+                    locked: 0b10,
+                }
+            )]
+        );
     }
 }

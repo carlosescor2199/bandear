@@ -527,9 +527,143 @@ slice. Push and PRs are the user's decision.
   - Commits: 56fdea7 `fix(desktop): edit the whole channel table, not the device's part`; this
     commit (`fix(desktop-ui): keep group ids and members across chained edits and hold pending
     toggles`).
-- [ ] T5 (engineer limit and locks): engine fields set only by the engineer path and enforced on
-  phone writes; reported to the phone; Android shows the limit and locked controls; the desktop
-  master strip and channel strips edit them. Route: delegated writer.
+- [x] T5a (engineer limit and locks: engine, protocol, desktop): engine fields set only by the
+  engineer path and enforced on phone writes; reported to the phone; kept per musician in the
+  session and re-applied on registration; the desktop master strip and channel strips edit them.
+  Route: delegated writer (trigger: 2+ non-trivial files across the engine, the desktop and the UI).
+  - Engine (`mix.rs`): `EngineerControls { limit_percent: u8 (default 100), locked: u32 }` (bit k =
+    channel k) and the partial `EngineerUpdate { limit_percent: Option<i32>, locked:
+    Option<Vec<bool>> }` (list from CH 1 on, at most 32, limit clamped; a pair's sides follow the
+    side that changed, the first wins when both differ), both public. Every `MixState` holds them
+    in two atomics (`engineer_limit: AtomicU8`, `locked: AtomicU32`); `MixValues.engineer` carries
+    them; `MixUpdate::merge_into` preserves them, so no `mix` can set them. Writers: `apply` (the
+    desk, may change locked channels), `apply_from_phone` (the control connection: after the merge
+    `keep_locked` puts back the level, pan, mute and solo of every locked channel, then
+    `keep_pairs_equal`), `apply_engineer` (desk path, new revision, no value moves) and
+    `restore_engineer` (whole controls, limit capped at 100, pairs locked whole, new revision only
+    when changed). Invariant: both sides of a linked pair are locked alike (`lock_pairs` on
+    restore, the follow rule on edits, and `set_channel_flags` locks a newly linked pair whole when
+    either side was locked).
+  - Ceiling: `mix_channels` clamps to `min(max_level_percent, engineer.limit_percent)`, both read
+    from the lock-free snapshot (no new lock or allocation on the audio path).
+  - Book and identity (`targets.rs`): `MusicianKey { Client(id), Address(SocketAddr) }` (public).
+    `TargetRegistry` keeps the engineer's controls per key (an address by IP) behind its own mutex
+    (taken after the table's lock, never while a mix writer lock is held). `set_controls` applies
+    and keeps them under the row's client id when it has one (dropping any kept for its IP), else
+    its address. `register` (new row, IP move by client id, re-registration, adopted configured
+    target) and `add` put the kept controls in force under the table's write lock, client id first
+    then IP, so the phone's first `mix` after registering already meets its locks and limit (no
+    event is emitted there: the ack carries them, the desk sees them with the next status).
+    `keep_controls` stores and re-resolves every row.
+  - API: `EngineHandle::set_engineer_controls(address, &EngineerUpdate) -> (MusicianKey,
+    MixValues)` (refuses while stopping; unknown musician or oversized list is an error and nothing
+    changes; emits `MixChanged{Engine}`, so the phone gets `mix_state`) and
+    `EngineHandle::keep_engineer_controls(&MusicianKey, EngineerControls)` (seeds the book; a
+    present musician whose mix changed is announced).
+  - Protocol (`MixReport`, `mix_ack` and `mix_state`): `"engineer_limit_percent": 60` (0-100, 100 =
+    no limit, apart from the phone's own `max_level_percent`) and `"locked": [true, false, ...]` (32
+    entries, aligned with `channels`), documented on the struct; old phones ignore them; a phone's
+    `mix` that carries them changes nothing.
+  - Session: a musician entry gains optional `"engineer": { "limitPercent": 60, "lockedChannels":
+    [1, 2] }` (1-based numbers) under the label's key (`client:<id>` else `address:<ip:port>`),
+    absent at the defaults; version stays 1 (an earlier build reads the entry and keeps the label
+    but drops `engineer` when it saves); an unreadable `engineer` reads as none and costs nothing
+    else. `engineer_for`, `engineer_controls`, `set_engineer` (client key drops the address key's
+    controls, as labels do).
+  - Desktop: Tauri `set_engineer_controls(address, controls: { limitPercent?, lockedChannels? })`
+    (`deny_unknown_fields`), one step under the engine lock with the session's inside: a running
+    engine takes them first, then they are saved under the key it returned; a stopping engine or an
+    unknown musician refuses and nothing is saved; no engine merges into the address's kept
+    controls (`applied: false`); answer `{ address, limitPercent, lockedChannels, keptFor:
+    "phone"|"address", applied, saved, saveError, mix }`. Every start hands the engine the session's
+    controls after the groups and channels (`session_engineer_controls`: limit capped, numbers
+    outside 1-32 and unreadable keys skipped). `MixDto` gains `engineerLimitPercent` and
+    `lockedChannels` (flat on status rows, nested in `mix-changed`, in the `set_mix` answer);
+    `set_mix` refuses them.
+  - UI: the mix model carries `engineerLimitPercent` and `lockedChannels` (`ENGINEER_FIELDS`;
+    older payloads read as open); their edits are pending edits like a fader's (`viewMix` shows
+    them, a layout change drops a lock edit as it drops a level edit) but go out through their own
+    coalescer to `set_engineer_controls` (`splitEdits`, `buildEngineerRequest`); a refusal is the
+    usual `mixError`, an answer that did not both apply and save is `controlsNotice`, said above
+    the strips (`formatEngineerControlsSet`). The master strip has a LIMIT fader ("Engineer limit",
+    sent when a gesture ends) beside the phone's CAP ("Phone level cap"), a readout "85% · cap 90% ·
+    limit 60%" and the line "The lower of the phone's cap and your limit wins: at most 60%." (both
+    faders described by it). Each channel strip has a lock toggle whose text is its state
+    ("Locked"/"Unlocked", plus the pressed fill and lamp), named "Lock Kick on the musician's
+    phone"; a pair locks as one (`channelEdits`). The fake bridge implements `set_engineer_controls`
+    with the same rules (pairs, phone kept off locked channels, desk free, meter ceiling = lower
+    of cap and limit, kept by client id else address, idle saves for the address, every start
+    re-applies, a pair linked after a lock locked whole) and `engineerKeys()`.
+  - RED: (a) with the plumbing and stubbed behaviour (the phone path was the desk's, no-op
+    `apply_engineer`/`restore_engineer`, ceiling ignoring the limit, reports without the fields)
+    19 of 270 server tests failed (10 mix, 3 targets, 3 engine, 2 real-socket control, 1
+    protocol); the protocol guard that a `mix` cannot set the controls passed (true by
+    construction). (b) against stubs (controls never saved, DTO without them, start handing none)
+    9 of 111 desktop tests failed; the refusal, not-saved, unreadable-entry, newer-session and
+    request-parsing tests passed (guards). UI against stub exports: 23 of 260 failed (22 of the 23
+    new tests and the updated mix field list); "set_mix cannot carry the engineer's controls"
+    passed (guard).
+  - GREEN: `cargo test -p personal-monitoring` 270 passed (20 new), control tests 36 passed in
+    three runs; real-socket proofs `a_locked_channel_and_the_engineers_limit_hold_against_the_phones_whole_mix`
+    (lock CH 1 and limit 60: `mix_state` shows them, the phone's whole mix moving CH 1 and its cap
+    is acked with seq, CH 1 unchanged, cap 90 kept, limit and lock reported, CH 1 at full scale
+    held at 60 %) and `a_phone_back_from_a_new_ip_after_the_grace_period_meets_the_engineers_controls`
+    (row removed after the grace period, the phone registers from another IP with its client id
+    and its first mix is held). `cargo test -p mixlink-desktop` 111 passed (14 new); UI 260 passed
+    (23 new; the mix field list, the first strip, the master strip and the mix messages
+    expectations gained the new fields); `cargo fmt` clean; clippy: no new warnings. Preview
+    (`?fake#/mix`): every strip shows "Unlocked", Kick's toggle reads "Locked" once pressed, PageDown
+    x4 on LIMIT gives "limit 60%" and "at most 60%" with the output meters lower, the demo phone
+    kept moving other channels while Kick stayed put, no console errors; the master readout now
+    wraps inside the strip. `cargo build -p mixlink-desktop`: deferred (the app is running).
+  - Size: about 1,280 authored changed lines in the engine commit and 2,000 in the desktop commit
+    (about 480 of them the new UI suite) plus this document; above the 400-line heuristic mostly
+    in tests; not split artificially.
+  - Commits: d15c36f `feat(engine): let the engineer limit and lock a musician's mix`; this commit
+    (`feat(desktop): keep engineer limits and locks per musician and edit them on the mix`).
+- [x] T5a-fix (review fixes for T5a, reviews `review-0ea360ebfcf62163` over 0408441..d15c36f and
+  `review-dc5567254620fe48` over d15c36f..bd0d75b). Route: inline writer of the delegated T5a
+  worker (bounded fixes in two engine files, three desktop files and the UI).
+  - R3-reused-row-inherits-previous-occupants-locks: a row reused by another musician (a different
+    client id, or none where there was one, or the other way round) gets that musician's kept
+    controls or the defaults (`replace_controls`), never the previous occupant's; the same musician
+    still keeps theirs. `Registration` gains `controls_changed`.
+  - R3-register-restore-not-announced: when a registration changes the controls the connection
+    emits `MixChanged{Engine}`, so the phone is sent `mix_state` with `engineer_limit_percent` and
+    `locked` right after it registers, before anything else it sends is handled, and the desktop
+    follows.
+  - R3-idle-controls-shadowed-by-phone-key: `set_engineer_controls` takes the row's `clientId`
+    (the window sends it; Tauri `client_id: Option<String>`); with no engine the edit builds on the
+    controls kept for the phone and is kept under `client:<id>`, dropping the address's (the key
+    the next engine resolves first, so nothing stands in for it); without one the address must
+    parse as a musician address and is kept under its canonical `address:` key. A running engine
+    still decides the key itself. The fake bridge does the same.
+  - R3-master-limit-change-wiring-untested: the master strip's wiring moved to
+    `lib/master-controls.js` (`wireMasterControls`, `showMasterValues`), tested with stand-in faders
+    on the real slider gesture: a finished limit gesture or key press sends one
+    `engineerLimitPercent` edit and moves send none, a re-render mid-drag does not move the thumb,
+    the level and cap go out as they move.
+  - RED: engine 2 of 272 failed (`a_different_phone_at_a_reused_address_gets_its_own_controls_or_none`:
+    the other phone's mix kept them; `a_registering_phone_is_told_the_engineers_controls_before_it_sends_a_mix`:
+    no `mix_state` came); desktop 2 of 113 (`idle_controls_for_a_known_phone_are_kept_under_its_client_id_for_the_next_start`,
+    `an_idle_edit_must_name_a_musician_address`); UI 7 of 265 against a stub wiring module and the
+    old API (4 master wiring tests, the fake idle test, the API and app argument expectations).
+  - GREEN: `cargo test -p personal-monitoring` 272 passed (2 new), control tests 37 passed in three
+    runs; `cargo test -p mixlink-desktop` 113 passed (2 new); UI 265 passed (5 new, 2 expectations
+    updated); `cargo fmt` clean; clippy: no new warnings. Preview (`?fake#/mix`): PageDown x3 on
+    LIMIT gives "limit 70%" and "at most 70%", no console errors. `cargo build -p mixlink-desktop`:
+    deferred (the app is running).
+  - Size: about 175 authored changed lines in the engine commit and 330 in the desktop commit plus
+    this document.
+  - Commits: 57dd604 `fix(engine): give a new phone at a reused address its own engineer
+    controls`; this commit (`fix(desktop): keep idle engineer edits under the musician's strongest
+    key`).
+- [ ] T5b (engineer limit and locks, Android): read `engineer_limit_percent` and `locked` from
+  `mix_ack` and `mix_state` (lenient: absent on older servers means no limit, nothing locked);
+  show the engineer's limit apart from the phone's level cap and say the lower one wins; show a
+  locked channel's controls disabled with the state in words (a pair as one strip); keep sending
+  whole mixes (the server keeps the locked values and the ack carries them). Route: delegated
+  writer.
 - [ ] T6 (presets, copy and mirror): presets in the session; apply to a musician; copy; one-way
   mirror with the follower locked; the Mix screen's controls. Route: delegated writer.
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
@@ -624,6 +758,29 @@ slice. Push and PRs are the user's decision.
   - SUGGESTION R3-screen-pending-hold-wiring-untested: add a screen-level test with a deferred
     fake answer proving a clicked Shown or group box stays as clicked until the answer.
 
+- T5a done (engineer limit and locks in the engine, the protocol and the desktop); see its entry
+  for evidence. Follow-ups: a musician whose mix is created afresh (an engine restart, or back after
+  the 15 s grace period) gets their locks and limit at once, but the locked channels start at the
+  neutral values and the phone cannot set them, so until T7's session load restores saved mixes the
+  engineer sets them again on the desk; an earlier build that saves the session drops the
+  `engineer` field; controls set with no engine are not paired (the engine locks a pair whole when
+  it applies them); the engine keeps the controls by IP for configured targets, so a phone
+  that registers at such an IP without controls of its own inherits them, as it inherits the
+  address's label. Rebuild the desktop app and check T5a live (deferred while the app ran).
+- T5a was reviewed in two parts because the whole slice exceeded the reviewer's lens context
+  budget: the engine part 0408441..d15c36f (`review-0ea360ebfcf62163`) and the desktop part
+  d15c36f..bd0d75b (`review-dc5567254620fe48`), both approved and acknowledged; next review base
+  bd0d75b. Their findings (R3-reused-row-inherits-previous-occupants-locks,
+  R3-register-restore-not-announced, R3-idle-controls-shadowed-by-phone-key,
+  R3-master-limit-change-wiring-untested) are fixed by T5a-fix.
+
+- Review `review-722972c3e330801a` over bd0d75b..c248e3b (T5a-fix) approved and acknowledged; next
+  review base c248e3b. One SUGGESTION folded into T6 (which extends the fake bridge):
+  R3-fake-idle-validation-diverges — with no engine the fake accepts addresses the desktop's
+  `SocketAddr` parse rejects (a host name and port) and keys an empty-string `clientId` under the
+  address while the desktop keys `Some("")` under the phone; make the desktop treat an empty
+  client id as none and make the fake validate exactly like the desktop.
+
 ## Next step
 
-T5 (engineer limit and locks).
+T5b (engineer limit and locks on Android).

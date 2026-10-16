@@ -722,6 +722,16 @@ async fn handle_control_connection(
                                 &*config_state,
                             );
                             let address = registration.address;
+                            // The registration put the engineer's limit and locks for this musician
+                            // in force (or took a previous occupant's away): announced as a change
+                            // through the engine, so this phone is sent its mix with them right
+                            // away, and the desktop follows.
+                            if registration.controls_changed {
+                                events.emit(EngineEvent::MixChanged {
+                                    address,
+                                    origin: MixOrigin::Engine,
+                                });
+                            }
                             // A new session starts with no link report: the one left by an earlier
                             // session describes a link that is gone, and kept it would turn stale
                             // while this session is connected and read as a lost link. A rename on
@@ -769,6 +779,9 @@ async fn handle_control_connection(
                     //
                     // A `mix` may carry the phone's number for it; the answer, ack or error, carries
                     // it back. Any other type that ends up here is never numbered.
+                    //
+                    // The phone's mix never changes what the engineer locked, and the ack carries
+                    // the values kept (see [MixState::apply_from_phone]).
                     let seq = if message_type == "mix" {
                         mix_sequence(&text)
                     } else {
@@ -778,7 +791,7 @@ async fn handle_control_connection(
                         None => mix_error(NO_TARGET_ERROR.to_owned(), seq)?,
                         Some(mix_state) => {
                             match parse_mix_update(&text)
-                                .and_then(|update| mix_state.apply(&update))
+                                .and_then(|update| mix_state.apply_from_phone(&update))
                             {
                                 Ok(values) => {
                                     events.emit(EngineEvent::MixChanged {
@@ -1521,6 +1534,206 @@ mod tests {
             .expect("the mix is acknowledged");
         let levels: Vec<u8> = serde_json::from_value(ack["channels"].clone()).unwrap();
         assert_eq!(&levels[..4], &[100, 40, 40, 100]);
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A phone's whole mix that moves CH 1 and CH 2, sets its own cap to 90 and, as a phone echoing
+    /// a report might, carries the engineer's fields too.
+    const WHOLE_MIX_MOVING_CH1: &str = r#"{"type":"mix","seq":5,"volume_percent":80,"max_level_percent":90,"muted":false,"channels":[20,40,100,100],"pans":[50,50,0,100],"mutes":[true,false,false,false],"solos":[false,false,false,false],"group_levels":[],"engineer_limit_percent":100,"locked":[false,false,false,false]}"#;
+
+    /// The ack to [WHOLE_MIX_MOVING_CH1] when CH 1 is locked at its defaults and the limit is 60:
+    /// CH 1 as it was, everything else the phone's, and the report shows the limit and the lock.
+    fn assert_locked_ch1_held(ack: &serde_json::Value) {
+        assert_eq!(ack["seq"], 5, "it answers the phone's mix");
+        let levels: Vec<u8> = serde_json::from_value(ack["channels"].clone()).unwrap();
+        assert_eq!(
+            &levels[..2],
+            &[100, 40],
+            "CH 1 is unchanged, CH 2 is the phone's"
+        );
+        assert_eq!(ack["pans"][0], 0, "CH 1's pan is kept");
+        assert_eq!(ack["mutes"][0], false, "CH 1's mute is kept");
+        assert_eq!(
+            ack["max_level_percent"], 90,
+            "the phone's own cap is its own"
+        );
+        assert_eq!(ack["volume_percent"], 80);
+        assert_eq!(
+            ack["engineer_limit_percent"], 60,
+            "the limit is not the phone's"
+        );
+        assert_eq!(ack["locked"][0], true);
+        assert_eq!(ack["locked"][1], false);
+    }
+
+    /// The engineer locks CH 1 and limits a connected musician to 60: the phone is told at once,
+    /// and its next whole mix, which moves CH 1 and its own cap, is acknowledged with CH 1 as it
+    /// was. The mixer's ceiling is the lower of the two caps.
+    #[tokio::test]
+    async fn a_locked_channel_and_the_engineers_limit_hold_against_the_phones_whole_mix() {
+        let config = live_config(&[], 4);
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &config.snapshot().layout,
+            )
+            .expect("registry should build"),
+        );
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_on(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+            Arc::clone(&config),
+        );
+        let mut client = connect_client(address).await;
+
+        crate::engine::set_target_controls(
+            &targets,
+            &events,
+            "127.0.0.1:50000",
+            &crate::mix::EngineerUpdate {
+                limit_percent: Some(60),
+                locked: Some(vec![true]),
+            },
+        )
+        .expect("the controls are valid");
+
+        let pushed = read_message_of_type(&mut client, "mix_state")
+            .await
+            .expect("the phone is told");
+        assert_eq!(pushed["engineer_limit_percent"], 60);
+        assert_eq!(pushed["locked"][0], true);
+        assert_eq!(pushed["locked"][1], false);
+
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+        assert_locked_ch1_held(&ack);
+
+        let mix = targets
+            .mix_state("127.0.0.1".parse().expect("loopback IP"))
+            .expect("configured target")
+            .current();
+        assert_eq!(
+            crate::mix::mix_channels(&[i16::MAX, 0, 0, 0], 4, mix),
+            [19_660, 0],
+            "CH 1 at full scale is held at 60 % of it, below the phone's 90"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A phone the engineer locked and limited drops off the network for longer than the grace
+    /// period and comes back from another IP: its row was removed, and the new one gets the
+    /// controls kept for its client id when it registers, before its first mix is handled.
+    #[tokio::test]
+    async fn a_phone_back_from_a_new_ip_after_the_grace_period_meets_the_engineers_controls() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let events = EventBus::default();
+        targets.register(
+            "192.168.1.10".parse().expect("old IP"),
+            50000,
+            Some("Ana".to_owned()),
+            Some(RETURNING_PHONE_ID),
+            &GroupLayout::default(),
+        );
+        let (key, _) = crate::engine::set_target_controls(
+            &targets,
+            &events,
+            "192.168.1.10:50000",
+            &crate::mix::EngineerUpdate {
+                limit_percent: Some(60),
+                locked: Some(vec![true]),
+            },
+        )
+        .expect("the controls are valid");
+        assert_eq!(
+            key,
+            crate::targets::MusicianKey::Client(RETURNING_PHONE_ID.to_owned())
+        );
+        let gone = Instant::now();
+        targets.mark_disconnected("192.168.1.10".parse().expect("old IP"), gone);
+        assert_eq!(
+            targets
+                .sweep_expired(gone + crate::targets::REGISTRATION_GRACE_PERIOD * 2)
+                .len(),
+            1,
+            "the row is removed"
+        );
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events,
+        );
+
+        let mut client = connect_client(address).await;
+        send_text(
+            &mut client,
+            &format!(
+                r#"{{"type":"register","name":"Ana","udp_port":50123,"client_id":"{RETURNING_PHONE_ID}"}}"#
+            ),
+        )
+        .await;
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+
+        assert_locked_ch1_held(&ack);
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A phone whose controls the desk kept registers: it is sent its mix with the limit and the
+    /// locks right after the registration, before it sends anything else, and its whole mix is then
+    /// held to them.
+    #[tokio::test]
+    async fn a_registering_phone_is_told_the_engineers_controls_before_it_sends_a_mix() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let events = EventBus::default();
+        crate::engine::keep_target_controls(
+            &targets,
+            &events,
+            &crate::targets::MusicianKey::Client(RETURNING_PHONE_ID.to_owned()),
+            crate::mix::EngineerControls {
+                limit_percent: 60,
+                locked: 0b1,
+            },
+        );
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events,
+        );
+        let mut client = connect_client(address).await;
+
+        send_text(
+            &mut client,
+            &format!(
+                r#"{{"type":"register","name":"Ana","udp_port":50123,"client_id":"{RETURNING_PHONE_ID}"}}"#
+            ),
+        )
+        .await;
+        let told = read_message_of_type(&mut client, "mix_state")
+            .await
+            .expect("the phone is told after it registers");
+
+        assert_eq!(told["engineer_limit_percent"], 60);
+        assert_eq!(told["locked"][0], true);
+        assert_eq!(told["locked"][1], false);
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+        assert_locked_ch1_held(&ack);
 
         stop_server(address, &stopped, server).await;
     }

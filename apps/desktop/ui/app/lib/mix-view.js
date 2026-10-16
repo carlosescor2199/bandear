@@ -3,7 +3,13 @@
 
 import { balanceToPans, channelLabel, pairUnits, pansToBalance } from "./channels.js";
 import { musicianByAddress, musiciansNeedingAttention, viewMix } from "./console-state.js";
-import { formatCaptureFormat, formatPercent, linkState, musicianLabel } from "./format.js";
+import {
+  formatCaptureFormat,
+  formatEngineerControlsSet,
+  formatPercent,
+  linkState,
+  musicianLabel,
+} from "./format.js";
 import { editKey } from "./mix.js";
 import { groupTone } from "./values.js";
 
@@ -62,11 +68,14 @@ function groupsWithTones(state) {
 /**
  * One strip per shown input of the device, left to right, for `address`'s mix as it shows (with
  * local edits): `{ index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone,
- * readout }`. A hidden input has no strip. A stereo pair is one strip (`stereo`, `sides` both
- * inputs, `index` the first): its level, mute and solo are its first side's, which the engine keeps
- * equal to the second's, and its pan is the balance the two pans make (pansToBalance). A strip is
- * called by its input's name, or its number when it has none (channelLabel). A muted strip reads
- * "muted", not only a duller fill. A channel's group is found by id: two groups may share a name.
+ * readout, locked, lockText }`. A hidden input has no strip. A stereo pair is one strip (`stereo`,
+ * `sides` both inputs, `index` the first): its level, mute and solo are its first side's, which the
+ * engine keeps equal to the second's, and its pan is the balance the two pans make
+ * (pansToBalance). A strip is called by its input's name, or its number when it has none
+ * (channelLabel). A muted strip reads "muted", not only a duller fill. A channel's group is found
+ * by id: two groups may share a name. `locked` says the engineer locked the strip for this
+ * musician's phone (a pair when either side is; the engine locks both), and `lockText` says so in
+ * words ("Locked" or "Unlocked").
  */
 export function channelStrips(state, address) {
   const mix = viewMix(state, address);
@@ -86,6 +95,7 @@ export function channelStrips(state, address) {
         : null;
       const stereo = second !== undefined;
       const muted = mix.channelMuted[index];
+      const locked = sides.some((side) => Boolean(mix.lockedChannels?.[side]));
       return {
         index,
         sides,
@@ -101,14 +111,17 @@ export function channelStrips(state, address) {
         solo: mix.channelSolo[index],
         tone: muted ? "muted" : "default",
         readout: muted ? "muted" : formatPercent(mix.channelGains[index]),
+        locked,
+        lockText: locked ? "Locked" : "Unlocked",
       };
     });
 }
 
 /**
  * The local edits a move on a channel strip makes, keyed as editKey does: a stereo strip's level,
- * mute or solo goes to both of its inputs, and its balance becomes both pans (balanceToPans); a
- * strip of one input edits that input. `strip` is `{ sides, stereo }` from channelStrips.
+ * mute, solo or lock goes to both of its inputs, and its balance becomes both pans
+ * (balanceToPans); a strip of one input edits that input. `strip` is `{ sides, stereo }` from
+ * channelStrips.
  */
 export function channelEdits({ sides, stereo }, field, value) {
   if (field === "pans" && stereo) {
@@ -143,18 +156,29 @@ export function groupStrips(state, address) {
   }));
 }
 
-/** The musician's master: `{ volume, cap, muted, readout }`, or null without that musician. */
+/**
+ * The musician's master: `{ volume, cap, limit, muted, readout, ceilingNote }`, or null without
+ * that musician. `cap` is the phone's own level cap (the musician sets it too), `limit` the
+ * engineer's limit for this musician (only the desk sets it); the engine plays at most the lower
+ * of the two, which `ceilingNote` says in words.
+ */
 export function masterStrip(state, address) {
   const mix = viewMix(state, address);
   if (!mix) {
     return null;
   }
   const level = mix.muted ? "muted" : formatPercent(mix.volumePercent);
+  const limit = mix.engineerLimitPercent ?? 100;
+  const ceiling = Math.min(mix.maxLevelPercent, limit);
   return {
     volume: mix.volumePercent,
     cap: mix.maxLevelPercent,
+    limit,
     muted: mix.muted,
-    readout: `${level}${SEPARATOR}cap ${formatPercent(mix.maxLevelPercent)}`,
+    readout: [level, `cap ${formatPercent(mix.maxLevelPercent)}`, `limit ${formatPercent(limit)}`].join(
+      SEPARATOR,
+    ),
+    ceilingNote: `The lower of the phone's cap and your limit wins: at most ${formatPercent(ceiling)}.`,
   };
 }
 
@@ -192,8 +216,9 @@ const COMMAND_FAILURES = Object.freeze({
 
 /**
  * The sentences above the strips: `departed` when the open musician was removed and another one
- * opened, `error` when a change was refused, `command` when the engine refused a stop or a device
- * switch while it went on running. Each is null when there is nothing to say.
+ * opened, `error` when a change was refused, `controls` when the engineer's limit and locks did not
+ * both apply and save (formatEngineerControlsSet), `command` when the engine refused a stop or a
+ * device switch while it went on running. Each is null when there is nothing to say.
  */
 export function mixMessages(state) {
   let command = null;
@@ -216,5 +241,11 @@ function musicianMessages(state) {
     const name = musician ? musicianLabel(musician) : state.mixError.address;
     error = `A change to ${name}'s mix was not applied: ${state.mixError.message}.`;
   }
-  return { departed, error };
+  let controls = null;
+  if (state.controlsNotice) {
+    const { address, outcome } = state.controlsNotice;
+    const musician = musicianByAddress(state, address);
+    controls = formatEngineerControlsSet(outcome, musician ? musicianLabel(musician) : address);
+  }
+  return { departed, error, controls };
 }

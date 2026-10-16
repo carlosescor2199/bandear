@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::mix::{MixUpdate, MixValues};
+use crate::mix::{MixUpdate, MixValues, MAX_MIX_CHANNELS};
 
 const PACKET_MAGIC: [u8; 4] = *b"PMON";
 const PACKET_VERSION: u8 = 1;
@@ -226,6 +226,21 @@ pub(crate) fn control_message_type(json: &str) -> Result<String, String> {
 /// the phone its mix was changed from elsewhere (the desktop, or another socket of the same
 /// musician). A phone that predates `mix_state` ignores it, as it ignores any unknown type. An ack
 /// carries the number of the `mix` it answers when that mix had one; a push never does.
+///
+/// Two fields report what the engineer set for the musician, which a phone shows but can never
+/// send back (a `mix` that carries them changes nothing):
+///
+/// - `engineer_limit_percent` (0-100, 100 when the engineer set no limit) caps what the musician
+///   hears, apart from the phone's own `max_level_percent`: the server applies the lower of the
+///   two, so a phone should show both and say that the lower one wins.
+/// - `locked` holds one entry per channel, index-aligned with `channels` (32 entries): `true` for a
+///   channel the engineer locked. The server keeps a locked channel's level, pan, mute and solo
+///   whatever the phone's `mix` says, while the rest of that mix applies, and the ack carries the
+///   kept values; a phone should show a locked channel's controls disabled. Both sides of a stereo
+///   pair are always locked together.
+///
+/// Both were added after the rest: a phone that predates them ignores them, as it ignores every
+/// field it does not know.
 #[derive(Serialize)]
 struct MixReport {
     #[serde(rename = "type")]
@@ -240,6 +255,8 @@ struct MixReport {
     mutes: Vec<bool>,
     solos: Vec<bool>,
     group_levels: Vec<u8>,
+    engineer_limit_percent: u8,
+    locked: Vec<bool>,
 }
 
 /// One group as it appears in the `config` message: its stable id, a name and 0-based source
@@ -349,6 +366,10 @@ fn mix_report(
         mutes: values.channel_muted.to_vec(),
         solos: values.channel_solo.to_vec(),
         group_levels: values.group_levels.to_vec(),
+        engineer_limit_percent: values.engineer.limit_percent,
+        locked: (0..MAX_MIX_CHANNELS)
+            .map(|channel| values.engineer.is_locked(channel))
+            .collect(),
     })
 }
 
@@ -373,7 +394,7 @@ fn error_reply(message: String, seq: Option<u64>) -> Result<String, serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mix::{MixValues, MAX_GROUPS, MAX_MIX_CHANNELS};
+    use crate::mix::{EngineerControls, MixValues, MAX_GROUPS, MAX_MIX_CHANNELS};
 
     #[test]
     fn serializes_documented_header_and_pcm_payload() {
@@ -489,6 +510,61 @@ mod tests {
         assert_eq!(json["solos"][3], true);
         assert_eq!(json["group_levels"].as_array().unwrap().len(), MAX_GROUPS);
         assert_eq!(json["group_levels"][0], 70);
+    }
+
+    #[test]
+    fn mix_reports_carry_the_engineers_limit_and_locked_channels() {
+        let values = MixValues {
+            engineer: EngineerControls {
+                limit_percent: 60,
+                locked: 0b101,
+            },
+            ..MixValues::default()
+        };
+
+        for message in [
+            mix_ack(values, Some(3)).unwrap(),
+            mix_state_message(values).unwrap(),
+        ] {
+            let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+            assert_eq!(json["engineer_limit_percent"], 60, "{message}");
+            assert_eq!(
+                json["max_level_percent"], 100,
+                "the phone's own cap is apart"
+            );
+            let locked: Vec<bool> = serde_json::from_value(json["locked"].clone()).unwrap();
+            assert_eq!(locked.len(), MAX_MIX_CHANNELS, "one entry per channel");
+            assert_eq!(&locked[..4], &[true, false, true, false]);
+        }
+        let open: serde_json::Value =
+            serde_json::from_str(&mix_state_message(MixValues::default()).unwrap()).unwrap();
+        assert_eq!(open["engineer_limit_percent"], 100);
+        assert_eq!(open["locked"][0], false);
+    }
+
+    /// The engineer's controls are not phone input: a `mix` that carries them, as a phone echoing a
+    /// report might, changes neither.
+    #[test]
+    fn a_phones_mix_cannot_set_the_engineers_controls() {
+        let current = MixValues {
+            engineer: EngineerControls {
+                limit_percent: 60,
+                locked: 0b1,
+            },
+            ..MixValues::default()
+        };
+
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":100,"muted":false,"engineer_limit_percent":100,"locked":[false]}"#,
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(values.engineer, current.engineer);
+        assert_eq!(
+            values.max_level_percent, 100,
+            "the phone's own cap is its own"
+        );
     }
 
     #[test]

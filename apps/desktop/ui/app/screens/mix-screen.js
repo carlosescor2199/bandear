@@ -45,6 +45,7 @@ const LAYOUT = `
   <div class="mix-tabs"><ml-musician-tabs></ml-musician-tabs></div>
   <p class="mix-message" role="status" data-departed hidden></p>
   <p class="mix-message mix-message--error" role="alert" data-error hidden></p>
+  <p class="mix-message" role="status" data-controls hidden></p>
   <p class="mix-message mix-message--error" role="alert" data-command hidden></p>
   <div class="mix-notice" data-notice hidden>
     <h2 data-notice-title></h2>
@@ -100,6 +101,7 @@ export function mountMixScreen(main, app) {
     tabs: screen.querySelector("ml-musician-tabs"),
     departed: screen.querySelector("[data-departed]"),
     error: screen.querySelector("[data-error]"),
+    controls: screen.querySelector("[data-controls]"),
     command: screen.querySelector("[data-command]"),
     notice: screen.querySelector("[data-notice]"),
     noticeTitle: screen.querySelector("[data-notice-title]"),
@@ -138,7 +140,7 @@ export function mountMixScreen(main, app) {
     parts.tabs.data = musicianTabs(state);
 
     const messages = mixMessages(state);
-    for (const name of ["departed", "error", "command"]) {
+    for (const name of ["departed", "error", "controls", "command"]) {
       parts[name].hidden = messages[name] === null;
       parts[name].textContent = messages[name] ?? "";
     }
@@ -197,7 +199,8 @@ export function mountMixScreen(main, app) {
   }
 
   // A channel strip's move goes to every input it stands for (both sides of a pair, its balance
-  // as two pans); a group or master move is one edit.
+  // as two pans, its lock); a group or master move is one edit. The console app sends the
+  // engineer's limit and locks with their own command (see console-app.js).
   function onMixEdit(event) {
     const address = app.store.getState().selected;
     const { field, index, sides, value } = event.detail;

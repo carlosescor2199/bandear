@@ -209,6 +209,30 @@ class ControlChannelTest {
     }
 
     @Test
+    fun aReportSaysWhoseMixThePhoneFollows() {
+        val socket = openChannel()
+
+        socket.receive(JSONObject(mixReport("mix_state")).put("following", "Ana").toString())
+        socket.receive(JSONObject(mixReport("mix_ack", seq = 12)).put("following", JSONObject.NULL).toString())
+
+        assertEquals(listOf("Ana", null), events.engineer.map { it.following })
+    }
+
+    @Test
+    fun followingIsReadLeniently() {
+        fun read(value: Any?) = parseEngineerControls(JSONObject(mixReport("mix_state")).put("following", value)).following
+
+        // Absent (an older server), null, or anything but a string follows nobody.
+        assertEquals(null, read(null))
+        assertEquals(null, read(JSONObject.NULL))
+        assertEquals(null, read(7))
+        assertEquals(null, read(JSONArray("""["Ana"]""")))
+        assertEquals("Ana", read("Ana"))
+        // A leader the desk has no name for is still followed.
+        assertEquals("", read(""))
+    }
+
+    @Test
     fun aMixNeverCarriesTheEngineersControls() {
         val socket = openChannel()
         socket.receive(withEngineer(mixReport("mix_state"), 60, JSONArray(List(32) { it == 0 })))
@@ -218,6 +242,7 @@ class ControlChannelTest {
         val mix = socket.sentOfType("mix").last()
         assertFalse(mix.has("engineer_limit_percent"))
         assertFalse(mix.has("locked"))
+        assertFalse(mix.has("following"))
     }
 
     // The numbers that match the server's answers to the phone's mixes.

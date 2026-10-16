@@ -516,16 +516,18 @@ internal fun parseMixReport(message: JSONObject): MixReport = MixReport(
 )
 
 /**
- * Reads the engineer's controls from a mix report: `engineer_limit_percent` (held to 0-100) and
- * `locked` (one entry per channel, `true` for a locked one). Both are lenient: a server that predates
- * them sends neither, which reads as no limit and nothing locked; a limit that is not a number is no
- * limit, a short list leaves the rest open, and an entry that is not a boolean is open.
+ * Reads the engineer's controls from a mix report: `engineer_limit_percent` (held to 0-100), `locked`
+ * (one entry per channel, `true` for a locked one) and `following` (the name of the musician whose
+ * mix this one follows). All are lenient: a server that predates them sends none, which reads as no
+ * limit, nothing locked and following nobody; a limit that is not a number is no limit, a short list
+ * leaves the rest open, an entry that is not a boolean is open, and a `following` that is null or not
+ * a string follows nobody (an empty name is still followed).
  */
 internal fun parseEngineerControls(message: JSONObject): EngineerControls {
     val limit = (message.opt("engineer_limit_percent") as? Number)?.toInt()?.coerceIn(0, 100) ?: 100
     val locked = message.optJSONArray("locked")
     val lockedChannels = if (locked == null) emptySet() else (0 until locked.length()).filter { locked.opt(it) == true }.toSet()
-    return EngineerControls(limit, lockedChannels)
+    return EngineerControls(limit, lockedChannels, following = message.opt("following") as? String)
 }
 
 /** The number of the phone's mix this answer names (`seq`), or null when it names none. */

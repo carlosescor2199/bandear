@@ -954,6 +954,47 @@ class MonitorReducerTest {
         assertEquals(EngineerControls(), ended.after(SessionStarted(server, DEFAULT_AUDIO_PORT)).mix.engineer)
     }
 
+    // Following another musician's mix (a mirror the engineer set).
+
+    /** The engineer's controls with the musician following [name]'s mix, or nobody's. */
+    private fun following(name: String?, locked: Set<Int> = emptySet()) = EngineerControls(lockedChannels = locked, following = name)
+
+    /** The leader's whole mix, every channel at [level]. */
+    private fun leadersMix(level: Int) = neutralMix.copy(channelGains = IntArray(32) { level })
+
+    @Test
+    fun aReportedFollowingHoldsAndAnOlderServerFollowsNobody() {
+        val state = lockedBy(following("Ana"))
+
+        assertEquals("Ana", state.mix.following)
+        assertNull(connectedWith(3).after(MixPushed(serverMix)).mix.following)
+        assertNull(state.after(MixPushed(neutralMix, following(null))).mix.following)
+    }
+
+    @Test
+    fun followingThatStartsWhileAMixIsOutstandingHoldsAtOnceAndTheAnswerBringsTheLeadersMix() {
+        val outstanding = connectedWith(3).sent(ChannelLevelChanged(0, 40))
+
+        val pushed = outstanding.after(MixPushed(leadersMix(60), following("Ana")))
+
+        // The push is overtaken by the phone's mix still on its way; whom it follows holds at once.
+        assertEquals("Ana", pushed.mix.following)
+        assertEquals(listOf(40, 100, 100), pushed.mix.levels)
+
+        val answered = pushed.after(MixAnswered(1, leadersMix(60), following("Ana")))
+
+        assertEquals(listOf(60, 60, 60), answered.mix.levels)
+        assertTrue(answered.mixSync.settled)
+    }
+
+    @Test
+    fun aNewSessionFollowsNobodyUntilItsServerSays() {
+        val ended = lockedBy(following("Ana")).after(SessionEnded)
+
+        assertEquals("Ana", ended.mix.following)
+        assertNull(ended.after(SessionStarted(server, DEFAULT_AUDIO_PORT)).mix.following)
+    }
+
     // Saved mixes.
 
     @Test

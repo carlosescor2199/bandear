@@ -137,14 +137,23 @@ data class MixUiState(
      */
     val channelDetails: List<ChannelInfo>? = null,
     /**
-     * What the engineer set for this musician (a limit and locked channels), as the server last
-     * reported it in this session. Never sent and never saved: the server alone sets it.
+     * What the engineer set for this musician (a limit, locked channels and whose mix it follows),
+     * as the server last reported it in this session. Never sent and never saved: the server alone
+     * sets it.
      */
     val engineer: EngineerControls = EngineerControls(),
 ) {
     /** The loudest the musician hears: the lower of the phone's [levelCap] and the engineer's limit. */
     val effectiveCap: Int
         get() = minOf(levelCap, engineer.limitPercent)
+
+    /**
+     * The musician whose mix this one follows, as the server last reported it, or null: while it is
+     * set the channels and groups are the leader's, and only the master, level cap and mute are the
+     * phone's.
+     */
+    val following: String?
+        get() = engineer.following
 
     /** True when the engineer locked [channel]'s strip: a pair is locked when either side is. */
     fun stripLocked(channel: Int): Boolean = stripSides(channel).any(engineer::isLocked)

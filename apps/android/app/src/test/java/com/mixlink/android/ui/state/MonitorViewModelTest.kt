@@ -557,6 +557,26 @@ class MonitorViewModelTest {
         assertEquals(listOf(100, 100, 100), lastMix().ints("channels"))
     }
 
+    /** A `mix_state` with every channel at [level] that names whose mix the phone follows. */
+    private fun followingState(name: String?, level: Int = 100): String =
+        JSONObject(mixState(levels = List(32) { level })).put("following", name ?: JSONObject.NULL).toString()
+
+    @Test
+    fun aPushedMixSaysWhoseMixThePhoneFollowsAndWhenItStops() {
+        connected(channels = 3)
+        answerMixes()
+
+        socket().receive(followingState("Ana", level = 70))
+
+        assertEquals("Ana", state.mix.following)
+        assertEquals(listOf(70, 70, 70), state.mix.levels)
+
+        socket().receive(followingState(null, level = 70))
+
+        assertNull(state.mix.following)
+        assertEquals(listOf(70, 70, 70), state.mix.levels)
+    }
+
     @Test
     fun masterChangesReachTheAudioThreadAndTheServer() {
         connected()

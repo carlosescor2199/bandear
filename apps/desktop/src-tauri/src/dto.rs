@@ -109,6 +109,29 @@ pub struct ChannelsSetDto {
     pub save_error: Option<String>,
 }
 
+/// The audio input the window ran an engine with, to keep for the next start (see
+/// [crate::commands::set_audio_settings]): `{ host, device, bufferFrames, asioDriver }`.
+///
+/// `host` is `auto`, `wasapi` or `asio`; `device` the input picked under `auto` or `wasapi` (none
+/// for the system's default); `asioDriver` the ASIO driver the engineer picked, required with
+/// `asio`. A field the desk does not know is rejected, as for [ChannelRequest].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioSettingsRequest {
+    #[serde(default = "auto_host")]
+    pub host: String,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub buffer_frames: Option<u32>,
+    #[serde(default)]
+    pub asio_driver: Option<String>,
+}
+
+fn auto_host() -> String {
+    "auto".to_owned()
+}
+
 /// The capture format the engine selected, in plain values a webview can render.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

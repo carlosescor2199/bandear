@@ -23,7 +23,13 @@
 //!   "groups": [
 //!     { "id": "g3f9a0c1d2e4b5a6", "name": "Drums", "channels": [1, 2, 3] }
 //!   ],
-//!   "presets": []
+//!   "presets": [],
+//!   "audio": {
+//!     "host": "wasapi",
+//!     "device": "INPUT 1/2 (Volt 4)",
+//!     "bufferFrames": 256,
+//!     "asioDriver": null
+//!   }
 //! }
 //! ```
 //!
@@ -54,6 +60,15 @@
 //!   and kept whatever it read, so its shape does not change the version.
 //! - `presets` is reserved for the engineer's mix presets. Until the code that owns it lands it is
 //!   written back exactly as it was read.
+//! - `audio` is the audio input the desk last ran with: the driver (`auto`, `wasapi` or `asio`), the
+//!   input device picked under `auto` or `wasapi` (null for the system's default input), the buffer
+//!   in frames (null for the engine's default) and the ASIO driver the engineer picked. The window
+//!   reads it when it opens ([crate::commands::audio_settings]) and builds every start from it, and
+//!   keeps a new choice only once an engine started or switched with it
+//!   ([crate::commands::set_audio_settings]). It is absent until then. Any field may be left out; a
+//!   choice that names ASIO without a driver is read as written, and the window treats it as no ASIO
+//!   (ASIO only ever starts on a driver the engineer picked). The section was added within version
+//!   1: an earlier build reads the file and drops it when it saves.
 //!
 //! Every save writes a temporary file next to the session, flushes it to disk and renames it over
 //! the session, so a crash or a full disk leaves the old file or the new one, never a torn one, and
@@ -105,6 +120,9 @@ pub struct Session {
     /// Reserved for the engineer's mix presets; kept as read.
     #[serde(default)]
     pub presets: Vec<Value>,
+    /// The audio input the desk last ran with; absent until an engine ran with a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<SessionAudio>,
 }
 
 impl Default for Session {
@@ -115,8 +133,31 @@ impl Default for Session {
             channels: Vec::new(),
             groups: Vec::new(),
             presets: Vec::new(),
+            audio: None,
         }
     }
+}
+
+/// The audio input the desk last ran with, as the window starts every engine from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAudio {
+    /// The driver: `auto` (the system's own), `wasapi` or `asio`.
+    #[serde(default = "auto_host")]
+    pub host: String,
+    /// The input device picked under `auto` or `wasapi`; `None` for the system's default input.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// The capture buffer in frames; `None` for the engine's default.
+    #[serde(default)]
+    pub buffer_frames: Option<u32>,
+    /// The ASIO driver the engineer picked, the only one an ASIO start ever opens.
+    #[serde(default)]
+    pub asio_driver: Option<String>,
+}
+
+fn auto_host() -> String {
+    "auto".to_owned()
 }
 
 /// What the desk keeps about one musician.
@@ -404,6 +445,27 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The audio input the desk last ran with, or `None` when none was kept.
+    pub fn audio(&self) -> Option<SessionAudio> {
+        self.lock().session.audio.clone()
+    }
+
+    /// Keeps the audio input the desk runs with. The file is written before success is reported; a
+    /// save that fails, or is refused over a session this build must not replace, changes nothing.
+    pub fn set_audio(&self, audio: SessionAudio) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            audio: Some(audio),
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     // The session is only replaced after a successful write, so even a poisoned lock guards a
     // session that matches the file; the desk keeps working rather than panicking.
     fn lock(&self) -> MutexGuard<'_, Loaded> {
@@ -490,12 +552,14 @@ fn parse(bytes: &[u8]) -> Parsed {
     let groups = take_section(&mut fields, "groups", &mut damaged);
     let channels = take_section(&mut fields, "channels", &mut damaged);
     let presets = take_section(&mut fields, "presets", &mut damaged);
+    let audio = take_section(&mut fields, "audio", &mut damaged);
     match serde_json::from_value::<Session>(Value::Object(fields)) {
         Ok(session) => Parsed::Current(
             Session {
                 groups,
                 channels,
                 presets,
+                audio,
                 ..session
             },
             damaged,
@@ -1449,6 +1513,127 @@ mod tests {
 
         assert!(error.contains("newer"), "{error}");
         assert_eq!(session.engineer_for(None, ADDRESS), None);
+    }
+
+    fn volt_on_wasapi() -> SessionAudio {
+        SessionAudio {
+            host: "wasapi".to_owned(),
+            device: Some("INPUT 1/2 (Volt 4)".to_owned()),
+            buffer_frames: Some(256),
+            asio_driver: None,
+        }
+    }
+
+    #[test]
+    fn the_audio_input_survives_a_reload_beside_the_other_sections() {
+        let directory = test_directory("audio");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("saved");
+
+        session.set_audio(volt_on_wasapi()).expect("saved");
+
+        assert_eq!(session.audio(), Some(volt_on_wasapi()));
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(reloaded.audio(), Some(volt_on_wasapi()));
+        assert_eq!(reloaded.notice(), None);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)),
+            serde_json::json!({
+                "version": 1,
+                "musicians": { "address:192.168.1.30:50000": { "label": "Ana" } },
+                "channels": [],
+                "groups": [],
+                "presets": [],
+                "audio": {
+                    "host": "wasapi",
+                    "device": "INPUT 1/2 (Volt 4)",
+                    "bufferFrames": 256,
+                    "asioDriver": null
+                }
+            }),
+            "the same version 1 file: an earlier build reads it and drops the section it does not know"
+        );
+    }
+
+    #[test]
+    fn a_damaged_audio_section_is_set_aside_on_its_own_and_the_rest_is_kept() {
+        let directory = test_directory("audio-damaged");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "groups":[{"id":"kit","name":"Drums","channels":[1]}],
+                "audio":{"host":"asio","bufferFrames":"lots"}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(session.audio(), None, "the audio input starts unknown");
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(session.groups().len(), 1, "the readable sections are kept");
+        let aside = files_in(&directory)
+            .into_iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.audio-damaged-")))
+            .expect("the damaged section is kept for recovery");
+        assert_eq!(
+            read_json(&directory.join(aside)),
+            serde_json::json!({ "host": "asio", "bufferFrames": "lots" })
+        );
+        assert!(session.notice().expect("reported").contains("audio"));
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)).get("audio"),
+            None,
+            "the session is saved without it"
+        );
+    }
+
+    #[test]
+    fn an_audio_section_may_leave_out_what_it_does_not_choose() {
+        let directory = test_directory("audio-short");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"audio":{"host":"asio"}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.audio(),
+            Some(SessionAudio {
+                host: "asio".to_owned(),
+                device: None,
+                buffer_frames: None,
+                asio_driver: None,
+            }),
+            "read as written: the window treats ASIO without a driver as no ASIO"
+        );
+        assert_eq!(session.notice(), None);
+    }
+
+    #[test]
+    fn saving_the_audio_input_is_refused_over_a_newer_session_and_a_failed_save_changes_nothing() {
+        let newer_directory = test_directory("audio-newer");
+        fs::write(newer_directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let newer = SessionStore::open(&newer_directory);
+        assert!(newer
+            .set_audio(volt_on_wasapi())
+            .expect_err("refused")
+            .contains("newer"));
+        assert_eq!(newer.audio(), None);
+
+        let directory = test_directory("audio-failed-save");
+        let session = SessionStore::open(&directory);
+        session.set_audio(volt_on_wasapi()).expect("saved");
+        fs::create_dir(directory.join(format!("{SESSION_FILE}.tmp"))).expect("blocker");
+        let other = SessionAudio {
+            device: None,
+            ..volt_on_wasapi()
+        };
+        session
+            .set_audio(other)
+            .expect_err("the write cannot happen");
+        assert_eq!(session.audio(), Some(volt_on_wasapi()));
     }
 
     #[test]

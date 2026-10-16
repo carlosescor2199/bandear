@@ -6,6 +6,7 @@ import {
   renameChannel,
   renameGroup,
   setChannelKind,
+  setGroupMembers,
 } from "../app/lib/channels-view.js";
 import { createConsoleApp } from "../app/lib/console-app.js";
 import { musicianByAddress, pendingEdits, viewMix } from "../app/lib/console-state.js";
@@ -674,5 +675,42 @@ test("a channel edit says why when the whole table cannot be read, and sends not
     message: "The channel details were not changed: engine state lock was poisoned.",
   });
   assert.equal(commands(fake, "set_channels").length, 0);
+  app.dispose();
+});
+
+test("chained group edits keep every group's id and 1-based members, whatever the list came from", async () => {
+  const { fake, app } = await connected();
+  await app.editGroups((groups) => addGroup(groups));
+  const added = app.store.getState().engine.status.groups[2].id;
+  await app.stop();
+
+  // No engine now: both edits are built on the last answer's list.
+  await app.editGroups((groups) => setGroupMembers(groups, added, [4], true));
+  await app.editGroups((groups) => renameGroup(groups, "vocals", "Voices"));
+  assert.deepEqual(commands(fake, "set_groups").at(-1).args.groups, [
+    { id: "drums", name: "Drums", channels: [1, 2, 3] },
+    { id: "vocals", name: "Voices", channels: [5, 6] },
+    { id: added, name: "Group 3", channels: [4] },
+  ]);
+
+  await app.start();
+  assert.deepEqual(
+    app.store.getState().engine.status.groups.map(({ id, channels }) => [id, channels]),
+    [
+      ["drums", [0, 1, 2]],
+      ["vocals", [4, 5]],
+      [added, [3]],
+    ],
+    "the status numbers inputs from 0",
+  );
+  await app.editGroups((groups) => setGroupMembers(groups, "drums", [1], false));
+  assert.deepEqual(
+    commands(fake, "set_groups").at(-1).args.groups.map(({ id, channels }) => [id, channels]),
+    [
+      ["drums", [2, 3]],
+      ["vocals", [5, 6]],
+      [added, [4]],
+    ],
+  );
   app.dispose();
 });

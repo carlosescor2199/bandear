@@ -4,8 +4,8 @@
 // Property: `data` = { cards, canAdd }: cards from groupCards (channels-view.js); `canAdd` is false
 //   once the engine's 16 groups are there.
 // Events (bubbling, composed): `group-add` {} for New group, `group-rename` { id, name } when a
-//   name is committed, `group-member` { id, numbers, member } when an input (both sides of a pair)
-//   is put in or out, `group-delete` { id } when a deletion is confirmed.
+//   name is committed, `group-member` { id, key, numbers, member } when an input (both sides of a
+//   pair; `key` the choice's) is put in or out, `group-delete` { id } when a deletion is confirmed.
 //
 // A name commits on Enter or when its field loses focus; Escape puts the saved name back; a field
 // being typed in is never overwritten. Delete asks first: "Keep" takes Delete's place and the
@@ -410,6 +410,7 @@ class MlGroupCards extends HTMLElement {
           box.addEventListener("change", () => {
             emit(this, "group-member", {
               id: view.id,
+              key: choice.key,
               numbers: entry.numbers,
               member: box.checked,
             });

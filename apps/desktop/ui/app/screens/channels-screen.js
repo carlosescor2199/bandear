@@ -12,12 +12,17 @@ import {
   channelRows,
   deleteGroup,
   groupCards,
+  memberKey,
+  pendingToggles,
   renameChannel,
   renameGroup,
   setChannelHidden,
   setChannelKind,
   setChannelLink,
   setGroupMembers,
+  shownKey,
+  withPendingMembers,
+  withPendingShown,
 } from "../lib/channels-view.js";
 
 const LAYOUT = `
@@ -59,6 +64,8 @@ export function mountChannelsScreen(main, app) {
   };
   // The answer to the engineer's last edit: `{ ok, message }`, or null before the first.
   let lastResult = null;
+  // The Shown and group boxes clicked whose edits are not answered yet: they show as clicked.
+  const pending = pendingToggles();
 
   function render() {
     const state = app.store.getState();
@@ -70,8 +77,14 @@ export function mountChannelsScreen(main, app) {
     if (!known) {
       return;
     }
-    parts.table.data = { rows: channelRows(state), kinds: KIND_OPTIONS };
-    parts.groups.data = { cards: groupCards(state), canAdd: canAddGroup(state) };
+    parts.table.data = {
+      rows: withPendingShown(channelRows(state), pending),
+      kinds: KIND_OPTIONS,
+    };
+    parts.groups.data = {
+      cards: withPendingMembers(groupCards(state), pending),
+      canAdd: canAddGroup(state),
+    };
   }
 
   let frame = 0;
@@ -89,15 +102,23 @@ export function mountChannelsScreen(main, app) {
     return app.store.getState().engine.status?.sourceChannels ?? 0;
   }
 
-  // Sends one edit and shows its outcome at once; the store's new status follows on its own.
-  async function edit(send) {
-    lastResult = await send;
+  // Sends one edit and shows its outcome at once; the status it brings is in the store by then.
+  // A toggle's edit holds the box as clicked (`toggle`: `{ key, value }`) until it is answered.
+  async function edit(send, toggle = null) {
+    const token = toggle ? pending.hold(toggle.key, toggle.value) : null;
+    if (toggle) {
+      render();
+    }
+    lastResult = await send();
+    if (toggle) {
+      pending.release(toggle.key, token);
+    }
     render();
   }
 
-  function editChannels(change) {
+  function editChannels(change, toggle = null) {
     const count = inputs();
-    return edit(app.editChannels((table) => change(table, count)));
+    return edit(() => app.editChannels((table) => change(table, count)), toggle);
   }
 
   screen.addEventListener("channel-rename", ({ detail: { index, name } }) =>
@@ -110,17 +131,23 @@ export function mountChannelsScreen(main, app) {
     editChannels((table, count) => setChannelLink(table, index, linked, count)),
   );
   screen.addEventListener("channel-shown", ({ detail: { index, shown } }) =>
-    editChannels((table, count) => setChannelHidden(table, index, !shown, count)),
+    editChannels((table, count) => setChannelHidden(table, index, !shown, count), {
+      key: shownKey(index),
+      value: shown,
+    }),
   );
-  screen.addEventListener("group-add", () => edit(app.editGroups(addGroup)));
+  screen.addEventListener("group-add", () => edit(() => app.editGroups(addGroup)));
   screen.addEventListener("group-rename", ({ detail: { id, name } }) =>
-    edit(app.editGroups((groups) => renameGroup(groups, id, name))),
+    edit(() => app.editGroups((groups) => renameGroup(groups, id, name))),
   );
-  screen.addEventListener("group-member", ({ detail: { id, numbers, member } }) =>
-    edit(app.editGroups((groups) => setGroupMembers(groups, id, numbers, member))),
+  screen.addEventListener("group-member", ({ detail: { id, key, numbers, member } }) =>
+    edit(() => app.editGroups((groups) => setGroupMembers(groups, id, numbers, member)), {
+      key: memberKey(id, key),
+      value: member,
+    }),
   );
   screen.addEventListener("group-delete", ({ detail: { id } }) =>
-    edit(app.editGroups((groups) => deleteGroup(groups, id))),
+    edit(() => app.editGroups((groups) => deleteGroup(groups, id))),
   );
 
   const unsubscribe = app.store.subscribe(scheduleRender);

@@ -121,13 +121,23 @@ function detailOf(entry) {
   };
 }
 
-/** The groups a status shows, as the desk sends them (1-based channels); none without a status. */
-export function groupDefinitionsOf(status) {
-  return (status?.groups ?? []).map(({ id, name, channels }) => ({
+/**
+ * Groups as the desk sends them, `[{ id, name, channels }]` with 1-based channels, from groups
+ * whose channels count from `first`: 0 for a status's groups, 1 for the groups a `set_groups`
+ * answer carries. Every group edit is built on this, whichever list it starts from, and gets
+ * copies, never the source's own lists.
+ */
+export function groupDefinitions(groups, first) {
+  return groups.map(({ id, name, channels }) => ({
     id,
     name,
-    channels: channels.map((channel) => channel + 1),
+    channels: channels.map((channel) => channel - first + 1),
   }));
+}
+
+/** The groups a status shows, as the desk sends them (1-based channels); none without a status. */
+export function groupDefinitionsOf(status) {
+  return groupDefinitions(status?.groups ?? [], 0);
 }
 
 // A copy of `table` with at least `count` entries and room for input `index`.
@@ -289,6 +299,73 @@ export function groupCards(state) {
       members,
       count: `${members.length} ${members.length === 1 ? "channel" : "channels"}`,
       choices,
+    };
+  });
+}
+
+/** The key of input `index`'s Shown box among the pending toggles. */
+export function shownKey(index) {
+  return `shown:${index}`;
+}
+
+/** The key of group `id`'s box for the input choice `key` (see groupCards) among the toggles. */
+export function memberKey(id, key) {
+  return `member:${id}:${key}`;
+}
+
+/**
+ * The toggles the engineer changed whose edits are not answered yet, so a re-render shows what
+ * was clicked rather than the status it is about to replace (a box flipping back invites a second
+ * click, which would queue the opposite edit). `hold(key, value)` keeps a value and returns its
+ * token; `release(key, token)` forgets it once that edit is answered, unless a later click holds
+ * the key now; `get(key)` is the value held, or undefined.
+ */
+export function pendingToggles() {
+  const held = new Map();
+  let tokens = 0;
+  return {
+    hold(key, value) {
+      tokens += 1;
+      held.set(key, { value, token: tokens });
+      return tokens;
+    },
+    release(key, token) {
+      if (held.get(key)?.token === token) {
+        held.delete(key);
+      }
+    },
+    get(key) {
+      return held.get(key)?.value;
+    },
+  };
+}
+
+/**
+ * `rows` (channelRows) with the Shown boxes held in `pending` as the engineer set them; both rows
+ * of a pair follow a box held on either. Rows with nothing held are returned as they are.
+ */
+export function withPendingShown(rows, pending) {
+  return rows.map((row) => {
+    let shown = pending.get(shownKey(row.index));
+    if (shown === undefined && row.stereo.linked) {
+      shown = pending.get(shownKey(row.stereo.partner));
+    }
+    return shown === undefined ? row : { ...row, hidden: !shown };
+  });
+}
+
+/** `cards` (groupCards) with the input boxes held in `pending` as the engineer set them. */
+export function withPendingMembers(cards, pending) {
+  return cards.map((card) => {
+    const held = card.choices.map((choice) => pending.get(memberKey(card.id, choice.key)));
+    if (held.every((value) => value === undefined)) {
+      return card;
+    }
+    return {
+      ...card,
+      choices: card.choices.map((choice, position) =>
+        held[position] === undefined ? choice : { ...choice, checked: held[position] },
+      ),
     };
   });
 }

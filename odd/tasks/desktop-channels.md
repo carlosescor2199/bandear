@@ -488,8 +488,45 @@ slice. Push and PRs are the user's decision.
     (b) because the screen's two organisms and its pure logic carry their tests; not split
     artificially.
   - Commits: 3310343 `test(desktop): force the group edit interleaving and guard outcome
-    messages`; bba07a8 `feat(desktop-ui): add the Channels and groups screen`; this commit
+    messages`; bba07a8 `feat(desktop-ui): add the Channels and groups screen`; 5cabdf2
     (`feat(desktop-ui): show named, hidden and paired channels on the mix`).
+- [x] T4b (review fixes for T4, review `review-7abd4e4333f80dbb`). Route: inline writer of the
+  delegated T4 worker (bounded fixes across the engine, the desktop commands and the UI).
+  - Whole table (R3-first-channel-edit-from-device-fitted-status): a `channel_table` command
+    answers the whole table the desk keeps, `[{ name, kind, hidden, link }]` in channel order with
+    the details of inputs the device lacks: with an engine running its table
+    (`EngineHandle::channel_table`, the `requested_channels` last set, so a failed save does not
+    matter), else the session's with an unknown kind read as `other`. `bridge.channelTable()`;
+    every channel edit reads it afresh and sends it back whole (the window no longer keeps a
+    channel list, and `channelTableOf` is gone); the fake answers it as the desktop does;
+    `events.rs` no longer says a switch drops details.
+  - Group shape (R3-kept-groups-roundtrip-shape-unproved): `groupDefinitions(groups, first)` turns
+    a status's groups (inputs from 0) and an answer's (from 1) into copies of `{ id, name, channels }`
+    numbered from 1; the app keeps the last answer through it. A chained app test (add a group, then
+    with the engine stopped give it an input and rename another on the last answer's list, restart,
+    remove an input) asserts every id and 1-based member; the Rust test sends a `set_groups` answer
+    back as the next request and gets the same ids and inputs.
+  - Pending toggles (R3-checkbox-reverts-while-edit-in-flight): `pendingToggles()` holds a clicked
+    value under a token (`release` with an older token keeps a later click), and
+    `withPendingShown` (both rows of a pair follow) and `withPendingMembers` show the held values;
+    the screen holds the Shown and group member boxes as clicked until their edit is answered
+    (`group-member` events now carry the choice key).
+  - RED: (a) the engine test, against a body returning the fitted list, failed ("the inputs the
+    device lacks are in it": 2 entries instead of 4); the desktop tests failed to compile (no
+    `read_channel_table`); UI 3 of 234 failed (the first edit on the 2-input device sent 2 entries,
+    the unreadable-table refusal, the fake's `channel_table`). (b) against stubs UI 2 of 237 failed
+    (`groupDefinitions`, the pending toggles); the chained app test and the Rust round-trip test
+    passed at once: they pin shapes that already matched.
+  - GREEN: `cargo test -p personal-monitoring` 250 passed (1 new); `cargo test -p mixlink-desktop`
+    97 passed (3 new); UI 237 passed (6 new; one assertion on the removed `channelTableOf` dropped);
+    `cargo fmt` clean; clippy: no warnings in the desktop crate or the new engine code. Preview
+    (`?fake#/channels`): hiding an input and putting one in a group work as before, no console
+    errors (the fake answers at once, so the held boxes are proved by the pure test). `cargo build
+    -p mixlink-desktop`: deferred (the app is running).
+  - Size: about 320 authored changed lines in (a) and 300 in (b) plus this document.
+  - Commits: 56fdea7 `fix(desktop): edit the whole channel table, not the device's part`; this
+    commit (`fix(desktop-ui): keep group ids and members across chained edits and hold pending
+    toggles`).
 - [ ] T5 (engineer limit and locks): engine fields set only by the engineer path and enforced on
   phone writes; reported to the phone; Android shows the limit and locked controls; the desktop
   master strip and channel strips edit them. Route: delegated writer.
@@ -563,17 +600,19 @@ slice. Push and PRs are the user's decision.
 
 - T4 done (Channels and groups screen, Mix names and pairs, T2b suggestions); see its entry for
   evidence. Follow-ups: rebuild the desktop app and check T4 live (deferred while the app ran);
-  the window reads the channel details from the status, which lists only the device's inputs, so a
-  window that has not had an edit answered yet, on a device with fewer inputs than the session's
-  table, replaces the details of the missing inputs on its first channel edit (a whole-table read,
-  a status field or a command, would close it); the lists the window edits from are the last
-  answers', so T7's session load must reset them; index.html could link `channels-screen.css`
-  directly (it is imported by `shell.css`); pairing two inputs in different groups leaves the
-  second side in its own group (the strip and the card follow the first side), so linking could
-  offer to join them; a pending edit is dropped on a layout change, and a `set_mix` already in
-  flight with the old group positions can still land after the regroup (last writer wins, as for
-  phones); the fake bridge never reports a failed save, so the "not saved" wording is covered by
-  the format tests only; `events.rs` still says a switch "drops" details.
+  the group list the window edits from after an answer is that answer's, so T7's session load must
+  reset it (channel edits read the whole table afresh since T4b); index.html could link
+  `channels-screen.css` directly (it is imported by `shell.css`); pairing two inputs in different
+  groups leaves the second side in its own group (the strip and the card follow the first side),
+  so linking could offer to join them; a pending edit is dropped on a layout change, and a
+  `set_mix` already in flight with the old group positions can still land after the regroup (last
+  writer wins, as for phones); the fake bridge never reports a failed save, so the "not saved"
+  wording is covered by the format tests only. Resolved by T4b: a first channel edit built on the
+  status's part of the table (now `channel_table`), and the `events.rs` wording.
+- Review `review-7abd4e4333f80dbb` over 879dd8b..5cabdf2 (T4) approved and acknowledged; next
+  review base 5cabdf2. Its findings (R3-first-channel-edit-from-device-fitted-status,
+  R3-kept-groups-roundtrip-shape-unproved, R3-checkbox-reverts-while-edit-in-flight) are fixed by
+  T4b.
 
 ## Next step
 

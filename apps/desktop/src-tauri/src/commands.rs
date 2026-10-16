@@ -1750,4 +1750,55 @@ mod tests {
             Some(3)
         );
     }
+
+    /// The groups a `set_groups` answer carries are what the window sends back on its next edit:
+    /// the same ids (a new group's included) and the same 1-based inputs, so a chain of edits never
+    /// moves a member or loses a group's identity.
+    #[test]
+    fn a_group_answer_sent_back_as_the_next_request_keeps_its_ids_and_inputs() {
+        let session = SessionStore::open(&session_directory("groups-roundtrip"));
+        let engine = running(StandInEngine::default());
+        let first = edit_groups(
+            &engine,
+            &session,
+            vec![
+                request(Some("kit"), "Drums", &[1, 2, 3]),
+                request(None, "Vocals", &[5, 6]),
+            ],
+        )
+        .expect("the groups are taken");
+        let new_id = first.groups[1].id.clone();
+        assert!(!new_id.is_empty(), "a new group gets an id");
+
+        let answer = serde_json::to_value(&first).expect("serializes");
+        assert_eq!(
+            answer["groups"],
+            serde_json::json!([
+                { "id": "kit", "name": "Drums", "channels": [1, 2, 3] },
+                { "id": new_id, "name": "Vocals", "channels": [5, 6] },
+            ]),
+            "the inputs are numbered from 1, as the request numbered them"
+        );
+        let mut requests: Vec<GroupRequest> =
+            serde_json::from_value(answer["groups"].clone()).expect("an answer is a request");
+        requests[1].name = "Voices".to_owned();
+        let second = edit_groups(&engine, &session, requests).expect("the groups are taken");
+
+        assert_eq!(
+            second
+                .groups
+                .iter()
+                .map(|group| (group.id.clone(), group.name.clone(), group.channels.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("kit".to_owned(), "Drums".to_owned(), vec![1, 2, 3]),
+                (new_id, "Voices".to_owned(), vec![5, 6]),
+            ]
+        );
+        assert_eq!(
+            applied_names(&engine),
+            Some(vec!["Drums".to_owned(), "Voices".to_owned()])
+        );
+        assert_eq!(session.groups(), second.groups);
+    }
 }

@@ -8,14 +8,20 @@ import {
   channelRows,
   deleteGroup,
   groupCards,
+  groupDefinitions,
   groupDefinitionsOf,
   linkChoice,
+  memberKey,
+  pendingToggles,
   renameChannel,
   renameGroup,
   setChannelHidden,
   setChannelKind,
   setChannelLink,
   setGroupMembers,
+  shownKey,
+  withPendingMembers,
+  withPendingShown,
 } from "../app/lib/channels-view.js";
 import { actions, consoleReducer, initialState } from "../app/lib/console-state.js";
 import { sampleStatus } from "../app/lib/fake-bridge.js";
@@ -336,4 +342,61 @@ test("the units of a device's inputs: a pair of two shown or two hidden inputs, 
     ]),
     [[0, 1], [2], [3], [4]],
   );
+});
+
+test("groups become what the desk sends, 1-based, from a status's groups or an answer's", () => {
+  const status = sampleStatus();
+  const answer = [
+    { id: "drums", name: "Drums", channels: [1, 2, 3] },
+    { id: "g1", name: "Group 3", channels: [4] },
+  ];
+
+  assert.deepEqual(groupDefinitions(status.groups, 0), groupDefinitionsOf(status));
+  assert.deepEqual(groupDefinitions(status.groups, 0)[0], {
+    id: "drums",
+    name: "Drums",
+    channels: [1, 2, 3],
+  });
+  const kept = groupDefinitions(answer, 1);
+  assert.deepEqual(kept, answer, "an answer is already numbered from 1");
+  assert.notEqual(kept[0].channels, answer[0].channels, "a copy, never the answer's own lists");
+  assert.deepEqual(
+    groupDefinitions([{ id: "x", name: "X", channels: [1], invalid: true, extra: 1 }], 1),
+    [{ id: "x", name: "X", channels: [1] }],
+    "only what the desk takes",
+  );
+});
+
+test("a toggle the engineer changed shows their choice until its edit is answered", () => {
+  const status = statusWith([
+    detail("Kick", "drums"),
+    detail("Keys L", "keys", { link: true }),
+    detail("Keys R", "keys"),
+  ]);
+  const rows = channelRows(stateOf(status));
+  const pending = pendingToggles();
+
+  const first = pending.hold(shownKey(2), false);
+  assert.deepEqual(
+    withPendingShown(rows, pending).map((row) => row.hidden),
+    [false, true, true],
+    "a pair's two rows follow the box clicked on either",
+  );
+  const second = pending.hold(shownKey(2), true);
+  pending.release(shownKey(2), first);
+  assert.deepEqual(
+    withPendingShown(rows, pending).map((row) => row.hidden),
+    [false, false, false],
+    "the first edit's answer leaves the later click showing",
+  );
+  pending.release(shownKey(2), second);
+  assert.deepEqual(withPendingShown(rows, pending), rows, "answered: the status shows again");
+  assert.equal(pending.get(shownKey(2)), undefined);
+
+  const cards = groupCards(running);
+  pending.hold(memberKey("drums", "4"), true);
+  const shown = withPendingMembers(cards, pending);
+  assert.equal(shown[0].choices.find((choice) => choice.key === "4").checked, true);
+  assert.deepEqual(shown[1], cards[1], "other groups' boxes are left as the status has them");
+  assert.equal(cards[0].choices.find((choice) => choice.key === "4").checked, false);
 });

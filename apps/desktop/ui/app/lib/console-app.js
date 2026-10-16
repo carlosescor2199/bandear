@@ -35,7 +35,7 @@ import {
   musicianByAddress,
   pendingEdits,
 } from "./console-state.js";
-import { groupDefinitionsOf } from "./channels-view.js";
+import { groupDefinitions, groupDefinitionsOf } from "./channels-view.js";
 import { ASIO_NEEDS_DRIVER, audioChoice, startRequest } from "./engine-config.js";
 import { formatChannelsSet, formatGroupsSet, sentenceWithReason } from "./format.js";
 import { buildMixRequest } from "./mix.js";
@@ -336,8 +336,9 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       return keptGroups ?? (status ? groupDefinitionsOf(status) : null);
     },
     send: (groups) => api.setGroups(groups),
+    // An answer numbers inputs from 1, as the request did; a status from 0.
     answered: (outcome) => {
-      keptGroups = outcome.groups;
+      keptGroups = groupDefinitions(outcome.groups, 1);
     },
     format: formatGroupsSet,
     refused: "The groups were not changed",

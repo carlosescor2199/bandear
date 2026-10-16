@@ -9,7 +9,7 @@ pub mod dto;
 pub mod names;
 
 use commands::DesktopState;
-use dto::{EngineStatusDto, InputDeviceDto, StartRequest, StartSummary};
+use dto::{EngineStatusDto, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest, StartSummary};
 use names::MusicianNames;
 use tauri::{Manager, State};
 
@@ -62,6 +62,15 @@ async fn remove_target(state: State<'_, DesktopState>, address: String) -> Resul
 }
 
 #[tauri::command]
+async fn set_mix(
+    state: State<'_, DesktopState>,
+    address: String,
+    mix: MixUpdateRequest,
+) -> Result<MixDto, String> {
+    commands::set_mix(state.inner(), address, mix)
+}
+
+#[tauri::command]
 async fn set_musician_name(
     state: State<'_, DesktopState>,
     address: String,
@@ -90,6 +99,7 @@ pub fn run() {
             switch_device,
             add_target,
             remove_target,
+            set_mix,
             set_musician_name
         ])
         .run(tauri::generate_context!())

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::mix::{merge_flags, merge_levels, MixValues};
+use crate::mix::{MixUpdate, MixValues};
 
 const PACKET_MAGIC: [u8; 4] = *b"PMON";
 const PACKET_VERSION: u8 = 1;
@@ -32,11 +32,12 @@ pub(crate) struct MixCommand {
     pub(crate) group_levels: Option<Vec<i32>>,
 }
 
-/// Parses a `mix` control message and merges it into the client's current values.
+/// Parses a `mix` control message into the engine's partial update.
 ///
 /// Lives here rather than in `mix` so the mix module stays free of wire-format knowledge: this is
-/// the mapping between the two, and the dependency then only runs one way.
-pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixValues, String> {
+/// the mapping between the two, and the dependency then only runs one way. The master values are
+/// required on the wire, so they are always present; the lists stay absent when not sent.
+pub(crate) fn parse_mix_update(json: &str) -> Result<MixUpdate, String> {
     let command: MixCommand = serde_json::from_str(json).map_err(|error| error.to_string())?;
     if command.message_type != "mix" {
         return Err(format!(
@@ -45,33 +46,23 @@ pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixVal
         ));
     }
 
-    let channel_gains = merge_levels(
-        "channels",
-        command.channels.as_ref(),
-        &current.channel_gains,
-    )?;
-    let pans = merge_levels("pans", command.pans.as_ref(), &current.pans)?;
-    let channel_muted = merge_flags("mutes", command.mutes.as_ref(), &current.channel_muted)?;
-    let channel_solo = merge_flags("solos", command.solos.as_ref(), &current.channel_solo)?;
-    let group_levels = merge_levels(
-        "group_levels",
-        command.group_levels.as_ref(),
-        &current.group_levels,
-    )?;
-
-    Ok(MixValues {
-        channel_gains,
-        pans,
-        channel_muted,
-        channel_solo,
-        group_levels,
-        // Membership is server configuration, never client input: preserve whatever the source
-        // snapshot carried.
-        channel_group: current.channel_group,
-        volume_percent: command.volume_percent.clamp(0, 100) as u8,
-        max_level_percent: command.max_level_percent.clamp(0, 100) as u8,
-        muted: command.muted,
+    Ok(MixUpdate {
+        channel_gains: command.channels,
+        pans: command.pans,
+        channel_muted: command.mutes,
+        channel_solo: command.solos,
+        group_levels: command.group_levels,
+        volume_percent: Some(command.volume_percent),
+        max_level_percent: Some(command.max_level_percent),
+        muted: Some(command.muted),
     })
+}
+
+/// Parses a `mix` control message and merges it into `current`, the two steps a connection takes
+/// in one call, so the tests can pin the parse and the merge together.
+#[cfg(test)]
+pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixValues, String> {
+    parse_mix_update(json)?.merge_into(current)
 }
 
 /// The longest musician name the server keeps from a registration.
@@ -205,8 +196,13 @@ pub(crate) fn control_message_type(json: &str) -> Result<String, String> {
     Ok(envelope.message_type)
 }
 
+/// A whole mix as the server reports it to a phone, in the field names the `mix` command uses.
+///
+/// Two messages share this shape: `mix_ack` answers the phone's own `mix`, and `mix_state` tells
+/// the phone its mix was changed from elsewhere (the desktop, or another socket of the same
+/// musician). A phone that predates `mix_state` ignores it, as it ignores any unknown type.
 #[derive(Serialize)]
-struct MixAck {
+struct MixReport {
     #[serde(rename = "type")]
     message_type: &'static str,
     volume_percent: u8,
@@ -259,8 +255,18 @@ pub(crate) fn serialize_packet(packet: &AudioPacket) -> Vec<u8> {
 }
 
 pub(crate) fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&MixAck {
-        message_type: "mix_ack",
+    mix_report("mix_ack", values)
+}
+
+/// The `mix_state` message: the musician's whole current mix, pushed when it changed without the
+/// phone asking, so the phone's screen can follow without sending the change back.
+pub(crate) fn mix_state_message(values: MixValues) -> Result<String, serde_json::Error> {
+    mix_report("mix_state", values)
+}
+
+fn mix_report(message_type: &'static str, values: MixValues) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&MixReport {
+        message_type,
         volume_percent: values.volume_percent,
         max_level_percent: values.max_level_percent,
         muted: values.muted,
@@ -282,7 +288,7 @@ pub(crate) fn control_error(message: String) -> Result<String, serde_json::Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mix::MixValues;
+    use crate::mix::{MixValues, MAX_GROUPS, MAX_MIX_CHANNELS};
 
     #[test]
     fn serializes_documented_header_and_pcm_payload() {
@@ -327,6 +333,54 @@ mod tests {
         let ack = mix_ack(values).unwrap();
 
         assert!(ack.contains(r#""group_levels":[80,"#));
+    }
+
+    #[test]
+    fn mix_state_carries_the_full_mix_under_its_own_type() {
+        let mut values = MixValues {
+            volume_percent: 42,
+            max_level_percent: 90,
+            muted: true,
+            ..MixValues::default()
+        };
+        values.channel_gains[1] = 30;
+        values.pans[0] = 50;
+        values.channel_muted[2] = true;
+        values.channel_solo[3] = true;
+        values.group_levels[0] = 70;
+
+        let json: serde_json::Value =
+            serde_json::from_str(&mix_state_message(values).unwrap()).unwrap();
+
+        assert_eq!(json["type"], "mix_state");
+        assert_eq!(json["volume_percent"], 42);
+        assert_eq!(json["max_level_percent"], 90);
+        assert_eq!(json["muted"], true);
+        assert_eq!(json["channels"].as_array().unwrap().len(), MAX_MIX_CHANNELS);
+        assert_eq!(json["channels"][1], 30);
+        assert_eq!(json["pans"][0], 50);
+        assert_eq!(json["pans"][1], 100);
+        assert_eq!(json["mutes"][2], true);
+        assert_eq!(json["solos"][3], true);
+        assert_eq!(json["group_levels"].as_array().unwrap().len(), MAX_GROUPS);
+        assert_eq!(json["group_levels"][0], 70);
+    }
+
+    #[test]
+    fn a_mix_command_becomes_an_update_that_leaves_absent_lists_alone() {
+        let update = parse_mix_update(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"pans":[10]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(update.volume_percent, Some(80));
+        assert_eq!(update.max_level_percent, Some(90));
+        assert_eq!(update.muted, Some(false));
+        assert_eq!(update.pans, Some(vec![10]));
+        assert_eq!(update.channel_gains, None);
+        assert_eq!(update.channel_muted, None);
+        assert_eq!(update.channel_solo, None);
+        assert_eq!(update.group_levels, None);
     }
 
     #[test]

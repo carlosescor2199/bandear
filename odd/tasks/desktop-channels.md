@@ -1541,6 +1541,9 @@ slice. Push and PRs are the user's decision.
 - Review `review-4c6fd738e50cbb30` over 05f3a6a..44b5572 approved and acknowledged; next review
   base 44b5572. Its WARNING (R3-own-levels-stale-after-meanwhile-edit) is fixed by T7b-fix2.
 
+- Review `review-c0bc7cb0513ac7d0` over 44b5572..ff2b413 (T7b-fix2) approved with no findings and
+  acknowledged. Every commit of phase 2 is now reviewed (last reviewed boundary ff2b413).
+
 ## Next step
 
 Live test of phase 2, then PRs (stacked-to-main) on the user's approval.

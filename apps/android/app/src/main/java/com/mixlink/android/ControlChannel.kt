@@ -127,7 +127,7 @@ internal class ControlChannel(
             // that follows finds a target to join. A reconnect does exactly the same, so the server
             // gets this musician's name and current mix back.
             sendRegistration()
-            sendCurrentMix()
+            sendOpeningMix()
         }
 
         override fun onMessage(socket: ControlSocket, text: String) {
@@ -349,8 +349,26 @@ internal class ControlChannel(
         }
     }
 
-    fun sendCurrentMix() {
-        sendMixControl()
+    /**
+     * Sends the mix as it stands when the connection opens. It is read now, on the socket's thread,
+     * before any message of this connection is handled, and only sent on the control scheduler: the
+     * server's `config` arrives right after the open, and a mix read after it would carry the strips
+     * `config` made up (neutral, for channels the phone never had) over the server's own values.
+     *
+     * So on a session's first connect, when the phone has no channels yet, it sends none (nor any
+     * group level): the server keeps its channels and groups, and its answer, which arrives after
+     * `config`, gives the phone the mix the server holds. Only the master volume, the level cap and
+     * the mute, which are always the phone's own, are sent as they are. A reconnect reads the
+     * phone's own mix, which the server takes back as it was.
+     */
+    private fun sendOpeningMix() {
+        val message = outgoingMixMessage()
+        scheduler.execute {
+            val webSocket = controlWebSocket ?: return@execute
+            if (!webSocket.send(message) && running.get()) {
+                listener.onControlError("WebSocket rejected mix update")
+            }
+        }
     }
 
     /**
@@ -370,18 +388,23 @@ internal class ControlChannel(
     fun sendMixControl() {
         scheduler.execute {
             val webSocket = controlWebSocket ?: return@execute
-            // The number is read before the mix: a change numbers itself after it lands, so the mix
-            // read next is at least as new as the number, and an answer never vouches for a mix older
-            // than the one it names.
-            val sequence = mixSequence()
-            val stored = currentSnapshot()
-            // `More of me` is derived here, at send time, and never written back. The stored values
-            // stay exactly as the musician left them, so turning the control off re-sends them.
-            val outgoing = if (moreOfMeEnabled()) stored.moreOfMeFor(musicianChannels(), lockedChannels()) ?: stored else stored
-            if (!webSocket.send(buildMixMessage(outgoing, sequence)) && running.get()) {
+            if (!webSocket.send(outgoingMixMessage()) && running.get()) {
                 listener.onControlError("WebSocket rejected mix update")
             }
         }
+    }
+
+    /** The `mix` message for the phone's current mix, under the newest change's number. */
+    private fun outgoingMixMessage(): String {
+        // The number is read before the mix: a change numbers itself after it lands, so the mix read
+        // next is at least as new as the number, and an answer never vouches for a mix older than
+        // the one it names.
+        val sequence = mixSequence()
+        val stored = currentSnapshot()
+        // `More of me` is derived here, at send time, and never written back. The stored values stay
+        // exactly as the musician left them, so turning the control off re-sends them.
+        val outgoing = if (moreOfMeEnabled()) stored.moreOfMeFor(musicianChannels(), lockedChannels()) ?: stored else stored
+        return buildMixMessage(outgoing, sequence)
     }
 
     /**

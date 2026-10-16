@@ -557,6 +557,69 @@ class MonitorViewModelTest {
         assertEquals(listOf(100, 100, 100), lastMix().ints("channels"))
     }
 
+    /** A `mix_state` with every channel at [level] that names whose mix the phone follows. */
+    private fun followingState(name: String?, level: Int = 100): String =
+        JSONObject(mixState(levels = List(32) { level })).put("following", name ?: JSONObject.NULL).toString()
+
+    @Test
+    fun aPushedMixSaysWhoseMixThePhoneFollowsAndWhenItStops() {
+        connected(channels = 3)
+        answerMixes()
+
+        socket().receive(followingState("Ana", level = 70))
+
+        assertEquals("Ana", state.mix.following)
+        assertEquals(listOf(70, 70, 70), state.mix.levels)
+
+        socket().receive(followingState(null, level = 70))
+
+        assertNull(state.mix.following)
+        assertEquals(listOf(70, 70, 70), state.mix.levels)
+    }
+
+    @Test
+    fun whileFollowingOnlyTheMasterMovesAndTheAnswerBringsTheLeadersChannels() {
+        connected(channels = 3)
+        answerMixes()
+        socket().receive(followingState("Ana", level = 70))
+        val sent = socket().sentOfType("mix").size
+
+        viewModel.setChannelLevel(0, 40)
+        viewModel.setChannelMuted(1, true)
+
+        assertEquals(sent, socket().sentOfType("mix").size)
+
+        viewModel.setMasterVolume(50)
+
+        assertEquals(listOf(70, 70, 70), lastMix().ints("channels"))
+        assertEquals(50, lastMix().getInt("volume_percent"))
+
+        // The server keeps the leader's channels (moved on meanwhile) and the answer carries them.
+        val answer = JSONObject(followingState("Ana", level = 65))
+            .put("type", "mix_ack")
+            .put("seq", lastMix().getLong("seq"))
+            .put("volume_percent", 50)
+        socket().receive(answer.toString())
+
+        assertEquals(listOf(65, 65, 65), state.mix.levels)
+        assertEquals(50, state.mix.masterVolume)
+    }
+
+    @Test
+    fun recallingWhileFollowingSendsNothingAndSaysWhy() {
+        store.banks += MixBank("Verse", MixSnapshot(channelGains = intArrayOf(10, 20, 30)))
+        connected(channels = 3)
+        answerMixes()
+        socket().receive(followingState("Ana", level = 70))
+        val sent = socket().sentOfType("mix").size
+
+        viewModel.recallMix("Verse")
+
+        assertEquals(sent, socket().sentOfType("mix").size)
+        assertEquals("\"Verse\" was not recalled: your mix follows Ana's", state.savedMixes.notice)
+        assertEquals(listOf(70, 70, 70), state.mix.levels)
+    }
+
     @Test
     fun masterChangesReachTheAudioThreadAndTheServer() {
         connected()

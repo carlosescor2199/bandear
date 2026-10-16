@@ -14,14 +14,13 @@ fun sheetChannelFor(channels: List<ChannelUiState>, openChannel: Int?): ChannelU
 
 /**
  * What a screen reader calls a strip's label button, which opens that channel's sheet: the channel
- * by its name ("Channel 3" when it has none), for a stereo pair that it is one, and whether the
- * engineer locked it.
+ * by its name ("Channel 3" when it has none), for a stereo pair that it is one, whether the
+ * engineer locked it and whose mix it follows.
  */
-fun channelSettingsLabel(channel: ChannelUiState): String = buildString {
-    append(if (channel.label == channelName(channel.index)) "Channel ${channel.index + 1}" else channel.label)
-    if (channel.stereo) append(" stereo pair")
-    append(" settings")
-    if (channel.locked) append(", locked by the engineer")
+fun channelSettingsLabel(channel: ChannelUiState): String {
+    val name = if (channel.label == channelName(channel.index)) "Channel ${channel.index + 1}" else channel.label
+    val settings = if (channel.stereo) "$name stereo pair settings" else "$name settings"
+    return lockedLabel(settings, channel.locked, channel.following)
 }
 
 /**

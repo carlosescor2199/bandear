@@ -46,10 +46,17 @@ data class ChannelInfo(
  *
  * [limitPercent] caps what the musician hears, apart from the phone's own level cap: the server
  * plays at most the lower of the two. [lockedChannels] are the 0-based channels whose level, pan,
- * mute and solo the server keeps whatever the phone sends. The defaults (no limit, nothing locked)
- * are what an older server, which reports neither, means.
+ * mute and solo the server keeps whatever the phone sends. [following] is the name of the musician
+ * whose mix the engineer made this one follow (a mirror), or null: while it is set the server keeps
+ * every channel and group from the leader's mix, and only the phone's master volume, level cap and
+ * mute apply. The defaults (no limit, nothing locked, following nobody) are what an older server,
+ * which reports none of them, means.
  */
-data class EngineerControls(val limitPercent: Int = 100, val lockedChannels: Set<Int> = emptySet()) {
+data class EngineerControls(
+    val limitPercent: Int = 100,
+    val lockedChannels: Set<Int> = emptySet(),
+    val following: String? = null,
+) {
     /** True when the engineer set a limit below full scale. */
     val limited: Boolean
         get() = limitPercent < 100

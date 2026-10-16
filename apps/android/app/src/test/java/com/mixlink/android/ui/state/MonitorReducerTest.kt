@@ -954,6 +954,138 @@ class MonitorReducerTest {
         assertEquals(EngineerControls(), ended.after(SessionStarted(server, DEFAULT_AUDIO_PORT)).mix.engineer)
     }
 
+    // Following another musician's mix (a mirror the engineer set).
+
+    /** The engineer's controls with the musician following [name]'s mix, or nobody's. */
+    private fun following(name: String?, locked: Set<Int> = emptySet()) = EngineerControls(lockedChannels = locked, following = name)
+
+    /** The leader's whole mix, every channel at [level]. */
+    private fun leadersMix(level: Int) = neutralMix.copy(channelGains = IntArray(32) { level })
+
+    @Test
+    fun aReportedFollowingHoldsAndAnOlderServerFollowsNobody() {
+        val state = lockedBy(following("Ana"))
+
+        assertEquals("Ana", state.mix.following)
+        assertNull(connectedWith(3).after(MixPushed(serverMix)).mix.following)
+        assertNull(state.after(MixPushed(neutralMix, following(null))).mix.following)
+    }
+
+    @Test
+    fun followingThatStartsWhileAMixIsOutstandingHoldsAtOnceAndTheAnswerBringsTheLeadersMix() {
+        val outstanding = connectedWith(3).sent(ChannelLevelChanged(0, 40))
+
+        val pushed = outstanding.after(MixPushed(leadersMix(60), following("Ana")))
+
+        // The push is overtaken by the phone's mix still on its way; whom it follows holds at once.
+        assertEquals("Ana", pushed.mix.following)
+        assertEquals(listOf(40, 100, 100), pushed.mix.levels)
+
+        val answered = pushed.after(MixAnswered(1, leadersMix(60), following("Ana")))
+
+        assertEquals(listOf(60, 60, 60), answered.mix.levels)
+        assertTrue(answered.mixSync.settled)
+    }
+
+    @Test
+    fun whileFollowingChannelAndGroupEditsChangeNothing() {
+        val state = running().after(ConfigReceived(3, listOf(GroupInfo("Band", listOf(0, 1)))), MixPushed(neutralMix, following("Ana")))
+
+        val tried = state.after(
+            ChannelLevelChanged(0, 40),
+            ChannelPanChanged(1, 20),
+            ChannelMuteChanged(2, true),
+            ChannelSoloChanged(0, true),
+            GroupLevelChanged(0, 50),
+        )
+
+        assertEquals(state, tried)
+        assertEquals(listOf("Ana", "Ana", "Ana"), state.mix.channels.map { it.following })
+        assertEquals(listOf("Ana"), state.mix.groups.map { it.following })
+    }
+
+    @Test
+    fun whileFollowingTheMasterTheCapAndTheMuteAreStillTheMusicians() {
+        val state = lockedBy(following("Ana")).after(MasterVolumeChanged(70), LevelCapChanged(80), MasterMuteChanged(true))
+
+        assertEquals(70, state.mix.masterVolume)
+        assertEquals(80, state.mix.levelCap)
+        assertTrue(state.mix.masterMuted)
+    }
+
+    @Test
+    fun anEditAfterFollowingStartsWithAMixOutstandingChangesNothing() {
+        val pushed = connectedWith(3).sent(ChannelLevelChanged(0, 40)).after(MixPushed(leadersMix(60), following("Ana")))
+
+        assertEquals(pushed, pushed.after(ChannelLevelChanged(1, 20), ChannelMuteChanged(0, true)))
+    }
+
+    @Test
+    fun recallingASavedMixWhileFollowingIsRefusedAndSaysWhy() {
+        val state = lockedBy(following("Ana")).after(MixesLoaded(listOf("Verse")))
+
+        val refused = state.after(MixRecalled("Verse", MixSnapshot(channelGains = intArrayOf(10, 20, 30), volumePercent = 40)))
+
+        assertEquals(state.mix, refused.mix)
+        assertNull(refused.savedMixes.activeName)
+        assertEquals("\"Verse\" was not recalled: your mix follows Ana's", refused.savedMixes.notice)
+        // A leader with no name is still named in words.
+        val nameless = lockedBy(following("")).after(MixRecalled("Verse", MixSnapshot()))
+        assertEquals("\"Verse\" was not recalled: your mix follows another musician's", nameless.savedMixes.notice)
+    }
+
+    @Test
+    fun moreOfMeIsOffWhileFollowingAndSaysWhy() {
+        val on = connectedWith(3).after(MusicianChannelChosen(1), MoreOfMeToggled(true))
+
+        val followed = on.after(MixPushed(leadersMix(60), following("Ana")))
+
+        assertFalse(followed.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.FOLLOWING, followed.moreOfMe.notice)
+        assertEquals(listOf(60, 60, 60), followed.mix.levels)
+        // Turning it on is refused while it lasts; My channel can still be chosen.
+        val asked = followed.after(MoreOfMeToggled(true))
+        assertFalse(asked.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.FOLLOWING, asked.moreOfMe.notice)
+        assertEquals(2, asked.after(MusicianChannelChosen(2)).moreOfMe.musicianChannel)
+    }
+
+    @Test
+    fun whenFollowingStopsTheControlsAreTheMusiciansAgainAndTheMixStaysAsItWas() {
+        val followed = connectedWith(3, listOf(GroupInfo("Band", listOf(0)))).after(
+            MusicianChannelChosen(1),
+            MoreOfMeToggled(true),
+            MixPushed(leadersMix(60), following("Ana")),
+        )
+
+        val free = followed.after(MixPushed(leadersMix(60), following(null)))
+
+        assertNull(free.mix.following)
+        assertEquals(listOf(60, 60, 60), free.mix.levels)
+        assertNull(free.moreOfMe.notice)
+        assertFalse(free.moreOfMe.enabled)
+        assertEquals(listOf(30, 60, 60), free.after(ChannelLevelChanged(0, 30)).mix.levels)
+        assertEquals(listOf(50), free.after(GroupLevelChanged(0, 50)).mix.groupLevels)
+        assertTrue(free.after(MoreOfMeToggled(true)).moreOfMe.enabled)
+        assertEquals(listOf(null, null, null), free.mix.channels.map { it.following })
+    }
+
+    @Test
+    fun aLockedChannelOfAFollowerIsBothLockedAndFollowing() {
+        val strip = lockedBy(following("Ana", locked = setOf(1))).mix.channels[1]
+
+        assertTrue(strip.locked)
+        assertEquals("Ana", strip.following)
+    }
+
+    @Test
+    fun aNewSessionFollowsNobodyUntilItsServerSays() {
+        val ended = lockedBy(following("Ana")).after(SessionEnded)
+
+        assertEquals("Ana", ended.mix.following)
+        assertNull(ended.after(SessionStarted(server, DEFAULT_AUDIO_PORT)).mix.following)
+    }
+
     // Saved mixes.
 
     @Test

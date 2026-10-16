@@ -27,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -131,16 +132,19 @@ internal fun ChannelSheetContent(
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         SheetHeader(channel, mine)
-        // A locked channel's controls fade and take no input; the note says why in words.
-        val open = !channel.locked
-        if (channel.locked) LockedNote()
+        // A held channel's controls fade and take no input; the notes say why in words, both when
+        // the channel is locked and the mix follows another's.
+        val following = channel.following
+        val open = !channel.locked && following == null
+        if (following != null) HeldNote(LineIcons.Follow, followingTitle(following))
+        if (channel.locked) HeldNote(LineIcons.Lock, LOCKED_NOTE)
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             // A stereo pair's pan is its balance: the same control, written as both pans.
             ValueRow(title = panTitle(channel.stereo), value = panText(channel.pan), dim = false)
             PanControl(
                 pan = channel.pan,
                 onPanChange = onPan,
-                contentDescription = lockedLabel(channelPanDescription(channel.label, channel.stereo), channel.locked),
+                contentDescription = lockedLabel(channelPanDescription(channel.label, channel.stereo), channel.locked, following),
                 modifier = Modifier.fillMaxWidth(),
                 enabled = open,
             )
@@ -151,7 +155,7 @@ internal fun ChannelSheetContent(
                 value = channel.level,
                 onValueChange = onLevel,
                 accent = stripColor(stripFillFor(channel.muted, mine, moreOfMeOn)),
-                contentDescription = stripFaderDescription(channel.label, mine, channel.muted, channel.locked),
+                contentDescription = stripFaderDescription(channel.label, mine, channel.muted, channel.locked, following),
                 modifier = Modifier.fillMaxWidth(),
                 enabled = open,
             )
@@ -159,7 +163,7 @@ internal fun ChannelSheetContent(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             SheetToggleKey(
                 text = muteKeyText(channel.muted),
-                description = "Mute ${lockedLabel(channel.label, channel.locked)}",
+                description = "Mute ${lockedLabel(channel.label, channel.locked, following)}",
                 on = channel.muted,
                 onColor = colors.red,
                 onToggle = onMuted,
@@ -168,7 +172,7 @@ internal fun ChannelSheetContent(
             )
             SheetToggleKey(
                 text = soloKeyText(channel.soloed),
-                description = "Solo ${lockedLabel(channel.label, channel.locked)}",
+                description = "Solo ${lockedLabel(channel.label, channel.locked, following)}",
                 on = channel.soloed,
                 onColor = colors.accent,
                 onToggle = onSoloed,
@@ -244,13 +248,16 @@ private fun ValueRow(title: String, value: String, dim: Boolean) {
     }
 }
 
-/** The lock and "Locked by the engineer" over a locked channel's controls. */
+/**
+ * Why a channel's controls take no input, over them, as an [icon] and [text] in words ("Locked by
+ * the engineer", "Following Ana's mix").
+ */
 @Composable
-private fun LockedNote() {
+private fun HeldNote(icon: ImageVector, text: String) {
     val colors = MixLinkTheme.colors
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(LineIcons.Lock, contentDescription = null, tint = colors.text, modifier = Modifier.size(18.dp))
-        Text(LOCKED_NOTE, style = MaterialTheme.typography.labelLarge, color = colors.text)
+        Icon(icon, contentDescription = null, tint = colors.text, modifier = Modifier.size(18.dp))
+        Text(text, style = MaterialTheme.typography.labelLarge, color = colors.text)
     }
 }
 

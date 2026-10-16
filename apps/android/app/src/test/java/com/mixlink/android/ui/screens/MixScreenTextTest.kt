@@ -53,6 +53,30 @@ class MixScreenTextTest {
     }
 
     @Test
+    fun aFollowedMixIsNamedInWords() {
+        assertEquals("Following Ana's mix", followingTitle("Ana"))
+        assertEquals("Following another musician's mix", followingTitle(" "))
+        assertEquals(
+            "Your channels and groups follow that mix. Your master, level cap and mute are still yours.",
+            FOLLOWING_DETAIL,
+        )
+        assertEquals("Following", FOLLOWING_TAG)
+    }
+
+    @Test
+    fun aFollowersControlsSayWhoseMixTheyFollow() {
+        assertEquals("Vox level, following Ana's mix", stripFaderDescription("Vox", mine = false, muted = false, following = "Ana"))
+        assertEquals(
+            "Vox level, locked by the engineer, following Ana's mix",
+            stripFaderDescription("Vox", mine = false, muted = false, locked = true, following = "Ana"),
+        )
+        assertEquals("Vox, following Ana's mix", lockedLabel("Vox", locked = false, following = "Ana"))
+        assertEquals("Vox, locked by the engineer, following Ana's mix", lockedLabel("Vox", locked = true, following = "Ana"))
+        assertEquals("Band group level", groupFaderDescription("Band", following = null))
+        assertEquals("Band group level, following Ana's mix", groupFaderDescription("Band", following = "Ana"))
+    }
+
+    @Test
     fun theEngineersLimitIsShownApartFromTheCapWithWhatTheMusicianGets() {
         assertNull(engineerLimitText(cap = 90, limit = 100))
         assertEquals("Limited to 60% by the engineer · at most 60%", engineerLimitText(cap = 100, limit = 60))

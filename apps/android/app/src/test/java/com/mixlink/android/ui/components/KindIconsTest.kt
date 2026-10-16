@@ -25,6 +25,12 @@ class KindIconsTest {
     }
 
     @Test
+    fun theFollowMarkDrawsAnArrowToABar() {
+        assertEquals("Following", LineIcons.Follow.name)
+        assertEquals(3, LineIcons.Follow.root.size)
+    }
+
+    @Test
     fun theLockDrawsAPadlock() {
         assertEquals("Locked", LineIcons.Lock.name)
         assertEquals(2, LineIcons.Lock.root.size)

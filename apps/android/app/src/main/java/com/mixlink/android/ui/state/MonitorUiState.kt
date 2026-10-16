@@ -137,14 +137,23 @@ data class MixUiState(
      */
     val channelDetails: List<ChannelInfo>? = null,
     /**
-     * What the engineer set for this musician (a limit and locked channels), as the server last
-     * reported it in this session. Never sent and never saved: the server alone sets it.
+     * What the engineer set for this musician (a limit, locked channels and whose mix it follows),
+     * as the server last reported it in this session. Never sent and never saved: the server alone
+     * sets it.
      */
     val engineer: EngineerControls = EngineerControls(),
 ) {
     /** The loudest the musician hears: the lower of the phone's [levelCap] and the engineer's limit. */
     val effectiveCap: Int
         get() = minOf(levelCap, engineer.limitPercent)
+
+    /**
+     * The musician whose mix this one follows, as the server last reported it, or null: while it is
+     * set the channels and groups are the leader's, and only the master, level cap and mute are the
+     * phone's.
+     */
+    val following: String?
+        get() = engineer.following
 
     /** True when the engineer locked [channel]'s strip: a pair is locked when either side is. */
     fun stripLocked(channel: Int): Boolean = stripSides(channel).any(engineer::isLocked)
@@ -183,6 +192,7 @@ data class MixUiState(
                     } else {
                         strips.filter { strip -> strip.sides.any { it in group.channels } }.map { labelOf(it.first) }
                     },
+                    following = following,
                 )
             }
         }
@@ -215,6 +225,7 @@ data class MixUiState(
             kind = channelDetails?.let { it.getOrNull(index)?.kind ?: ChannelKind.OTHER },
             pairedWith = second,
             locked = strip.sides.any(engineer::isLocked),
+            following = following,
         )
     }
 
@@ -284,6 +295,11 @@ data class ChannelUiState(
      * and solo cannot be changed from the phone.
      */
     val locked: Boolean = false,
+    /**
+     * The musician whose mix this one follows, or null: while it is set the strip's level, pan,
+     * mute and solo are the leader's and cannot be changed from the phone.
+     */
+    val following: String? = null,
 ) {
     /** True when the strip is a stereo pair, whose pan is a balance. */
     val stereo: Boolean
@@ -303,6 +319,8 @@ data class GroupUiState(
     val channels: List<Int>,
     val level: Int,
     val members: List<String> = channels.map(::channelName),
+    /** The musician whose mix this one follows, or null: while it is set the level is the leader's. */
+    val following: String? = null,
 )
 
 /** A channel the musician can call theirs, by the 0-based channel its strip is known by. */
@@ -319,6 +337,9 @@ enum class MoreOfMeNotice(val message: String) {
 
     /** The engineer locked the musician's channel, so the phone cannot lift it. */
     CHANNEL_LOCKED("More of me is off: the engineer locked your channel"),
+
+    /** The musician's mix follows another's, whose channels the server keeps, so nothing is lifted. */
+    FOLLOWING("More of me is off while your mix follows another musician's"),
 }
 
 /**
@@ -392,3 +413,6 @@ data class DiagnosticsUiState(
 
 /** How a channel is named on its strip and in the More of me caption: "CH 1" for index 0. */
 fun channelName(index: Int): String = "CH ${index + 1}"
+
+/** The musician a mix follows, as the phone names them: [following] trimmed, or "another musician". */
+fun leaderName(following: String): String = following.trim().ifEmpty { "another musician" }

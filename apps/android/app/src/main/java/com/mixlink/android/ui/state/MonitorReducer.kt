@@ -131,11 +131,20 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
         savedMixes = state.savedMixes.copy(activeName = event.name, notice = "Saved \"${event.name}\"")
             .listing(event.names),
     )
-    is MixRecalled -> state.copy(
-        mix = state.mix.recalled(event.snapshot),
-        savedMixes = state.savedMixes.copy(activeName = event.name, notice = "Recalled \"${event.name}\"")
-            .listing(state.savedMixes.names),
-    )
+    // While the mix follows another's the server keeps every channel and group from it, so a saved
+    // mix is not recalled at all (not even its master), and the notice says why.
+    is MixRecalled -> when (val leader = state.mix.following) {
+        null -> state.copy(
+            mix = state.mix.recalled(event.snapshot),
+            savedMixes = state.savedMixes.copy(activeName = event.name, notice = "Recalled \"${event.name}\"")
+                .listing(state.savedMixes.names),
+        )
+        else -> state.copy(
+            savedMixes = state.savedMixes.copy(
+                notice = "\"${event.name}\" was not recalled: your mix follows ${leaderName(leader)}'s",
+            ),
+        )
+    }
     is MixMissing -> state.copy(
         savedMixes = state.savedMixes.copy(notice = "\"${event.name}\" is no longer saved").listing(event.names),
     )
@@ -227,7 +236,7 @@ private fun applyConfig(
         groupLevels = List(groups.size) { mix.groupLevels.getOrElse(it) { NEUTRAL } },
         channelDetails = details,
     )
-    return state.copy(mix = announced, moreOfMe = state.moreOfMe.fittedTo(announced).offIfLocked(announced))
+    return state.copy(mix = announced, moreOfMe = state.moreOfMe.fittedTo(announced).offIfHeld(announced))
 }
 
 /**
@@ -235,21 +244,29 @@ private fun applyConfig(
  * mix they came with is overtaken by a change of the phone's still on its way: the phone never sends
  * them, so nothing of its own can overtake them, and the server reports them in order. A report
  * belongs to a session, so a late one changes nothing once the session ended. More of me goes off
- * when the musician's channel is now locked.
+ * when the musician's channel is now locked or the mix now follows another; when following stops,
+ * its notice goes (More of me stays off until the musician turns it on).
  */
 private fun MonitorUiState.withEngineer(controls: EngineerControls): MonitorUiState {
     if (!connection.sessionRunning || mix.engineer == controls) return this
     val held = mix.copy(engineer = controls)
-    return copy(mix = held, moreOfMe = moreOfMe.offIfLocked(held))
+    val freed = mix.following != null && held.following == null && moreOfMe.notice == MoreOfMeNotice.FOLLOWING
+    return copy(mix = held, moreOfMe = (if (freed) moreOfMe.copy(notice = null) else moreOfMe).offIfHeld(held))
 }
 
 /**
- * More of me off, saying why, when it is on and the engineer locked the musician's channel: the
- * server keeps that channel as the engineer left it, so it cannot be lifted.
+ * More of me off, saying why, when it is on and the server would discard its lift: the mix follows
+ * another musician's (the server keeps every channel from it), or the engineer locked the musician's
+ * channel (the server keeps that channel as the engineer left it).
  */
-private fun MoreOfMeUiState.offIfLocked(mix: MixUiState): MoreOfMeUiState {
+private fun MoreOfMeUiState.offIfHeld(mix: MixUiState): MoreOfMeUiState {
     val channel = musicianChannel ?: return this
-    return if (enabled && mix.stripLocked(channel)) copy(enabled = false, notice = MoreOfMeNotice.CHANNEL_LOCKED) else this
+    return when {
+        !enabled -> this
+        mix.following != null -> copy(enabled = false, notice = MoreOfMeNotice.FOLLOWING)
+        mix.stripLocked(channel) -> copy(enabled = false, notice = MoreOfMeNotice.CHANNEL_LOCKED)
+        else -> this
+    }
 }
 
 /**
@@ -273,14 +290,15 @@ private fun MoreOfMeUiState.fittedTo(mix: MixUiState): MoreOfMeUiState {
 /**
  * Applies [change] to the mix when [channel] has an entry, with the channels the edit writes: both
  * sides when [channel]'s strip is a stereo pair, otherwise [channel] alone. Any other channel changes
- * nothing, and neither does a strip the engineer locked (a pair when either side is): the server
- * would keep its values anyway, so the phone's whole mix never carries a changed locked value.
+ * nothing, and neither does a strip the engineer locked (a pair when either side is) or any strip
+ * while the mix follows another's: the server would keep their values anyway, so the phone's whole
+ * mix never carries a changed value it keeps.
  */
 private inline fun MonitorUiState.withStrip(
     channel: Int,
     change: (mix: MixUiState, sides: List<Int>) -> MixUiState,
 ): MonitorUiState {
-    if (channel !in mix.levels.indices || mix.stripLocked(channel)) return this
+    if (channel !in mix.levels.indices || mix.following != null || mix.stripLocked(channel)) return this
     return copy(mix = change(mix, mix.stripSides(channel)))
 }
 
@@ -299,11 +317,12 @@ private fun List<Int>.panned(sides: List<Int>, pan: Int): List<Int> {
 
 /**
  * Sets one group's level. The levels list is rebuilt to one entry per announced group, the others
- * reading as they do on screen, exactly as the old group fader did.
+ * reading as they do on screen, exactly as the old group fader did. While the mix follows another's
+ * nothing changes: the server keeps every group level from the leader's mix.
  */
 private fun setGroupLevel(state: MonitorUiState, group: Int, level: Int): MonitorUiState {
     val mix = state.mix
-    if (group !in mix.groupDefinitions.indices) return state
+    if (group !in mix.groupDefinitions.indices || mix.following != null) return state
     val levels = List(mix.groupDefinitions.size) { index ->
         if (index == group) level else mix.groupLevels.getOrElse(index) { NEUTRAL }
     }
@@ -311,14 +330,15 @@ private fun setGroupLevel(state: MonitorUiState, group: Int, level: Int): Monito
 }
 
 /**
- * More of me turns on only with a channel to lift: asking without one, or while the engineer locked
- * it, leaves it off and says why.
+ * More of me turns on only with a channel to lift: asking without one, while the mix follows
+ * another's, or while the engineer locked the channel, leaves it off and says why.
  */
 private fun toggleMoreOfMe(state: MonitorUiState, on: Boolean): MoreOfMeUiState {
     val moreOfMe = state.moreOfMe
     val channel = moreOfMe.musicianChannel
     return when {
         on && channel == null -> moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.NEEDS_CHANNEL)
+        on && state.mix.following != null -> moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.FOLLOWING)
         on && state.mix.stripLocked(channel!!) -> moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.CHANNEL_LOCKED)
         else -> moreOfMe.copy(enabled = on, notice = null)
     }
@@ -336,7 +356,7 @@ private fun chooseMusicianChannel(state: MonitorUiState, channel: Int?): Monitor
     val next = if (channel == null && moreOfMe.enabled) {
         moreOfMe.copy(musicianChannel = null, enabled = false, notice = MoreOfMeNotice.NO_CHANNEL_SELECTED)
     } else {
-        moreOfMe.copy(musicianChannel = channel, notice = null).offIfLocked(state.mix)
+        moreOfMe.copy(musicianChannel = channel, notice = null).offIfHeld(state.mix)
     }
     return state.copy(moreOfMe = next)
 }

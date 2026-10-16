@@ -58,6 +58,7 @@ import com.mixlink.android.ui.state.ConnectionUiState
 import com.mixlink.android.ui.state.MixUiState
 import com.mixlink.android.ui.state.MonitorUiState
 import com.mixlink.android.ui.state.MoreOfMeUiState
+import com.mixlink.android.ui.theme.ColorToken
 import com.mixlink.android.ui.theme.MixLinkShapes
 import com.mixlink.android.ui.theme.MixLinkTheme
 import com.mixlink.android.ui.theme.MixLinkType
@@ -124,6 +125,18 @@ fun MixScreen(
                 title = banner.title,
                 detail = banner.detail,
                 busy = banner.busy,
+                modifier = Modifier
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .fillMaxWidth(),
+            )
+        }
+        // While the engineer has this mix follow another musician's, say whose, and what stays theirs.
+        val following = mix.following
+        if (following != null) {
+            StatusBanner(
+                token = ColorToken.BLUE,
+                title = followingTitle(following),
+                detail = FOLLOWING_DETAIL,
                 modifier = Modifier
                     .padding(horizontal = 16.dp, vertical = 4.dp)
                     .fillMaxWidth(),
@@ -443,6 +456,26 @@ private fun MixOlderServerPreview() = MixPreview(PreviewSamples.olderServer)
 )
 @Composable
 private fun MixEngineerControlsPreview() = MixPreview(PreviewSamples.engineerControls)
+
+@Preview(
+    name = "Mix · following Lead vocal's mix",
+    widthDp = PREVIEW_WIDTH_DP,
+    heightDp = PREVIEW_HEIGHT_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun MixFollowingPreview() = MixPreview(PreviewSamples.following)
+
+@Preview(
+    name = "Mix · following, groups",
+    widthDp = PREVIEW_WIDTH_DP,
+    heightDp = PREVIEW_HEIGHT_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun MixFollowingGroupsPreview() = MixPreview(PreviewSamples.following, initialView = MixView.GROUPS)
 
 @Preview(
     name = "Mix · no channel chosen",

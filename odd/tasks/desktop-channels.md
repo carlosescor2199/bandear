@@ -706,6 +706,66 @@ slice. Push and PRs are the user's decision.
     the second plus this document.
   - Commits: 2c01a83 `feat(android): read the engineer's limit and locks`; this commit
     (`feat(android): show locked channels and the engineer's limit`).
+- [x] T5c (the audio input the engineer chose is reopened and remembered; bug from the live test
+  on 2026-10-15): the engineer switched the input live under WASAPI to "INPUT 1/2 (Volt 4)" and a
+  later Start reopened the Windows default ("Varios micrófonos (Realtek)"). The live switch
+  (`switchDevice` in `console-app.js`) never recorded the device in the applied audio choices, so
+  the only start path (`startRequest`, phase 1's T7b) asked for none; and the choices lived only in
+  memory, lost when the app closed. Route: delegated writer (trigger: 2+ non-trivial files across
+  the desktop Rust and the UI).
+  - Choices: `{ host, device, bufferFrames, asioDriver }`: `device` is the input picked under auto
+    or WASAPI (null for the system's default), `asioDriver` the one picked under ASIO. A plain start
+    opens `rememberedDevice` (ASIO: the picked driver; else `device`). A successful live switch
+    records `device`; a restart on a named device (auto) records it too; a change of driver that
+    names no input starts on the new driver's default (`audioChoice`); a buffer restart still
+    reopens the running device. A refused switch or a failed start changes nothing.
+  - Session (`session.rs`): optional `audio` section `{ host, device, bufferFrames, asioDriver }`,
+    every field optional, read on its own (a damaged one is set aside as
+    `session.json.audio-damaged-<ms>`, the rest kept); version stays 1 (an earlier build drops it
+    when it saves). Exposed by a read command rather than the status, because the window needs it
+    before any engine runs: `audio_settings` (null before any) and `set_audio_settings` (kept only
+    while an engine runs, for a known driver, never ASIO without a picked driver; names trimmed; a
+    refusal or a failed save changes nothing). The fake bridge mirrors both (`savedAudio` option and
+    accessor) and now fails a start on an input it lacks, as the engine does (a part of the name, in
+    any case).
+  - Window: reads the choices once, before the automatic start (`restoredAudio`: none gives the
+    defaults; ASIO without a driver, from an older or odd file, is the system's own driver). They
+    are saved only once an engine started or switched with them (`applyAudio`, a live switch, or the
+    next start of a choice kept while nothing ran, `setAudio`); a failed save is said ("The audio
+    input runs but was not saved for the next start: ...") and tried again at the next start.
+  - Missing input: a plain start (Start, Try again, the automatic start, a start after a stop) that
+    fails while its input is no longer listed for its driver (matched as the engine matches)
+    starts on `fallbackAudio`: the same driver's default input, or the system's own driver when the
+    choice was ASIO, so never ASIO. It says "The saved input ... was not found, so the engine
+    started on the system's default input. The saved input is kept and tried again at the next
+    start." (Mix and Network screens, `role="status"`, for that run), saves nothing, and the next
+    start tries the saved input again. A failure while the input is listed is shown as before; a
+    default input that fails too is said with both. While a run is on the default input a buffer
+    change waits for the next start instead of restarting it.
+  - Network screen: the driver and buffer selects show the remembered choice; the device select
+    shows the running input, or with no engine the one the next start opens.
+  - RED: (a) Rust against stubs (`audio()` none, `set_audio` a no-op, `keep_audio_settings`
+    accepting anything and keeping nothing, `audio` not read on its own) 8 of 121 failed (4 session,
+    4 command; the damaged-section test lost the labels as the whole file was moved aside). (b) UI
+    against stub exports and the old controller 26 of 286 failed: the 21 new tests and 5
+    expectations that gained `device` or `audio` (the live-switch test: `audio.device` undefined and
+    the next start on the default). The test for a default input that fails too, added after that
+    run, failed with the old controller (10 of 287 then; the refused-switch test passed there as a
+    guard, since nothing was ever recorded).
+  - GREEN: `cargo test -p mixlink-desktop` 121 passed (8 new); UI 287 passed (22 new, 5
+    expectations updated); `cargo fmt` clean; clippy: no warnings in the desktop crate; `cargo build
+    -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok. Preview (`index.html?fake`):
+    WASAPI, a live switch to "Microphone (USB audio)" (confirmed), Stop and Start: the engine
+    reopened it, and the selects show WASAPI and that input.
+  - Follow-ups: live check with the Volt (switch, restart the app, then start with it unplugged); a
+    missing saved input is not offered in the device list; after an ASIO fallback the driver select
+    shows ASIO while the default input runs (the notice says why); a driver change drops the saved
+    input, as the old restart on the driver's default did.
+  - Size: about 450 authored changed lines in the desktop commit and 870 in the UI commit (about 460
+    of them tests) plus this document; above the 400-line heuristic mostly in tests; not split
+    artificially.
+  - Commits: 32b1eaf `feat(desktop): keep the audio input in the session for the next start`; this
+    commit (`fix(desktop-ui): reopen the input the engineer chose, also after a restart`).
 - [ ] T6 (presets, copy and mirror): presets in the session; apply to a musician; copy; one-way
   mirror with the follower locked; the Mix screen's controls. Route: delegated writer.
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to

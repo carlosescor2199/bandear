@@ -127,6 +127,60 @@ test("the engine API calls each command with the argument names the desktop comm
   ]);
 });
 
+test("the engine API reads and keeps the audio input with the argument names the desktop takes", async () => {
+  const bridge = recordingBridge();
+  const api = createEngineApi(bridge);
+  const volt = { host: "wasapi", device: "Volt 4", bufferFrames: 256, asioDriver: null };
+
+  await api.audioSettings();
+  await api.setAudioSettings(volt);
+
+  assert.deepEqual(bridge.calls, [
+    ["audio_settings", undefined],
+    ["set_audio_settings", { settings: volt }],
+  ]);
+});
+
+test("the fake keeps the audio input as the desktop's session does", async () => {
+  const volt = { host: "wasapi", device: "Volt 4", bufferFrames: 256, asioDriver: null };
+  const fake = createFakeBridge();
+  assert.equal(await fake.invoke("audio_settings"), null, "nothing kept yet");
+
+  await assert.rejects(fake.invoke("set_audio_settings", { settings: volt }), /not running/);
+  await fake.invoke("start_engine", { config: {} });
+  await assert.rejects(
+    fake.invoke("set_audio_settings", { settings: { ...volt, host: "asio", asioDriver: " " } }),
+    /ASIO/,
+  );
+  await assert.rejects(
+    fake.invoke("set_audio_settings", { settings: { ...volt, host: "kernel" } }),
+    /kernel/,
+  );
+  assert.equal(fake.savedAudio(), null, "nothing refused is kept");
+  assert.deepEqual(
+    await fake.invoke("set_audio_settings", { settings: { ...volt, host: "WASAPI", device: " Volt 4 " } }),
+    volt,
+  );
+  assert.deepEqual(await fake.invoke("audio_settings"), volt);
+  assert.deepEqual(fake.savedAudio(), volt);
+
+  const seeded = createFakeBridge({ savedAudio: volt });
+  assert.deepEqual(await seeded.invoke("audio_settings"), volt, "a session kept before");
+});
+
+test("the fake refuses a start on an input it does not have, as the engine does", async () => {
+  const fake = createFakeBridge();
+
+  await assert.rejects(
+    fake.invoke("start_engine", { config: { host: "wasapi", deviceFilter: "INPUT 1/2 (Volt 4)" } }),
+    /no input device name contains "input 1\/2 \(volt 4\)"/,
+  );
+  const summary = await fake.invoke("start_engine", {
+    config: { host: "wasapi", deviceFilter: "usb AUDIO" },
+  });
+  assert.equal(summary.deviceName, "Microphone (USB audio)", "a part of the name, in any case");
+});
+
 test("the engine API listens for the three engine events", async () => {
   const bridge = recordingBridge();
   const api = createEngineApi(bridge);

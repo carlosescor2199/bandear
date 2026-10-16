@@ -189,6 +189,25 @@ test("with no engine the device cannot be switched, and the numbers are blank", 
   );
 });
 
+test("the audio selects show the remembered choice, and the running device while one runs", () => {
+  const volt = { host: "wasapi", device: "Microphone (USB audio)", bufferFrames: 512 };
+  const idle = reduce([actions.audio(volt), actions.devices("wasapi", sampleDevices())]);
+
+  const view = audioSetupView(idle, NO_DRAFT);
+  assert.equal(view.host, "wasapi");
+  assert.equal(view.device, "Microphone (USB audio)", "the input the next start opens");
+  assert.equal(view.buffer, 512);
+
+  const asio = reduce([
+    actions.audio({ host: "asio", asioDriver: "Volt ASIO" }),
+    actions.devices("asio", [{ name: "Volt ASIO", channels: 0 }]),
+  ]);
+  assert.equal(audioSetupView(asio, NO_DRAFT).device, "Volt ASIO", "under ASIO, its driver");
+
+  const runningOnDefault = reduce([actions.audio(volt), actions.status(sampleStatus())]);
+  assert.equal(audioSetupView(runningOnDefault, NO_DRAFT).device, "Demo interface");
+});
+
 test("an address is checked before it is sent, with a sentence that says what is wrong", () => {
   assert.deepEqual(validateAddress(" 192.168.1.50 "), { ok: true, address: "192.168.1.50" });
   assert.deepEqual(validateAddress("192.168.1.50:50000"), {

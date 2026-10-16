@@ -16,7 +16,12 @@
 //   mixError   { address, message } of the last refused change, cleared by the next answer.
 //   controlsNotice { address, outcome }: the last `set_engineer_controls` answer for `address`
 //              when it did not both apply and save; cleared by its next full success.
-//   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
+//   audio      { host, device, bufferFrames, asioDriver }: the driver, input, buffer and picked ASIO
+//              driver the next start asks for (see engine-config.js); the desk's session keeps them.
+//   audioNotice { kind, message }: a word about the audio input for the current run: "fallback"
+//              when the input the choices name was missing and the engine started on the default
+//              input, "unsaved" when the choices run but the session could not keep them. A run's
+//              end clears it.
 //   connection { status, error }: "connecting", "ready" (the engine answered, or a status came)
 //              or "failed" with the reason the console cannot hear the engine.
 //   commandError { action, message }: a stop or a device switch the engine refused while its
@@ -58,6 +63,7 @@ export const initialState = Object.freeze({
   mixError: null,
   controlsNotice: null,
   audio: DEFAULT_AUDIO,
+  audioNotice: null,
   connection: Object.freeze({ status: "connecting", error: null }),
   commandError: null,
   devices: Object.freeze({ host: null, list: Object.freeze([]), error: null }),
@@ -94,8 +100,13 @@ export const actions = Object.freeze({
     sent,
     outcome,
   }),
-  /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
+  /**
+   * A change of the audio choices for the next start: the driver (`host`), the input (`device`),
+   * the buffer (`bufferFrames`) or the picked ASIO driver (`asioDriver`), see audioChoice.
+   */
   audio: (change) => ({ type: "audio", change }),
+  /** `{ kind, message }` about the audio input of the current run, or null to clear it. */
+  audioNotice: (notice) => ({ type: "audio-notice", notice }),
   /** The input devices listed for `host`, or the reason they could not be listed. */
   devices: (host, list, error = null) => ({ type: "devices", devices: { host, list, error } }),
   /**
@@ -276,6 +287,7 @@ function setPhase(state, { phase, error }) {
       mixError: null,
       controlsNotice: null,
       commandError: null,
+      audioNotice: null,
     };
   }
   return { ...state, engine: { ...state.engine, phase, error }, commandError: null };
@@ -406,6 +418,8 @@ export function consoleReducer(state, action) {
       return engineerAnswered(state, action);
     case "audio":
       return { ...state, audio: audioChoice(state.audio, action.change) };
+    case "audio-notice":
+      return { ...state, audioNotice: action.notice };
     case "command-failed":
       return commandFailed(state, action);
     case "command-done":

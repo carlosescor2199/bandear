@@ -97,6 +97,18 @@ export function createEngineApi(bridge) {
      */
     setEngineerControls: (address, controls, clientId = null) =>
       bridge.invoke("set_engineer_controls", { address, controls, clientId }),
+    /**
+     * The audio input the desk last ran with, `{ host, device, bufferFrames, asioDriver }`, or null
+     * before any was kept; read as kept (see restoredAudio in engine-config.js).
+     */
+    audioSettings: () => bridge.invoke("audio_settings"),
+    /**
+     * Keeps `settings`, `{ host, device, bufferFrames, asioDriver }`, for every later start, once
+     * the running engine started or switched with them. Resolves to them as kept. It rejects with no
+     * engine running, for an unknown driver and for ASIO without a picked driver, and nothing is
+     * kept.
+     */
+    setAudioSettings: (settings) => bridge.invoke("set_audio_settings", { settings }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

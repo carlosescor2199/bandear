@@ -303,7 +303,22 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   - GREEN: server unit tests 353 -> 379, all passing; clippy reports nothing in `wav.rs` (its 7
     warnings are older, in capture, engine, mix and control). Tests run in memory, plus one 4 KB
     temporary file; RF64 is reached with a 120-160 byte limit, never by writing 4 GiB.
-  - Commit: this commit.
+  - Commit: b9e1073.
+  - [x] T3-fix (review-c02182433a1b692a findings): a data size of 0 is recovered as an unfinished
+    file only when the file is laid out as `WavWriter` lays it out (`JUNK`/`ds64` of 28 bytes at
+    12, a 40-byte `fmt ` at 48, audio at 104) or when the bytes after the data chunk's header
+    cannot begin a chunk (four printable ASCII characters and a size that fits); another writer's
+    empty data chunk followed by `LIST` stays empty (R3-002). The desktop exit-hook test no longer
+    races the saver's interval: a test-only guard (`manual_savers()`, thread-local) makes savers
+    started on the test's thread write only when flushed, so the test proves that only
+    `RunEvent::Exit` writes the waiting mix, deterministically (R3-001).
+    RED: server, `an_empty_data_chunk_of_another_writer_stays_empty` read the LIST chunk as 4
+    frames of noise; the layout guard checked by mutation (no `ours` check:
+    `an_unfinished_file_laid_out_as_ours_is_recovered_even_if_its_audio_reads_like_a_chunk`
+    failed). Desktop, a 450 ms pause after `mark(20)` (a descheduled test thread) made the old
+    test fail with `Some(20)` on `Ready`; the new test passed with the same pauses.
+    GREEN: server unit tests 379 -> 381; desktop 205 -> 206 on 3 runs (the saver guard test
+    added, the exit test replaced); clippy reports nothing in `wav.rs`. Commit: this commit.
 - [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
   `take.json`, markers, dropped-frame accounting, refusing device switches while recording, disk
   estimate, Tauri commands. Route: delegated writer.
@@ -339,6 +354,9 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   acknowledged; both findings (R3-001 the output lane, R3-002 the start and exit seams) are fixed
   by T2b-fix2. Next review base: 9ce6711.
 - T2b-fix2 (d8f2ab1) is pending review in the slice from 9ce6711.
+- Review lineage review-c02182433a1b692a over 9ce6711..b9e1073 (T2b-fix2 and T3) approved and
+  acknowledged; both findings (R3-001 the exit test racing the saver's interval, R3-002 an empty
+  data chunk read as audio) are fixed by T3-fix. Next review base: b9e1073.
 
 ## Next step
 

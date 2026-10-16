@@ -53,8 +53,10 @@
 //! [WavReader] recovers files that never got a good header: when the data size is 0 (the writer
 //! died before its first refresh), missing (an RF64 file without its `ds64`) or larger than the
 //! file (the header reached the disk before the audio), it reads the whole frames actually there.
-//! It cannot see audio past a smaller data size, because bytes after the data chunk may be other
-//! chunks.
+//! A data size of 0 is taken for an unfinished file only when the file is laid out as this writer
+//! lays it out, or when the bytes after the data chunk's header cannot begin a chunk: another
+//! writer's empty data chunk followed by `LIST` or `bext` stays empty. The reader cannot see
+//! audio past a smaller data size either, because bytes after the data chunk may be other chunks.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -95,7 +97,8 @@ const DS64_SIZE: u32 = 28;
 /// Where the writer's header keeps each field it rewrites.
 const RIFF_SIZE_OFFSET: u64 = 4;
 const JUNK_OFFSET: u64 = 12;
-const DATA_SIZE_OFFSET: u64 = JUNK_OFFSET + 8 + DS64_SIZE as u64 + 8 + FMT_SIZE as u64 + 4;
+const FMT_OFFSET: u64 = JUNK_OFFSET + 8 + DS64_SIZE as u64;
+const DATA_SIZE_OFFSET: u64 = FMT_OFFSET + 8 + FMT_SIZE as u64 + 4;
 const HEADER_LEN: u64 = DATA_SIZE_OFFSET + 4;
 
 /// The largest size a 32-bit RIFF field holds: in RF64, 0xFFFFFFFF means "see ds64".
@@ -606,7 +609,8 @@ struct Layout {
 
 /// Reads the header of the WAV file in `source`: walks the chunks (skipping unknown ones and their
 /// pad bytes) for `fmt ` and `data`, takes the data size from `ds64` in an RF64 file, and counts
-/// the whole frames the audio holds, recovering a size that is 0, missing or past the end.
+/// the whole frames the audio holds, recovering a size that is 0 (in an unfinished file, see the
+/// module documentation), missing or past the end.
 fn read_layout<R: Read + Seek>(source: &mut R) -> Result<Layout, WavError> {
     let file_length = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
@@ -630,6 +634,9 @@ fn read_layout<R: Read + Seek>(source: &mut R) -> Result<Layout, WavError> {
     let mut spec = None;
     // Where the audio starts and the size its header gives, if any.
     let mut audio: Option<(u64, Option<u64>)> = None;
+    // Whether the chunks so far sit where WavWriter puts them (see the layout in the module
+    // documentation).
+    let mut writer_layout = false;
     let mut offset = 12u64;
     while spec.is_none() || audio.is_none() {
         let Some(body) = offset.checked_add(8).filter(|body| *body <= file_length) else {
@@ -639,6 +646,9 @@ fn read_layout<R: Read + Seek>(source: &mut R) -> Result<Layout, WavError> {
         let chunk: [u8; 8] = read_array(source, "a chunk header")?;
         let id = [chunk[0], chunk[1], chunk[2], chunk[3]];
         let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        if offset == JUNK_OFFSET {
+            writer_layout = (id == JUNK || id == DS64) && size == DS64_SIZE;
+        }
         // In RF64 a size of 0xFFFFFFFF says the real size is in ds64.
         let declared = (!rf64 || size != u32::MAX).then_some(u64::from(size));
         let skip = match id {
@@ -647,6 +657,7 @@ fn read_layout<R: Read + Seek>(source: &mut R) -> Result<Layout, WavError> {
                 declared
             }
             FMT if spec.is_none() => {
+                writer_layout &= offset == FMT_OFFSET && size == FMT_SIZE;
                 spec = Some(read_format(source, size)?);
                 declared
             }
@@ -685,8 +696,14 @@ fn read_layout<R: Read + Seek>(source: &mut R) -> Result<Layout, WavError> {
         audio.ok_or_else(|| WavError::Malformed("there is no data chunk".to_owned()))?;
     // The data chunk's header was read whole, so its audio starts inside the file.
     let present = file_length - data_start;
+    // A data size of 0 is a writer that died before its first refresh only in a file laid out as
+    // ours, or when what follows cannot begin a chunk; otherwise the data chunk is really empty
+    // and what follows are other chunks (LIST, bext), not audio.
+    let ours = writer_layout && data_start == HEADER_LEN;
+    let empty = length == Some(0) && !ours && begins_chunk(source, data_start, file_length)?;
     let length = match length {
         Some(length) if length > 0 && length <= present => length,
+        Some(_) if empty => 0,
         // 0 (no refresh yet), missing (RF64 without ds64) or past the end (a crash): what is there.
         _ => present,
     };
@@ -695,6 +712,23 @@ fn read_layout<R: Read + Seek>(source: &mut R) -> Result<Layout, WavError> {
         data_start,
         frames: length / u64::from(spec.bytes_per_frame()),
     })
+}
+
+/// Whether the bytes at `offset` can begin a chunk: an id of four printable ASCII characters and
+/// a size that fits in the file.
+fn begins_chunk<R: Read + Seek>(
+    source: &mut R,
+    offset: u64,
+    file_length: u64,
+) -> Result<bool, WavError> {
+    let Some(body) = offset.checked_add(8).filter(|body| *body <= file_length) else {
+        return Ok(false);
+    };
+    source.seek(SeekFrom::Start(offset))?;
+    let chunk: [u8; 8] = read_array(source, "a chunk header")?;
+    let printable = chunk[..4].iter().all(|byte| (0x20..=0x7E).contains(byte));
+    let size = u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
+    Ok(printable && body.checked_add(size).is_some_and(|end| end <= file_length))
 }
 
 /// The 64-bit data size from a ds64 chunk of `size` bytes.
@@ -1226,6 +1260,35 @@ mod tests {
         // A frame cut short by the crash is left out.
         bytes.truncate(bytes.len() - 4);
         assert_eq!(read_all(bytes).1, expected[..198]);
+    }
+
+    #[test]
+    fn an_empty_data_chunk_of_another_writer_stays_empty() {
+        // Chunks after an empty data chunk are not audio.
+        let bytes = riff(&[
+            (b"fmt ", &plain_fmt(1, 2, 48_000, 24)),
+            (b"data", &[]),
+            (b"LIST", b"INFOISFT\x05\x00\x00\x00tool\x00"),
+        ]);
+        assert_eq!(read_all(bytes), (stereo24(), Vec::new()));
+
+        // Bytes that cannot begin a chunk are the audio of a writer that died before its first
+        // refresh, whoever laid the file out.
+        let mut bytes = riff(&[(b"fmt ", &plain_fmt(1, 1, 48_000, 24)), (b"data", &[])]);
+        bytes.extend_from_slice(&le24(&[0x40_0000, -0x40_0000, 0x20_0000]));
+        assert_eq!(read_all(bytes), (mono24(), vec![0.5, -0.5, 0.25]));
+    }
+
+    #[test]
+    fn an_unfinished_file_laid_out_as_ours_is_recovered_even_if_its_audio_reads_like_a_chunk() {
+        let samples = noise(200, 3);
+        let store = SharedStore::default();
+        let mut writer = WavWriter::new(store.clone(), stereo24()).unwrap();
+        writer.write_frames(&samples).unwrap();
+        drop(writer);
+        let mut bytes = store.contents();
+        bytes[104..112].copy_from_slice(b"LIST\x04\x00\x00\x00");
+        assert_eq!(WavReader::new(Cursor::new(bytes)).unwrap().frames(), 100);
     }
 
     #[test]

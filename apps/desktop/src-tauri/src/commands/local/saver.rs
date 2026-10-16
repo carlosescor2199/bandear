@@ -27,6 +27,32 @@ pub(crate) const SAVE_INTERVAL: Duration = Duration::from_millis(400);
 type Write = dyn Fn(&SessionMix) -> Result<(), String> + Send + Sync;
 type Log = dyn Fn(&str) + Send + Sync;
 
+#[cfg(test)]
+thread_local! {
+    /// Whether savers started on this thread write only when flushed (see [manual_savers]).
+    static MANUAL_SAVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the guard is dropped, every saver started on this thread has no thread of its own and
+/// writes only when flushed or dropped, like [LocalMixSaver::manual]. For tests that build a whole
+/// `DesktopState` and must not race its saver's interval.
+#[cfg(test)]
+pub(crate) fn manual_savers() -> ManualSavers {
+    MANUAL_SAVERS.with(|manual| manual.set(true));
+    ManualSavers(())
+}
+
+/// See [manual_savers].
+#[cfg(test)]
+pub(crate) struct ManualSavers(());
+
+#[cfg(test)]
+impl Drop for ManualSavers {
+    fn drop(&mut self) {
+        MANUAL_SAVERS.with(|manual| manual.set(false));
+    }
+}
+
 /// Writes the latest local mix marked, off the engine lock (see the module documentation).
 pub(crate) struct LocalMixSaver {
     inner: Arc<Inner>,
@@ -62,6 +88,10 @@ impl LocalMixSaver {
         log: impl Fn(&str) + Send + Sync + 'static,
         interval: Duration,
     ) -> Self {
+        #[cfg(test)]
+        if MANUAL_SAVERS.with(std::cell::Cell::get) {
+            return Self::manual(write, log);
+        }
         let inner = Arc::new(Inner::new(Box::new(write), Box::new(log), interval));
         let thread = {
             let inner = Arc::clone(&inner);
@@ -325,6 +355,30 @@ mod tests {
             *written.lock().expect("book"),
             vec![1, 2],
             "a stop does not wait out the interval"
+        );
+    }
+
+    #[test]
+    fn savers_started_under_the_manual_guard_write_only_when_flushed() {
+        let (written, write) = recorder();
+        let manual = manual_savers();
+        let saver = LocalMixSaver::start(write, |_| {}, Duration::from_millis(1));
+        saver.mark(mix(1));
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            written.lock().expect("book").is_empty(),
+            "no thread writes on its own"
+        );
+        saver.flush();
+        assert_eq!(*written.lock().expect("book"), vec![1]);
+
+        drop(manual);
+        let (written, write) = recorder();
+        let threaded = LocalMixSaver::start(write, |_| {}, Duration::from_millis(1));
+        threaded.mark(mix(2));
+        assert!(
+            wait_until(|| *written.lock().expect("book") == vec![2]),
+            "once the guard is dropped, savers write on their own again"
         );
     }
 

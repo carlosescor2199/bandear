@@ -396,21 +396,28 @@ mod tests {
     }
 
     #[test]
-    fn quitting_the_app_writes_the_local_mix_still_waiting() {
+    fn only_quitting_the_app_writes_the_local_mix_still_waiting() {
         let directory = std::env::temp_dir()
             .join("mixlink-run-event-tests")
             .join("exit");
         let _ = std::fs::remove_dir_all(&directory);
+        // The state's saver writes only when flushed, so no interval can write the mix behind the
+        // test's back however the threads are scheduled: whatever reaches the session was written
+        // by the run event.
+        let _manual = commands::local::saver::manual_savers();
         let state = DesktopState::new(SessionStore::open(&directory));
-        // The saver writes a first change at once and holds the next for its interval.
-        state.mark_local_mix(mix(10));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while kept_volume(&state) != Some(10) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(kept_volume(&state), Some(10));
-        state.mark_local_mix(mix(20));
 
+        state.mark_local_mix(mix(10));
+        on_run_event(Some(&state), &tauri::RunEvent::Ready);
+        assert_eq!(
+            kept_volume(&state),
+            None,
+            "nothing is written on another event"
+        );
+        on_run_event(Some(&state), &tauri::RunEvent::Exit);
+        assert_eq!(kept_volume(&state), Some(10), "written on exit");
+
+        state.mark_local_mix(mix(20));
         on_run_event(Some(&state), &tauri::RunEvent::Ready);
         assert_eq!(
             kept_volume(&state),
@@ -421,7 +428,7 @@ mod tests {
         assert_eq!(
             kept_volume(&state),
             Some(20),
-            "written on exit, without waiting out the interval"
+            "the latest mix is written on exit"
         );
         on_run_event(None, &tauri::RunEvent::Exit);
     }

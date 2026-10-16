@@ -4,7 +4,7 @@
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,13 +21,15 @@ use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
     EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MetersDto, MirrorRequest,
-    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, StartRequest, StartSummary,
+    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, SessionSavedDto, StartRequest,
+    StartSummary,
 };
 use crate::events::EventPump;
 use crate::session::{
-    SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionMirror, SessionPreset,
-    SessionPresetChannel, SessionPresetMix, SessionStore,
+    address_key, client_key, Session, SessionAudio, SessionChannel, SessionEngineer, SessionGroup,
+    SessionMirror, SessionPreset, SessionPresetChannel, SessionPresetMix, SessionStore,
 };
+use crate::sessions::{SessionMix, SnapshotStore, SnapshotSummary, SESSIONS_DIRECTORY};
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
@@ -53,17 +55,22 @@ pub struct DesktopState {
     pump: Mutex<Option<EventPump>>,
     start_pump: Option<PumpStarter>,
     session: SessionStore,
+    /// The engineer's named sessions, in the `sessions` folder beside the session file (see
+    /// [crate::sessions]).
+    snapshots: SnapshotStore,
 }
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
     pub fn new(session: SessionStore) -> Self {
+        let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
         Self {
             engine: Mutex::new(None),
             run: AtomicU64::new(0),
             pump: Mutex::new(None),
             start_pump: None,
             session,
+            snapshots,
         }
     }
 
@@ -195,6 +202,11 @@ fn session_channels(session: &SessionStore) -> Vec<ChannelMeta> {
 /// the phone's client id and an `address:` key as that address. A limit above 100 reads as 100 and
 /// a channel number outside 1-32 is left out; a key this build cannot read is skipped and logged.
 fn session_engineer_controls(session: &SessionStore) -> Vec<(MusicianKey, EngineerControls)> {
+    controls_of(&session.current())
+}
+
+/// [session_engineer_controls] of a whole session, the one kept or one being loaded.
+fn controls_of(session: &Session) -> Vec<(MusicianKey, EngineerControls)> {
     session
         .engineer_controls()
         .into_iter()
@@ -226,6 +238,11 @@ fn musician_key_of(key: &str) -> Option<MusicianKey> {
 /// phone is told. A mirror whose follower or leader key this build cannot read is skipped and
 /// logged.
 fn session_mirrors(session: &SessionStore) -> Vec<(MusicianKey, MusicianKey, String)> {
+    mirrors_of(&session.current())
+}
+
+/// [session_mirrors] of a whole session, the one kept or one being loaded.
+fn mirrors_of(session: &Session) -> Vec<(MusicianKey, MusicianKey, String)> {
     session
         .mirrors()
         .into_iter()
@@ -1737,6 +1754,148 @@ fn session_audio(settings: AudioSettingsRequest) -> Result<SessionAudio, String>
     })
 }
 
+/// What went wrong or changed when the desk opened its session (a damaged section set aside, a
+/// damaged file moved aside, a session from a newer MixLink left alone, labels imported), for the
+/// window to say; `None` when it simply loaded (see [SessionStore::notice]).
+pub fn session_notice(state: &DesktopState) -> Option<String> {
+    state.session.notice()
+}
+
+/// The engineer's saved sessions, the newest first, each with why it cannot be loaded when it
+/// cannot (see [crate::sessions]).
+pub fn sessions(state: &DesktopState) -> Result<Vec<SnapshotSummary>, String> {
+    state.snapshots.list()
+}
+
+/// What a session save or load reads of the running engine: the device's input count, the ids of
+/// the live groups in their order (every musician's group levels are placed by them) and every
+/// musician the engine lists, with their mix, their phone's client id and whom they follow.
+struct DeskView {
+    inputs: usize,
+    groups: Vec<String>,
+    musicians: Vec<MusicianStatus>,
+}
+
+/// Reads the running engine for a session save or load: the engine in the app, a stand-in in the
+/// tests.
+trait DeskReader {
+    fn desk(&self) -> DeskView;
+}
+
+impl DeskReader for EngineHandle {
+    fn desk(&self) -> DeskView {
+        let status = self.status();
+        DeskView {
+            inputs: usize::from(status.source_channels),
+            groups: status.groups.into_iter().map(|group| group.id).collect(),
+            musicians: status.musicians,
+        }
+    }
+}
+
+/// The key the desk keeps what it knows about the musician on `row` under: their phone's client id
+/// when it announced one, else their address as the status writes it.
+fn row_key(row: &MusicianStatus) -> String {
+    match phone_id(row.client_id.as_deref()) {
+        Some(id) => client_key(id),
+        None => address_key(&row.address.to_string()),
+    }
+}
+
+/// Every musician's mix as a named session keeps it (see [crate::sessions::SessionMix]), under the
+/// key the desk keeps the musician under: the level, pan, mute and solo of the device's inputs,
+/// the group levels by group id, the master volume and the master mute. Never the phone's own
+/// level cap.
+fn saved_mixes(desk: &DeskView) -> BTreeMap<String, SessionMix> {
+    desk.musicians
+        .iter()
+        .map(|row| {
+            let mix = &row.mix;
+            let inputs = desk.inputs.min(mix.channel_gains.len());
+            let saved = SessionMix {
+                channels: (0..inputs)
+                    .map(|channel| SessionPresetChannel {
+                        gain: mix.channel_gains[channel],
+                        pan: mix.pans[channel],
+                        muted: mix.channel_muted[channel],
+                        solo: mix.channel_solo[channel],
+                    })
+                    .collect(),
+                groups: desk
+                    .groups
+                    .iter()
+                    .zip(mix.group_levels)
+                    .map(|(id, level)| (id.clone(), level))
+                    .collect(),
+                volume_percent: mix.volume_percent,
+                muted: mix.muted,
+            };
+            (row_key(row), saved)
+        })
+        .collect()
+}
+
+/// Saves the desk's whole session as a named session called `name` (trimmed, at most 40
+/// characters, no other saved session's name in any case), with every musician's mix when an
+/// engine runs, and answers what was saved ([SessionSavedDto]).
+///
+/// The session is everything the desk keeps (labels, the engineer's controls and mirrors, channel
+/// details, groups, presets and the audio input); each musician's mix is read from the running
+/// engine under the key the desk keeps them by (see [saved_mixes]). With no engine running the
+/// session is saved without mixes. A refused name, or a save that fails, saves nothing.
+pub fn save_session(state: &DesktopState, name: String) -> Result<SessionSavedDto, String> {
+    let outcome = save_session_with(&state.engine, &state.session, &state.snapshots, &name)?;
+    println!(
+        "[mixlink-desktop] save_session: \"{}\" ({}) with {} mixes",
+        outcome.session.name, outcome.session.id, outcome.session.mixes
+    );
+    Ok(outcome)
+}
+
+/// [save_session] over any engine slot, session and folder of named sessions.
+fn save_session_with<E: DeskReader>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    snapshots: &SnapshotStore,
+    name: &str,
+) -> Result<SessionSavedDto, String> {
+    // The mixes and the session are read under the engine lock (the session's inside it), so no
+    // edit lands between them.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let desk = guard.as_ref().map(DeskReader::desk);
+    let mixes = desk.as_ref().map(saved_mixes).unwrap_or_default();
+    let saved = snapshots.save(name, session.current(), mixes, |taken| new_id('s', taken))?;
+    Ok(SessionSavedDto {
+        session: saved,
+        engine_running: desk.is_some(),
+    })
+}
+
+/// Renames the saved session `id` (the name checked as [save_session] checks it) and answers it as
+/// listed. Only its name changes; one that cannot be loaded is not renamed.
+pub fn rename_session(
+    state: &DesktopState,
+    id: String,
+    name: String,
+) -> Result<SnapshotSummary, String> {
+    let renamed = state.snapshots.rename(&id, &name)?;
+    println!(
+        "[mixlink-desktop] rename_session: {id} -> \"{}\"",
+        renamed.name
+    );
+    Ok(renamed)
+}
+
+/// Deletes the saved session `id`, whether or not it can be read. The window asks the engineer to
+/// confirm first.
+pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
+    state.snapshots.delete(&id)?;
+    println!("[mixlink-desktop] delete_session: {id}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2209,6 +2368,11 @@ mod tests {
         copied: Option<(String, Vec<String>)>,
         /// The mirror it took last: the follower and the leader's address and name.
         mirrored: Option<(String, Option<(String, String)>)>,
+        /// What a session save or load reads of it: the device's inputs, the live groups' ids
+        /// (those of the groups it took last, once it took any) and the musicians here.
+        inputs: usize,
+        live_groups: Vec<String>,
+        here: Mutex<Vec<MusicianStatus>>,
     }
 
     impl StandInEngine {
@@ -2375,6 +2539,19 @@ mod tests {
 
         fn channel_table(&self) -> Vec<ChannelMeta> {
             self.applied_channels.clone().unwrap_or_default()
+        }
+    }
+
+    impl DeskReader for StandInEngine {
+        fn desk(&self) -> DeskView {
+            DeskView {
+                inputs: self.inputs,
+                groups: self.applied.as_ref().map_or_else(
+                    || self.live_groups.clone(),
+                    |groups| groups.iter().map(|group| group.id.clone()).collect(),
+                ),
+                musicians: self.here.lock().expect("rows lock").clone(),
+            }
         }
     }
 
@@ -4074,5 +4251,167 @@ mod tests {
             )],
             "a leader key this build cannot read is skipped"
         );
+    }
+
+    /// A musician the engine lists: at `address`, with `client_id`, their control channel up or
+    /// down, and `mix`.
+    fn here(
+        address: &str,
+        client_id: Option<&str>,
+        connected: bool,
+        mix: MixValues,
+    ) -> MusicianStatus {
+        MusicianStatus {
+            control_connected: connected,
+            mix,
+            ..engine_row(address, client_id)
+        }
+    }
+
+    /// A mix with the first channels at `gains` (pans centred), the first groups at `levels`, and
+    /// this master volume, mute and phone cap.
+    fn mix_of(gains: &[u8], levels: &[u8], volume: u8, muted: bool, cap: u8) -> MixValues {
+        let mut mix = MixValues {
+            volume_percent: volume,
+            muted,
+            max_level_percent: cap,
+            ..MixValues::default()
+        };
+        mix.channel_gains[..gains.len()].copy_from_slice(gains);
+        mix.pans[..gains.len()].fill(50);
+        mix.group_levels[..levels.len()].copy_from_slice(levels);
+        mix
+    }
+
+    fn saved_mix(gains: &[u8], groups: &[(&str, u8)], volume: u8, muted: bool) -> SessionMix {
+        SessionMix {
+            channels: gains
+                .iter()
+                .map(|&gain| SessionPresetChannel {
+                    gain,
+                    pan: 50,
+                    muted: false,
+                    solo: false,
+                })
+                .collect(),
+            groups: groups
+                .iter()
+                .map(|(id, level)| ((*id).to_owned(), *level))
+                .collect(),
+            volume_percent: volume,
+            muted,
+        }
+    }
+
+    /// A desk's session, a folder of named sessions beside it, and an engine slot.
+    fn desk(
+        test: &str,
+        engine: Option<StandInEngine>,
+    ) -> (SessionStore, SnapshotStore, Mutex<Option<StandInEngine>>) {
+        let directory = session_directory(test);
+        let session = SessionStore::open(&directory);
+        let snapshots = SnapshotStore::new(directory.join(SESSIONS_DIRECTORY));
+        (session, snapshots, Mutex::new(engine))
+    }
+
+    /// The desk's session with a label, groups, channels, controls, a mirror, a preset and an
+    /// audio input.
+    fn working_session(session: &SessionStore) {
+        session.set_label(Some(PHONE), ANA, "Ana").expect("saved");
+        session
+            .set_groups(vec![SessionGroup {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1],
+            }])
+            .expect("saved");
+        session
+            .set_channels(vec![kept("Kick", "drums", false, false)])
+            .expect("saved");
+        session
+            .set_engineer(Some(PHONE), ANA, kept_controls(60, &[1]))
+            .expect("saved");
+        session
+            .set_mirror(
+                None,
+                RACK,
+                Some(kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)),
+            )
+            .expect("saved");
+        session
+            .set_audio(SessionAudio {
+                host: "wasapi".to_owned(),
+                device: Some("INPUT 1/2 (Volt 4)".to_owned()),
+                buffer_frames: Some(256),
+                asio_driver: None,
+            })
+            .expect("saved");
+    }
+
+    #[test]
+    fn a_saved_session_keeps_the_whole_desk_session_and_every_musicians_mix_by_key() {
+        let (session, snapshots, engine) = desk(
+            "session-save",
+            Some(StandInEngine {
+                inputs: 2,
+                live_groups: vec!["kit".to_owned(), "vox".to_owned()],
+                here: Mutex::new(vec![
+                    here(
+                        ANA,
+                        Some(PHONE),
+                        true,
+                        mix_of(&[80, 40, 7], &[70, 30], 85, false, 90),
+                    ),
+                    here(
+                        RACK,
+                        None,
+                        false,
+                        mix_of(&[100, 90], &[100, 55], 60, true, 100),
+                    ),
+                ]),
+                ..StandInEngine::default()
+            }),
+        );
+        working_session(&session);
+
+        let saved = save_session_with(&engine, &session, &snapshots, " Show ").expect("saved");
+
+        assert_eq!(saved.session.name, "Show");
+        assert_eq!(saved.session.mixes, 2);
+        assert!(saved.engine_running);
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(
+            read.snapshot.session,
+            session.current(),
+            "every section the desk keeps"
+        );
+        assert_eq!(
+            read.snapshot.mixes,
+            BTreeMap::from([
+                (
+                    client_key(PHONE),
+                    saved_mix(&[80, 40], &[("kit", 70), ("vox", 30)], 85, false)
+                ),
+                (
+                    address_key(RACK),
+                    saved_mix(&[100, 90], &[("kit", 100), ("vox", 55)], 60, true)
+                ),
+            ]),
+            "the device's inputs, group levels by id, master volume and mute, by the musician's key"
+        );
+    }
+
+    #[test]
+    fn with_no_engine_the_session_is_saved_without_mixes() {
+        let (session, snapshots, engine) = desk("session-save-idle", None);
+        working_session(&session);
+
+        let saved = save_session_with(&engine, &session, &snapshots, "Rehearsal").expect("saved");
+
+        assert!(!saved.engine_running);
+        assert_eq!(saved.session.mixes, 0);
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(read.snapshot.session, session.current());
+        assert!(read.snapshot.mixes.is_empty());
     }
 }

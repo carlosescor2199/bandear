@@ -14,6 +14,7 @@ use personal_monitoring::{
 };
 
 use crate::session::{address_key, client_key, SessionChannel, SessionGroup, SessionPreset};
+use crate::sessions::SnapshotSummary;
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
@@ -326,6 +327,15 @@ pub struct MirrorSetDto {
     pub save_error: Option<String>,
     /// The follower's whole mix now stored; null when no engine took the mirror.
     pub mix: Option<MixDto>,
+}
+
+/// What [crate::commands::save_session] saved: the named session as the window lists it, and
+/// whether an engine ran, so the musicians' mixes were saved with it (`session.mixes` of them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSavedDto {
+    pub session: SnapshotSummary,
+    pub engine_running: bool,
 }
 
 /// One musician's whole mix.

@@ -1544,6 +1544,12 @@ slice. Push and PRs are the user's decision.
 - Review `review-c0bc7cb0513ac7d0` over 44b5572..ff2b413 (T7b-fix2) approved with no findings and
   acknowledged. Every commit of phase 2 is now reviewed (last reviewed boundary ff2b413).
 
+- Live test (2026-10-16): the desktop app (built with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`
+  after two system crashes during heavier builds) and the Galaxy S23 with the phase 2 app; the
+  user tested the phase 2 features and reported "está excelente y funciona bien". ASIO was not
+  exercised.
+
 ## Next step
 
-Live test of phase 2, then PRs (stacked-to-main) on the user's approval.
+Phase 2 is complete, reviewed and live-tested. Next: pull requests (stacked-to-main) on the
+user's approval, then phase 3 (local mix and multitrack recording).

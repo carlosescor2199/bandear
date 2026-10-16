@@ -12,7 +12,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use personal_monitoring::{
     check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
@@ -20,7 +20,8 @@ use personal_monitoring::{
     MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus, PresetChannel,
 };
 
-use self::local::{apply_kept_local, LocalEngine};
+use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
+use self::local::{apply_kept_local, with_pending, LocalEngine};
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
@@ -61,19 +62,32 @@ pub struct DesktopState {
     run: AtomicU64,
     pump: Mutex<Option<EventPump>>,
     start_pump: Option<PumpStarter>,
-    session: SessionStore,
+    /// Shared with [Self::local_saver]'s thread, which keeps the local mix in it.
+    session: Arc<SessionStore>,
     /// The engineer's named sessions, in the `sessions` folder beside the session file (see
     /// [crate::sessions]).
     snapshots: SnapshotStore,
     /// Why the local output the session keeps was not opened by the running engine (see
     /// [local]), for the status to say; taken inside the engine lock, never the other way round.
     local_notice: Mutex<Option<String>>,
+    /// Keeps the local mix in the session off the engine lock (see [local::saver]). Paused inside
+    /// the engine lock by a start and a load; it writes taking only the session's lock.
+    local_saver: LocalMixSaver,
 }
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
     pub fn new(session: SessionStore) -> Self {
         let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
+        let session = Arc::new(session);
+        let local_saver = {
+            let session = Arc::clone(&session);
+            LocalMixSaver::start(
+                move |mix| session.set_local_mix(mix.clone()),
+                |line| eprintln!("[mixlink-desktop] {line}"),
+                SAVE_INTERVAL,
+            )
+        };
         Self {
             engine: Mutex::new(None),
             run: AtomicU64::new(0),
@@ -82,6 +96,7 @@ impl DesktopState {
             session,
             snapshots,
             local_notice: Mutex::new(None),
+            local_saver,
         }
     }
 
@@ -90,10 +105,6 @@ impl DesktopState {
         if let Ok(mut kept) = self.local_notice.lock() {
             *kept = notice;
         }
-    }
-
-    fn local_notice(&self) -> Option<String> {
-        self.local_notice.lock().ok().and_then(|kept| kept.clone())
     }
 
     /// Streams every engine started from now on through a pump that `start_pump` builds, given the
@@ -397,7 +408,12 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_channels = session_channels(&state.session);
     let saved_controls = session_engineer_controls(&state.session);
     let saved_mirrors = session_mirrors(&state.session);
-    let saved_local = state.session.local();
+    // With the saver paused, so a local mix marked and not written yet is read with the session
+    // (it stays marked, and is written later).
+    let saved_local = {
+        let paused = state.local_saver.pause();
+        with_pending(state.session.local(), paused.pending())
+    };
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
@@ -519,11 +535,28 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
 
 /// The status of `handle`, the engine in `state`, read while the caller holds the engine lock.
 fn status_of(state: &DesktopState, handle: &EngineHandle) -> EngineStatusDto {
-    let mut status = EngineStatusDto::from(&handle.status());
-    status.run = state.run();
-    apply_names(&mut status, &state.session);
-    status.local_output.notice = state.local_notice();
-    status
+    status_dto(
+        &handle.status(),
+        state.run(),
+        &state.session,
+        &state.local_notice,
+    )
+}
+
+/// The window's status of the engine `status`, of engine run `run`: each row named from
+/// `session`'s labels, and the local output with what the desk said about the kept one (`notice`,
+/// read inside the engine lock like every write of it).
+fn status_dto(
+    status: &personal_monitoring::EngineStatus,
+    run: u64,
+    session: &SessionStore,
+    notice: &Mutex<Option<String>>,
+) -> EngineStatusDto {
+    let mut dto = EngineStatusDto::from(status);
+    dto.run = run;
+    apply_names(&mut dto, session);
+    dto.local_output.notice = notice.lock().ok().and_then(|said| said.clone());
+    dto
 }
 
 /// Returns the live input and output levels, for the `meters` event.
@@ -1731,8 +1764,9 @@ fn edit_channels<E: ChannelEngine>(
     })
 }
 
-/// Stops the engine's event pump, then the engine, and joins their threads. Stopping when idle is
-/// a no-op.
+/// Stops the engine's event pump, then the engine, and joins their threads; then, with the engine
+/// lock released, writes the local mix still waiting to be kept (see [local::saver]). Stopping
+/// when idle is a no-op.
 pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
     let mut pump = state
         .pump
@@ -1743,10 +1777,13 @@ pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
         .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
-    match guard.take() {
+    let stopped = match guard.take() {
         Some(mut handle) => handle.stop().map_err(|error| error.to_string()),
         None => Ok(()),
-    }
+    };
+    drop(guard);
+    state.local_saver.flush();
+    stopped
 }
 
 /// Lists the input devices one backend offers, each with the channel count a switch would capture.
@@ -2084,13 +2121,21 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   off, and one the running driver does not offer, or that cannot be opened, leaves it off and is
 ///   said (`localOutputNotice`), never replaced by another device.
 ///
-/// The load is one step under the engine lock, with the session's inside it. A save that fails
-/// after the engine took the session is reported in the answer, not as an error.
+/// The load is one step under the engine lock, with the session's inside it; what the status says
+/// about the loaded output is written inside it too, as a start and an output choice write it. A
+/// local mix still waiting to be kept is kept with a session that leaves the desk's own local mix,
+/// and dropped for one whose saved local mix replaced it. A save that fails after the engine took
+/// the session is reported in the answer, not as an error.
 pub fn load_session(state: &DesktopState, id: String) -> Result<SessionLoadedDto, String> {
-    let outcome = load_session_with(&state.engine, &state.session, &state.snapshots, &id)?;
-    if outcome.applied && outcome.local_loaded {
-        state.set_local_notice(outcome.local_output_notice.clone());
-    }
+    let engine = &state.engine;
+    let outcome = load_session_with(
+        engine,
+        &state.session,
+        &state.snapshots,
+        &state.local_saver,
+        &state.local_notice,
+        &id,
+    )?;
     println!(
         "[mixlink-desktop] load_session: \"{}\" ({id}) applied={} saved={} pushed={} skipped={} refused={}",
         outcome.session.name,
@@ -2155,11 +2200,14 @@ fn loaded_audio(
     }
 }
 
-/// [load_session] over any engine slot, session and folder of named sessions.
+/// [load_session] over any engine slot, session, folder of named sessions, local mix saver and
+/// notice.
 fn load_session_with<E: SessionEngine>(
     engine: &Mutex<Option<E>>,
     session: &SessionStore,
     snapshots: &SnapshotStore,
+    saver: &LocalMixSaver,
+    notice: &Mutex<Option<String>>,
     id: &str,
 ) -> Result<SessionLoadedDto, String> {
     let SnapshotRead {
@@ -2186,6 +2234,9 @@ fn load_session_with<E: SessionEngine>(
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
     // A session the desk must not replace refuses the load before the engine takes anything.
     session.check_saves()?;
+    // No local mix is written while the session is read and replaced: one still waiting is the
+    // desk's own, newer than the session's.
+    let paused = saver.pause();
     let previous = session.current();
     let (audio, audio_loaded, audio_skipped) =
         loaded_audio(snapshot.session.audio.clone(), previous.audio.clone());
@@ -2193,7 +2244,9 @@ fn load_session_with<E: SessionEngine>(
     let saved_local = snapshot.session.local.clone();
     let next = Session {
         audio: audio.clone(),
-        local: saved_local.clone().or(previous.local),
+        local: saved_local
+            .clone()
+            .or_else(|| with_pending(previous.local, paused.pending())),
         ..snapshot.session.clone()
     };
     let live = match guard.as_mut() {
@@ -2217,9 +2270,14 @@ fn load_session_with<E: SessionEngine>(
             session.set_channels_behind(true);
             Some(error)
         }
-        // Nothing took it, so nothing changed.
+        // Nothing took it, so nothing changed: a local mix waiting is still the desk's.
         Err(error) => return Err(error),
     };
+    // The local mix waiting is in the session now, or the engine plays the loaded one instead.
+    if save_error.is_none() || saved_local.is_some() {
+        paused.clear();
+    }
+    drop(paused);
     let (mixes, skipped, refused, local) = match live {
         Some(live) => (live.pushed, live.skipped, live.refused, live.local),
         None => (
@@ -2237,6 +2295,14 @@ fn load_session_with<E: SessionEngine>(
         Some(local) => (local.mix.as_ref().map(MixDto::from), local.notice),
         None => (None, None),
     };
+    // What the status says about the loaded output, written inside the engine lock like every
+    // other write of it, so a later output choice is never undone by it.
+    if applied && saved_local.is_some() {
+        if let Ok(mut said) = notice.lock() {
+            said.clone_from(&local_output_notice);
+        }
+    }
+    drop(guard);
     Ok(SessionLoadedDto {
         session: summary,
         applied,
@@ -3900,7 +3966,7 @@ mod tests {
             session_directory_kept(test).join(format!("{}.tmp", crate::session::SESSION_FILE));
         std::fs::create_dir_all(&blocker).expect("blocker");
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert!(outcome.applied && !outcome.saved, "{outcome:?}");
         assert!(session.channels_behind());
@@ -5480,7 +5546,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert!(outcome.applied && outcome.saved, "{outcome:?}");
         let log = log_of(&engine);
@@ -5586,7 +5652,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         let pushed = pushed_to(&engine);
         assert_eq!(
@@ -5681,7 +5747,7 @@ mod tests {
             }];
             saved_session(&test, "show", &snapshot(kept.clone(), &[]));
 
-            let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+            let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
             assert_eq!(outcome.audio_loaded, loaded, "{case}");
             assert_eq!(
@@ -5728,7 +5794,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert!(!outcome.applied && outcome.saved, "{outcome:?}");
         assert!(outcome.mixes.is_empty());
@@ -5747,6 +5813,137 @@ mod tests {
             "the groups apply at the next start"
         );
         assert_eq!(outcome.session.name, "Show");
+    }
+
+    /// [load_session_with] with no local mix waiting to be kept and the notice set aside.
+    fn load_into<E: SessionEngine>(
+        engine: &Mutex<Option<E>>,
+        session: &SessionStore,
+        snapshots: &SnapshotStore,
+        id: &str,
+    ) -> Result<SessionLoadedDto, String> {
+        let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
+        load_session_with(engine, session, snapshots, &saver, &Mutex::new(None), id)
+    }
+
+    /// A status of the engine with no musicians and no local output.
+    fn engine_status_now() -> personal_monitoring::EngineStatus {
+        personal_monitoring::EngineStatus {
+            device_name: "Test device".to_owned(),
+            capture_format: personal_monitoring::CaptureFormat {
+                channels: 2,
+                sample_rate: 48_000,
+                sample_format: "I16".to_owned(),
+                buffer_size: "Default".to_owned(),
+            },
+            control_port: DEFAULT_CONTROL_PORT,
+            sample_rate: 48_000,
+            source_channels: 2,
+            groups: Vec::new(),
+            channels: Vec::new(),
+            channel_levels: vec![0, 0],
+            stopped: false,
+            samples_received: 0,
+            packets_sent: 0,
+            packets_discarded: 0,
+            musicians: Vec::new(),
+            local_mix: MixValues::default(),
+            local_output: personal_monitoring::LocalOutputStatus::default(),
+        }
+    }
+
+    #[test]
+    fn a_load_says_why_its_output_was_not_opened_on_the_status_and_a_later_choice_clears_it() {
+        let test = "session-load-notice";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 1,
+                outputs: offering(&[("Speakers (Realtek Audio)", 2)]),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[], 1);
+        loaded.local = Some(local_section(Some(("Volt 4", 0))));
+        saved_session(test, "show", &snapshot(loaded, &[]));
+        let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
+        let notice = Mutex::new(Some("said at start".to_owned()));
+
+        let outcome = load_session_with(&engine, &session, &snapshots, &saver, &notice, "show")
+            .expect("loaded");
+
+        let said = outcome.local_output_notice.expect("said");
+        let status = status_dto(&engine_status_now(), 3, &session, &notice);
+        assert_eq!(
+            status.local_output.notice.as_deref(),
+            Some(said.as_str()),
+            "the status says what the load said, written before the load returned"
+        );
+        local::choose_output(
+            &engine,
+            &session,
+            &notice,
+            Some(crate::dto::LocalOutputRequestDto {
+                device: "Speakers (Realtek Audio)".to_owned(),
+                first_channel: 0,
+            }),
+        )
+        .expect("taken");
+        let status = status_dto(&engine_status_now(), 3, &session, &notice);
+        assert_eq!(status.local_output.notice, None, "a later choice clears it");
+    }
+
+    #[test]
+    fn a_local_mix_waiting_to_be_kept_stays_with_a_load_that_keeps_the_desks_own_and_goes_with_one_that_replaces_it(
+    ) {
+        let test = "session-load-pending";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 1,
+                ..StandInEngine::default()
+            }),
+        );
+        let waiting = saved_mix(&[33], &[], 44, false);
+        let written: Arc<Mutex<Vec<SessionMix>>> = Arc::default();
+        let saver = {
+            let written = Arc::clone(&written);
+            LocalMixSaver::manual(
+                move |mix: &SessionMix| {
+                    written.lock().expect("written").push(mix.clone());
+                    Ok(())
+                },
+                |_| {},
+            )
+        };
+        let notice = Mutex::new(None);
+        saved_session(test, "older", &snapshot(layout_session(&[], 1), &[]));
+        let mut with_local = layout_session(&[], 1);
+        with_local.local = Some(local_section(None));
+        saved_session(test, "newer", &snapshot(with_local.clone(), &[]));
+
+        saver.mark(waiting.clone());
+        load_session_with(&engine, &session, &snapshots, &saver, &notice, "older").expect("loaded");
+        assert_eq!(
+            session.local().and_then(|local| local.mix),
+            Some(waiting.clone()),
+            "the desk's own local mix, as it plays, is kept with the loaded session"
+        );
+        saver.flush();
+        assert!(
+            written.lock().expect("written").is_empty(),
+            "nothing older is written after the load"
+        );
+
+        saver.mark(waiting);
+        load_session_with(&engine, &session, &snapshots, &saver, &notice, "newer").expect("loaded");
+        saver.flush();
+        assert!(written.lock().expect("written").is_empty());
+        assert_eq!(
+            session.local(),
+            with_local.local,
+            "the loaded local mix replaced the one waiting"
+        );
     }
 
     fn local_section(output: Option<(&str, u16)>) -> SessionLocal {
@@ -5796,7 +5993,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert!(outcome.applied && outcome.saved, "{outcome:?}");
         assert!(outcome.local_loaded);
@@ -5866,7 +6063,7 @@ mod tests {
         loaded.local = Some(local_section(Some(("OUTPUT 1/2 (Volt 4)", 0))));
         saved_session(test, "show", &snapshot(loaded.clone(), &[]));
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         let notice = outcome.local_output_notice.expect("said");
         assert!(
@@ -5912,7 +6109,7 @@ mod tests {
         session.set_local_output(own.output.clone()).expect("kept");
         saved_session(test, "show", &snapshot(layout_session(&[], 1), &[]));
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert!(!outcome.local_loaded);
         assert!(outcome.local_mix.is_none());
@@ -5931,8 +6128,7 @@ mod tests {
             "show",
             &snapshot(loaded.clone(), &[]),
         );
-        let outcome =
-            load_session_with(&idle, &idle_session, &idle_snapshots, "show").expect("loaded");
+        let outcome = load_into(&idle, &idle_session, &idle_snapshots, "show").expect("loaded");
         assert!(outcome.local_loaded && !outcome.applied);
         assert!(outcome.local_mix.is_none(), "nothing plays it yet");
         assert_eq!(
@@ -5955,7 +6151,7 @@ mod tests {
         saved_session(test, "channels", &snapshot(overlapping, &[]));
 
         for (id, says) in [("groups", "groups"), ("channels", "channel details")] {
-            let error = load_session_with(&engine, &session, &snapshots, id).expect_err("refused");
+            let error = load_into(&engine, &session, &snapshots, id).expect_err("refused");
             assert!(error.contains(says), "{id}: {error}");
         }
 
@@ -5984,7 +6180,7 @@ mod tests {
             &snapshot(layout_session(&[("kit", &[1])], 1), &[]),
         );
 
-        let error = load_session_with(&engine, &session, &snapshots, "show").expect_err("refused");
+        let error = load_into(&engine, &session, &snapshots, "show").expect_err("refused");
 
         assert!(error.contains("newer"), "{error}");
         assert_eq!(
@@ -6016,7 +6212,7 @@ mod tests {
             &snapshot(layout_session(&[("kit", &[1])], 1), &[]),
         );
 
-        let error = load_session_with(&engine, &session, &snapshots, "show").expect_err("refused");
+        let error = load_into(&engine, &session, &snapshots, "show").expect_err("refused");
 
         assert!(error.contains("stopping"), "{error}");
         assert_eq!(session.current(), before);
@@ -6064,7 +6260,7 @@ mod tests {
         );
         saved_session(test, "show", &snapshot(loaded, &[]));
 
-        load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         let (controls, mirrors) = kept_books(&engine);
         assert_eq!(
@@ -6128,7 +6324,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert_eq!(outcome.refused.len(), 1, "{:?}", outcome.refused);
         assert!(
@@ -6165,7 +6361,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert_eq!(
             outcome.refused,
@@ -6215,7 +6411,7 @@ mod tests {
             ),
         );
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert_eq!(
             outcome.skipped,
@@ -6252,7 +6448,7 @@ mod tests {
         )
         .expect("written");
 
-        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+        let outcome = load_into(&engine, &session, &snapshots, "show").expect("loaded");
 
         assert_eq!(outcome.damaged.len(), 2, "{:?}", outcome.damaged);
         assert_eq!(session.label_for(Some(PHONE), ANA), Some("Ana".to_owned()));

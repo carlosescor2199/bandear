@@ -258,7 +258,17 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     no throttle, a failure logged every time): 4 of 203 failed, one per mutation. UI: 7 of 31 new
     tests failing before the change. GREEN: desktop 196 -> 203 (3 runs), `cargo build` clean; UI
     375 -> 382; preview with no console errors (two quick choices end on the last one).
-    Commits: 1decd1d (backend). Commit: this commit.
+    Commits: 1decd1d (backend), 9ce6711 (UI).
+  - [x] T2b-fix2 (review-a198f89aefeca3bf findings): the output-choice lane never stays rejected
+    (R3-001): every choice settles with an answer, the lane catches, a refusal, an answer that
+    cannot be read and a status that cannot be read are said in the message, and a later choice
+    still goes out. Seam tests (R3-002): a start right after a fader edit plays the edit through
+    `kept_local` (`with_pending`) and the edit is still written later; the exit hook is
+    `on_run_event`, which writes the waiting local mix on `RunEvent::Exit` only.
+    RED: UI, the 2 new lane tests failing (the status failure unsaid; an unreadable answer said as
+    "not changed"); desktop, by 2 mutations (the start ignoring the waiting edit, exit not
+    flushing): 2 of 205 failed. GREEN: desktop 203 -> 205 (3 runs), `cargo build` clean; UI
+    382 -> 384. Commit: this commit.
 - [ ] T3 (WAV/RF64 writer): pure, heavily tested writer for 24-bit and 32-bit float, mono and
   stereo, RF64 upgrade, crash-safe headers; and a reader for playback. Route: delegated writer.
 - [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
@@ -292,6 +302,9 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   acknowledged: review-dab3acc47185a219 (f83180f..b70131d) and review-8a82f3af04262a69
   (b70131d..25530e6). Their findings (part 1 R3-001 and R3-002, part 2 R3-001 to R3-004) are fixed
   by T2b-fix. Next review base: 25530e6.
+- Review lineage review-a198f89aefeca3bf over 25530e6..9ce6711 (T2b-fix) approved and
+  acknowledged; both findings (R3-001 the output lane, R3-002 the start and exit seams) are fixed
+  by T2b-fix2. Next review base: 9ce6711.
 
 ## Next step
 

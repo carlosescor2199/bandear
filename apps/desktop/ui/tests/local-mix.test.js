@@ -777,3 +777,59 @@ test("the fake reads the pair's first output as the desktop does", async () => {
   const odd = await fake.invoke("set_local_output", { output: { device: DEMO, firstChannel: 1 } });
   assert.equal(odd.localOutput.firstChannel, 1, "an odd pair within the device, as the engine takes it");
 });
+
+// T2b-fix2: the output lane survives a failed status read or an unreadable answer
+
+test("a status read that fails after an output choice is said, and the next choice still goes through", async () => {
+  const fake = createFakeBridge({ running: true });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  fake.failNext("engine_status", "the desk did not answer");
+
+  const failed = await app.setLocalOutput({ device: DEMO, firstChannel: 2 });
+  const next = await app.setLocalOutput({ device: SPEAKERS, firstChannel: 0 });
+
+  assert.equal(failed.ok, true, "the output was chosen");
+  assert.equal(
+    failed.message,
+    "The local mix plays on Demo interface · outputs 3/4. Where it plays now could not be " +
+      "read: the desk did not answer.",
+  );
+  assert.deepEqual(next, {
+    ok: true,
+    message: "The local mix plays on Speakers (Realtek Audio) · outputs 1/2.",
+    superseded: false,
+  });
+  assert.equal(app.store.getState().engine.status.localOutput.device, SPEAKERS);
+  app.dispose();
+});
+
+test("an answer that cannot be read is said as such, and the next choice still goes through", async () => {
+  const fake = createFakeBridge({ running: true });
+  let garbled = true;
+  const bridge = {
+    ...fake,
+    invoke: async (command, args) => {
+      const answer = await fake.invoke(command, args);
+      if (command === "set_local_output" && garbled) {
+        garbled = false;
+        return null;
+      }
+      return answer;
+    },
+  };
+  const app = createConsoleApp({ bridge });
+  await app.ready;
+
+  const unreadable = await app.setLocalOutput({ device: DEMO, firstChannel: 2 });
+  const next = await app.setLocalOutput({ device: SPEAKERS, firstChannel: 0 });
+
+  assert.equal(unreadable.ok, true, "the desk took it");
+  assert.match(
+    unreadable.message,
+    /^The local mix output was changed, but the desk's answer could not be read: /,
+  );
+  assert.equal(next.message, "The local mix plays on Speakers (Realtek Audio) · outputs 1/2.");
+  assert.equal(app.store.getState().engine.status.localOutput.device, SPEAKERS);
+  app.dispose();
+});

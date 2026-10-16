@@ -484,7 +484,9 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   // Plays the local mix on `output` (`{ device, firstChannel }`) or nowhere with null, then reads
   // the status, which says where it plays. Answers `{ ok, message, superseded }`; `superseded`
   // says a newer choice came after this one (it may not even have gone out), so only the last
-  // choice's outcome is worth saying.
+  // choice's outcome is worth saying. Every choice settles with an answer: a refusal, an answer
+  // that cannot be read and a status that cannot be read are said in `message`, and none of them
+  // ever stops a later choice from going out.
   function setLocalOutput(output) {
     const choice = ++outputChoice;
     const overtaken = () => choice !== outputChoice;
@@ -492,20 +494,48 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       if (overtaken()) {
         return { ok: true, message: null, superseded: true };
       }
-      let result;
+      let answer;
       try {
-        result = { ok: true, message: formatLocalOutputSet(await api.setLocalOutput(output)) };
+        answer = await api.setLocalOutput(output);
       } catch (error) {
-        result = {
-          ok: false,
-          message: sentenceWithReason("The local mix output was not changed", message(error)),
-        };
+        const refused = sentenceWithReason("The local mix output was not changed", message(error));
+        return settleOutput({ ok: false, message: refused }, overtaken);
       }
-      await readStatus();
-      return { ...result, superseded: overtaken() };
+      let words;
+      try {
+        words = formatLocalOutputSet(answer);
+      } catch (error) {
+        words = sentenceWithReason(
+          "The local mix output was changed, but the desk's answer could not be read",
+          message(error),
+        );
+      }
+      return settleOutput({ ok: true, message: words }, overtaken);
     };
-    outputLane = outputLane.then(send);
-    return outputLane;
+    // The lane itself never stays rejected: whatever happens to one choice, the next goes out.
+    const answer = outputLane.then(send).catch((error) => ({
+      ok: false,
+      message: sentenceWithReason("The local mix output may not have changed", message(error)),
+      superseded: overtaken(),
+    }));
+    outputLane = answer;
+    return answer;
+  }
+
+  // Reads the status after an output choice and finishes its answer: a status that cannot be read
+  // is said after the outcome, and `superseded` is worked out last.
+  async function settleOutput(result, overtaken) {
+    let unread;
+    try {
+      unread = await readStatus();
+    } catch (error) {
+      unread = error;
+    }
+    const unknown = unread
+      ? sentenceWithReason("Where it plays now could not be read", message(unread))
+      : null;
+    const words = unknown ? `${result.message} ${unknown}` : result.message;
+    return { ...result, message: words, superseded: overtaken() };
   }
 
   // Applies a driver or buffer change by restarting the engine, as a DAW does: on the device in

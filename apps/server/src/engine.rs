@@ -636,20 +636,18 @@ pub(crate) fn keep_target_controls(
     }
 }
 
-/// Replaces every control and mirror the engine keeps with a loaded session's, as
-/// [EngineHandle::replace_kept] does: the controls first, then the mirrors, each mix that changed
-/// announced as a change made through the engine, in that order. Returns the mirrors refused.
+/// Replaces every control and mirror the engine keeps with a loaded session's in one step, as
+/// [EngineHandle::replace_kept] does (see [TargetRegistry::replace_kept]): each mix that changed is
+/// announced as a change made through the engine, those the controls moved first. Returns the
+/// mirrors refused.
 pub(crate) fn replace_target_kept(
     targets: &TargetRegistry,
     events: &EventBus,
     controls: &[(MusicianKey, EngineerControls)],
     mirrors: &[(MusicianKey, MusicianKey, String)],
 ) -> Vec<String> {
-    for address in targets.replace_kept_controls(controls) {
-        announce_engine_change(events, address);
-    }
-    let (changed, refused) = targets.replace_mirrors(mirrors);
-    for address in changed {
+    let (by_controls, by_mirrors, refused) = targets.replace_kept(controls, mirrors);
+    for address in by_controls.into_iter().chain(by_mirrors) {
         announce_engine_change(events, address);
     }
     refused

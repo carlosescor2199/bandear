@@ -305,6 +305,10 @@ pub(crate) struct TargetRegistry {
     /// taking it: lets a test hold a propagation there while another one runs.
     #[cfg(test)]
     after_leader_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, in the next [Self::replace_kept], between the controls' replacement and the
+    /// mirrors': lets a test try a registration there.
+    #[cfg(test)]
+    between_replacements: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TargetRegistry {
@@ -339,6 +343,8 @@ impl TargetRegistry {
             propagation: Mutex::new(()),
             #[cfg(test)]
             after_leader_read: Mutex::new(None),
+            #[cfg(test)]
+            between_replacements: Mutex::new(None),
         })
     }
 
@@ -548,23 +554,23 @@ impl TargetRegistry {
     }
 
     /// Replaces every mirror the engine keeps with `kept` (the follower's key, the leader's key and
-    /// the name the follower's phone is told), as a desk loading a saved session does: a mirror kept
-    /// before and not in `kept` is forgotten, also for a musician who is not here, so it never comes
-    /// back when they register. Each of `kept` is admitted in order as [Self::keep_mirror] admits one
-    /// (never on oneself, never closing a circle with those admitted before it); a refused one is
-    /// left out and named. Then every musician here is put on their mirror, or freed from the one
-    /// they lost. Returns the musicians whose stored mix changed and the refusals.
-    pub(crate) fn replace_mirrors(
+    /// the name the follower's phone is told): a mirror kept before and not in `kept` is forgotten,
+    /// also for a musician who is not here, so it never comes back when they register. Each of
+    /// `kept` is admitted in order as [Self::keep_mirror] admits one (never on oneself, never closing
+    /// a circle with those admitted before it); a refused one is left out and named. Then every
+    /// musician of `entries` (the table, held by the caller) is put on their mirror, or freed from
+    /// the one they lost. Returns the musicians whose stored mix changed and the refusals.
+    fn replace_mirrors_in(
         &self,
+        entries: &[TargetEntry],
         kept: &[(MusicianKey, MusicianKey, String)],
     ) -> (Vec<SocketAddr>, Vec<String>) {
-        let entries = self.read();
         let mut refused = Vec::new();
         {
             let mut book = self.mirror_book();
             book.clear();
             for (follower, leader, name) in kept {
-                match admitted(&book, &entries, follower, leader, name) {
+                match admitted(&book, entries, follower, leader, name) {
                     Ok(mirror) => {
                         book.insert(BookKey::from(follower), mirror);
                     }
@@ -572,7 +578,7 @@ impl TargetRegistry {
                 }
             }
         }
-        (self.restore_mirrors(&entries), refused)
+        (self.restore_mirrors(entries), refused)
     }
 
     /// Puts the mirror kept for each musician of `entries` in force, or none (see
@@ -714,16 +720,45 @@ impl TargetRegistry {
             .collect()
     }
 
-    /// Replaces every control the engine keeps with `kept`, as a desk loading a saved session does:
-    /// controls kept before and not in `kept` are forgotten, also for a musician who is not here, so
-    /// they never come back when that musician registers. Every musician here is resolved again,
-    /// client id first, and takes the controls now kept for them or the defaults (no limit, nothing
-    /// locked). Returns the addresses of the musicians whose stored mix changed.
-    pub(crate) fn replace_kept_controls(
+    /// Replaces every control and every mirror the engine keeps with `controls` and `mirrors`, as a
+    /// desk loading a saved session does, in one step: the table is held for reading from the first
+    /// replacement through the last musician resolved, so no registration comes between them (one
+    /// meets either both old books or both new ones). See [Self::replace_controls_in] and
+    /// [Self::replace_mirrors_in]. Returns the musicians whose stored mix the controls changed, those
+    /// the mirrors changed, and the mirrors refused.
+    pub(crate) fn replace_kept(
         &self,
+        controls: &[(MusicianKey, EngineerControls)],
+        mirrors: &[(MusicianKey, MusicianKey, String)],
+    ) -> (Vec<SocketAddr>, Vec<SocketAddr>, Vec<String>) {
+        let entries = self.read();
+        let by_controls = self.replace_controls_in(&entries, controls);
+        #[cfg(test)]
+        {
+            // Taken first, so the hook's own lock is not held while it runs.
+            let hook = self
+                .between_replacements
+                .lock()
+                .expect("test hook lock poisoned")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let (by_mirrors, refused) = self.replace_mirrors_in(&entries, mirrors);
+        (by_controls, by_mirrors, refused)
+    }
+
+    /// Replaces every control the engine keeps with `kept`: controls kept before and not in `kept`
+    /// are forgotten, also for a musician who is not here, so they never come back when that
+    /// musician registers. Every musician of `entries` (the table, held by the caller) is resolved
+    /// again, client id first, and takes the controls now kept for them or the defaults (no limit,
+    /// nothing locked). Returns the addresses of the musicians whose stored mix changed.
+    fn replace_controls_in(
+        &self,
+        entries: &[TargetEntry],
         kept: &[(MusicianKey, EngineerControls)],
     ) -> Vec<SocketAddr> {
-        let entries = self.read();
         {
             let mut book = self
                 .controls
@@ -2242,10 +2277,13 @@ mod tests {
         registry.keep_controls(&MusicianKey::Address(address(A)), limit(40));
         assert_eq!(controls_at(&registry, "192.168.1.3"), limit(40));
 
-        let changed = registry.replace_kept_controls(&[
-            (MusicianKey::Address(address(B)), limit(70)),
-            (MusicianKey::Client(PHONE_B.to_owned()), limit(55)),
-        ]);
+        let (changed, _, _) = registry.replace_kept(
+            &[
+                (MusicianKey::Address(address(B)), limit(70)),
+                (MusicianKey::Client(PHONE_B.to_owned()), limit(55)),
+            ],
+            &[],
+        );
 
         assert_eq!(
             changed,
@@ -2272,6 +2310,63 @@ mod tests {
     }
 
     #[test]
+    fn a_registration_never_comes_between_the_replaced_controls_and_mirrors() {
+        let registry = Arc::new(racks());
+        let phone = MusicianKey::Client(PHONE_A.to_owned());
+        registry.keep_controls(
+            &phone,
+            EngineerControls {
+                limit_percent: 100,
+                locked: 0b1,
+            },
+        );
+        registry
+            .keep_mirror(&phone, &MusicianKey::Address(address(B)), "Bass")
+            .expect("kept for a phone not here");
+        let racing = Arc::clone(&registry);
+        let in_between = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&in_between);
+        let thread = Arc::new(Mutex::new(None));
+        let handle = Arc::clone(&thread);
+        *registry
+            .between_replacements
+            .lock()
+            .expect("test hook lock") = Some(Box::new(move || {
+            // Ana's phone registers right between the two replacements, if it can get in.
+            let (done, finished) = std::sync::mpsc::channel();
+            *handle.lock().expect("thread slot") = Some(std::thread::spawn(move || {
+                let registration =
+                    register_phone(&racing, "192.168.1.30", 50000, "Ana", Some(PHONE_A));
+                let _ = done.send(());
+                registration
+            }));
+            if finished.recv_timeout(Duration::from_millis(150)).is_ok() {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+
+        registry.replace_kept(&[], &[]);
+
+        let registration = thread
+            .lock()
+            .expect("thread slot")
+            .take()
+            .expect("the hook ran")
+            .join()
+            .expect("the registration thread");
+        assert!(
+            !in_between.load(std::sync::atomic::Ordering::SeqCst),
+            "the registration waited for the whole replacement"
+        );
+        assert!(!registration.followed, "it never met the dropped mirror");
+        assert_eq!(mix_at(&registry, "192.168.1.30:50000").following(), None);
+        assert_eq!(
+            controls_at(&registry, "192.168.1.30"),
+            EngineerControls::default()
+        );
+    }
+
+    #[test]
     fn replacing_the_kept_mirrors_frees_a_follower_here_and_forgets_one_not_here() {
         let registry = racks();
         desk_gains(&registry, B, &[30, 40]);
@@ -2284,15 +2379,18 @@ mod tests {
             .keep_mirror(&MusicianKey::Client(PHONE_A.to_owned()), &key(B), "Bass")
             .expect("kept for a phone not here");
 
-        let (changed, refused) = registry.replace_mirrors(&[
-            (key(C), key(B), "Bass".to_owned()),
-            (key(B), key(C), "Keys".to_owned()),
-            (
-                MusicianKey::Client(PHONE_B.to_owned()),
-                key(C),
-                "Keys".to_owned(),
-            ),
-        ]);
+        let (_, changed, refused) = registry.replace_kept(
+            &[],
+            &[
+                (key(C), key(B), "Bass".to_owned()),
+                (key(B), key(C), "Keys".to_owned()),
+                (
+                    MusicianKey::Client(PHONE_B.to_owned()),
+                    key(C),
+                    "Keys".to_owned(),
+                ),
+            ],
+        );
 
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(refused[0].contains("circle"), "{refused:?}");

@@ -16,6 +16,10 @@ import "./channel-strip.js";
 import "./group-strip.js";
 import "./master-strip.js";
 
+// Organisms of the Channels and groups screen.
+import "./channel-table.js";
+import "./group-cards.js";
+
 // Organisms of the Network and system screen.
 import "./musicians-table.js";
 import "./audio-setup.js";

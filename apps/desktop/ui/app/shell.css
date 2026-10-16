@@ -1,7 +1,12 @@
 /*
  * The console shell: the sidebar and the main region. Laid out for 1100-1440 px windows; a
  * narrower window keeps the sidebar as an icon rail, and a very narrow one stacks it on top.
+ *
+ * The Channels and groups screen's layout comes in here, since index.html links the shell's
+ * sheet and the first two screens' sheets only.
  */
+
+@import url("screens/channels-screen.css");
 
 .skip-link {
   position: absolute;

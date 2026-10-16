@@ -6,6 +6,17 @@ const MINUS = "−";
 const SEPARATOR = " · ";
 
 /**
+ * `lead` and the reason after a colon, as one sentence: "lead: reason." A reason that ends with
+ * full stops, or no reason at all (null, empty, blank), still gives one sentence with one.
+ */
+export function sentenceWithReason(lead, reason) {
+  const text = String(reason ?? "")
+    .trim()
+    .replace(/\.+$/, "");
+  return text ? `${lead}: ${text}.` : `${lead}.`;
+}
+
+/**
  * What a group edit did, from the `set_groups` answer `{ groups, applied, saved, saveError }`:
  * live on every phone, saved for the next start (no engine was running), or live but not kept.
  */
@@ -15,27 +26,20 @@ export function formatGroupsSet({ applied, saved, saveError }) {
   }
   return saved
     ? "Groups applied to every phone."
-    : `Groups applied to every phone, but not saved: ${saveError}.`;
+    : sentenceWithReason("Groups applied to every phone, but not saved", saveError);
 }
 
 /**
  * What a channel edit did, from the `set_channels` answer `{ channels, applied, saved, saveError }`,
- * in the words of formatGroupsSet. A reason that ends with a full stop, or no reason at all, still
- * gives one sentence.
+ * in the words of formatGroupsSet.
  */
 export function formatChannelsSet({ applied, saved, saveError }) {
   if (!applied) {
     return "Channel details saved; they apply at the next start.";
   }
-  if (saved) {
-    return "Channel details applied to every phone.";
-  }
-  const reason = String(saveError ?? "")
-    .trim()
-    .replace(/\.+$/, "");
-  return reason
-    ? `Channel details applied to every phone, but not saved: ${reason}.`
-    : "Channel details applied to every phone, but not saved.";
+  return saved
+    ? "Channel details applied to every phone."
+    : sentenceWithReason("Channel details applied to every phone, but not saved", saveError);
 }
 
 /** "85%". */

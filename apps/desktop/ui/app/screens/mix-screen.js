@@ -8,12 +8,14 @@ import { editKey } from "../lib/mix.js";
 import { musicianLabel } from "../lib/format.js";
 import { selectedMusician } from "../lib/console-state.js";
 import {
+  channelEdits,
   channelStrips,
   groupStrips,
   masterStrip,
   mixMessages,
   mixNotice,
   musicianTabs,
+  stripLevel,
   topBarView,
 } from "../lib/mix-view.js";
 
@@ -58,15 +60,33 @@ const LAYOUT = `
   </div>
 `;
 
-// Keeps exactly `count` children of `container`, made by `create`, and returns them.
-function ensureChildren(container, count, create) {
-  while (container.children.length > count) {
-    container.lastElementChild.remove();
+// Keeps one child of `container` per item, in the items' order, each kept by its key (made by
+// `create` for a new key) and returned. A child stays with its key while others come and go, so a
+// group strip stays with its group (by id) and a channel strip with its input when groups are
+// reordered or an input is hidden or paired, even in the middle of a drag.
+function keyedChildren(container, items, keyOf, create) {
+  const byKey = new Map([...container.children].map((child) => [child.dataset.key, child]));
+  const children = items.map((item) => {
+    const key = String(keyOf(item));
+    let child = byKey.get(key);
+    if (child) {
+      byKey.delete(key);
+    } else {
+      child = create();
+      child.dataset.key = key;
+    }
+    return child;
+  });
+  for (const stale of byKey.values()) {
+    stale.remove();
   }
-  while (container.children.length < count) {
-    container.append(create());
-  }
-  return [...container.children];
+  children.forEach((child, position) => {
+    const here = container.children[position];
+    if (here !== child) {
+      container.insertBefore(child, here ?? null);
+    }
+  });
+  return children;
 }
 
 /** Mounts the Mix screen in `main` for the console `app`; returns the unmount function. */
@@ -132,16 +152,22 @@ export function mountMixScreen(main, app) {
     }
     parts.body.setAttribute("aria-label", `${musicianLabel(musician)}'s mix`);
     const strips = channelStrips(state, address);
-    ensureChildren(parts.channels, strips.length, () =>
-      document.createElement("ml-channel-strip"),
-    ).forEach((element, index) => {
-      element.data = strips[index];
+    keyedChildren(
+      parts.channels,
+      strips,
+      (strip) => strip.index,
+      () => document.createElement("ml-channel-strip"),
+    ).forEach((element, position) => {
+      element.data = strips[position];
     });
     const groups = groupStrips(state, address);
-    ensureChildren(parts.groups, groups.length, () =>
-      document.createElement("ml-group-strip"),
-    ).forEach((element, index) => {
-      element.data = groups[index];
+    keyedChildren(
+      parts.groups,
+      groups,
+      (group) => group.id,
+      () => document.createElement("ml-group-strip"),
+    ).forEach((element, position) => {
+      element.data = groups[position];
     });
     parts.master.data = masterStrip(state, address);
   }
@@ -161,18 +187,25 @@ export function mountMixScreen(main, app) {
     if (parts.body.hidden) {
       return;
     }
-    [...parts.channels.children].forEach((strip, index) => {
-      strip.setLevel(channels[index] ?? 0);
-    });
+    for (const strip of parts.channels.children) {
+      if (strip.data) {
+        strip.setLevel(stripLevel(strip.data.sides, channels));
+      }
+    }
     const output = musicians[app.store.getState().selected];
     parts.master.setLevels(output?.left ?? 0, output?.right ?? 0);
   }
 
+  // A channel strip's move goes to every input it stands for (both sides of a pair, its balance
+  // as two pans); a group or master move is one edit.
   function onMixEdit(event) {
     const address = app.store.getState().selected;
-    const { field, index, value } = event.detail;
+    const { field, index, sides, value } = event.detail;
     if (address) {
-      app.edit(address, { [editKey(field, index)]: value });
+      app.edit(
+        address,
+        sides ? channelEdits(event.detail, field, value) : { [editKey(field, index)]: value },
+      );
     }
   }
 

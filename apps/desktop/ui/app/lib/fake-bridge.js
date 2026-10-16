@@ -345,8 +345,10 @@ function withPort(address) {
  * groups are announced in a status before the moved mixes), answers `{ groups, applied, saved,
  * saveError }` as the desktop does, and every start that names no groups takes them. Channel
  * details too: `set_channels` keeps them, applies them while the engine runs and answers `{
- * channels, applied, saved, saveError }`; every start takes them and a device switch keeps those of
- * the inputs that remain, as the engine does. A hidden input is heard in no musician's meter; a new
+ * channels, applied, saved, saveError }` and `channel_table` reads them back whole; every start takes
+ * them, and the engine keeps them whole
+ * while a status shows those of the inputs the device has, so a device switch shows the details of
+ * inputs that come back again, as the engine does. A hidden input is heard in no musician's meter; a new
  * pair is panned apart (0 and 100) in every mix, announced in a status before the moved mixes; and
  * every change of a pair's level, mute or solo, from the desk or a phone, moves both sides (see
  * keepPairsEqual). Besides `invoke` and `listen` it offers
@@ -385,9 +387,12 @@ export function createFakeBridge({
   let runningGroups = savedGroups;
   let lastGroupId = 0;
   // The engineer's channel details as the session keeps them (every start takes them and
-  // `set_channels` replaces them), and the ones the engine has now, fitted to its inputs.
+  // `set_channels` replaces them), and the ones the engine has now. As in the engine, the running
+  // ones are kept whole, entries past the device included: only what the status shows is fitted
+  // to the inputs (see channelRows), and the mixes' pairs come from the whole table, so a pair
+  // missing its second side stays linked in every mix.
   let savedChannels = channelDetails(engine.channels);
-  let runningChannels = fitChannels(savedChannels, engine.sourceChannels);
+  let runningChannels = savedChannels;
 
   // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
   // and names are trimmed.
@@ -412,15 +417,16 @@ export function createFakeBridge({
     engine.channels = channelRows(engine.sourceChannels, engine.groups, runningChannels);
   }
 
-  // Gives the running engine the channel `details`, fitted to the current device.
+  // Gives the running engine the channel `details`, kept whole and shown fitted to the device.
   function showChannels(details) {
-    runningChannels = fitChannels(details, engine.sourceChannels);
+    runningChannels = details;
     engine.channels = channelRows(engine.sourceChannels, engine.groups, runningChannels);
   }
 
   // As the engine does when pairs are linked: every musician's new pairs are panned apart (0 and
   // 100) and take the first side's level, mute and solo, each mix under a new revision. Returns the
-  // rows that moved: every row when a pair was linked that `previous` did not have, else none.
+  // rows that moved: every row when a pair was linked that `previous` did not have, else none. The
+  // pairs are the whole table's, as the engine's mixes take them, so a device switch moves none.
   function linkMixes(previous) {
     const linked = runningChannels.map((channel, index) => channel.link && !previous[index]?.link);
     if (!linked.some(Boolean)) {
@@ -476,13 +482,13 @@ export function createFakeBridge({
 
   // Captures from `device`; one whose channel count is unknown keeps the current count. As in the
   // engine, the groups are re-checked against the new inputs, never rewritten, and the channel
-  // details of the inputs that remain are kept and the rest dropped.
+  // details are kept whole: the status shows those of the inputs the device has, so the details of
+  // inputs that come back are shown again.
   function useDevice(device) {
     engine.deviceName = device.name;
     if (device.channels > 0) {
       engine.captureFormat = { ...engine.captureFormat, channels: device.channels };
       engine.sourceChannels = device.channels;
-      runningChannels = fitChannels(runningChannels, device.channels);
       showGroups(runningGroups);
     }
   }
@@ -536,7 +542,7 @@ export function createFakeBridge({
       }
       // As the desktop does: every start takes the kept channel details, so a new engine pans
       // every kept pair apart before the window hears of it.
-      runningChannels = fitChannels(savedChannels, engine.sourceChannels);
+      runningChannels = savedChannels;
       showGroups(runningGroups);
       linkMixes([]);
       isRunning = true;
@@ -651,17 +657,20 @@ export function createFakeBridge({
         const previous = runningChannels;
         const shown = JSON.stringify(engine.channels);
         showChannels(next);
-        if (JSON.stringify(engine.channels) === shown) {
-          // As in the engine, the same details change nothing and announce nothing.
-          return outcome;
+        // As the desktop does: the new details go out first, then every mix a new pair moved. The
+        // same details, or a change only to inputs the device lacks, announce no status.
+        if (JSON.stringify(engine.channels) !== shown) {
+          emit("status", clone(engine));
         }
-        // As the desktop does: the new details go out first, then every mix a new pair moved.
-        emit("status", clone(engine));
         for (const row of linkMixes(previous)) {
           announceMix(row.address, "desktop", mixFromDto(row));
         }
       }
       return outcome;
+    },
+    channel_table() {
+      // As the desktop answers: the running engine's whole table, else the session's.
+      return clone(isRunning ? runningChannels : savedChannels);
     },
   };
 

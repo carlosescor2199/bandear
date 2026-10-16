@@ -1,8 +1,10 @@
 // What the Mix screen shows, worked out from the console state. Pure functions, no DOM: the
 // screen's organisms only render these plain objects.
 
+import { balanceToPans, channelLabel, pairUnits, pansToBalance } from "./channels.js";
 import { musicianByAddress, musiciansNeedingAttention, viewMix } from "./console-state.js";
 import { formatCaptureFormat, formatPercent, linkState, musicianLabel } from "./format.js";
+import { editKey } from "./mix.js";
 import { groupTone } from "./values.js";
 
 const SEPARATOR = " · ";
@@ -58,10 +60,13 @@ function groupsWithTones(state) {
 }
 
 /**
- * One strip per input of the device, for `address`'s mix as it shows (with local edits):
- * `{ index, label, group, gain, pan, muted, solo, tone, readout }`. Channels have no names yet,
- * so a strip is called by its number. A muted strip reads "muted", not only a duller fill. A
- * channel's group is found by id: two groups may share a name.
+ * One strip per shown input of the device, left to right, for `address`'s mix as it shows (with
+ * local edits): `{ index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone,
+ * readout }`. A hidden input has no strip. A stereo pair is one strip (`stereo`, `sides` both
+ * inputs, `index` the first): its level, mute and solo are its first side's, which the engine keeps
+ * equal to the second's, and its pan is the balance the two pans make (pansToBalance). A strip is
+ * called by its input's name, or its number when it has none (channelLabel). A muted strip reads
+ * "muted", not only a duller fill. A channel's group is found by id: two groups may share a name.
  */
 export function channelStrips(state, address) {
   const mix = viewMix(state, address);
@@ -70,25 +75,52 @@ export function channelStrips(state, address) {
     return [];
   }
   const groups = groupsWithTones(state);
-  return status.channels.slice(0, status.sourceChannels).map((channel, index) => {
-    const group = channel.groupId
-      ? groups.find((candidate) => candidate.id === channel.groupId)
-      : null;
-    const muted = mix.channelMuted[index];
-    return {
-      index,
-      label: `CH ${channel.number}`,
-      group: group
-        ? { id: group.id, name: group.name, tone: group.tone, invalid: group.invalid }
-        : null,
-      gain: mix.channelGains[index],
-      pan: mix.pans[index],
-      muted,
-      solo: mix.channelSolo[index],
-      tone: muted ? "muted" : "default",
-      readout: muted ? "muted" : formatPercent(mix.channelGains[index]),
-    };
-  });
+  const channels = status.channels.slice(0, status.sourceChannels);
+  return pairUnits(channels)
+    .filter(([first]) => !channels[first].hidden)
+    .map((sides) => {
+      const [index, second] = sides;
+      const channel = channels[index];
+      const group = channel.groupId
+        ? groups.find((candidate) => candidate.id === channel.groupId)
+        : null;
+      const stereo = second !== undefined;
+      const muted = mix.channelMuted[index];
+      return {
+        index,
+        sides,
+        stereo,
+        label: channelLabel(channel),
+        kind: channel.kind ?? "other",
+        group: group
+          ? { id: group.id, name: group.name, tone: group.tone, invalid: group.invalid }
+          : null,
+        gain: mix.channelGains[index],
+        pan: stereo ? pansToBalance(mix.pans[index], mix.pans[second]) : mix.pans[index],
+        muted,
+        solo: mix.channelSolo[index],
+        tone: muted ? "muted" : "default",
+        readout: muted ? "muted" : formatPercent(mix.channelGains[index]),
+      };
+    });
+}
+
+/**
+ * The local edits a move on a channel strip makes, keyed as editKey does: a stereo strip's level,
+ * mute or solo goes to both of its inputs, and its balance becomes both pans (balanceToPans); a
+ * strip of one input edits that input. `strip` is `{ sides, stereo }` from channelStrips.
+ */
+export function channelEdits({ sides, stereo }, field, value) {
+  if (field === "pans" && stereo) {
+    const [left, right] = balanceToPans(value);
+    return { [editKey("pans", sides[0])]: left, [editKey("pans", sides[1])]: right };
+  }
+  return Object.fromEntries(sides.map((side) => [editKey(field, side), value]));
+}
+
+/** The level a strip's meter shows: its input's peak, or the louder side of a pair. */
+export function stripLevel(sides, levels) {
+  return Math.max(...sides.map((side) => levels[side] ?? 0));
 }
 
 /**

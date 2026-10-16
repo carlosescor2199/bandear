@@ -588,9 +588,47 @@ pub fn set_channels(
     Ok(outcome)
 }
 
+/// The engineer's whole channel table, as the window edits it: every entry kept, in channel order
+/// (the first is CH 1), details of inputs the current device lacks included. The engine status
+/// lists only the device's inputs, so a window that edited from it would send a shorter list as
+/// the whole table and lose the rest; it reads this instead and sends it back with its change.
+///
+/// With an engine running this is the engine's table ([EngineHandle::channel_table]), which is
+/// what it took last even when saving it failed; with none, the session's, a kind this build does
+/// not know read as `other`, as a start applies it.
+pub fn channel_table(state: &DesktopState) -> Result<Vec<SessionChannel>, String> {
+    read_channel_table(&state.engine, &state.session)
+}
+
+/// [channel_table] over any engine slot and session.
+fn read_channel_table<E: ChannelEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+) -> Result<Vec<SessionChannel>, String> {
+    // The lock order every command that holds both follows: the engine's, then the session's.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let table = match guard.as_ref() {
+        Some(engine) => engine.channel_table(),
+        None => session_channels(session),
+    };
+    Ok(table
+        .into_iter()
+        .map(|channel| SessionChannel {
+            name: channel.name,
+            kind: channel.kind.name().to_owned(),
+            hidden: channel.hidden,
+            link: channel.linked_to_next,
+        })
+        .collect())
+}
+
 /// What a channel edit needs from the running engine, as [GroupEngine] is for a group edit.
 trait ChannelEngine {
     fn set_channels(&mut self, channels: Vec<ChannelMeta>) -> Result<(), String>;
+    /// The whole table the engine keeps (see [channel_table]).
+    fn channel_table(&self) -> Vec<ChannelMeta>;
 }
 
 impl ChannelEngine for EngineHandle {
@@ -598,6 +636,10 @@ impl ChannelEngine for EngineHandle {
         EngineHandle::set_channels(self, channels)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn channel_table(&self) -> Vec<ChannelMeta> {
+        EngineHandle::channel_table(self)
     }
 }
 
@@ -1172,12 +1214,40 @@ mod tests {
     }
 
     /// Stands in for a running engine in a group edit: it records what it took, can be stopping,
-    /// and takes a moment to apply, as the real engine's regroup does.
+    /// and takes a moment to apply, as the real engine's regroup does. With a [Park] it holds the
+    /// next edit that reaches it right after taking its groups, before that edit is saved.
     #[derive(Default)]
     struct StandInEngine {
         applied: Option<Vec<GroupDefinition>>,
         applied_channels: Option<Vec<ChannelMeta>>,
         stopping: bool,
+        park: Option<Park>,
+    }
+
+    /// Holds one group edit between its apply and its save while another edit runs: the edit
+    /// says it is parked, then waits until the session's groups change (another edit saved while
+    /// this one was half done) or `wait` passes, and notes which.
+    struct Park {
+        session: std::sync::Arc<SessionStore>,
+        parked: std::sync::mpsc::Sender<()>,
+        wait: std::time::Duration,
+        saved_meanwhile: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Park {
+        fn hold(self) {
+            let before = self.session.groups();
+            self.parked.send(()).expect("the test waits for the park");
+            let deadline = std::time::Instant::now() + self.wait;
+            while std::time::Instant::now() < deadline {
+                if self.session.groups() != before {
+                    self.saved_meanwhile
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     impl GroupEngine for StandInEngine {
@@ -1187,6 +1257,9 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
             self.applied = Some(definitions);
+            if let Some(park) = self.park.take() {
+                park.hold();
+            }
             Ok(())
         }
     }
@@ -1198,6 +1271,10 @@ mod tests {
             }
             self.applied_channels = Some(channels);
             Ok(())
+        }
+
+        fn channel_table(&self) -> Vec<ChannelMeta> {
+            self.applied_channels.clone().unwrap_or_default()
         }
     }
 
@@ -1278,33 +1355,69 @@ mod tests {
         assert_eq!(applied_names(&engine), Some(vec!["Drums".to_owned()]));
     }
 
-    /// Two windows (or two quick clicks) edit the groups at the same moment while the engine is busy
-    /// (a status read holds it), round after round: whichever edit wins, the session and the running
-    /// engine always end with the same one.
+    /// Two windows (or two quick clicks) edit the groups at the same moment. Every round forces the
+    /// overlap: the first edit is parked right after the engine took its groups, and the second
+    /// edit runs meanwhile. Under a save-then-apply order the second edit's groups reach the
+    /// session while the first edit is half done (the order that leaves the session and the engine
+    /// apart when the applies then land the other way round), and the park reports it. Since each
+    /// edit is one step under the engine lock, the second edit waits until the first is saved, and
+    /// the session and the engine end with the second edit's groups.
     #[test]
     fn two_group_edits_at_once_leave_the_session_and_the_engine_with_the_same_groups() {
-        let session = SessionStore::open(&session_directory("groups-concurrent"));
+        let session =
+            std::sync::Arc::new(SessionStore::open(&session_directory("groups-concurrent")));
         let engine = running(StandInEngine::default());
-        for round in 0..30 {
-            std::thread::scope(|scope| {
-                let busy = engine.lock().expect("engine lock");
-                for name in ["First", "Second"] {
-                    let (engine, session) = (&engine, &session);
-                    scope.spawn(move || {
-                        edit_groups(engine, session, vec![request(Some(name), name, &[1])])
-                            .expect("a valid edit");
-                    });
-                }
-                // Both edits arrive while the engine is busy.
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                drop(busy);
+        for round in 0..6 {
+            let (first, second) = if round % 2 == 0 {
+                ("First", "Second")
+            } else {
+                ("Second", "First")
+            };
+            let (parked, parked_signal) = std::sync::mpsc::channel();
+            let saved_meanwhile = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_mut()
+                .expect("a running stand-in")
+                .park = Some(Park {
+                session: std::sync::Arc::clone(&session),
+                parked,
+                wait: std::time::Duration::from_millis(100),
+                saved_meanwhile: std::sync::Arc::clone(&saved_meanwhile),
             });
 
+            std::thread::scope(|scope| {
+                let (engine, session) = (&engine, &session);
+                scope.spawn(move || {
+                    edit_groups(engine, session, vec![request(Some(first), first, &[1])])
+                        .expect("a valid edit");
+                });
+                parked_signal
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the first edit reached the engine");
+                // The second edit runs while the first sits between its apply and its save.
+                scope.spawn(move || {
+                    edit_groups(engine, session, vec![request(Some(second), second, &[1])])
+                        .expect("a valid edit");
+                });
+            });
+
+            assert!(
+                !saved_meanwhile.load(std::sync::atomic::Ordering::SeqCst),
+                "round {round}: the second edit was saved while the first was between its apply \
+                 and its save"
+            );
             let saved: Vec<String> = session
                 .groups()
                 .iter()
                 .map(|group| group.name.clone())
                 .collect();
+            assert_eq!(
+                saved,
+                vec![second.to_owned()],
+                "round {round}: the later edit wins"
+            );
             assert_eq!(applied_names(&engine), Some(saved), "round {round}");
         }
     }
@@ -1556,5 +1669,136 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The window edits the whole list: with an engine running it reads the engine's, entries for
+    /// inputs the device lacks included; with none, the session's, a kind this build does not know
+    /// read as it applies.
+    #[test]
+    fn the_channel_table_is_the_running_engines_whole_list_else_the_sessions() {
+        let session = SessionStore::open(&session_directory("channel-table"));
+        session
+            .set_channels(vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "theremin", true, false),
+            ])
+            .expect("kept");
+        let idle: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        assert_eq!(
+            read_channel_table(&idle, &session).expect("readable"),
+            vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "other", true, false),
+            ]
+        );
+
+        let engine = running(StandInEngine::default());
+        let whole = vec![
+            detail("Kick", "drums", false, false),
+            detail("Keys L", "keys", false, true),
+            detail("Keys R", "keys", false, false),
+            detail("Spare", "other", true, false),
+        ];
+        edit_channels(&engine, &session, whole).expect("the details are taken");
+        assert_eq!(
+            read_channel_table(&engine, &session).expect("readable"),
+            vec![
+                kept("Kick", "drums", false, false),
+                kept("Keys L", "keys", false, true),
+                kept("Keys R", "keys", false, false),
+                kept("Spare", "other", true, false),
+            ]
+        );
+    }
+
+    /// What the window reads is what it sends back: with one entry changed on the table it read,
+    /// every other entry (the details of inputs a smaller device lacks among them) is kept by the
+    /// engine and the session.
+    #[test]
+    fn an_edit_of_the_table_read_back_keeps_every_other_entry() {
+        let session = SessionStore::open(&session_directory("channel-table-edit"));
+        let engine = running(StandInEngine::default());
+        edit_channels(
+            &engine,
+            &session,
+            vec![
+                detail("Kick", "drums", false, false),
+                detail("Snare", "drums", false, false),
+                detail("Spare", "other", true, false),
+            ],
+        )
+        .expect("the details are taken");
+
+        let read = serde_json::to_string(&read_channel_table(&engine, &session).expect("readable"))
+            .expect("serializes");
+        let mut requests: Vec<ChannelRequest> =
+            serde_json::from_str(&read).expect("the window can send back what it reads");
+        requests[0].name = "Kick in".to_owned();
+        edit_channels(&engine, &session, requests).expect("the details are taken");
+
+        assert_eq!(
+            session.channels(),
+            vec![
+                kept("Kick in", "drums", false, false),
+                kept("Snare", "drums", false, false),
+                kept("Spare", "other", true, false),
+            ]
+        );
+        assert_eq!(
+            applied_channels(&engine).map(|channels| channels.len()),
+            Some(3)
+        );
+    }
+
+    /// The groups a `set_groups` answer carries are what the window sends back on its next edit:
+    /// the same ids (a new group's included) and the same 1-based inputs, so a chain of edits never
+    /// moves a member or loses a group's identity.
+    #[test]
+    fn a_group_answer_sent_back_as_the_next_request_keeps_its_ids_and_inputs() {
+        let session = SessionStore::open(&session_directory("groups-roundtrip"));
+        let engine = running(StandInEngine::default());
+        let first = edit_groups(
+            &engine,
+            &session,
+            vec![
+                request(Some("kit"), "Drums", &[1, 2, 3]),
+                request(None, "Vocals", &[5, 6]),
+            ],
+        )
+        .expect("the groups are taken");
+        let new_id = first.groups[1].id.clone();
+        assert!(!new_id.is_empty(), "a new group gets an id");
+
+        let answer = serde_json::to_value(&first).expect("serializes");
+        assert_eq!(
+            answer["groups"],
+            serde_json::json!([
+                { "id": "kit", "name": "Drums", "channels": [1, 2, 3] },
+                { "id": new_id, "name": "Vocals", "channels": [5, 6] },
+            ]),
+            "the inputs are numbered from 1, as the request numbered them"
+        );
+        let mut requests: Vec<GroupRequest> =
+            serde_json::from_value(answer["groups"].clone()).expect("an answer is a request");
+        requests[1].name = "Voices".to_owned();
+        let second = edit_groups(&engine, &session, requests).expect("the groups are taken");
+
+        assert_eq!(
+            second
+                .groups
+                .iter()
+                .map(|group| (group.id.clone(), group.name.clone(), group.channels.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("kit".to_owned(), "Drums".to_owned(), vec![1, 2, 3]),
+                (new_id, "Voices".to_owned(), vec![5, 6]),
+            ]
+        );
+        assert_eq!(
+            applied_names(&engine),
+            Some(vec!["Drums".to_owned(), "Voices".to_owned()])
+        );
+        assert_eq!(session.groups(), second.groups);
     }
 }

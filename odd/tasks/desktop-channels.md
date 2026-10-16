@@ -409,8 +409,124 @@ slice. Push and PRs are the user's decision.
     artificially.
   - Commits: 73d5d9c `feat(android): read channel names, kinds, hidden channels and pairs`; this
     commit (`feat(android): show named channels and stereo pairs on the mix`).
-- [ ] T4 (Channels and groups screen): board 3 in the desktop UI; the Mix screen uses names,
-  icons, hidden channels, linked strips and group ids. Route: delegated writer.
+- [x] T4 (Channels and groups screen): board 3 in the desktop UI; the Mix screen uses names,
+  icons, hidden channels, linked strips and group ids; the T2b review suggestions. Route: delegated
+  writer (trigger: 2+ non-trivial files across the UI's view models, organisms, screens and the
+  fake bridge).
+  - T2b suggestions: `formatGroupsSet` and `formatChannelsSet` share `sentenceWithReason` (one full
+    stop whatever the reason ends with; no reason, null or blank, gives "... but not saved.")
+    (R3-format-groups-set-unguarded-save-error). The concurrency test now forces the overlap: the
+    `GroupEngine` stand-in takes a `Park` that holds the first edit right after the engine took its
+    groups and signals the test, which only then starts the second edit; the park waits up to
+    100 ms for the session's groups to change and reports it. Each round (6, alternating which
+    edit goes first) asserts that no save landed during the park, that the later edit wins and that
+    the session and the engine agree (R3-concurrency-test-not-discriminating).
+  - Screen (`#/channels`, between Mix and Network in the sidebar and `ROUTES`):
+    `screens/channels-screen.js` (container: rAF rendering, meters to the table, events to edits,
+    the last outcome in words in a `role="status"` line or a `role="alert"` line) with two
+    organisms: `<ml-channel-table>` (a row per input: name field, Enter saves, Escape reverts,
+    never overwritten while focused; instrument select with its line icon; horizontal live meter;
+    Stereo toggle with "Linked with CH n"/"Mono" in words, and when unavailable it stays focusable
+    with `aria-disabled` and the reason beside it via `aria-describedby`; the group chip; a Shown box
+    with "Shown"/"Hidden" in words, a pair hiding together) and `<ml-group-cards>` (cards kept by
+    id; New group up to 16; Edit opens the name field, the inputs as checkboxes, a pair once, with
+    "in Vocals"/"hidden" notes, and a guarded Delete: Keep takes its place and the confirmation
+    works only after `CONFIRM_DELAY_MS`, disarming after 10 s or on Escape). `kind-icons.js` draws
+    the 11 kinds and the stereo rings. The screen's sheet is `@import`ed by `shell.css` (index.html
+    is outside this task's surfaces).
+  - Pure logic (`lib/channels-view.js`): `channelRows`, `linkChoice` (a pair from either side;
+    otherwise the next input must exist, be in no pair and be shown or hidden alike, each refusal
+    a sentence), `groupCards`, `canAddGroup`, `KIND_OPTIONS`, and edits of the whole list:
+    `renameChannel`, `setChannelKind`, `setChannelHidden` (both sides of a pair, found in the whole
+    table), `setChannelLink` (undo from either side), `addGroup` ("Group n", at most 16),
+    `renameGroup`, `setGroupMembers` (joining one group leaves any other; a pair joins with both
+    inputs), `deleteGroup`; `channels.js` gains `KIND_LABELS` and `pairUnits`.
+  - Edits (`console-app.js` `editChannels(change)`/`editGroups(change)`): one at a time, each built
+    on the list the last answer gave (the whole list, entries past the device included), else on
+    the status's; with neither (no engine yet) the edit is refused instead of overwriting the
+    session; answers `{ ok, message }` with `formatChannelsSet`/`formatGroupsSet` or "... were not
+    changed: reason.", then reads the status.
+  - Mix: `channelStrips` gives one strip per shown unit (`pairUnits`): hidden inputs have none, a
+    pair is one strip `{ sides, stereo }` labelled by its first input, with the first side's
+    level, mute and solo and `pansToBalance` as its pan; strips are named by `channelLabel` and
+    carry `kind`. `channelEdits` writes a pair's level, mute and solo to both inputs and its balance
+    as both pans (`balanceToPans`); `stripLevel` meters a pair by its louder side. The strip shows
+    the kind icon, the name (ellipsis, full name as title), a STEREO mark (an empty line on mono
+    strips keeps pans and faders aligned) and names its pan "... balance". The screen keeps strips
+    by key (channel strips by first input, group strips by group id), so a strip stays with its
+    group or input when the layout changes.
+  - Settle rule (`console-state.js` `settleLayout`, on every status): pending edits are keyed by
+    position, so when the groups' ids change order or number every pending `groupLevels.*` edit is
+    dropped, and when an input's role changes (hidden, single, first or second side of a pair) its
+    pending channel edits are dropped; a rename keeps everything. Dropped rather than remapped: at
+    status time the musicians' mixes are still positioned for the old groups (the moved mixes
+    follow), so a remapped edit would be sent with stale neighbours.
+  - Fake bridge: the running details are the whole table, fitted only for the status
+    (`channelRows`); a switch refits nothing else, pairs in the mixes come from the whole table (a
+    pair missing its second side stays linked), a change only past the device announces no status;
+    its test now proves the details of inputs that come back are shown again and no pan moves.
+  - RED: (a) `formatGroupsSet` printed "...: the disk is full..." (1 of 210 failed); the forced
+    test, run against `edit_groups` mutated to save before taking the engine lock, failed in round
+    0 ("the second edit was saved while the first was between its apply and its save"), and passes
+    against the real order (the old 30-round test had passed against the old order too, T2b).
+    (b) against stubs 19 of 226
+    failed (the 16 new view-model and app tests, the 2 router tests and the flipped fake switch
+    test). (c) against stubs 6 of 231 failed (labels and kinds, hidden and pairs, `channelEdits`,
+    `stripLevel`, the two settle tests).
+  - GREEN: UI 231 passed (21 new; the router, fake switch, group wording and first strip tests
+    changed); `cargo test -p mixlink-desktop` 94 passed, the
+    group-edit test 5 of 5 runs (0.65 s each); `cargo fmt` clean; clippy: no warnings in the desktop
+    crate. Preview (`dev/serve.mjs 5198`, `/index.html?fake#/channels` and `#/mix`): renamed CH 1
+    with Enter, Escape reverted a name, a name being typed survived the 4 Hz statuses, paired CH 3-4
+    (CH 2 then says "CH 3 is already paired with CH 4.", CH 6 that it is the last input), hid a
+    pair, added a group, moved an input between groups, a double click on Delete kept the group and
+    a confirmed Delete removed it; the Mix showed names and icons, no strip for hidden inputs, the
+    pair as one STEREO strip whose balance (PageUp twice) read back 70 ("R40"); no console errors.
+    `cargo build -p mixlink-desktop`: deferred (the app is running for live testing).
+  - Size: about 140 authored changed lines in (a), 2,050 in (b) (about 860 in the two organisms
+    with their styles, 450 tests) and 440 in (c) plus this document; above the 400-line heuristic in
+    (b) because the screen's two organisms and its pure logic carry their tests; not split
+    artificially.
+  - Commits: 3310343 `test(desktop): force the group edit interleaving and guard outcome
+    messages`; bba07a8 `feat(desktop-ui): add the Channels and groups screen`; 5cabdf2
+    (`feat(desktop-ui): show named, hidden and paired channels on the mix`).
+- [x] T4b (review fixes for T4, review `review-7abd4e4333f80dbb`). Route: inline writer of the
+  delegated T4 worker (bounded fixes across the engine, the desktop commands and the UI).
+  - Whole table (R3-first-channel-edit-from-device-fitted-status): a `channel_table` command
+    answers the whole table the desk keeps, `[{ name, kind, hidden, link }]` in channel order with
+    the details of inputs the device lacks: with an engine running its table
+    (`EngineHandle::channel_table`, the `requested_channels` last set, so a failed save does not
+    matter), else the session's with an unknown kind read as `other`. `bridge.channelTable()`;
+    every channel edit reads it afresh and sends it back whole (the window no longer keeps a
+    channel list, and `channelTableOf` is gone); the fake answers it as the desktop does;
+    `events.rs` no longer says a switch drops details.
+  - Group shape (R3-kept-groups-roundtrip-shape-unproved): `groupDefinitions(groups, first)` turns
+    a status's groups (inputs from 0) and an answer's (from 1) into copies of `{ id, name, channels }`
+    numbered from 1; the app keeps the last answer through it. A chained app test (add a group, then
+    with the engine stopped give it an input and rename another on the last answer's list, restart,
+    remove an input) asserts every id and 1-based member; the Rust test sends a `set_groups` answer
+    back as the next request and gets the same ids and inputs.
+  - Pending toggles (R3-checkbox-reverts-while-edit-in-flight): `pendingToggles()` holds a clicked
+    value under a token (`release` with an older token keeps a later click), and
+    `withPendingShown` (both rows of a pair follow) and `withPendingMembers` show the held values;
+    the screen holds the Shown and group member boxes as clicked until their edit is answered
+    (`group-member` events now carry the choice key).
+  - RED: (a) the engine test, against a body returning the fitted list, failed ("the inputs the
+    device lacks are in it": 2 entries instead of 4); the desktop tests failed to compile (no
+    `read_channel_table`); UI 3 of 234 failed (the first edit on the 2-input device sent 2 entries,
+    the unreadable-table refusal, the fake's `channel_table`). (b) against stubs UI 2 of 237 failed
+    (`groupDefinitions`, the pending toggles); the chained app test and the Rust round-trip test
+    passed at once: they pin shapes that already matched.
+  - GREEN: `cargo test -p personal-monitoring` 250 passed (1 new); `cargo test -p mixlink-desktop`
+    97 passed (3 new); UI 237 passed (6 new; one assertion on the removed `channelTableOf` dropped);
+    `cargo fmt` clean; clippy: no warnings in the desktop crate or the new engine code. Preview
+    (`?fake#/channels`): hiding an input and putting one in a group work as before, no console
+    errors (the fake answers at once, so the held boxes are proved by the pure test). `cargo build
+    -p mixlink-desktop`: deferred (the app is running).
+  - Size: about 320 authored changed lines in (a) and 300 in (b) plus this document.
+  - Commits: 56fdea7 `fix(desktop): edit the whole channel table, not the device's part`; this
+    commit (`fix(desktop-ui): keep group ids and members across chained edits and hold pending
+    toggles`).
 - [ ] T5 (engineer limit and locks): engine fields set only by the engineer path and enforced on
   phone writes; reported to the phone; Android shows the limit and locked controls; the desktop
   master strip and channel strips edit them. Route: delegated writer.
@@ -482,6 +598,32 @@ slice. Push and PRs are the user's decision.
 - Live (2026-10-15): the new phone app (T3b) was installed on the Galaxy S23 and the desktop app
   rebuilt with T1-T3; channel and group editing awaits T4's screen.
 
+- T4 done (Channels and groups screen, Mix names and pairs, T2b suggestions); see its entry for
+  evidence. Follow-ups: rebuild the desktop app and check T4 live (deferred while the app ran);
+  the group list the window edits from after an answer is that answer's, so T7's session load must
+  reset it (channel edits read the whole table afresh since T4b); index.html could link
+  `channels-screen.css` directly (it is imported by `shell.css`); pairing two inputs in different
+  groups leaves the second side in its own group (the strip and the card follow the first side),
+  so linking could offer to join them; a pending edit is dropped on a layout change, and a
+  `set_mix` already in flight with the old group positions can still land after the regroup (last
+  writer wins, as for phones); the fake bridge never reports a failed save, so the "not saved"
+  wording is covered by the format tests only. Resolved by T4b: a first channel edit built on the
+  status's part of the table (now `channel_table`), and the `events.rs` wording.
+- Review `review-7abd4e4333f80dbb` over 879dd8b..5cabdf2 (T4) approved and acknowledged; next
+  review base 5cabdf2. Its findings (R3-first-channel-edit-from-device-fitted-status,
+  R3-kept-groups-roundtrip-shape-unproved, R3-checkbox-reverts-while-edit-in-flight) are fixed by
+  T4b.
+
+- Review `review-8f6510a3d9fdca0a` over 5cabdf2..0408441 (T4b) approved and acknowledged; next
+  review base 0408441. Folded into T7 (session work):
+  - WARNING R3-idle-channel-edit-rewrites-unknown-kinds: with no engine, `read_channel_table`
+    returns the session's table with unknown kinds already turned into `other`, and the window
+    sends it back whole, so an idle edit permanently rewrites a kind written by a newer build on
+    every entry. Keep the stored kind string through the round trip unless the engineer changes
+    that entry, and test it.
+  - SUGGESTION R3-screen-pending-hold-wiring-untested: add a screen-level test with a deferred
+    fake answer proving a clicked Shown or group box stays as clicked until the answer.
+
 ## Next step
 
-T4 (Channels and groups screen).
+T5 (engineer limit and locks).

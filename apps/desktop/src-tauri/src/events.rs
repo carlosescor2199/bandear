@@ -14,9 +14,10 @@
 //!   local names applied; and at once when the groups change (an edit, or a device switch that
 //!   changes which groups the device can feed), ahead of the `mix-changed` of every musician whose
 //!   group levels moved with an edit. Groups and the channels in them carry the group's `id`. It
-//!   also goes out at once when the channel details change (an edit, or a device switch that drops
-//!   the details of inputs the device lacks), ahead of the `mix-changed` of every musician whose
-//!   pans a new stereo pair set; each channel carries its `name`, `kind`, `hidden` and `link`.
+//!   also goes out at once when the channel details it shows change (an edit, or a device switch:
+//!   it shows the details of the inputs the device has, while the engine keeps the rest for when
+//!   they come back, see `channel_table`), ahead of the `mix-changed` of every musician whose pans a
+//!   new stereo pair set; each channel carries its `name`, `kind`, `hidden` and `link`.
 //! - `mix-changed`, as soon as a mix changes:
 //!   `{ "run": n, "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`,
 //!   the whole mix stored after the change. A musician removed in between is not announced.

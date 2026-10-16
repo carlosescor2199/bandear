@@ -24,13 +24,16 @@
 // never jumps back to an older value while its change is on the way. Each copy of a musician's mix
 // carries the engine's revision, and a status row, a `mix-changed` event and a `set_mix` answer
 // can arrive in any order: the store keeps the copy with the highest revision from any of them and
-// never goes back to a lower one. An answer also settles the edits it carried.
+// never goes back to a lower one. An answer also settles the edits it carried. A status that moves
+// the layout (the groups' order, an input's pairing or hiding) drops the edits whose position no
+// longer means the same thing (see settleLayout).
 //
 // Every engine payload names its run. Starting, a failed start and a confirmed stop end the
 // current run, and a payload of an ended or older run is ignored, so a late event can never bring
 // back an engine that has stopped. A stop the engine refused ends nothing: the engine may still
 // run, so its run stays live and the refusal is shown (`commandFailed`).
 
+import { pairUnits } from "./channels.js";
 import { DEFAULT_AUDIO, audioChoice } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
 import { MIX_FIELDS, applyEdits, mixFromDto, parseEditKey, settleEdits } from "./mix.js";
@@ -127,6 +130,64 @@ function onlyListed(pending, addresses) {
   return kept.length === Object.keys(pending).length ? pending : Object.fromEntries(kept);
 }
 
+const CHANNEL_TABLES = new Set(["channelGains", "pans", "channelMuted", "channelSolo"]);
+
+// What each input of a status is on the Mix: "hidden", "single", or the "first" or "second" side
+// of a stereo pair.
+function inputRoles(status) {
+  const channels = (status.channels ?? []).slice(0, status.sourceChannels);
+  const roles = [];
+  for (const unit of pairUnits(channels)) {
+    unit.forEach((index, side) => {
+      if (channels[index].hidden) {
+        roles[index] = "hidden";
+      } else if (unit.length === 1) {
+        roles[index] = "single";
+      } else {
+        roles[index] = side === 0 ? "first" : "second";
+      }
+    });
+  }
+  return roles;
+}
+
+function sameGroups(before, after) {
+  const ids = (status) => (status.groups ?? []).map((group) => group.id);
+  const [was, is] = [ids(before), ids(after)];
+  return was.length === is.length && was.every((id, position) => id === is[position]);
+}
+
+// The pending edits that still mean what they meant once the console's layout went from status
+// `before` to `after`. Edits are keyed by position: a group level by the group's place, which
+// moves when a group is added, deleted or reordered, and a channel's values by input, whose strip
+// changes when it joins or leaves a pair or is hidden or shown. Such edits are dropped, so the
+// next send never writes a level meant for one group onto another, nor a mono strip's pan onto
+// a new pair; the faders show what the engine has. A rename moves nothing and keeps every edit.
+function settleLayout(pending, before, after) {
+  if (!before || Object.keys(pending).length === 0) {
+    return pending;
+  }
+  const groupsMoved = !sameGroups(before, after);
+  const [rolesBefore, rolesAfter] = [inputRoles(before), inputRoles(after)];
+  const stale = (key) => {
+    const { field, index } = parseEditKey(key);
+    if (field === "groupLevels") {
+      return groupsMoved;
+    }
+    return CHANNEL_TABLES.has(field) && rolesBefore[index] !== rolesAfter[index];
+  };
+  let dropped = false;
+  const settled = {};
+  for (const [address, edits] of Object.entries(pending)) {
+    const kept = Object.entries(edits).filter(([key]) => !stale(key));
+    dropped ||= kept.length !== Object.keys(edits).length;
+    if (kept.length > 0) {
+      settled[address] = Object.fromEntries(kept);
+    }
+  }
+  return dropped ? settled : pending;
+}
+
 // True when `incoming` is a newer copy of a musician's mix than `current`.
 function isNewer(incoming, current) {
   return incoming.revision > current.revision;
@@ -166,7 +227,7 @@ function receiveStatus(state, status) {
     musicians,
     selected: stays ? state.selected : (musicians[0]?.address ?? null),
     departed,
-    pending: onlyListed(state.pending, addresses),
+    pending: settleLayout(onlyListed(state.pending, addresses), state.engine.status, status),
     mixError: state.mixError && addresses.has(state.mixError.address) ? state.mixError : null,
     // A status proves the console hears the engine.
     connection: READY,

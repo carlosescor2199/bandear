@@ -15,7 +15,7 @@ use dto::{
     MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use events::EventPump;
-use session::SessionStore;
+use session::{SessionChannel, SessionStore};
 use tauri::{Manager, State};
 
 /// Fails to compile rather than at runtime if the shared state ever gains a non-`Send` field,
@@ -108,6 +108,14 @@ async fn set_channels(
     commands::set_channels(state.inner(), channels)
 }
 
+/// The engineer's whole channel table (`[{ name, kind, hidden, link }]` in channel order, details of
+/// inputs the device lacks included): what the window edits and sends back with `set_channels`
+/// (see [commands::channel_table]).
+#[tauri::command]
+async fn channel_table(state: State<'_, DesktopState>) -> Result<Vec<SessionChannel>, String> {
+    commands::channel_table(state.inner())
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -141,7 +149,8 @@ pub fn run() {
             set_mix,
             set_musician_name,
             set_groups,
-            set_channels
+            set_channels,
+            channel_table
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

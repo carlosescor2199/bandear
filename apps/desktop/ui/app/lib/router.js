@@ -1,9 +1,15 @@
 // The console's sections and hash routing. Pure functions, no DOM.
 //
-// Only the sections this phase builds are listed; each later phase adds its own.
+// Only the sections built so far are listed, in the design's order; each later phase adds its own.
 
 export const ROUTES = Object.freeze([
   Object.freeze({ id: "mix", hash: "#/mix", label: "Mix", title: "Mix" }),
+  Object.freeze({
+    id: "channels",
+    hash: "#/channels",
+    label: "Channels and groups",
+    title: "Channels and groups",
+  }),
   Object.freeze({
     id: "network",
     hash: "#/network",

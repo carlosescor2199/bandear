@@ -78,6 +78,13 @@ export function createEngineApi(bridge) {
      * nothing changed.
      */
     setChannels: (channels) => bridge.invoke("set_channels", { channels }),
+    /**
+     * The whole channel table the desk keeps, `[{ name, kind, hidden, link }]` in channel order:
+     * the details of inputs the current device lacks included, which a status leaves out. A
+     * channel edit is built on it and sent back whole with setChannels. With an engine running it
+     * is the engine's table, else the session's.
+     */
+    channelTable: () => bridge.invoke("channel_table"),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

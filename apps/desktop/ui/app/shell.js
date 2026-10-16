@@ -1,4 +1,5 @@
-// The console shell: the sidebar, hash routing (#/mix by default, #/network) and the main region.
+// The console shell: the sidebar, hash routing (#/mix by default, #/channels, #/network) and the
+// main region.
 //
 // Each section renders into the main region through a screen: a function `(main, route)` that
 // builds the section and may return a cleanup function, called when the engineer leaves it.
@@ -14,16 +15,19 @@ import { createTauriBridge } from "./lib/bridge.js";
 import { createConsoleApp } from "./lib/console-app.js";
 import { createFakeBridge } from "./lib/fake-bridge.js";
 import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
+import { mountChannelsScreen } from "./screens/channels-screen.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
 import { mountNetworkScreen } from "./screens/network-screen.js";
 
 const ICONS = Object.freeze({
   mix: `<path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 14h4M10 8h4M16 12h4"/>`,
+  channels: `<path d="M4 6h16M4 12h16M4 18h10"/>`,
   network: `<path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1"/>`,
 });
 
 const PLACEHOLDERS = Object.freeze({
   mix: "Each musician's channel strips, groups and master appear here.",
+  channels: "Name each input, pair stereo sources, hide spares and build groups.",
   network: "Tune each phone's connection, watch its health and look after the server.",
 });
 
@@ -148,6 +152,7 @@ if (nav && main) {
     skipLink: document.querySelector("[data-skip-link]"),
     screens: {
       mix: app ? (screenMain) => mountMixScreen(screenMain, app) : unavailableScreen,
+      channels: app ? (screenMain) => mountChannelsScreen(screenMain, app) : unavailableScreen,
       network: app ? (screenMain) => mountNetworkScreen(screenMain, app) : unavailableScreen,
     },
   });

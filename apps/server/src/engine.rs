@@ -860,14 +860,17 @@ impl LevelMeter {
 ///
 /// One pass, no allocation, the same linear scale as the input meters. A trailing sample that is
 /// not a whole frame is left out.
-fn stereo_peak(stereo: &[i16]) -> [u8; 2] {
-    let mut left = 0u16;
-    let mut right = 0u16;
+fn stereo_peak(stereo: &[f32]) -> [u8; 2] {
+    let mut left = 0.0f32;
+    let mut right = 0.0f32;
     for frame in stereo.chunks_exact(2) {
-        left = left.max(frame[0].unsigned_abs());
-        right = right.max(frame[1].unsigned_abs());
+        left = left.max(frame[0].abs());
+        right = right.max(frame[1].abs());
     }
-    [peak_to_level(left), peak_to_level(right)]
+    [
+        peak_to_level(pcm16_magnitude(left)),
+        peak_to_level(pcm16_magnitude(right)),
+    ]
 }
 
 /// The left and right peak of one musician's mixed output, held for the meter read.
@@ -876,16 +879,19 @@ fn stereo_peak(stereo: &[i16]) -> [u8; 2] {
 /// after their gains, pans, solos, mutes, master and level cap. Like [LevelMeter], an update costs
 /// one pass over the block and two atomic updates, with no allocation, lock or clock, the level
 /// falls with the audio, and reading is a pure load.
-#[derive(Default)]
+///
+/// A clone shares the same levels (they sit behind one [Arc]), so the network sink can take the
+/// meter with the rest of a block's targets and update it after the target table is released.
+#[derive(Clone, Default)]
 pub(crate) struct OutputMeter {
-    levels: [AtomicU32; 2],
+    levels: Arc<[AtomicU32; 2]>,
 }
 
 impl OutputMeter {
     /// Lets the held levels fall by this block's length and raises them to its peaks (see
     /// [hold_peak]). A buffer that is not whole stereo frames is not a mixed output and is ignored,
     /// as [LevelMeter::observe] ignores incomplete frames.
-    pub(crate) fn observe(&self, stereo: &[i16]) {
+    pub(crate) fn observe(&self, stereo: &[f32]) {
         if !stereo.len().is_multiple_of(2) {
             return;
         }
@@ -897,14 +903,14 @@ impl OutputMeter {
 
     /// Lets both sides fall by `frames` of silence, for a wait in which no audio arrived.
     pub(crate) fn fall(&self, frames: usize) {
-        for level in &self.levels {
+        for level in self.levels.iter() {
             hold_peak(level, 0, frames);
         }
     }
 
     /// Returns both sides to zero, for a capture that stopped.
     pub(crate) fn clear(&self) {
-        for level in &self.levels {
+        for level in self.levels.iter() {
             level.store(0, Ordering::Relaxed);
         }
     }
@@ -2610,7 +2616,7 @@ mod tests {
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[16_384, 32_767]), 2);
         let output = OutputMeter::default();
-        output.observe(&[32_767, 16_384]);
+        output.observe(&pcm(&[32_767, 16_384]));
 
         for _ in 0..50 {
             assert_eq!(inputs.read(2), vec![50, 100]);
@@ -2625,20 +2631,20 @@ mod tests {
         let inputs = LevelMeter::new();
         let output = OutputMeter::default();
         inputs.observe(&pcm(&[32_767]), 1);
-        output.observe(&[32_767, 32_767]);
+        output.observe(&pcm(&[32_767, 32_767]));
 
         inputs.observe(&vec![0.0; 7_200], 1);
-        output.observe(&vec![0; 2 * 7_200]);
+        output.observe(&vec![0.0; 2 * 7_200]);
         assert_eq!(inputs.read(1), vec![90], "0.15 s after a full-scale peak");
         assert_eq!(output.read(), [90, 90]);
 
         inputs.observe(&vec![0.0; 64_080], 1);
-        output.observe(&vec![0; 2 * 64_080]);
+        output.observe(&vec![0.0; 2 * 64_080]);
         assert_eq!(inputs.read(1), vec![1], "one step short of 1.5 s");
         assert_eq!(output.read(), [1, 1]);
 
         inputs.observe(&vec![0.0; 720], 1);
-        output.observe(&vec![0; 2 * 720]);
+        output.observe(&vec![0.0; 2 * 720]);
         assert_eq!(inputs.read(1), vec![0], "1.5 s after the peak");
         assert_eq!(output.read(), [0, 0]);
     }
@@ -2649,15 +2655,15 @@ mod tests {
         let inputs = LevelMeter::new();
         let output = OutputMeter::default();
         inputs.observe(&pcm(&[32_767, 32_767]), 2);
-        output.observe(&[32_767, 32_767]);
+        output.observe(&pcm(&[32_767, 32_767]));
         inputs.observe(&vec![0.0; 2 * 36_000], 2);
-        output.observe(&vec![0; 2 * 36_000]);
+        output.observe(&vec![0.0; 2 * 36_000]);
         assert_eq!(inputs.read(2), vec![50, 50], "half way down after 0.75 s");
         assert_eq!(output.read(), [50, 50]);
 
         // One frame: 80 on the first side, 30 on the second.
         inputs.observe(&pcm(&[26_214, 9_830]), 2);
-        output.observe(&[26_214, 9_830]);
+        output.observe(&pcm(&[26_214, 9_830]));
 
         assert_eq!(inputs.read(2), vec![80, 50]);
         assert_eq!(output.read(), [80, 50]);
@@ -2666,21 +2672,21 @@ mod tests {
     #[test]
     fn a_stereo_peak_reads_each_side_of_an_interleaved_buffer() {
         // Left peaks at half scale (on its negative swing), right at full scale.
-        assert_eq!(stereo_peak(&[8_000, 100, -16_384, 32_767]), [50, 100]);
+        assert_eq!(stereo_peak(&pcm(&[8_000, 100, -16_384, 32_767])), [50, 100]);
         assert_eq!(stereo_peak(&[]), [0, 0]);
-        assert_eq!(stereo_peak(&[0, i16::MIN]), [0, 100]);
+        assert_eq!(stereo_peak(&pcm(&[0, i16::MIN])), [0, 100]);
     }
 
     #[test]
     fn an_output_meter_holds_each_sides_peak() {
         let meter = OutputMeter::default();
 
-        meter.observe(&[16_384, 32_767]);
+        meter.observe(&pcm(&[16_384, 32_767]));
         // A quieter block does not pull the held peak below its fall.
-        meter.observe(&[100, 100]);
+        meter.observe(&pcm(&[100, 100]));
         assert_eq!(meter.read(), [50, 100]);
         // A buffer that is not whole stereo frames is ignored.
-        meter.observe(&[32_767, 32_767, 32_767]);
+        meter.observe(&pcm(&[32_767, 32_767, 32_767]));
         assert_eq!(meter.read(), [50, 100]);
     }
 
@@ -2691,7 +2697,9 @@ mod tests {
         let address: SocketAddr = "192.168.1.3:50000".parse().unwrap();
         let registry = TargetRegistry::new(&[address], &GroupLayout::default())
             .expect("registry should build");
-        registry.read()[0].output_meter.observe(&[32_767, 16_384]);
+        registry.read()[0]
+            .output_meter
+            .observe(&pcm(&[32_767, 16_384]));
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[32_767, 16_384]), 2);
 
@@ -2715,7 +2723,9 @@ mod tests {
         let second: SocketAddr = "192.168.1.4:50000".parse().unwrap();
         let registry = TargetRegistry::new(&[first, second], &GroupLayout::default())
             .expect("registry should build");
-        registry.read()[0].output_meter.observe(&[32_767, -16_384]);
+        registry.read()[0]
+            .output_meter
+            .observe(&pcm(&[32_767, -16_384]));
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[16_384, 0, -32_767, 0]), 2);
 

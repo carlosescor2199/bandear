@@ -4,8 +4,11 @@ use crate::mix::{MixUpdate, MixValues, MAX_MIX_CHANNELS};
 
 const PACKET_MAGIC: [u8; 4] = *b"PMON";
 const PACKET_VERSION: u8 = 1;
-const HEADER_SIZE: usize = 4 + 1 + 1 + 4 + 8 + 2;
+pub(crate) const HEADER_SIZE: usize = 4 + 1 + 1 + 4 + 8 + 2;
 
+/// A whole 16-bit audio packet: the shape packets were built in before the float path, kept for
+/// the tests that feed the network sink packets and as the reference its output is checked against.
+#[cfg(test)]
 pub(crate) struct AudioPacket {
     pub(crate) channels: u8,
     pub(crate) sample_rate: u32,
@@ -337,8 +340,34 @@ pub(crate) fn to_pcm16(sample: f32) -> i16 {
     (sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16
 }
 
+/// Writes one audio packet into `bytes`, replacing what it held: the header, then `samples`
+/// converted to PCM16 ([to_pcm16]). Reusing `bytes` from packet to packet keeps the send path free
+/// of allocation once it holds the longest packet.
+///
+/// Packet layout: magic[4], version[1], channels[1], sample_rate[4 LE], sequence[8 LE],
+/// sample_count[2 LE], then sample_count PCM16 samples in LE.
+pub(crate) fn encode_audio_packet(
+    bytes: &mut Vec<u8>,
+    channels: u8,
+    sample_rate: u32,
+    sequence: u64,
+    samples: &[f32],
+) {
+    bytes.clear();
+    bytes.extend_from_slice(&PACKET_MAGIC);
+    bytes.push(PACKET_VERSION);
+    bytes.push(channels);
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&sequence.to_le_bytes());
+    bytes.extend_from_slice(&(samples.len() as u16).to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&to_pcm16(*sample).to_le_bytes());
+    }
+}
+
 // Packet layout: magic[4], version[1], channels[1], sample_rate[4 LE],
 // sequence[8 LE], sample_count[2 LE], then sample_count PCM16 samples in LE.
+#[cfg(test)]
 pub(crate) fn serialize_packet(packet: &AudioPacket) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HEADER_SIZE + packet.samples.len() * 2);
     bytes.extend_from_slice(&PACKET_MAGIC);
@@ -437,6 +466,52 @@ mod tests {
                 0xff, 0x34, 0x12,
             ]
         );
+    }
+
+    #[test]
+    fn encodes_the_documented_packet_into_a_reused_buffer() {
+        let mut bytes = Vec::with_capacity(HEADER_SIZE + 4);
+        let capacity = bytes.capacity();
+
+        for _ in 0..3 {
+            encode_audio_packet(
+                &mut bytes,
+                2,
+                48_000,
+                9,
+                &[-1.0 / 32_768.0, 4_660.0 / 32_768.0],
+            );
+        }
+
+        assert_eq!(
+            bytes,
+            vec![
+                b'P', b'M', b'O', b'N', 1, 2, 0x80, 0xbb, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0xff,
+                0xff, 0x34, 0x12,
+            ]
+        );
+        assert_eq!(
+            bytes.capacity(),
+            capacity,
+            "the buffer is reused, not grown"
+        );
+    }
+
+    #[test]
+    fn every_16_bit_sample_survives_the_float_path_and_the_rest_saturate() {
+        use crate::pipeline::CaptureSample;
+
+        for sample in i16::MIN..=i16::MAX {
+            assert_eq!(to_pcm16(sample.to_f32()), sample);
+        }
+        assert_eq!(to_pcm16(1.0), i16::MAX);
+        assert_eq!(to_pcm16(-2.0), i16::MIN);
+        assert_eq!(
+            to_pcm16(0.5 / 32_768.0),
+            1,
+            "half a step rounds away from zero"
+        );
+        assert_eq!(to_pcm16(f32::NAN), 0);
     }
 
     #[test]

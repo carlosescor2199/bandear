@@ -191,15 +191,22 @@ mod tests {
 
     /// A phone on loopback address `127.0.0.{host}`, or `None` when the machine has no such
     /// address. The engine keys musicians by IP, so a test with several musicians needs several
-    /// loopback addresses; Linux and Windows answer on all of 127/8, but macOS only configures
-    /// 127.0.0.1 unless told otherwise (`sudo ifconfig lo0 alias 127.0.0.2`). A test that needs
-    /// the address skips itself, saying so, rather than failing.
+    /// loopback addresses. Linux and Windows answer on all of 127/8, so there a failed bind is a
+    /// real failure and the test fails. macOS only configures 127.0.0.1 unless told otherwise
+    /// (`sudo ifconfig lo0 alias 127.0.0.2`): there the test reports itself skipped and returns,
+    /// unless `MIXLINK_REQUIRE_LOOPBACK_ALIASES` is set, which makes the gap a failure too.
     fn musician_phone(host: u8) -> Option<UdpSocket> {
         match UdpSocket::bind(format!("127.0.0.{host}:0")) {
             Ok(socket) => Some(socket),
             Err(error) => {
+                let required = cfg!(any(target_os = "windows", target_os = "linux"))
+                    || std::env::var_os("MIXLINK_REQUIRE_LOOPBACK_ALIASES").is_some();
+                assert!(
+                    !required,
+                    "127.0.0.{host} cannot be bound ({error}); this test needs it for a second musician"
+                );
                 eprintln!(
-                    "skipped: 127.0.0.{host} cannot be bound ({error}); a second musician needs a second loopback address"
+                    "SKIPPED: 127.0.0.{host} cannot be bound ({error}); add the loopback alias or set MIXLINK_REQUIRE_LOOPBACK_ALIASES to make this a failure"
                 );
                 None
             }
@@ -499,22 +506,23 @@ mod tests {
 
     /// The whole per-block path after warm-up, as it runs live: a 24-bit, 96 kHz stereo callback
     /// converted, filtered, decimated and metered into the ring, then each block mixed for three
-    /// phones, metered, encoded and sent. Not one heap allocation or free on the way. Where only
-    /// 127.0.0.1 can be bound (macOS by default) it runs with that one phone rather than not at all.
+    /// phones, metered, encoded and sent, and mixed and metered for the local mix, with no local
+    /// output and then with one playing. Not one heap allocation or free on the way.
     #[test]
     fn the_capture_to_phone_path_never_allocates() {
         use crate::pipeline::tests::allocations;
 
+        // Three phones, the second with a centred mix of its own. Where only 127.0.0.1 can be
+        // bound (macOS without aliases, see [musician_phone]) the path runs with that one phone,
+        // which then takes the centred mix, rather than not at all.
         let phones: Vec<UdpSocket> = (1..=3).filter_map(musician_phone).collect();
         let addresses: Vec<SocketAddr> = phones
             .iter()
             .map(|phone| phone.local_addr().expect("phone address"))
             .collect();
         let targets = registry(&addresses);
-        targets
-            .read()
-            .last()
-            .expect("127.0.0.1 always binds")
+        let centred = addresses.len().min(2) - 1;
+        targets.read()[centred]
             .mix_state
             .apply(&MixUpdate {
                 pans: Some(vec![50, 50]),
@@ -555,7 +563,10 @@ mod tests {
         )
         .expect("capture should build");
         let sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
-        let mut pipeline = Pipeline::new(vec![Box::new(sink)], links.levels);
+        let local_mix = Arc::new(crate::mix::MixState::default());
+        let (local, mut outputs) =
+            crate::output::local_output_sink(local_mix, crate::engine::OutputMeter::default());
+        let mut pipeline = Pipeline::new(vec![Box::new(sink), Box::new(local)], links.levels);
         pipeline.set_source(reader);
         let callback: Vec<i32> = (0..2 * 256).map(|index| (index * 4_096) << 8).collect();
         for _ in 0..4 {
@@ -563,10 +574,26 @@ mod tests {
             pipeline.pump();
         }
 
-        let (allocations, frees) = allocations::count(|| {
+        // Both sinks, with no local output.
+        let without_output = allocations::count(|| {
             for _ in 0..1_000 {
                 capture.write(&callback);
                 pipeline.pump();
+            }
+        });
+
+        // Both sinks with a local output playing (its device callback runs here too), after the
+        // block that installs it.
+        let (feed, mut player, _shared) = crate::output::output_link(2, 0, 128);
+        outputs.send(Some(feed)).expect("the sink listens");
+        capture.write(&callback);
+        pipeline.pump();
+        let mut device_buffer = vec![0.0f32; 2 * 128];
+        let with_output = allocations::count(|| {
+            for _ in 0..1_000 {
+                capture.write(&callback);
+                pipeline.pump();
+                player.fill(&mut device_buffer);
             }
         });
 
@@ -574,6 +601,7 @@ mod tests {
         for drain in drains {
             drain.join().expect("drain thread");
         }
-        assert_eq!((allocations, frees), (0, 0));
+        assert_eq!(without_output, (0, 0), "no local output");
+        assert_eq!(with_output, (0, 0), "a local output playing");
     }
 }

@@ -184,7 +184,21 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   - GREEN: server unit tests 329 -> 333 -> 350; the output callback makes zero allocations and
     frees over 2000 callbacks; desktop `cargo check --all-targets` clean (status and meters
     literals gained the new fields).
-  - Commits: 1a0223f (local mix), and this commit (local output).
+  - Commits: 1a0223f (local mix), f83180f (local output).
+  - [x] T2a-fix (review findings): the local output sink's per-block path is allocation- and
+    free-free. Its stereo buffer is sized for the longest block when the sink is built, feeds
+    travel to it in a preallocated `rtrb` command ring (4 slots), and the feed a change lets go of
+    goes back through a return ring to `OutputControl`, which frees it on the engine's side (on the
+    next change, status read or stop), never on the engine thread. The sink also takes changes in
+    its idle `silence` call, so a change lands within one idle wait without audio. The
+    multi-musician network tests fail on Windows and Linux when 127.0.0.2/3 cannot be bound, and
+    elsewhere report SKIPPED unless `MIXLINK_REQUIRE_LOOPBACK_ALIASES` is set; the allocation test
+    keeps its centred mix on the second phone. RED: `a_live_output_change_frees_nothing_on_the_engine_thread`
+    counted (0, 3) allocations/frees on the engine thread with the channel design. GREEN: server
+    unit tests 350 -> 353 (the live-change test, a change taken without audio, bounded changes);
+    the full engine path with the network and local sinks makes (0, 0) over 1000 blocks with no
+    output and with an output playing; desktop `cargo check --all-targets` clean.
+    Commit: this commit.
 - [ ] T2b (local mix and output, desktop): session persistence of the local mix and the output
   choice, Tauri commands over the T2a API, the Local mix tab and the "Local mix out" select.
   Route: delegated writer.
@@ -210,7 +224,10 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   acknowledged: review-bd3440d2b6f6bfc9 (0bb278b..cdb5d84) and review-4f74b5710abf87fc
   (cdb5d84..f4ffdbe). Part 1's R3-001 (the network sink still allocating) was resolved by
   ebadce2; the rest (part 1 R3-002 and R3-003, part 2 R3-001) by T1-fix. Next review base: f4ffdbe.
-- T2 split into T2a (engine, done in 1a0223f and the local-output commit) and T2b (desktop).
+- T2 split into T2a (engine, done in 1a0223f and f83180f) and T2b (desktop).
+- Review lineage review-6ec7e1a9fbf7a242 over f4ffdbe..f83180f (T1-fix and T2a) approved and
+  acknowledged; its findings (R3-001 local sink on the engine thread, R3-002 silent loopback
+  skips) are fixed by T2a-fix. Next review base: f83180f.
   Live checks still owed for T7: an ASIO output on the Volt next to its capture (cpal opens both
   directions on one driver), and drift over a long WASAPI run.
 

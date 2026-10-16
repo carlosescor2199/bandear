@@ -15,6 +15,7 @@ import {
 import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
+import { checkSessionName } from "./sessions.js";
 import { clampLevel } from "./values.js";
 
 const DEFAULT_PORT = 50000;
@@ -188,6 +189,28 @@ function musicianRow(address, identity, link, mixChanges = {}) {
   };
 }
 
+// The change a loaded session's `saved` mix makes to `row`'s, as the desktop pushes it: each saved
+// input from CH 1 on, every live group's level by its id (`groups`, a status's; a group the saved
+// mix does not name keeps its level), the master volume and mute; only the master for a musician
+// whose mix `follows` another's. Never the phone's cap or the engineer's controls.
+function savedUpdate(saved, groups, row, follows) {
+  const master = { volumePercent: saved.volumePercent ?? 100, muted: Boolean(saved.muted) };
+  if (follows) {
+    return master;
+  }
+  const channels = (saved.channels ?? []).slice(0, row.channelGains.length);
+  return {
+    ...master,
+    channelGains: channels.map((channel) => channel.gain ?? 100),
+    pans: channels.map((channel) => channel.pan ?? 50),
+    channelMuted: channels.map((channel) => Boolean(channel.muted)),
+    channelSolo: channels.map((channel) => Boolean(channel.solo)),
+    groupLevels: groups.map((group, position) =>
+      Object.hasOwn(saved.groups ?? {}, group.id) ? saved.groups[group.id] : row.groupLevels[position],
+    ),
+  };
+}
+
 // The key the desk keeps a musician's local label under, as the desktop's session does: the
 // phone's client id when it has one, so the label follows it to any IP, else the address.
 function labelKey(row) {
@@ -197,6 +220,38 @@ function labelKey(row) {
 // The keys a musician is known by, the strongest first: their phone's, then their address's.
 function keysOf(row) {
   return row.clientId ? [`client:${row.clientId}`, `address:${row.address}`] : [`address:${row.address}`];
+}
+
+// Whether the desk keys `one` and `other` name one musician as the desktop compares them with no
+// engine: two phones by client id, two addresses by host (the engine keeps one musician per IP);
+// a phone and an address are told apart.
+function sameMusician(one, other) {
+  const kind = (key) => key.slice(0, key.indexOf(":"));
+  const value = (key) => key.slice(key.indexOf(":") + 1);
+  if (kind(one) !== kind(other)) {
+    return false;
+  }
+  return kind(one) === "client"
+    ? value(one) === value(other)
+    : hostOf(value(one)) === hostOf(value(other));
+}
+
+// Adds to `known` every key of each of `groups` (keys naming one musician) that shares a musician
+// with it (sameMusician), until no group adds more.
+function widenKeys(known, groups) {
+  let before;
+  do {
+    before = known.length;
+    for (const group of groups) {
+      if (group.some((key) => known.some((own) => sameMusician(key, own)))) {
+        for (const key of group) {
+          if (!known.includes(key)) {
+            known.push(key);
+          }
+        }
+      }
+    }
+  } while (known.length !== before);
 }
 
 /**
@@ -404,8 +459,18 @@ function withPort(address) {
  * once and on every later change (from the desk, a phone, a preset or a copy, and on to whoever
  * follows them), holds the follower's phone off its channels and groups, refuses a circle, keeps it
  * like the engineer's controls (by phone, else address; idle edits for the next start) and every
- * start puts the kept mirrors in force; every status row says whom it follows (`mirror`). Besides
- * `invoke` and `listen` it offers
+ * start puts the kept mirrors in force; every status row says whom it follows (`mirror`). Named
+ * sessions too, with the desktop's rules (see sessions.js): `save_session` keeps the whole desk
+ * session (labels, groups, channel details, limits and locks, mirrors, presets and the audio input)
+ * and, while the engine runs, every musician's mix by their key; `sessions` lists them newest first
+ * (`savedSessions` seeds them, one with a `problem` cannot be loaded or renamed); `rename_session`
+ * and `delete_session`; `load_session` checks the saved groups and channel details, replaces the
+ * desk session and, while the engine runs, applies the groups and details, then the limits, locks
+ * and mirrors, then pushes each saved mix to the musician here under its key (a phone that is not
+ * connected and a musician not here are skipped; a follower gets only its master), answering as
+ * the desktop does; its audio input is taken only as the engineer could choose it (ASIO only with a
+ * picked driver) and only for the next start. `session_notice` answers `sessionNotice`; `clock`
+ * gives the time a session is saved at. Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
@@ -424,6 +489,9 @@ export function createFakeBridge({
   statusOnStart = true,
   savedAudio = null,
   presets = [],
+  savedSessions = [],
+  sessionNotice = null,
+  clock = () => Date.now(),
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
@@ -463,6 +531,11 @@ export function createFakeBridge({
   // The mirrors as the desk's session keeps them, `{ leader, name }` by the follower's labelKey
   // (the leader by theirs): every start and `set_mirror` put them in force.
   const mirrorBook = new Map();
+  // The named sessions, `{ name, savedAt, session, mixes, problem }` by id.
+  const sessionBook = new Map(
+    clone(savedSessions).map(({ id, ...saved }) => [id, { mixes: {}, problem: null, ...saved }]),
+  );
+  let lastSessionId = 0;
 
   // A rule of mixes.js or mix.js broken, as the desk refuses it: the error text, not an Error.
   function checked(rule) {
@@ -500,6 +573,37 @@ export function createFakeBridge({
     } else {
       mirrorBook.delete(key);
     }
+  }
+
+  // Whether, with no engine running, the musician known by the keys `follower` following the one
+  // known by the keys `leader` would close a circle with the kept mirrors, as the desktop decides it:
+  // at every step a musician is known by all the keys the desk has for them (the window's, and each
+  // kept mirror's key with the address kept beside a phone's key), joined when two keys name one
+  // musician (sameMusician), and the mirror kept for them is looked up by each of those keys,
+  // phones first. A chain longer than the mirrors can only go round already.
+  function closesCircleOffline(follower, leader) {
+    const kept = [...mirrorBook.entries()].map(([key, mirror]) => [
+      mirror.followerAddress ? [key, `address:${mirror.followerAddress}`] : [key],
+      mirror.leaderAddress ? [mirror.leader, `address:${mirror.leaderAddress}`] : [mirror.leader],
+    ]);
+    const groups = [follower, leader, ...kept.flat()];
+    const named = (keys) => keys.some((key) => follower.some((own) => sameMusician(key, own)));
+    let known = [...leader];
+    for (let step = 0; step <= kept.length; step += 1) {
+      widenKeys(known, groups);
+      if (named(known)) {
+        return true;
+      }
+      known.sort((one, other) => Number(one.startsWith("address:")) - Number(other.startsWith("address:")));
+      const next = known
+        .map((key) => kept.find(([follows]) => sameMusician(follows[0], key)))
+        .find(Boolean);
+      if (!next) {
+        return false;
+      }
+      known = [...next[1]];
+    }
+    return true;
   }
 
   // Whether following the kept mirrors from `leaderKey` reaches the follower (known by `keys`, and
@@ -619,6 +723,126 @@ export function createFakeBridge({
 
   function presetsAnswer(preset) {
     return { preset: preset ? clone(preset) : null, presets: clone(keptPresets) };
+  }
+
+  // A named session as `sessions` lists it.
+  function sessionSummary(id, saved) {
+    return {
+      id,
+      name: saved.name,
+      savedAt: saved.savedAt ?? null,
+      mixes: saved.problem ? 0 : Object.keys(saved.mixes ?? {}).length,
+      problem: saved.problem ?? null,
+    };
+  }
+
+  // Every named session, the newest first, as the desktop lists them.
+  function listSessions() {
+    return [...sessionBook.entries()]
+      .map(([id, saved]) => sessionSummary(id, saved))
+      .sort((one, other) => (other.savedAt ?? -1) - (one.savedAt ?? -1) || (one.id < other.id ? -1 : 1));
+  }
+
+  function sessionAt(id) {
+    const saved = sessionBook.get(id);
+    if (!saved) {
+      throw `there is no saved session with the id \`${id}\``;
+    }
+    return saved;
+  }
+
+  // The desk's whole session, as a named session keeps it.
+  function deskSession() {
+    return clone({
+      labels: [...labels.entries()],
+      groups: savedGroups,
+      channels: savedChannels,
+      engineer: [...engineerBook.entries()],
+      mirrors: [...mirrorBook.entries()],
+      presets: keptPresets,
+      audio: keptAudio,
+    });
+  }
+
+  // Every musician's mix by their key, as a named session keeps it: the device's inputs, the
+  // group levels by id, the master volume and mute.
+  function mixesNow() {
+    return Object.fromEntries(
+      engine.musicians.map((row) => [
+        labelKey(row),
+        {
+          channels: Array.from({ length: engine.sourceChannels }, (_, index) => ({
+            gain: row.channelGains[index],
+            pan: row.pans[index],
+            muted: row.channelMuted[index],
+            solo: row.channelSolo[index],
+          })),
+          groups: Object.fromEntries(
+            engine.groups.map((group, position) => [group.id, row.groupLevels[position]]),
+          ),
+          volumePercent: row.volumePercent,
+          muted: row.muted,
+        },
+      ]),
+    );
+  }
+
+  // The audio input a loaded session leaves the desk with, as the desktop takes it: the saved one
+  // when the engineer could have chosen it, else the desk's own and why.
+  function loadedAudio(saved) {
+    if (!saved) {
+      return { audio: keptAudio, loaded: false, skipped: null };
+    }
+    const host = String(saved.host ?? "auto").trim().toLowerCase();
+    const named = (name) => (typeof name === "string" && name.trim() ? name.trim() : null);
+    const asioDriver = named(saved.asioDriver);
+    if (!HOSTS.includes(host)) {
+      return {
+        audio: keptAudio,
+        loaded: false,
+        skipped: `the audio driver \`${saved.host}\` is none of auto, wasapi, asio`,
+      };
+    }
+    if (host === "asio" && !asioDriver) {
+      return {
+        audio: keptAudio,
+        loaded: false,
+        skipped: "ASIO is kept only with the ASIO driver the engineer picked, and none is named",
+      };
+    }
+    return {
+      audio: { host, device: named(saved.device), bufferFrames: saved.bufferFrames ?? null, asioDriver },
+      loaded: true,
+      skipped: null,
+    };
+  }
+
+  // Pushes each of a loaded session's `mixes` to the musician here under its key, as the desktop
+  // does, and answers the mixes pushed and the ones that went to nobody.
+  function pushSavedMixes(mixes, skippedMix) {
+    const pushed = [];
+    const skipped = [];
+    const used = new Set();
+    for (const row of engine.musicians) {
+      const key = keysOf(row).find((candidate) => Object.hasOwn(mixes, candidate));
+      if (!key) {
+        continue;
+      }
+      used.add(key);
+      if (row.clientId && !row.controlConnected) {
+        skipped.push(skippedMix(key, "notConnected"));
+        continue;
+      }
+      const follows = keptMirror(row)?.name ?? null;
+      const merged = mergeInto(row, savedUpdate(mixes[key], engine.groups, row, follows));
+      announceMix(row.address, "desktop", merged);
+      propagate(row);
+      pushed.push({ address: row.address, follows, mix: clone(merged) });
+    }
+    for (const key of Object.keys(mixes).filter((candidate) => !used.has(candidate))) {
+      skipped.push(skippedMix(key, "notHere"));
+    }
+    return { pushed, skipped };
   }
 
   // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
@@ -1125,14 +1349,24 @@ export function createFakeBridge({
             throw `invalid musician address \`${leader.address}\``;
           }
           const leaderPhone = phoneOf(leader.clientId);
-          const leaderKey = leaderPhone ? `client:${leaderPhone}` : `address:${leader.address}`;
-          if (hostOf(leader.address) === hostOf(address) || keys.includes(leaderKey)) {
+          const leading = leaderPhone
+            ? [`client:${leaderPhone}`, `address:${leader.address}`]
+            : [`address:${leader.address}`];
+          // Keys are compared as the desktop compares them: phones by client id, addresses by IP.
+          if (leading.some((key) => keys.some((own) => sameMusician(key, own)))) {
             throw `${address} cannot follow their own mix`;
           }
-          if (closesCircleFrom(leaderKey, keys)) {
+          if (closesCircleOffline(keys, leading)) {
             throw circle();
           }
-          kept = { leader: leaderKey, name: named(hostOf(leader.address)) };
+          // As the desktop keeps it: a phone's key with its address beside it, so a later check
+          // with no engine knows both keys of that musician.
+          kept = {
+            leader: leading[0],
+            name: named(hostOf(leader.address)),
+            ...(leaderPhone ? { leaderAddress: leader.address } : {}),
+            ...(phone ? { followerAddress: address } : {}),
+          };
         }
         if (phone) {
           mirrorBook.delete(`address:${address}`);
@@ -1153,6 +1387,8 @@ export function createFakeBridge({
         kept = {
           leader: labelKey(leading),
           name: named(leading.clientName ?? hostOf(leading.address)),
+          ...(leading.clientId ? { leaderAddress: leading.address } : {}),
+          ...(row.clientId ? { followerAddress: row.address } : {}),
         };
       }
       // As the desktop keeps it: for the phone, dropping what was kept for its address.
@@ -1174,6 +1410,113 @@ export function createFakeBridge({
         propagate(row);
       }
       return answer(kept, row.clientId ? "phone" : "address", true, clone(mixFromDto(row)));
+    },
+    session_notice() {
+      return sessionNotice;
+    },
+    sessions() {
+      return listSessions();
+    },
+    save_session({ name } = {}) {
+      const saved = {
+        name: checked(() => checkSessionName(name, listSessions())),
+        savedAt: clock(),
+        session: deskSession(),
+        mixes: isRunning ? mixesNow() : {},
+        problem: null,
+      };
+      let id;
+      do {
+        lastSessionId += 1;
+        id = `s${lastSessionId}`;
+      } while (sessionBook.has(id));
+      sessionBook.set(id, saved);
+      return { session: sessionSummary(id, saved), engineRunning: isRunning };
+    },
+    rename_session({ id, name } = {}) {
+      const saved = sessionAt(id);
+      if (saved.problem) {
+        throw `the saved session \`${id}\` cannot be renamed: ${saved.problem}`;
+      }
+      saved.name = checked(() => checkSessionName(name, listSessions(), id));
+      return sessionSummary(id, saved);
+    },
+    delete_session({ id } = {}) {
+      sessionAt(id);
+      sessionBook.delete(id);
+      return null;
+    },
+    load_session({ id } = {}) {
+      const saved = sessionAt(id);
+      if (saved.problem) {
+        throw `the saved session \`${id}\` cannot be loaded: ${saved.problem}`;
+      }
+      const { session, mixes } = clone(saved);
+      // As the desktop does: the saved groups and details are checked before anything changes.
+      try {
+        checkGroups(withIds(session.groups ?? []));
+      } catch (error) {
+        throw `the saved groups cannot be used: ${error}`;
+      }
+      try {
+        checkChannels(channelRequests(session.channels ?? []));
+      } catch (error) {
+        throw `the saved channel details cannot be used: ${error.message ?? error}`;
+      }
+      const audio = loadedAudio(session.audio);
+      const savedLabels = new Map(session.labels ?? []);
+      const skippedMix = (key, reason) => ({
+        key,
+        label: savedLabels.get(key) ?? null,
+        reason,
+        error: null,
+      });
+      // The desk's session is the loaded one from now on.
+      labels.clear();
+      for (const [key, label] of savedLabels) {
+        labels.set(key, label);
+      }
+      engineerBook.clear();
+      for (const [key, controls] of session.engineer ?? []) {
+        engineerBook.set(key, controls);
+      }
+      mirrorBook.clear();
+      for (const [key, mirror] of session.mirrors ?? []) {
+        mirrorBook.set(key, mirror);
+      }
+      keptPresets = session.presets ?? [];
+      keptAudio = audio.audio;
+      let pushed = [];
+      let skipped = [];
+      if (isRunning) {
+        // In the desktop's order: groups and details (each status before the mixes they move),
+        // then limits, locks and mirrors, then the saved mixes.
+        commands.set_groups({ groups: session.groups ?? [] });
+        commands.set_channels({ channels: session.channels ?? [] });
+        engine.musicians.forEach(showLabel);
+        giveKeptControls();
+        giveKeptMirrors();
+        emit("status", statusNow());
+        ({ pushed, skipped } = pushSavedMixes(mixes ?? {}, skippedMix));
+      } else {
+        savedGroups = withIds(session.groups ?? []);
+        savedChannels = channelRequests(session.channels ?? []);
+        skipped = Object.keys(mixes ?? {}).map((key) => skippedMix(key, "notRunning"));
+      }
+      return {
+        session: sessionSummary(id, saved),
+        applied: isRunning,
+        saved: true,
+        saveError: null,
+        mixes: pushed,
+        skipped,
+        refused: [],
+        damaged: [],
+        audio: clone(keptAudio),
+        audioLoaded: audio.loaded,
+        audioSkipped: audio.skipped,
+        presets: clone(keptPresets),
+      };
     },
   };
 

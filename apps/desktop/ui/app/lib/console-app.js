@@ -37,6 +37,13 @@
 // - The Mix screen's tools: presets (read once connected, `loadPresets` again), save, rename,
 //   delete and apply them, copy a mix onto others, and start or stop a mirror. Each answers `{ ok,
 //   message }`, the desk's answer in words, and reads the status after it.
+// - Named sessions (the Network and system screen's Session panel): the saved sessions and what the
+//   desk said when it opened its session (both read once connected, `loadSessions` again), save,
+//   rename, delete and load. A load waits for the channel and group edits on their way, drops every
+//   edit still waiting, and from its answer on the groups are the loaded ones (the last group
+//   answer is forgotten), the presets are the loaded ones and, when its audio input was taken, the
+//   next start opens it (the engine is never restarted). `unsavedEdits()` counts the edits a load
+//   would drop, so the panel can ask first. Each answers `{ ok, message }` and reads the list again.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -62,6 +69,7 @@ import { formatChannelsSet, formatGroupsSet, musicianLabel, sentenceWithReason }
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
+import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
 
 // After a start whose status could not be read: how often and how far apart to ask again.
@@ -404,10 +412,15 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
     store.dispatch(actions.connected());
     // The presets live in the desk's session, engine or not; a failed read leaves them unknown
-    // until the Mix tools read them again.
+    // until the Mix tools read them again. So do the saved sessions and the desk's word about its
+    // session, which the Session panel shows.
     if (store.getState().presets === null) {
       await loadPresets();
     }
+    if (store.getState().sessions.list === null) {
+      await loadSessions();
+    }
+    await readSessionNotice();
     if (answer.state === "notRunning" && autoStart) {
       if (unread) {
         // Never the defaults in place of a kept input that could not be read: Try again reads it
@@ -498,10 +511,21 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     return { ok: true };
   }
 
-  // The groups as the last answer to a group edit gave them; null until one answered.
+  // The groups as the last answer to a group edit gave them; null until one answered, and again
+  // once a saved session was loaded (its groups are the desk's then).
   let keptGroups = null;
-  // Desk edits, one at a time: each starts once the one before it was answered.
+  // Desk edits and session loads, one at a time: each starts once the one before it was answered.
   let editing = Promise.resolve();
+  // The channel and group edits asked for and not answered yet.
+  let editsOnTheirWay = 0;
+
+  // Runs `run` after every desk edit and load asked for before it, and keeps the next one waiting
+  // for it. `run` never rejects.
+  function inTurn(run) {
+    const result = editing.then(run);
+    editing = result;
+    return result;
+  }
 
   // Replaces one of the lists the desk keeps with `change(list)`. `kind` says where the whole list
   // comes from (null when the desk does not know it), how to send it, what to keep of the answer
@@ -519,11 +543,12 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
         return { ok: true, message: kind.format(outcome) };
       } catch (error) {
         return { ok: false, message: sentenceWithReason(kind.refused, message(error)) };
+      } finally {
+        editsOnTheirWay -= 1;
       }
     };
-    const result = editing.then(run);
-    editing = result;
-    return result;
+    editsOnTheirWay += 1;
+    return inTurn(run);
   }
 
   // The channel details: always the whole table the desk keeps, read afresh, never the status's
@@ -583,6 +608,84 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   // The name of the preset `id` as the console knows it, or a plain word for one it does not.
   function presetName(id) {
     return store.getState().presets?.find((preset) => preset.id === id)?.name ?? "the preset";
+  }
+
+  // Reads the saved sessions into the store. Resolves to null, or to the error of a failed read
+  // (the list stays as it was known, or unknown, and the failure is kept to be said).
+  async function loadSessions() {
+    try {
+      store.dispatch(actions.sessions(await api.sessions()));
+      return null;
+    } catch (error) {
+      store.dispatch(actions.sessionsFailed(message(error)));
+      return error;
+    }
+  }
+
+  // Reads what the desk said when it opened its session. A failed read says nothing.
+  async function readSessionNotice() {
+    try {
+      store.dispatch(actions.sessionNotice(await api.sessionNotice()));
+    } catch {
+      // The notice is a courtesy: the next connect asks again.
+    }
+  }
+
+  // The name of the saved session `id` as the console lists it, or a plain word for one it does not.
+  function sessionName(id) {
+    return (
+      store.getState().sessions.list?.find((saved) => saved.id === id)?.name ?? "the saved session"
+    );
+  }
+
+  // Runs one of the Session panel's commands: `run` resolves to the outcome in words, and the list
+  // of saved sessions is read again after it, whatever the answer. A refusal is said after
+  // `refused`. Answers `{ ok, message }`.
+  async function sessionCommand(run, refused) {
+    let result;
+    try {
+      result = { ok: true, message: await run() };
+    } catch (error) {
+      result = { ok: false, message: sentenceWithReason(refused, message(error)) };
+    }
+    await loadSessions();
+    return result;
+  }
+
+  // Loads the saved session `id` once every edit asked for before it was answered: the edits still
+  // waiting are dropped (when it is asked for, so none goes out over it, and when it is answered),
+  // and the window builds its next group edit on the loaded groups.
+  function loadSession(id) {
+    return inTurn(() =>
+      sessionCommand(async () => {
+        store.dispatch(actions.dropEdits());
+        const outcome = await api.loadSession(id);
+        keptGroups = null;
+        if (outcome.audioLoaded) {
+          // The session keeps exactly what the next start opens.
+          choiceKnown = true;
+          choiceUnsaved = false;
+        }
+        store.dispatch(actions.sessionLoaded(outcome));
+        await readStatus();
+        const musicians = store.getState().musicians;
+        return formatSessionLoaded(outcome, {
+          labelAt,
+          nameOf: (skipped) => skippedName(skipped, musicians),
+        });
+      }, `"${sessionName(id)}" was not loaded`),
+    );
+  }
+
+  // The edits a load would drop: every mix edit still waiting and every channel or group edit not
+  // answered yet.
+  function unsavedEdits() {
+    const { pending } = store.getState();
+    const mixEdits = Object.values(pending).reduce(
+      (count, edits) => count + Object.keys(edits).length,
+      0,
+    );
+    return mixEdits + editsOnTheirWay;
   }
 
   // The window's title follows the input device, as the old window's did.
@@ -703,6 +806,38 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
         const outcome = await api.setMirror(address, request, follower?.clientId ?? null);
         return formatMirrorSet(outcome, labelAt(address), leader ? musicianLabel(leader) : null);
       }, "The mirror was not changed"),
+    /** Reads the saved sessions again; resolves to null, or to the error of a failed read. */
+    loadSessions,
+    /**
+     * Saves the desk's whole session, and every musician's mix while an engine runs, as `name`;
+     * answers `{ ok, message }` (formatSessionSaved).
+     */
+    saveSession: (name) =>
+      sessionCommand(
+        async () => formatSessionSaved(await api.saveSession(name)),
+        "The session was not saved",
+      ),
+    /** Renames the saved session `id` to `name`; answers `{ ok, message }`. */
+    renameSession: (id, name) =>
+      sessionCommand(async () => {
+        const before = sessionName(id);
+        const renamed = await api.renameSession(id, name);
+        return `Renamed the saved session "${before}" to "${renamed.name}".`;
+      }, "The saved session was not renamed"),
+    /** Deletes the saved session `id`; answers `{ ok, message }`. */
+    deleteSession: (id) =>
+      sessionCommand(async () => {
+        const name = sessionName(id);
+        await api.deleteSession(id);
+        return `Deleted the saved session "${name}".`;
+      }, "The saved session was not deleted"),
+    /**
+     * Loads the saved session `id` in place of the desk's (see loadSession above); answers `{ ok,
+     * message }` (formatSessionLoaded).
+     */
+    loadSession,
+    /** How many edits a load would drop now; see loadSession. */
+    unsavedEdits,
     select(address) {
       store.dispatch(actions.select(address));
     },

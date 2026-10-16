@@ -374,3 +374,78 @@ export function withPendingMembers(cards, pending) {
 export function canAddGroup(state) {
   return (state.engine.status?.groups ?? []).length < MAX_GROUPS;
 }
+
+/**
+ * The Channels and groups screen apart from the DOM: `handle(type, detail)` turns one of its
+ * organisms' events (`types`) into the console `app`'s channel or group edit, and `view()` is what
+ * the screen renders now: `{ known, rows, cards, canAdd, outcome }`, the rows and cards with every
+ * Shown and group box the engineer clicked held as clicked until its edit is answered (a status that
+ * comes meanwhile still shows the old value), and the last edit's outcome `{ ok, message }` (null
+ * before the first). `changed()` asks the screen to render again: when a box is held and when an
+ * edit is answered. A channel edit fills the list up to the device's inputs.
+ */
+export function channelsScreenCommands({ app, changed = () => {} }) {
+  const pending = pendingToggles();
+  let outcome = null;
+
+  // Sends one edit and keeps its outcome; a toggle's (`{ key, value }`) box is held as clicked
+  // until it is answered.
+  async function edit(send, toggle = null) {
+    const token = toggle ? pending.hold(toggle.key, toggle.value) : null;
+    if (toggle) {
+      changed();
+    }
+    try {
+      outcome = await send();
+    } finally {
+      if (toggle) {
+        pending.release(toggle.key, token);
+      }
+      changed();
+    }
+    return outcome;
+  }
+
+  function editChannels(change, toggle = null) {
+    const count = app.store.getState().engine.status?.sourceChannels ?? 0;
+    return edit(() => app.editChannels((table) => change(table, count)), toggle);
+  }
+
+  const handlers = {
+    "channel-rename": ({ index, name }) =>
+      editChannels((table, count) => renameChannel(table, index, name, count)),
+    "channel-kind": ({ index, kind }) =>
+      editChannels((table, count) => setChannelKind(table, index, kind, count)),
+    "channel-link": ({ index, linked }) =>
+      editChannels((table, count) => setChannelLink(table, index, linked, count)),
+    "channel-shown": ({ index, shown }) =>
+      editChannels((table, count) => setChannelHidden(table, index, !shown, count), {
+        key: shownKey(index),
+        value: shown,
+      }),
+    "group-add": () => edit(() => app.editGroups(addGroup)),
+    "group-rename": ({ id, name }) => edit(() => app.editGroups((groups) => renameGroup(groups, id, name))),
+    "group-member": ({ id, key, numbers, member }) =>
+      edit(() => app.editGroups((groups) => setGroupMembers(groups, id, numbers, member)), {
+        key: memberKey(id, key),
+        value: member,
+      }),
+    "group-delete": ({ id }) => edit(() => app.editGroups((groups) => deleteGroup(groups, id))),
+  };
+
+  return {
+    types: Object.keys(handlers),
+    handle: (type, detail) => handlers[type](detail ?? {}),
+    view() {
+      const state = app.store.getState();
+      const known = state.engine.status !== null;
+      return {
+        known,
+        rows: known ? withPendingShown(channelRows(state), pending) : [],
+        cards: known ? withPendingMembers(groupCards(state), pending) : [],
+        canAdd: canAddGroup(state),
+        outcome,
+      };
+    },
+  };
+}

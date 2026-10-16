@@ -1049,9 +1049,112 @@ slice. Push and PRs are the user's decision.
     document.
   - Commits: ef67872 `feat(android): read whose mix the phone is following`; this commit
     (`feat(android): show and respect a followed mix`).
-- [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
-  connected phones; the deferred Android follow-up (adopt the server's answer after `config`);
-  docs. Route: delegated writer.
+- T7 (session save and load, RF7) is split in two: T7a (desktop) and T7b (Android).
+- [x] T7a (session save and load, desktop): named session snapshots saved, listed, loaded, renamed
+  and deleted; a load pushes the saved mixes to the phones; the items folded into T7 for the
+  desktop. Route: delegated writer (trigger: 2+ non-trivial files across the desktop Rust, the UI
+  and the fake bridge); no engine change was needed (the status already lists every musician's
+  mix with its client id, and the live group ids).
+  - Snapshot store (`apps/desktop/src-tauri/src/sessions.rs`): one file per snapshot,
+    `sessions/<id>.json` beside `session.json` (id `s` + 16 hex digits; only ids of letters,
+    digits, `-` and `_` are read or written, so none reaches outside the folder), written atomically
+    like the session (`write_atomically` is now generic, the temporary file `<name>.tmp`). Shape:
+    the whole session at version 1 (labels, controls, mirrors, `channels` as kept, unknown kinds
+    included, `groups`, `presets`, `audio`) plus `name`, `savedAt` (unix ms) and `mixes`: `{
+    "client:<id>" | "address:<ip:port>": { channels: [{ gain, pan, muted, solo }] (the device's
+    inputs at save time), groups: { <groupId>: level }, volumePercent, muted } }`, never the phone's
+    own cap (the engineer's limit and locks stay with the musician entry). Read as tolerantly as the
+    session (`versioned_fields` and `read_session` are shared): a damaged section, or one musician's
+    unreadable mix, is left out and named; a file that is not JSON, has no usable version or
+    unreadable labels, or comes from a newer version is listed with its `problem`, cannot be loaded
+    or renamed, is never changed, and can be deleted. Names trimmed, 1-40 characters, unique in any
+    case; listed newest first.
+  - Commands: `session_notice`, `sessions`, `save_session(name)` (`{ session, engineRunning }`; the
+    mixes are read from the running engine's status under the engine lock, with the session inside
+    it; no engine saves the session without mixes), `rename_session`, `delete_session` and
+    `load_session(id)`.
+  - Load (`load_session`): the saved groups and channel details are checked first (`check_groups`,
+    `check_channels`), and a session file the desk must not replace (newer version) refuses the load
+    before the engine takes anything. With an engine running, one step under the engine lock with
+    the session's inside: groups, then channel details (as a start applies them; `config` before
+    any moved mix, as the engine guarantees), then the engineer's controls (every key either session
+    keeps controls under: the loaded controls, or what the loaded session resolves for that musician,
+    so a phone key the old session had never shadows the loaded address entry) and mirrors (a
+    musician here whose mirror changes or goes is stopped first, then every kept mirror is handed to
+    the engine; a refusal is named), then each saved mix pushed through the desk's `set_mix` path to
+    the musician listed under its key (client id first, then address), so the phone gets
+    `mix_state`: channels from CH 1 on, group levels by id onto the live positions (a live group the
+    mix does not name keeps its level), master volume and mute, never the cap. Push rule (decided:
+    on reconnect the phone's own mix wins): only musicians here; a phone whose control channel is
+    down is skipped (`notConnected`), a saved mix with nobody here too (`notHere`); a configured
+    target with no phone gets its mix (it plays it); a follower gets only its master volume and mute.
+    Then the session is replaced (`SessionStore::replace`); a save that fails after the engine took
+    it is reported. With no engine the session is replaced and every saved mix is `notRunning`.
+    Audio: applied only at the next start (the engine is never restarted), and taken only as the
+    engineer could choose it (`session_audio`: a known driver, ASIO only with its picked driver);
+    otherwise the desk keeps its own and `audioSkipped` says why. Answer `{ session, applied, saved,
+    saveError, mixes: [{ address, follows, mix }], skipped: [{ key, label, reason, error }], refused,
+    damaged, audio, audioLoaded, audioSkipped, presets }`.
+  - UI: `lib/sessions.js` (`checkSessionName`, `formatSavedAt`, `sessionRows`, `sessionPanelView`,
+    `formatSessionSaved`, `formatSessionLoaded`, `skippedName`, `createSessionPanel`,
+    `sessionPanelCommands`); the engine API (`sessionNotice`, `sessions`, `saveSession`,
+    `renameSession`, `deleteSession`, `loadSession`); the console reads the list and the notice once
+    connected, answers each command `{ ok, message }` and reads the list again. A load runs in turn
+    after any channel or group edit on its way, drops every waiting edit (`dropEdits` when it is
+    asked for, `sessionLoaded` when it is answered), forgets the last group answer (so the next group
+    edit builds on the loaded groups; channel edits already read the table afresh), takes the loaded
+    presets and, when taken, the loaded audio input for the next start. `unsavedEdits()` counts the
+    waiting mix edits and the list edits on their way. `<ml-session-panel>` in the Network and system
+    screen's aside under the audio input: the desk's notice, "Save session as", the saved sessions
+    (select with when and how many mixes, or why not), Load (asks "N changes are still on the way to
+    the engine. Loading … drops them." with Cancel and Load anyway while edits wait), Rename, Delete
+    behind the delayed confirm (Keep in its place), the outcome in words (status or alert). The fake
+    bridge implements all of it with the same rules (`savedSessions`, `sessionNotice`, `clock`).
+  - Folded items: (a) T4 follow-up: after a load the window's group list is the loaded one and
+    waiting edits are dropped; (b) WARNING R3-idle-channel-edit-rewrites-unknown-kinds: `edit_channels`
+    keeps a kind this build does not know that the session stores for an input while the edit leaves
+    that input's kind as it applies (`other`), with or without an engine (`keep_unknown_kinds`);
+    choosing another kind replaces it; (c) SUGGESTION R3-screen-pending-hold-wiring-untested: the
+    Channels screen's wiring moved to `channelsScreenCommands` (channels-view.js, DOM-free) and is
+    tested with a bridge that defers `set_channels`/`set_groups` (effect included) until released: a
+    clicked Shown or group box stays as clicked, also through a status with the old value, until the
+    answer, and a refused edit lets it show the desk's value; (d) `SessionStore::notice` is shown in
+    the Session panel ("When the console opened its saved session: …"); (e) the fake's offline mirror
+    check compares keys as the desktop does (`sameMusician`: phones by client id, addresses by host)
+    and follows every key of each musician through the kept `leaderAddress`/`followerAddress`
+    (`closesCircleOffline`, a port of `closes_circle`); the fake now keeps those addresses as the
+    desktop does.
+  - RED: (a) Rust against stubs (no mixes captured or read, no name or id checks, a load applying
+    only groups and channels, the audio taken unchecked) 13 of 162 failed: 6 of 8 snapshot-store
+    tests and 7 of 11 command tests (the guards for an unreadable snapshot, a failed save, a save with
+    no engine, refused groups or channels, a newer session and a stopping engine passed); the
+    refused-mirror naming test was added after that run. (b) UI against a stub `sessions.js` and the
+    T6-era console, state, fake and bridge: 20 of 343 failed (all new). (c) the unknown-kind test
+    failed (`kind: "other"` saved for the Theremin); the channels-screen tests failed 3 of 3 against a
+    mutant that never holds a box; the fake's circle test failed 1 of 11 against the old string
+    comparison (one expectation gained `followerAddress`).
+  - GREEN: `cargo test -p mixlink-desktop` 164 passed (21 new: 8 snapshot store, 2 save, 10 load, 1
+    unknown kinds); UI 347 passed (24 new); `cargo fmt` clean; clippy: no warnings in the desktop
+    crate; `cargo build -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok.
+    `personal-monitoring` untouched. Preview (`index.html?fake#/network`): Save as "Sunday
+    service" (4 musicians' mixes), Load (pushed to Lead vocal, Bass, Keys and Drums), the question
+    while edits wait (Cancel focused), Delete only after the pause; no console errors.
+  - Size: about 1,390 changed lines in the save commit, 1,240 in the load commit, 1,970 in the UI
+    commit (about 600 of them tests) and 520 in the fix commit plus this document; above the
+    400-line heuristic mostly in tests, split by work unit under the 2,000-line review budget.
+  - Follow-ups: a control or mirror the loaded session drops for a musician who is not here stays in
+    the running engine's book until the next start (the engine has no way to forget one; a mirror the
+    loaded session adds that would close a circle with such a stale one is refused and named, and the
+    next start applies the session); a load replaces the labels too, so a label set after the snapshot
+    is gone; export and import to arbitrary files is phase 4; live check with the desktop app and the
+    phones (a load while a phone moves a fader: the later writer wins).
+  - Commits: c5eacf2 `feat(desktop): save named sessions with every musician's mix`; abcea45
+    `feat(desktop): load a named session and push its mixes to the phones`; 196a5a1
+    `feat(desktop-ui): save and load sessions from the console`; this commit (`fix(desktop): keep
+    unknown kinds through edits and test the screen's held boxes`).
+- [ ] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
+  answer after `config`, R3-config-pairs-musician-channel-moreofme-on-unsent) and whatever the
+  phone needs to show a loaded session's pushed mix; docs. Route: delegated writer.
 
 ## Progress
 
@@ -1213,7 +1316,20 @@ slice. Push and PRs are the user's decision.
   going at once, the leader's changes following live, master, cap and mute still moving the
   phone's output); the leader's name is the one the desk had when the mirror was set (T6a); a
   recalled master volume is refused with the rest of a saved mix while following.
+- Review `review-59d6a66ac3a8d487` over aaf926b..f7cc192 (T6b) approved and acknowledged; next
+  review base f7cc192. Its one SUGGESTION (the Compose `enabled` wiring of followed strips has no
+  test of its own) is covered by the previews and the live check; no fix round.
+
+- T7 split into T7a (desktop) and T7b (Android). T7a done (named sessions saved, listed, loaded,
+  renamed and deleted; a load applies live and pushes the saved mixes to the phones here; the
+  folded desktop items); see its entry for evidence and follow-ups. Folded items resolved: the T4
+  follow-up (the window's group list and waiting edits after a load), WARNING
+  R3-idle-channel-edit-rewrites-unknown-kinds, SUGGESTION R3-screen-pending-hold-wiring-untested,
+  the session notice shown in the UI, and the fake's offline mirror check comparing keys as the
+  desktop does. Still open for T7b: R3-config-pairs-musician-channel-moreofme-on-unsent (Android).
+  Review base f7cc192; the T7a slice is four commits of about 1,390, 1,240, 1,970 and 520 changed
+  lines, so it is reviewed commit by commit.
 
 ## Next step
 
-T7 (session save and load).
+T7b (session save and load, Android).

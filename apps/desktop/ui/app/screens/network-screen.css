@@ -1,6 +1,6 @@
 /*
- * The Network and system screen: the musicians table beside the audio input, which drops below
- * the table in a narrower window.
+ * The Network and system screen: the musicians table beside the audio input and the Session panel,
+ * which drop below the table in a narrower window.
  */
 
 .network-screen {
@@ -27,7 +27,10 @@
 }
 
 .network-side {
+  display: flex;
   flex: 1 1 300px;
+  flex-direction: column;
+  gap: var(--ml-space-4);
   min-width: 0;
 }
 

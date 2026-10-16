@@ -183,7 +183,7 @@ mod tests {
     use crate::pipeline::{CaptureLinks, CaptureStats, CaptureWriter, Pipeline, PipelineHandle};
     use crate::protocol::{serialize_packet, AudioPacket};
     use std::sync::mpsc::sync_channel;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn bind(value: &str) -> UdpSocket {
         UdpSocket::bind(value).expect("test socket should bind")
@@ -322,8 +322,13 @@ mod tests {
         capture.write(&[9_830i16, 6_554]);
         assert!(receive(&phone, Duration::from_secs(2)).is_some());
 
-        // About 30 steps of 720 frames is 0.45 s of audio; wait well past it with nothing sent.
-        std::thread::sleep(Duration::from_secs(1));
+        // About 30 steps of 720 frames is 0.45 s; poll with nothing sent, for at most 5 s.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (targets.read()[0].output_meter.read() != [0, 0] || inputs.read(2) != [0, 0])
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         assert_eq!(targets.read()[0].output_meter.read(), [0, 0]);
         assert_eq!(inputs.read(2), vec![0, 0]);

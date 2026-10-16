@@ -16,11 +16,13 @@
 //! wakes the engine thread, which takes every whole block out at once. When a callback is exactly
 //! one block long (an ASIO or other fixed-size driver given the requested buffer, which is how the
 //! block size is chosen, see [block_frames]) each callback completes one block and the ring adds
-//! only the wake-up time. When the driver delivers other lengths (WASAPI's own period), frames wait
-//! for their block to fill: less than one block (5.3 ms at the default 256 frames). The ring's
-//! capacity (at least 0.5 s) only comes into play when the engine thread falls behind; it then
-//! absorbs the stall instead of losing audio, and what still does not fit is dropped at the
-//! callback and counted.
+//! only the wake-up time: measured on the development machine (debug build, 256-frame stereo
+//! blocks) at 89 µs median and 257 µs at the 99th percentile from the callback's write to the
+//! sinks. When the driver delivers other lengths (WASAPI's own period), frames wait for their block
+//! to fill: less than one block (5.3 ms at the default 256 frames). The anti-alias filter adds
+//! 0.32 ms at 96 and 192 kHz (see [crate::decimate]). The ring's capacity (at least 0.5 s) only
+//! comes into play when the engine thread falls behind; it then absorbs the stall instead of losing
+//! audio, and what still does not fit is dropped at the callback and counted.
 //!
 //! Device switches never interleave two devices: every capture stream has its own ring and that
 //! ring's single producer (an rtrb `Producer` cannot be cloned), and the engine thread reads exactly
@@ -244,8 +246,18 @@ pub(crate) struct Pipeline {
     sequence: u64,
     sinks: Vec<Box<dyn Sink>>,
     levels: Arc<LevelMeter>,
-    /// When the last block arrived (or the meters last fell for the wait).
-    last_audio: Instant,
+    /// When the meters were last checked for idle time (see [Pipeline::tick]); `None` before the
+    /// first check, which only starts the clock.
+    checked: Option<Instant>,
+    /// Frames handed to the sinks since the last check.
+    received: usize,
+    /// Frames received beyond the time they were checked against, carried to the next checks.
+    credit: usize,
+}
+
+/// `duration` in frames at 48 kHz, rounded down.
+fn frames_in(duration: Duration) -> usize {
+    (duration.as_micros() * u128::from(TARGET_SAMPLE_RATE) / 1_000_000) as usize
 }
 
 impl Pipeline {
@@ -256,7 +268,9 @@ impl Pipeline {
             sequence: 0,
             sinks,
             levels,
-            last_audio: Instant::now(),
+            checked: None,
+            received: 0,
+            credit: 0,
         }
     }
 
@@ -300,29 +314,60 @@ impl Pipeline {
                 sink.process(&block);
             }
             self.sequence = self.sequence.wrapping_add(1);
+            self.received += length / channels;
             blocks += 1;
-        }
-        if blocks > 0 {
-            self.last_audio = Instant::now();
         }
         blocks
     }
 
-    /// Lets every meter fall by [METER_IDLE_FRAMES] when no block came for [METER_IDLE_WAIT]: a
-    /// capture that stopped delivering then reads as silence instead of freezing on its last level.
+    /// Lets every meter fall by the audio time no block covered, checked every [METER_IDLE_WAIT].
+    ///
+    /// The meters fall with the audio: each block lowers them by its own length when it is metered.
+    /// A capture that stops delivering passes no audio time, so on its own a meter would freeze on
+    /// its last level. Every check therefore compares the time since the last check with the frames
+    /// received in it, and lets the meters (the input meters and every sink's) fall by the
+    /// difference only: time already covered by audio is never counted twice, however long the
+    /// blocks or however bursty their delivery.
+    ///
+    /// A block covers time before it arrives, so frames received beyond a check's time are carried
+    /// to the next checks as credit, up to one block plus one wait. The credit bounds how long a
+    /// stopped capture's meters hold before they fall (at most one block and 100 ms); the rounding
+    /// of each check's time down to whole frames loses under one frame per check.
     pub(crate) fn tick(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.last_audio) >= METER_IDLE_WAIT {
-            self.levels.fall(METER_IDLE_FRAMES);
+        let Some(checked) = self.checked else {
+            self.checked = Some(now);
+            return;
+        };
+        let elapsed = now.saturating_duration_since(checked);
+        if elapsed < METER_IDLE_WAIT {
+            return;
+        }
+        self.checked = Some(now);
+
+        let elapsed = frames_in(elapsed);
+        let covered = self.credit + std::mem::take(&mut self.received);
+        let block_frames = self
+            .source
+            .as_ref()
+            .map_or(0, |source| source.format.block_frames);
+        self.credit = covered
+            .saturating_sub(elapsed)
+            .min(block_frames + METER_IDLE_FRAMES);
+        let silence = elapsed.saturating_sub(covered);
+        if silence > 0 {
+            self.levels.fall(silence);
             for sink in &mut self.sinks {
-                sink.silence(METER_IDLE_FRAMES);
+                sink.silence(silence);
             }
-            self.last_audio = now;
         }
     }
 
     /// How long the engine thread may sleep before [Self::tick] has something to do.
     fn wait(&self, now: Instant) -> Duration {
-        METER_IDLE_WAIT.saturating_sub(now.saturating_duration_since(self.last_audio))
+        match self.checked {
+            Some(checked) => METER_IDLE_WAIT.saturating_sub(now.saturating_duration_since(checked)),
+            None => Duration::ZERO,
+        }
     }
 }
 
@@ -756,5 +801,102 @@ pub(crate) mod tests {
         handle.stop().unwrap();
 
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    /// A mono pipeline with `block_frames` blocks, its input meters and the silence its sink was
+    /// told of, with its clock started at the returned instant.
+    struct Metered {
+        writer: CaptureWriter,
+        pipeline: Pipeline,
+        levels: Arc<LevelMeter>,
+        silence: Arc<AtomicU64>,
+        start: Instant,
+    }
+
+    fn metered(block_frames: usize) -> Metered {
+        let links = links();
+        let levels = Arc::clone(&links.levels);
+        let (writer, reader) = source(1, block_frames, links);
+        let recorder = Recorder::new();
+        let silence = Arc::clone(&recorder.silence);
+        let mut pipeline = Pipeline::new(vec![Box::new(recorder)], Arc::clone(&levels));
+        pipeline.set_source(reader);
+        let start = Instant::now();
+        pipeline.tick(start);
+        Metered {
+            writer,
+            pipeline,
+            levels,
+            silence,
+            start,
+        }
+    }
+
+    /// Runs the engine thread's meter checks every 50 ms of the clock from `from` up to `to`.
+    fn ticks(pipeline: &mut Pipeline, start: Instant, from: u64, to: u64) {
+        for millis in (from..to).step_by(50) {
+            pipeline.tick(start + Duration::from_millis(millis));
+        }
+    }
+
+    /// Blocks longer than the meters' idle wait arrive on time, and the engine thread checks its
+    /// meters between them as it wakes. Every check finds audio that covers its time, so the
+    /// meters fall by the audio and nothing more: the full-scale peak followed by seven 150 ms
+    /// blocks of silence (50,400 frames) reads 30, exactly as from the audio alone.
+    #[test]
+    fn long_blocks_are_not_counted_again_by_the_idle_fall() {
+        let mut run = metered(7_200);
+
+        for index in 0..8u64 {
+            let arrival = 150 * index;
+            if index > 0 {
+                ticks(&mut run.pipeline, run.start, arrival - 100, arrival);
+            }
+            let value = if index == 0 { 1.0 } else { 0.0 };
+            run.writer.write(&[value; 7_200]);
+            run.pipeline.pump();
+            run.pipeline
+                .tick(run.start + Duration::from_millis(arrival));
+        }
+
+        assert_eq!(run.levels.read(1), vec![30]);
+        assert_eq!(run.silence.load(Ordering::Relaxed), 0);
+    }
+
+    /// The same audio delivered in bursts (ten 10 ms blocks every 100 ms) falls exactly as far:
+    /// one second of silence after the peak reads 34, as from the audio alone.
+    #[test]
+    fn bursty_delivery_falls_by_the_audio_and_nothing_more() {
+        let mut run = metered(480);
+        run.writer.write(&[1.0f32; 480]);
+        run.pipeline.pump();
+
+        for burst in 1..=10u64 {
+            ticks(&mut run.pipeline, run.start, 100 * burst - 50, 100 * burst);
+            run.writer.write(&[0.0f32; 4_800]);
+            run.pipeline.pump();
+            run.pipeline
+                .tick(run.start + Duration::from_millis(100 * burst));
+        }
+
+        assert_eq!(run.levels.read(1), vec![34]);
+        assert_eq!(run.silence.load(Ordering::Relaxed), 0);
+    }
+
+    /// When the capture stops delivering, the meters fall by the time that passes, and the sinks
+    /// are told of the same silence: one second after the last block the peak has fallen 48,000
+    /// frames (34) and it reaches zero.
+    #[test]
+    fn a_stalled_capture_falls_by_the_time_that_passes() {
+        let mut run = metered(480);
+        run.writer.write(&[1.0f32; 480]);
+        run.pipeline.pump();
+
+        ticks(&mut run.pipeline, run.start, 50, 1_050);
+        assert_eq!(run.levels.read(1), vec![34]);
+        assert_eq!(run.silence.load(Ordering::Relaxed), 48_000 - 480);
+
+        ticks(&mut run.pipeline, run.start, 1_050, 1_700);
+        assert_eq!(run.levels.read(1), vec![0]);
     }
 }

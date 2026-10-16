@@ -768,11 +768,12 @@ fn shown_level(held: &AtomicU32) -> u8 {
         .min(100) as u8
 }
 
-/// How long the send loop waits for a packet before it counts the wait as silence for the meters.
+/// How often the engine thread checks the meters for time no audio covered.
 ///
 /// A capture that stops delivering (a device that vanished, a stopped stream) passes no audio time,
-/// so an audio-time fall alone would freeze the last level. The send loop waits on the packet queue
-/// anyway; when nothing arrives for this long, it lowers every meter by this much audio.
+/// so an audio-time fall alone would freeze the last level. Every this often the engine thread
+/// lowers every meter by the time that passed minus the audio that arrived in it (see
+/// [crate::pipeline::Pipeline::tick]), so time is never counted twice.
 pub(crate) const METER_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// [METER_IDLE_WAIT] in frames at the packaged rate.
@@ -3863,5 +3864,160 @@ mod tests {
             before
         );
         assert!(observed.try_recv().is_err(), "nothing is announced");
+    }
+
+    /// A capture format for a test source with `channels` channels.
+    fn test_format(channels: u16) -> CaptureFormat {
+        CaptureFormat {
+            channels,
+            sample_rate: TARGET_SAMPLE_RATE,
+            sample_format: "F32".to_owned(),
+            buffer_size: describe_buffer(Some(64)),
+        }
+    }
+
+    /// A capture source the test drives itself, writing into the engine like a device's callback.
+    fn test_capture(
+        engine: &EngineHandle,
+        channels: u16,
+    ) -> (crate::pipeline::CaptureWriter, OpenedCapture) {
+        let (writer, reader) = crate::pipeline::CaptureWriter::new(
+            TARGET_SAMPLE_RATE,
+            crate::pipeline::SourceFormat {
+                channels: usize::from(channels),
+                block_frames: 64,
+            },
+            engine.capture_links().expect("the engine is running"),
+        )
+        .expect("a 48 kHz source builds");
+        let opened = OpenedCapture {
+            stream: None,
+            reader,
+            device_name: format!("Test input ({channels})"),
+            format: test_format(channels),
+        };
+        (writer, opened)
+    }
+
+    /// A running engine with no audio device: the engine thread and the network sink run as in a
+    /// session, with one phone at `phone`, and the capture is a stereo source the test drives.
+    fn engine_without_device(phone: SocketAddr) -> (EngineHandle, crate::pipeline::CaptureWriter) {
+        let targets = Arc::new(
+            TargetRegistry::new(&[phone], &GroupLayout::default()).expect("registry should build"),
+        );
+        let levels = Arc::new(LevelMeter::new());
+        let packet_stats = Arc::new(PacketStats {
+            sent: AtomicU64::new(0),
+            discarded: AtomicU64::new(0),
+        });
+        let network = NetworkSink::new(Arc::clone(&targets), Arc::clone(&packet_stats))
+            .expect("the sink binds");
+        let pipeline =
+            PipelineHandle::spawn(Pipeline::new(vec![Box::new(network)], Arc::clone(&levels)))
+                .expect("the engine thread starts");
+        let mut engine = EngineHandle {
+            device_name: String::new(),
+            capture_format: test_format(0),
+            control_port: 0,
+            buffer_frames: Some(64),
+            host: AudioHost::Auto,
+            source_channels: 0,
+            group_definitions: Vec::new(),
+            levels,
+            targets,
+            stopped: Arc::new(AtomicBool::new(false)),
+            capture_stats: Arc::new(CaptureStats::default()),
+            packet_stats,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            config_state: Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default())),
+            events: EventBus::default(),
+            stream: None,
+            pipeline: Some(pipeline),
+            control_thread: None,
+            discovery_thread: None,
+        };
+        let (capture, opened) = test_capture(&engine, 2);
+        engine
+            .install_capture(opened)
+            .expect("the test source installs");
+        (engine, capture)
+    }
+
+    /// Polls the engine's meters until `done` holds, for at most two seconds.
+    fn meters_until(engine: &EngineHandle, done: impl Fn(&EngineMeters) -> bool) -> EngineMeters {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let meters = engine.meters();
+            if done(&meters) || Instant::now() > deadline {
+                return meters;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Stopping ends capture and the engine thread, which would leave the last levels frozen, so
+    /// the engine clears every input and output meter itself.
+    #[test]
+    fn stopping_the_engine_clears_every_meter() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let address = phone.local_addr().expect("phone address");
+        let (mut engine, mut capture) = engine_without_device(address);
+
+        capture.write(&[0.5f32; 2 * 64]);
+        let lit = meters_until(&engine, |meters| {
+            meters.musicians[0]
+                .output_levels
+                .iter()
+                .all(|level| *level > 0)
+        });
+        assert!(lit.channel_levels.iter().all(|level| *level > 0), "{lit:?}");
+        assert!(lit.musicians[0]
+            .output_levels
+            .iter()
+            .all(|level| *level > 0));
+
+        engine.stop().expect("the engine stops");
+
+        assert_eq!(
+            engine.meters(),
+            EngineMeters {
+                channel_levels: vec![0, 0],
+                musicians: vec![MusicianMeters {
+                    address,
+                    output_levels: [0, 0],
+                }],
+            }
+        );
+    }
+
+    /// A switch clears the input meters at once (the old device's levels describe a stream that is
+    /// gone), and the new device raises its own from its first block.
+    #[test]
+    fn switching_the_input_clears_the_input_meters_and_the_new_one_raises_its_own() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (mut engine, mut old) = engine_without_device(phone.local_addr().expect("address"));
+        // The capture meters each block as it writes it (a fall the engine thread counts for idle
+        // time can only lower a level, so a lit meter is checked as lit, not at an exact value).
+        old.write(&[0.5f32; 2 * 64]);
+        assert!(engine
+            .meters()
+            .channel_levels
+            .iter()
+            .all(|level| *level > 0));
+
+        let (mut new, opened) = test_capture(&engine, 2);
+        drop(old);
+        let format = engine.install_capture(opened).expect("the switch commits");
+
+        assert_eq!(format.channels, 2);
+        assert_eq!(engine.meters().channel_levels, vec![0, 0]);
+        new.write(&[0.25f32; 2 * 64]);
+        let raised = engine.meters().channel_levels;
+        assert!(
+            raised.iter().all(|level| *level > 0 && *level <= 25),
+            "{raised:?}"
+        );
+
+        engine.stop().expect("the engine stops");
     }
 }

@@ -194,6 +194,13 @@ export function formatSessionLoaded(outcome, { labelAt, nameOf }) {
         "The desk keeps its own.",
     );
   }
+  // The engineer's local mix: the saved one plays now, and its output may not have opened.
+  if (outcome.localMix) {
+    sentences.push("The local mix is the saved one.");
+  }
+  if (outcome.localOutputNotice) {
+    sentences.push(outcome.localOutputNotice);
+  }
   return sentences.join(" ");
 }
 

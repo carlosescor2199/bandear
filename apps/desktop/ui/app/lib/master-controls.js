@@ -19,10 +19,17 @@ export function wireMasterControls({ level, cap, limit, mute }, edit) {
   mute.addEventListener("change", (event) => edit("muted", event.detail.pressed));
 }
 
-/** Shows the master `data` (from masterStrip, mix-view.js) on `parts`. */
+/**
+ * Shows the master `data` (from masterStrip, mix-view.js) on `parts`. A mix with no cap or limit
+ * (the engineer's local mix: both null) leaves those faders as they were; the strip hides them.
+ */
 export function showMasterValues({ level, cap, limit, mute }, data) {
   level.value = data.volume;
-  cap.value = data.cap;
-  limit.value = data.limit;
+  if (data.cap !== null) {
+    cap.value = data.cap;
+  }
+  if (data.limit !== null) {
+    limit.value = data.limit;
+  }
   mute.pressed = data.muted;
 }

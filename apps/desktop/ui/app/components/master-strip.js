@@ -4,7 +4,8 @@
 // two wins, and Mute.
 //
 // Property: `data`, from masterStrip (mix-view.js):
-//   { volume, cap, limit, muted, readout, ceilingNote }.
+//   { volume, cap, limit, muted, readout, ceilingNote }. The engineer's local mix has no cap or
+//   limit (both null, and no note): the strip then shows the level and Mute alone.
 // Method: `setLevels(left, right)`, the output peaks from the `meters` event.
 // Event: `mix-edit` { field, index: null, value } (bubbling, composed) for the level
 //   ("volumePercent") and the cap ("maxLevelPercent") as they move, Mute ("muted"), and the limit
@@ -37,6 +38,10 @@ const styles = sheet(`
   }
   .column ml-fader {
     flex: 1 1 auto;
+  }
+  .column[hidden],
+  .note[hidden] {
+    display: none;
   }
   .sub {
     color: var(--ml-text-muted);
@@ -74,11 +79,11 @@ class MlMasterStrip extends HTMLElement {
             <ml-fader data-field="volumePercent" label="Master level"></ml-fader>
             <span class="sub" aria-hidden="true">LEVEL</span>
           </div>
-          <div class="column" title="The musician's own level cap; they can change it on their phone too">
+          <div class="column" data-cap title="The musician's own level cap; they can change it on their phone too">
             <ml-fader data-field="maxLevelPercent" compact label="Phone level cap" aria-describedby="ceiling"></ml-fader>
             <span class="sub" aria-hidden="true">CAP</span>
           </div>
-          <div class="column" title="Your limit for this musician; their phone cannot change it">
+          <div class="column" data-limit title="Your limit for this musician; their phone cannot change it">
             <ml-fader data-field="engineerLimitPercent" compact label="Engineer limit" aria-describedby="ceiling"></ml-fader>
             <span class="sub" aria-hidden="true">LIMIT</span>
           </div>
@@ -100,6 +105,8 @@ class MlMasterStrip extends HTMLElement {
       readout: root.querySelector(".readout"),
       note: root.querySelector(".note"),
       mute: root.querySelector("ml-toggle"),
+      capColumn: root.querySelector("[data-cap]"),
+      limitColumn: root.querySelector("[data-limit]"),
     };
     // The limit goes out when a gesture ends, the rest as it moves (see master-controls.js).
     wireMasterControls(this.#parts, (field, value) => this.#edit(field, value));
@@ -114,8 +121,11 @@ class MlMasterStrip extends HTMLElement {
     const parts = this.#parts;
     reflect(parts.level, "tone", data.muted ? "muted" : "accent");
     showMasterValues(parts, data);
+    parts.capColumn.hidden = data.cap === null;
+    parts.limitColumn.hidden = data.limit === null;
     setText(parts.readout, data.readout);
-    setText(parts.note, data.ceilingNote);
+    parts.note.hidden = !data.ceilingNote;
+    setText(parts.note, data.ceilingNote ?? "");
   }
 
   setLevels(left, right) {

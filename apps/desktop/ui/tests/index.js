@@ -23,3 +23,4 @@ import "./mix-tools-logic.test.js";
 import "./sessions.test.js";
 import "./session-console.test.js";
 import "./channels-screen.test.js";
+import "./local-mix.test.js";

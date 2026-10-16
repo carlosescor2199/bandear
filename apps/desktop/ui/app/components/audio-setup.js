@@ -1,9 +1,16 @@
-// <ml-audio-setup>: the audio input: driver, input device, buffer and what the engine reports.
+// <ml-audio-setup>: the audio input: driver, input device, buffer and what the engine reports;
+// and "Local mix out", the output the engineer's local mix plays on.
 //
-// Property: `data`, from audioSetupView (network-view.js) plus `{ hosts, buffers, devicesError }`.
+// Property: `data`, from audioSetupView (network-view.js) plus `{ hosts, buffers, devicesError,
+//   localOutput }`, `localOutput` from localOutputView (local-mix.js) plus `said`, the last
+//   change's outcome `{ ok, message }` or null.
 // Events (bubbling, composed): `audio-host` { host }, `audio-device` { name }, `audio-buffer`
 //   { frames }, `audio-switch-confirm` and `audio-switch-cancel` (the warning before a switch
-//   that leaves groups without inputs), `audio-asio-apply` (start on the ASIO driver picked).
+//   that leaves groups without inputs), `audio-asio-apply` (start on the ASIO driver picked),
+//   `local-output` { value } (an output chosen: a value of outputOptions, "" for None).
+//
+// The local output's state is always said in words ("Playing on…", "Off…", "Stopped…"); a stop on
+// its own and a kept output the engine did not open are said as alerts.
 //
 // While an ASIO choice waits for its driver the warning about kernel-mode drivers shows, the
 // device list offers the ASIO drivers with nothing picked, and "Start on this driver" stays off
@@ -114,6 +121,17 @@ const styles = sheet(`
     color: var(--ml-text-muted);
     font-size: var(--ml-text-sm);
   }
+  .local-state,
+  [data-local-said] {
+    margin: 0;
+    font-size: var(--ml-text-md);
+  }
+  [data-local-said]:empty {
+    display: none;
+  }
+  [data-local-said][data-ok="false"] {
+    color: var(--ml-danger-text);
+  }
   [hidden] {
     display: none !important;
   }
@@ -152,6 +170,14 @@ class MlAudioSetup extends HTMLElement {
           </span>
           <label for="buffer">Buffer</label>
           <select id="buffer"></select>
+          <label for="local-out">Local mix out</label>
+          <select id="local-out" aria-describedby="local-state local-hint"></select>
+          <p class="full local-state" id="local-state" data-local-state></p>
+          <p class="error full" role="alert" data-local-alert hidden></p>
+          <p class="caution full" role="alert" data-local-notice hidden></p>
+          <p class="error full" role="alert" data-local-error hidden></p>
+          <p class="full" role="status" data-local-said></p>
+          <p class="hint full" id="local-hint" data-local-hint></p>
         </div>
         <dl>
           <dt>Capture format</dt><dd data-format></dd>
@@ -185,8 +211,18 @@ class MlAudioSetup extends HTMLElement {
       port: $("[data-port]"),
       samples: $("[data-samples]"),
       packets: $("[data-packets]"),
+      localOut: $("#local-out"),
+      localState: $("[data-local-state]"),
+      localAlert: $("[data-local-alert]"),
+      localNotice: $("[data-local-notice]"),
+      localError: $("[data-local-error]"),
+      localSaid: $("[data-local-said]"),
+      localHint: $("[data-local-hint]"),
     };
     const parts = this.#parts;
+    parts.localOut.addEventListener("change", () =>
+      emit(this, "local-output", { value: parts.localOut.value }),
+    );
     parts.host.addEventListener("change", () => emit(this, "audio-host", { host: parts.host.value }));
     parts.device.addEventListener("change", () =>
       emit(this, "audio-device", { name: parts.device.value }),
@@ -229,6 +265,30 @@ class MlAudioSetup extends HTMLElement {
     setText(parts.port, data.readouts.controlPort);
     setText(parts.samples, data.readouts.samplesReceived);
     setText(parts.packets, data.readouts.packets);
+    this.#showLocalOutput(data.localOutput);
+  }
+
+  #showLocalOutput(local) {
+    const parts = this.#parts;
+    if (!local) {
+      return;
+    }
+    fill(parts.localOut, local.options, local.value);
+    parts.localOut.disabled = local.disabled;
+    reflect(parts.localState, "data-kind", local.state.kind);
+    setText(parts.localState, local.state.text);
+    for (const [part, text] of [
+      [parts.localAlert, local.state.alert],
+      [parts.localNotice, local.notice],
+      [parts.localError, local.error],
+    ]) {
+      part.hidden = !text;
+      setText(part, text ?? "");
+    }
+    const said = local.said ?? null;
+    reflect(parts.localSaid, "data-ok", said ? String(said.ok) : null);
+    setText(parts.localSaid, said?.message ?? "");
+    setText(parts.localHint, local.hint ?? "");
   }
 }
 

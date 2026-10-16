@@ -7,8 +7,9 @@
 // move with the leader's.
 //
 // Property: `data`, one entry of channelStrips (mix-view.js):
-//   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout, locked,
-//   lockText, following }.
+//   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout, lockable,
+//   locked, lockText, following }. A strip that is not `lockable` (the engineer's local mix, which
+//   no phone plays) has no lock.
 // Method: `setLevel(level)`, the input peak from the `meters` event (a pair's louder side).
 // Event: `mix-edit` { field, index, sides, stereo, value } (bubbling, composed) for a move of the
 //   fader ("channelGains") or the pan ("pans", a balance for a pair) and a press of Mute
@@ -171,6 +172,7 @@ class MlChannelStrip extends HTMLElement {
     parts.mute.pressed = data.muted;
     reflect(parts.solo, "label", `Solo ${label}`);
     parts.solo.pressed = data.solo;
+    parts.lock.hidden = data.lockable === false;
     reflect(parts.lock, "label", `Lock ${label} on the musician's phone`);
     parts.lock.pressed = data.locked;
     setText(parts.lock, data.lockText);

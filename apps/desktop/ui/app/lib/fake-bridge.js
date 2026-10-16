@@ -51,9 +51,37 @@ const NOT_CONNECTED = { ...NO_REPORTS, controlConnected: false };
 const STATUS_INTERVAL_MS = 250;
 const METER_INTERVAL_MS = 33;
 
+/** The outputs the fake's ASIO driver has: under ASIO it offers only these, its own. */
+const ASIO_OUTPUTS = 4;
+
 function clone(value) {
   return structuredClone(value);
 }
+
+/** The status's local output while none plays, the default. */
+function offOutput() {
+  return {
+    device: null,
+    firstChannel: null,
+    state: "off",
+    reason: null,
+    underrunFrames: 0,
+    droppedFrames: 0,
+    notice: null,
+  };
+}
+
+/** The status's local output playing on `device` from `firstChannel`. */
+function playingOutput(device, firstChannel) {
+  return { ...offOutput(), device, firstChannel, state: "running" };
+}
+
+/** An output in the desk's words, as the desktop's notices write it: "Volt 4 · outputs 3/4". */
+function outputWords({ device, firstChannel }) {
+  return `${device} · outputs ${firstChannel + 1}/${firstChannel + 2}`;
+}
+
+const OUTPUT_FIELDS = Object.freeze(["device", "firstChannel"]);
 
 // The status's channels on a device with `count` inputs: each with the engineer's `details` (fitted
 // to the device, see fitChannels; a kind this build does not know shown as it applies, `other`)
@@ -336,6 +364,9 @@ export function sampleStatus() {
         { channelMuted: [false, false, false, true] },
       ),
     ],
+    // The engineer's local mix, the engine's default, and no local output, the default.
+    localMix: { ...defaultMix(), revision: 1 },
+    localOutput: offOutput(),
   };
 }
 
@@ -345,6 +376,17 @@ export function sampleStatus() {
  */
 export function sampleAsioDrivers() {
   return [{ name: "Demo ASIO driver", channels: 0 }];
+}
+
+/**
+ * The output devices `output_devices` offers under the system's driver (auto or WASAPI): a
+ * four-output interface and the computer's own speakers.
+ */
+export function sampleOutputs() {
+  return [
+    { name: "Demo interface", channels: 4 },
+    { name: "Speakers (Realtek Audio)", channels: 2 },
+  ];
 }
 
 /** The input devices `list_input_devices` offers; a device with 0 channels is listed but unusable. */
@@ -395,8 +437,8 @@ function heardLevels(musician, hidden, levels) {
 
 /**
  * A `meters` payload for `status` at `time` milliseconds; the same time gives the same levels.
- * Each musician's output is mixed from the inputs as the engine mixes them, so a hidden input is
- * heard in no one's meter.
+ * Each musician's output, and the engineer's local mix (`local`), is mixed from the inputs as the
+ * engine mixes them, so a hidden input is heard in no one's meter.
  */
 export function syntheticMeters(status, time) {
   const seconds = time / 1000;
@@ -406,7 +448,10 @@ export function syntheticMeters(status, time) {
   for (const musician of status.musicians) {
     musicians[musician.address] = heardLevels(musician, hidden, channels);
   }
-  return { run: status.run, channels, musicians };
+  const local = status.localMix
+    ? heardLevels(status.localMix, hidden, channels)
+    : { left: 0, right: 0 };
+  return { run: status.run, channels, musicians, local };
 }
 
 function hostOf(address) {
@@ -483,27 +528,54 @@ function withPort(address) {
  * `failStart(message)`, `engineerKeys()` (the keys the engineer's controls are kept under),
  * `mirrors()` (the mirrors kept), `savedAudio()` (the audio input kept) and `calls`, every `{
  * command, args }` invoked. `presets` seeds the presets the session keeps.
+ *
+ * The engineer's local mix too, with the desktop's rules (see local-mix.js): `set_local_mix`
+ * merges a change as `set_mix` does (no level cap: `maxLevelPercent` is refused), keeps it in the
+ * session by group id and announces it as `{ run, id: "local", origin: "desktop", mix }`; a group
+ * edit or a new pair moves it as it moves every musician's. `output_devices` lists `outputs` while
+ * the engine runs (under ASIO only the driver's own outputs); `set_local_output` plays the local mix
+ * on a pair of an output it offers, or none, refusing as the engine does, and with the engine
+ * stopped keeps the choice for the next start. Every start plays the kept local mix by group id
+ * and opens the kept output only when its driver offers it; one it does not is left off and the
+ * status says why (`localOutput.notice`), never another device in its place. A saved session keeps
+ * them and a load takes them the same way; one saved without them leaves the desk's own. The
+ * `meters` carry the local mix's peak (`local`). `savedLocal` seeds what the session keeps, and
+ * `savedLocal()` reads it; `failLocalOutput(reason)` stops the output in use, as an unplugged
+ * device does.
  */
 export function createFakeBridge({
   status = sampleStatus(),
   devices = sampleDevices(),
+  outputs = sampleOutputs(),
   running = false,
   failStart = null,
   answersFirst = false,
   statusOnStart = true,
   savedAudio = null,
+  savedLocal = null,
   presets = [],
   savedSessions = [],
   sessionNotice = null,
   clock = () => Date.now(),
 } = {}) {
   const engine = clone(status);
+  engine.localMix ??= { ...defaultMix(), revision: 0 };
+  engine.localOutput ??= offOutput();
   const listeners = new Map();
   const calls = [];
   let isRunning = running;
   let run = running ? engine.run : 0;
   let startError = failStart;
-  let revision = Math.max(0, ...engine.musicians.map((musician) => musician.revision ?? 0));
+  let revision = Math.max(
+    0,
+    engine.localMix.revision ?? 0,
+    ...engine.musicians.map((musician) => musician.revision ?? 0),
+  );
+  // The local mix and its output as the desk's session keeps them, `{ mix, output }` (the mix as a
+  // saved session keeps a mix, the output `{ device, firstChannel }`), or null before either was
+  // kept; and the driver the engine runs, whose outputs it offers.
+  let keptLocal = savedLocal ? clone(savedLocal) : null;
+  let runningHost = "auto";
   // The desk's local labels by labelKey; the labels the status already shows are kept ones.
   const labels = new Map();
   for (const row of engine.musicians) {
@@ -755,8 +827,12 @@ export function createFakeBridge({
     return saved;
   }
 
-  // The desk's whole session, as a named session keeps it.
+  // The desk's whole session, as a named session keeps it: while the engine runs, with the local
+  // mix it plays.
   function deskSession() {
+    const local = isRunning
+      ? { mix: savedMixOf(engine.localMix), output: keptLocal?.output ?? null }
+      : keptLocal;
     return clone({
       labels: [...labels.entries()],
       groups: savedGroups,
@@ -765,29 +841,122 @@ export function createFakeBridge({
       mirrors: [...mirrorBook.entries()],
       presets: keptPresets,
       audio: keptAudio,
+      ...(local ? { local } : {}),
     });
   }
 
-  // Every musician's mix by their key, as a named session keeps it: the device's inputs, the
-  // group levels by id, the master volume and mute.
+  // A mix as the desk keeps a whole mix: the device's inputs, the group levels by id, the master
+  // volume and mute; never a level cap.
+  function savedMixOf(mix) {
+    return {
+      channels: Array.from({ length: engine.sourceChannels }, (_, index) => ({
+        gain: mix.channelGains[index],
+        pan: mix.pans[index],
+        muted: mix.channelMuted[index],
+        solo: mix.channelSolo[index],
+      })),
+      groups: Object.fromEntries(
+        engine.groups.map((group, position) => [group.id, mix.groupLevels[position]]),
+      ),
+      volumePercent: mix.volumePercent,
+      muted: mix.muted,
+    };
+  }
+
+  // Every musician's mix by their key, as a named session keeps it.
   function mixesNow() {
-    return Object.fromEntries(
-      engine.musicians.map((row) => [
-        labelKey(row),
-        {
-          channels: Array.from({ length: engine.sourceChannels }, (_, index) => ({
-            gain: row.channelGains[index],
-            pan: row.pans[index],
-            muted: row.channelMuted[index],
-            solo: row.channelSolo[index],
-          })),
-          groups: Object.fromEntries(
-            engine.groups.map((group, position) => [group.id, row.groupLevels[position]]),
-          ),
-          volumePercent: row.volumePercent,
-          muted: row.muted,
-        },
-      ]),
+    return Object.fromEntries(engine.musicians.map((row) => [labelKey(row), savedMixOf(row)]));
+  }
+
+  // The outputs the running driver offers: under ASIO only the driver's own.
+  function offeredOutputs() {
+    return runningHost === "asio" ? [{ name: engine.deviceName, channels: ASIO_OUTPUTS }] : outputs;
+  }
+
+  // Why the running engine refuses to play on `output`, as the engine words it, or null.
+  function outputRefusal({ device, firstChannel }) {
+    const offered = offeredOutputs().find((candidate) => candidate.name === device);
+    if (!offered) {
+      return runningHost === "asio"
+        ? `"${device}" is not an output the engine offers: under ASIO only the capture driver's own outputs can be used`
+        : `"${device}" is not an output device of this computer`;
+    }
+    const last = firstChannel + 2;
+    if (last > offered.channels) {
+      return `outputs ${last - 1}-${last} are past "${device}", which has ${offered.channels} outputs`;
+    }
+    return null;
+  }
+
+  // The output the window sent, as the desktop reads it: `{ device, firstChannel }` with nothing
+  // else, the device named.
+  function outputRequest(output) {
+    if (output === null || output === undefined) {
+      return null;
+    }
+    for (const field of Object.keys(output)) {
+      if (!OUTPUT_FIELDS.includes(field)) {
+        throw `unknown field \`${field}\`, expected \`device\` or \`firstChannel\``;
+      }
+    }
+    if (typeof output.device !== "string" || output.device === "") {
+      throw "an output needs the name of its device";
+    }
+    return { device: output.device, firstChannel: Number(output.firstChannel ?? 0) };
+  }
+
+  // Keeps `change` of the local section (its mix or its output) in the desk's session.
+  function keepLocal(change) {
+    keptLocal = { mix: null, output: null, ...keptLocal, ...change };
+  }
+
+  function announceLocal() {
+    emit("mix-changed", { run, id: "local", origin: "desktop", mix: clone(engine.localMix) });
+  }
+
+  // Merges `update` into the local mix as the engine does (a pair's sides kept equal) under a new
+  // revision.
+  function mergeLocal(update) {
+    let merged;
+    try {
+      const before = mixFromDto(engine.localMix);
+      merged = keepPairsEqual(before, mergeMixUpdate(before, update ?? {}), runningChannels);
+    } catch (error) {
+      throw error.message;
+    }
+    revision += 1;
+    merged.revision = revision;
+    engine.localMix = merged;
+    return merged;
+  }
+
+  // As every start and a load do with a kept local section: its mix through the desk's path, by
+  // group id, then its output, opened only when the running driver offers it; one it does not, or
+  // none kept, leaves the output off, never another device in its place. Answers why the kept
+  // output was not opened, or null.
+  function applyKeptLocal(local) {
+    if (local?.mix) {
+      mergeLocal(savedUpdate(local.mix, engine.groups, engine.localMix, null));
+      announceLocal();
+    }
+    const output = local?.output ?? null;
+    const now = engine.localOutput;
+    if (
+      output &&
+      now.state === "running" &&
+      now.device === output.device &&
+      now.firstChannel === output.firstChannel
+    ) {
+      return null;
+    }
+    const refusal = output ? outputRefusal(output) : null;
+    engine.localOutput = output && !refusal ? playingOutput(output.device, output.firstChannel) : offOutput();
+    if (!refusal) {
+      return null;
+    }
+    return (
+      `The saved local mix output, ${outputWords(output)}, was not opened: the running audio ` +
+      "driver does not offer it. The local mix plays nowhere until you choose an output."
     );
   }
 
@@ -878,26 +1047,38 @@ export function createFakeBridge({
     engine.channels = channelRows(engine.sourceChannels, engine.groups, runningChannels);
   }
 
+  // For each input, whether it starts a pair the running details link and `previous` did not.
+  function newPairs(previous) {
+    return runningChannels.map((channel, index) => channel.link && !previous[index]?.link);
+  }
+
   // As the engine does when pairs are linked: every musician's new pairs are panned apart (0 and
   // 100) and take the first side's level, mute and solo, each mix under a new revision; a new pair
   // with either side locked is locked whole. Returns the rows that moved: every row when a pair was
   // linked that `previous` did not have, else none. The pairs are the whole table's, as the
   // engine's mixes take them, so a device switch moves none.
   function linkMixes(previous) {
-    const linked = runningChannels.map((channel, index) => channel.link && !previous[index]?.link);
+    const linked = newPairs(previous);
     if (!linked.some(Boolean)) {
       return [];
     }
-    return engine.musicians.map((row) => {
-      const before = mixFromDto(row);
-      const panned = mixFromDto(row);
-      linked.forEach((link, first) => {
-        if (link) {
+    const link = (mix) => {
+      const before = mixFromDto(mix);
+      const panned = mixFromDto(mix);
+      linked.forEach((pair, first) => {
+        if (pair) {
           panned.pans[first] = 0;
           panned.pans[first + 1] = 100;
         }
       });
       revision += 1;
+      return { before, panned };
+    };
+    // As the engine does, the local mix moves with them (announced after them, see set_channels).
+    const local = link(engine.localMix);
+    engine.localMix = { ...keepPairsEqual(local.before, local.panned, runningChannels), revision };
+    return engine.musicians.map((row) => {
+      const { before, panned } = link(row);
       Object.assign(row, keepPairsEqual(before, panned, runningChannels), {
         lockedChannels: lockPairs(panned.lockedChannels, runningChannels),
         revision,
@@ -1037,6 +1218,12 @@ export function createFakeBridge({
       if (wanted) {
         useDevice(wanted);
       }
+      // As the engine does: a new engine has the default local mix and no local output, on the
+      // driver it was started with.
+      runningHost = config?.host ?? "auto";
+      revision += 1;
+      engine.localMix = { ...defaultMix(), revision };
+      engine.localOutput = offOutput();
       // As the desktop does: every start takes the kept channel details, so a new engine pans
       // every kept pair apart before the window hears of it.
       runningChannels = savedChannels;
@@ -1047,6 +1234,10 @@ export function createFakeBridge({
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
+      // As the desktop does last: the kept local mix, then the kept output when the driver
+      // offers it; the status says why one it does not offer was left off.
+      const notice = applyKeptLocal(keptLocal);
+      engine.localOutput.notice = notice;
       if (statusOnStart) {
         emit("status", statusNow());
       }
@@ -1143,6 +1334,46 @@ export function createFakeBridge({
       propagate(row);
       return clone(merged);
     },
+    set_local_mix({ mix } = {}) {
+      requireRunning();
+      if (mix?.maxLevelPercent !== undefined) {
+        throw "the local mix has no level cap: `maxLevelPercent` belongs to a musician's phone";
+      }
+      const merged = mergeLocal(mix);
+      // As the desktop does: the engine takes it, then the session keeps it by group id.
+      keepLocal({ mix: savedMixOf(merged) });
+      if (answersFirst) {
+        setTimeout(announceLocal, 0);
+      } else {
+        announceLocal();
+      }
+      return clone(merged);
+    },
+    output_devices() {
+      if (!isRunning) {
+        throw "the engine is not running: the outputs offered depend on the driver it runs";
+      }
+      return clone(offeredOutputs());
+    },
+    set_local_output({ output = null } = {}) {
+      const chosen = outputRequest(output);
+      if (isRunning) {
+        // As the engine does: a refusal changes nothing and the output in use keeps playing.
+        const refusal = chosen ? outputRefusal(chosen) : null;
+        if (refusal) {
+          throw refusal;
+        }
+        engine.localOutput = chosen ? playingOutput(chosen.device, chosen.firstChannel) : offOutput();
+      }
+      keepLocal({ output: chosen });
+      return {
+        output: clone(chosen),
+        localOutput: isRunning ? clone(engine.localOutput) : null,
+        applied: isRunning,
+        saved: true,
+        saveError: null,
+      };
+    },
     set_groups({ groups } = {}) {
       const next = withIds(groups ?? []);
       checkGroups(next);
@@ -1169,6 +1400,14 @@ export function createFakeBridge({
             row.revision = revision;
             announceMix(row.address, "desktop", mixFromDto(row));
           }
+          // As the engine does: the local mix's levels follow their groups too, announced last.
+          revision += 1;
+          engine.localMix = {
+            ...engine.localMix,
+            groupLevels: regroupedLevels(engine.localMix.groupLevels, before, after),
+            revision,
+          };
+          announceLocal();
         }
       }
       return outcome;
@@ -1193,8 +1432,12 @@ export function createFakeBridge({
         if (JSON.stringify(engine.channels) !== shown) {
           emit("status", statusNow());
         }
+        const linked = newPairs(previous).some(Boolean);
         for (const row of linkMixes(previous)) {
           announceMix(row.address, "desktop", mixFromDto(row));
+        }
+        if (linked) {
+          announceLocal();
         }
       }
       return outcome;
@@ -1493,11 +1736,18 @@ export function createFakeBridge({
       }
       keptPresets = session.presets ?? [];
       keptAudio = audio.audio;
+      // As the desktop does: a saved session from before the local mix leaves the desk's own.
+      const localLoaded = Boolean(session.local);
+      if (localLoaded) {
+        keptLocal = clone(session.local);
+      }
       let pushed = [];
       let skipped = [];
+      let localMix = null;
+      let localOutputNotice = null;
       if (isRunning) {
         // In the desktop's order: groups and details (each status before the mixes they move),
-        // then limits, locks and mirrors, then the saved mixes.
+        // then limits, locks and mirrors, then the saved mixes, then the local mix and output.
         commands.set_groups({ groups: session.groups ?? [] });
         // The loaded details are the session's first, so a kind a newer build wrote is taken.
         savedChannels = channelRequests(session.channels ?? []);
@@ -1507,6 +1757,11 @@ export function createFakeBridge({
         giveKeptMirrors();
         emit("status", statusNow());
         ({ pushed, skipped } = pushSavedMixes(mixes ?? {}, skippedMix));
+        if (localLoaded) {
+          localOutputNotice = applyKeptLocal(keptLocal);
+          engine.localOutput.notice = localOutputNotice;
+          localMix = keptLocal.mix ? clone(engine.localMix) : null;
+        }
       } else {
         savedGroups = withIds(session.groups ?? []);
         savedChannels = channelRequests(session.channels ?? []);
@@ -1525,6 +1780,9 @@ export function createFakeBridge({
         audioLoaded: audio.loaded,
         audioSkipped: audio.skipped,
         presets: clone(keptPresets),
+        localLoaded,
+        localMix,
+        localOutputNotice,
       };
     },
   };
@@ -1635,6 +1893,19 @@ export function createFakeBridge({
     /** The audio input the session keeps, as `audio_settings` reads it: null before any. */
     savedAudio() {
       return keptAudio ? clone(keptAudio) : null;
+    },
+    /** The local mix and output the session keeps, `{ mix, output }`: null before either. */
+    savedLocal() {
+      return keptLocal ? clone(keptLocal) : null;
+    },
+    /** The local output in use stops on its own with `reason`, as an unplugged device does. */
+    failLocalOutput(reason) {
+      if (engine.localOutput.device !== null) {
+        engine.localOutput = { ...engine.localOutput, state: "failed", reason };
+        if (isRunning) {
+          emit("status", statusNow());
+        }
+      }
     },
     /** From now on the answers to `command` wait for `releaseAnswers`, as a slow link would. */
     holdAnswers(command) {

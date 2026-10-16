@@ -478,6 +478,7 @@ test("the sample's groups and the channels in them carry the groups' ids", () =>
 test("editing the fake engine's groups moves every musician's levels with their groups by id", async () => {
   const fake = createFakeBridge({ running: true });
   await fake.invoke("set_mix", { address: LEAD, mix: { groupLevels: [40, 70] } });
+  await fake.invoke("set_local_mix", { mix: { groupLevels: [40, 70] } });
   const before = (await fake.invoke("engine_status")).musicians[0].revision;
   const seen = await recordEvents(fake);
 
@@ -514,13 +515,15 @@ test("editing the fake engine's groups moves every musician's levels with their 
   assert.deepEqual(lead.groupLevels.slice(0, 3), [70, 100, 100]);
   assert.ok(lead.revision > before, "the move is a newer revision");
   assert.deepEqual(
-    seen.map(([event, payload]) => [event, payload.address ?? null, payload.origin ?? null]),
+    seen.map(([event, payload]) => [event, payload.address ?? payload.id, payload.origin ?? null]),
     [
-      ["status", null, null],
+      ["status", undefined, null],
       ...status.musicians.map((musician) => ["mix-changed", musician.address, "desktop"]),
+      ["mix-changed", "local", "desktop"],
     ],
-    "the new groups are announced before the levels placed for them",
+    "the new groups are announced before the levels placed for them, the local mix's last",
   );
+  assert.deepEqual(status.localMix.groupLevels.slice(0, 3), [70, 100, 100], "the local mix's too");
   assert.deepEqual(seen[1][1].mix.groupLevels.slice(0, 2), [70, 100]);
 });
 
@@ -675,14 +678,19 @@ test("linking a pair on the fake engine pans it apart in every mix after the new
   assert.deepEqual(lead.channelGains.slice(1, 3), [70, 70], "the first side's level");
   assert.ok(lead.revision > before, "the link is a newer revision");
   assert.deepEqual(
-    seen.map(([event, payload]) => [event, payload.address ?? null]),
-    [["status", null], ...status.musicians.map((musician) => ["mix-changed", musician.address])],
-    "the new details are announced before the pans placed for them",
+    seen.map(([event, payload]) => [event, payload.address ?? payload.id ?? null]),
+    [
+      ["status", null],
+      ...status.musicians.map((musician) => ["mix-changed", musician.address]),
+      ["mix-changed", "local"],
+    ],
+    "the new details are announced before the pans placed for them, the local mix's last",
   );
+  assert.deepEqual(status.localMix.pans.slice(1, 3), [0, 100], "the local mix's pair too");
 
   // The same details again change nothing and announce nothing.
   await fake.invoke("set_channels", { channels: KEYS });
-  assert.equal(seen.length, 1 + status.musicians.length);
+  assert.equal(seen.length, 2 + status.musicians.length);
 });
 
 test("the fake engine keeps both sides of a pair equal whoever changes one", async () => {
@@ -705,6 +713,8 @@ test("a hidden channel is heard in no mix of the fake engine, as if every musici
   for (const musician of muted.musicians) {
     musician.channelMuted[4] = true;
   }
+  // The local mix too: a hidden input is heard in no mix at all.
+  muted.localMix.channelMuted[4] = true;
   const everyHidden = structuredClone(status);
   for (const channel of everyHidden.channels) {
     channel.hidden = true;

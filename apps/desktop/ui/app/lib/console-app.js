@@ -23,7 +23,11 @@
 //   coalescer: one request in flight per musician, the latest edits always sent, each answer
 //   settling the edits it carried and offering its mix by revision. Edits of the engineer's limit
 //   and locks (ENGINEER_FIELDS) go the same way through their own coalescer to
-//   `set_engineer_controls`; an answer that did not both apply and save is kept to be said.
+//   `set_engineer_controls`; an answer that did not both apply and save is kept to be said. The
+//   engineer's local mix (LOCAL_MIX) goes the same way with `set_local_mix`.
+// - The local mix's output (the Network and system screen's "Local mix out"): `loadOutputs` lists
+//   the outputs the running engine offers, `setLocalOutput` plays the local mix on one or none and
+//   answers `{ ok, message }` (formatLocalOutputSet), reading the status after it.
 // - Meters skip the store: `onMeters` listeners get each `meters` payload of the live run.
 // - The Network and system screen's commands: list devices, apply a driver or buffer (a
 //   restart; ASIO only on a picked driver), switch the device (live under WASAPI, a restart
@@ -50,10 +54,12 @@
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
 import {
+  LOCAL_MIX,
   actions,
   consoleReducer,
   initialState,
   isLiveRun,
+  mixOf,
   musicianByAddress,
   pendingEdits,
 } from "./console-state.js";
@@ -68,6 +74,7 @@ import {
   startRequest,
 } from "./engine-config.js";
 import { formatChannelsSet, formatGroupsSet, musicianLabel, sentenceWithReason } from "./format.js";
+import { formatLocalOutputSet } from "./local-mix.js";
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
@@ -97,17 +104,20 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   // the loaded session; they are dropped once it loaded, and sent as usual if it was refused.
   let loading = false;
 
-  // Sends `address`'s pending mix edits as they are when the send goes out. The coalescer calls it
-  // at most once at a time per musician, and again after an answer when edits are still waiting.
+  // Sends `address`'s pending mix edits as they are when the send goes out: a musician's with
+  // `set_mix`, the local mix's (LOCAL_MIX) with `set_local_mix`. The coalescer calls it at most
+  // once at a time per mix, and again after an answer when edits are still waiting.
   async function sendMix(address) {
     const state = store.getState();
-    const musician = musicianByAddress(state, address);
+    const mix = mixOf(state, address);
     const sent = splitEdits(pendingEdits(state, address)).mix;
-    if (loading || !musician || Object.keys(sent).length === 0) {
+    if (loading || !mix || Object.keys(sent).length === 0) {
       return;
     }
     try {
-      const answer = await api.setMix(address, buildMixRequest(musician.mix, sent));
+      const request = buildMixRequest(mix, sent);
+      const answer =
+        address === LOCAL_MIX ? await api.setLocalMix(request) : await api.setMix(address, request);
       store.dispatch(actions.mixApplied(address, sent, answer));
     } catch (error) {
       store.dispatch(actions.mixFailed(address, sent, error));
@@ -448,6 +458,35 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
   }
 
+  // Lists the outputs the running engine offers for the local mix. Resolves to null, or to the
+  // error of a failed listing (with no engine running there is nothing to list), which is kept to
+  // be said.
+  async function loadOutputs() {
+    try {
+      store.dispatch(actions.outputs(await api.outputDevices()));
+      return null;
+    } catch (error) {
+      store.dispatch(actions.outputsFailed(message(error)));
+      return error;
+    }
+  }
+
+  // Plays the local mix on `output` (`{ device, firstChannel }`) or nowhere with null, then reads
+  // the status, which says where it plays. Answers `{ ok, message }`.
+  async function setLocalOutput(output) {
+    let result;
+    try {
+      result = { ok: true, message: formatLocalOutputSet(await api.setLocalOutput(output)) };
+    } catch (error) {
+      result = {
+        ok: false,
+        message: sentenceWithReason("The local mix output was not changed", message(error)),
+      };
+    }
+    await readStatus();
+    return result;
+  }
+
   // Applies a driver or buffer change by restarting the engine, as a DAW does: on the device in
   // use with `keepDevice`, on `deviceFilter` when named, else on the input the choices name for
   // the driver (a new driver: its default input). ASIO loads a kernel-mode driver, so it only ever
@@ -751,6 +790,10 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     start: startChoice,
     stop,
     loadDevices,
+    /** Lists the outputs the running engine offers for the local mix; see loadOutputs. */
+    loadOutputs,
+    /** Plays the local mix on `{ device, firstChannel }`, or nowhere with null; `{ ok, message }`. */
+    setLocalOutput,
     applyAudio,
     /**
      * Keeps an audio choice for the next start without restarting anything; the session keeps it

@@ -3,14 +3,15 @@
 // per animation frame, routes the meters straight to the strips, and turns the organisms' events
 // into engine calls and mix edits. The tools beside the musician tabs (Mirror, Copy mix to…,
 // Presets) act on the open musician's mix, and their last outcome is said in words above the
-// strips.
+// strips. The last tab is the engineer's Local mix (local-mix.js): the same strips without a lock,
+// a cap or a limit, and no tools, metered by the `meters` event's `local` peak.
 
 import "../components/index.js";
 import { editKey } from "../lib/mix.js";
 import { mixToolsView } from "../lib/mixes.js";
 import { mixToolCommands } from "../lib/mix-tools.js";
 import { musicianLabel } from "../lib/format.js";
-import { selectedMusician } from "../lib/console-state.js";
+import { LOCAL_MIX, selectedMusician } from "../lib/console-state.js";
 import {
   channelEdits,
   channelStrips,
@@ -18,7 +19,7 @@ import {
   masterStrip,
   mixMessages,
   mixNotice,
-  musicianTabs,
+  mixTabs,
   stripLevel,
   topBarView,
 } from "../lib/mix-view.js";
@@ -165,7 +166,7 @@ export function mountMixScreen(main, app) {
     const state = app.store.getState();
     const address = state.selected;
     parts.topBar.data = topBarView(state);
-    parts.tabs.data = musicianTabs(state);
+    parts.tabs.data = mixTabs(state);
     renderTools(state);
 
     const messages = mixMessages(state);
@@ -176,12 +177,13 @@ export function mountMixScreen(main, app) {
 
     const notice = mixNotice(state);
     renderNotice(notice);
+    const local = address === LOCAL_MIX && state.localMix !== null;
     const musician = selectedMusician(state);
-    parts.body.hidden = notice !== null || musician === null;
+    parts.body.hidden = notice !== null || (musician === null && !local);
     if (parts.body.hidden) {
       return;
     }
-    parts.body.setAttribute("aria-label", `${musicianLabel(musician)}'s mix`);
+    parts.body.setAttribute("aria-label", local ? "Local mix" : `${musicianLabel(musician)}'s mix`);
     const strips = channelStrips(state, address);
     keyedChildren(
       parts.channels,
@@ -214,7 +216,7 @@ export function mountMixScreen(main, app) {
     }
   }
 
-  function onMeters({ channels, musicians }) {
+  function onMeters({ channels, musicians, local }) {
     if (parts.body.hidden) {
       return;
     }
@@ -223,7 +225,8 @@ export function mountMixScreen(main, app) {
         strip.setLevel(stripLevel(strip.data.sides, channels));
       }
     }
-    const output = musicians[app.store.getState().selected];
+    const selected = app.store.getState().selected;
+    const output = selected === LOCAL_MIX ? local : musicians[selected];
     parts.master.setLevels(output?.left ?? 0, output?.right ?? 0);
   }
 

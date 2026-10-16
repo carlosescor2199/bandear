@@ -3,10 +3,14 @@
 // organisms: it renders what network-view.js and sessions.js work out, keeps the screen's own
 // choices (an ASIO driver not started yet, a device switch waiting for confirmation, the form's
 // error) and turns events into engine calls (the Session panel's through sessionPanelCommands).
+// The audio setup also chooses where the engineer's local mix plays ("Local mix out", see
+// local-mix.js): the outputs are listed again for every engine run, since they depend on its
+// driver.
 
 import "../components/audio-setup.js";
 import "../components/musicians-table.js";
 import "../components/session-panel.js";
+import { localOutputView, parseOutputValue } from "../lib/local-mix.js";
 import {
   BUFFER_OPTIONS,
   HOST_OPTIONS,
@@ -62,6 +66,8 @@ export function mountNetworkScreen(main, app) {
     pendingSwitch: null,
     addError: null,
     tableError: null,
+    // The last change of the local mix's output, `{ ok, message }`, said until the next one.
+    outputSaid: null,
   };
 
   function render() {
@@ -82,6 +88,7 @@ export function mountNetworkScreen(main, app) {
       hosts: HOST_OPTIONS,
       buffers: BUFFER_OPTIONS,
       devicesError: state.devices.error ? `Devices could not be listed: ${state.devices.error}` : null,
+      localOutput: { ...localOutputView(state), said: local.outputSaid },
     };
     parts.session.data = { ...sessionPanelView(state), unsaved: app.unsavedEdits };
   }
@@ -194,6 +201,22 @@ export function mountNetworkScreen(main, app) {
     update({ tableError: result.ok ? null : `Could not save the name: ${result.message}` });
   }
 
+  async function onLocalOutput({ detail: { value } }) {
+    update({ outputSaid: await app.setLocalOutput(parseOutputValue(value)) });
+  }
+
+  // The outputs depend on the driver an engine runs, so each run lists them again.
+  let listedRun = null;
+  function followRun(state) {
+    const run = state.engine.status ? state.engine.run : null;
+    if (run !== listedRun) {
+      listedRun = run;
+      if (run !== null) {
+        app.loadOutputs();
+      }
+    }
+  }
+
   screen.addEventListener("audio-host", onHost);
   screen.addEventListener("audio-device", onDevice);
   screen.addEventListener("audio-switch-confirm", onConfirmSwitch);
@@ -203,6 +226,7 @@ export function mountNetworkScreen(main, app) {
   screen.addEventListener("musician-add", onAdd);
   screen.addEventListener("musician-remove", onRemove);
   screen.addEventListener("musician-rename", onRename);
+  screen.addEventListener("local-output", onLocalOutput);
   // The Session panel's commands: each outcome is said in the panel at once, with the store's data.
   const sessions = sessionPanelCommands({
     app,
@@ -219,9 +243,13 @@ export function mountNetworkScreen(main, app) {
       );
     });
   }
-  const unsubscribe = app.store.subscribe(scheduleRender);
+  const unsubscribe = app.store.subscribe((state) => {
+    followRun(state);
+    scheduleRender();
+  });
   render();
   app.loadDevices(app.store.getState().audio.host);
+  followRun(app.store.getState());
 
   return () => {
     unsubscribe();

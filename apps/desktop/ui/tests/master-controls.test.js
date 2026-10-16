@@ -119,3 +119,14 @@ test("the level and the phone's cap go out as they move, and Mute as it is press
     "each control shows its own value",
   );
 });
+
+test("the local mix's master, with no cap or limit, shows its level and mute and leaves those alone", () => {
+  const { parts } = strip();
+
+  showMasterValues(parts, { volume: 40, cap: null, limit: null, muted: true });
+
+  assert.deepEqual(
+    [parts.level.value, parts.cap.value, parts.limit.value, parts.mute.pressed],
+    [40, 90, 100, true],
+  );
+});

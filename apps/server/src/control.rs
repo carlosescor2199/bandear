@@ -722,6 +722,16 @@ async fn handle_control_connection(
                                 &*config_state,
                             );
                             let address = registration.address;
+                            // The registration put the engineer's limit and locks for this musician
+                            // in force (or took a previous occupant's away): announced as a change
+                            // through the engine, so this phone is sent its mix with them right
+                            // away, and the desktop follows.
+                            if registration.controls_changed {
+                                events.emit(EngineEvent::MixChanged {
+                                    address,
+                                    origin: MixOrigin::Engine,
+                                });
+                            }
                             // A new session starts with no link report: the one left by an earlier
                             // session describes a link that is gone, and kept it would turn stale
                             // while this session is connected and read as a lost link. A rename on
@@ -1675,6 +1685,54 @@ mod tests {
             .await
             .expect("the mix is acknowledged");
 
+        assert_locked_ch1_held(&ack);
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A phone whose controls the desk kept registers: it is sent its mix with the limit and the
+    /// locks right after the registration, before it sends anything else, and its whole mix is then
+    /// held to them.
+    #[tokio::test]
+    async fn a_registering_phone_is_told_the_engineers_controls_before_it_sends_a_mix() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let events = EventBus::default();
+        crate::engine::keep_target_controls(
+            &targets,
+            &events,
+            &crate::targets::MusicianKey::Client(RETURNING_PHONE_ID.to_owned()),
+            crate::mix::EngineerControls {
+                limit_percent: 60,
+                locked: 0b1,
+            },
+        );
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events,
+        );
+        let mut client = connect_client(address).await;
+
+        send_text(
+            &mut client,
+            &format!(
+                r#"{{"type":"register","name":"Ana","udp_port":50123,"client_id":"{RETURNING_PHONE_ID}"}}"#
+            ),
+        )
+        .await;
+        let told = read_message_of_type(&mut client, "mix_state")
+            .await
+            .expect("the phone is told after it registers");
+
+        assert_eq!(told["engineer_limit_percent"], 60);
+        assert_eq!(told["locked"][0], true);
+        assert_eq!(told["locked"][1], false);
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
         assert_locked_ch1_held(&ack);
 
         stop_server(address, &stopped, server).await;

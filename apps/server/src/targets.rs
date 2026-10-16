@@ -78,12 +78,14 @@ impl TargetOrigin {
     }
 }
 
-/// What a registration did: the address the target now has and, when a known client came back
-/// from another IP, the address its entry moved from.
+/// What a registration did: the address the target now has, when a known client came back from
+/// another IP the address its entry moved from, and whether the registration changed the
+/// engineer's controls on the musician's mix (see [TargetRegistry::register]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Registration {
     pub(crate) address: SocketAddr,
     pub(crate) moved_from: Option<SocketAddr>,
+    pub(crate) controls_changed: bool,
 }
 
 /// One configured musician destination: the UDP address plus the state that belongs to it.
@@ -173,6 +175,16 @@ impl TargetRegistry {
             .is_some()
     }
 
+    /// Puts the controls kept for `entry`'s musician in force on its mix, or the defaults (no
+    /// limit, nothing locked) when none are kept: for a row another musician has just taken over.
+    /// Returns whether its stored mix changed.
+    fn replace_controls(&self, entry: &TargetEntry) -> bool {
+        let controls = self
+            .kept_controls(entry.origin.client_id(), entry.address.ip())
+            .unwrap_or_default();
+        entry.mix_state.restore_engineer(controls).is_some()
+    }
+
     /// Changes the engineer's controls for the musician whose IP `value` names (see
     /// [crate::EngineHandle::set_engineer_controls]) and keeps them for that musician: under their
     /// phone's client id when it announced one, which also drops any kept for their IP, else under
@@ -252,7 +264,10 @@ impl TargetRegistry {
     ///
     /// The engineer's controls kept for the musician (by client id, else by IP) are put in force on
     /// the mix under the same write lock, so the phone's first `mix` after it registers already
-    /// meets its locks and limit.
+    /// meets its locks and limit. A row another musician takes over (a different client id, or
+    /// none where there was one, or the other way round) gets that musician's kept controls or the
+    /// defaults, never the previous occupant's. [Registration::controls_changed] says whether the
+    /// mix changed, so the caller can tell the phone.
     pub(crate) fn register(
         &self,
         peer: IpAddr,
@@ -284,19 +299,29 @@ impl TargetRegistry {
             let entry = &mut entries[index];
             entry.address = address;
             entry.origin = origin;
-            self.restore_kept_controls(entry);
+            let controls_changed = self.restore_kept_controls(entry);
             return Registration {
                 address,
                 moved_from: Some(moved_from),
+                controls_changed,
             };
         }
         if let Some(existing) = entries.iter_mut().find(|entry| entry.address.ip() == peer) {
+            // The row is reused by whoever registers from its IP. Someone else (another phone, or
+            // one that announces no id where a phone was) gets the controls kept for them, or none:
+            // never the previous occupant's.
+            let same_musician = existing.origin.client_id() == client_id;
             existing.address = address;
             existing.origin = origin;
-            self.restore_kept_controls(existing);
+            let controls_changed = if same_musician {
+                self.restore_kept_controls(existing)
+            } else {
+                self.replace_controls(existing)
+            };
             return Registration {
                 address,
                 moved_from: None,
+                controls_changed,
             };
         }
         let entry = TargetEntry {
@@ -309,11 +334,12 @@ impl TargetRegistry {
             output_meter: OutputMeter::default(),
             origin,
         };
-        self.restore_kept_controls(&entry);
+        let controls_changed = self.restore_kept_controls(&entry);
         entries.push(entry);
         Registration {
             address,
             moved_from: None,
+            controls_changed,
         }
     }
 
@@ -750,6 +776,82 @@ mod tests {
         );
     }
 
+    const OTHER_PHONE: &str = "7d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a";
+
+    /// A row reused by someone else (another phone at the same IP, or a phone that announces no
+    /// id) never keeps the previous occupant's limit and locks: it takes those kept for the new
+    /// musician, or none. The phone that comes back gets its own again.
+    #[test]
+    fn a_different_phone_at_a_reused_address_gets_its_own_controls_or_none() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            Some(PHONE),
+            &GroupLayout::default(),
+        );
+        let (_, _, set) = registry
+            .set_controls(
+                "192.168.1.4:50000",
+                &EngineerUpdate {
+                    limit_percent: Some(60),
+                    locked: Some(vec![true]),
+                },
+            )
+            .expect("the phone's controls are set");
+        let kept = set.engineer;
+
+        let other = registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            Some(OTHER_PHONE),
+            &GroupLayout::default(),
+        );
+        assert!(other.controls_changed, "the other phone's mix lost them");
+        assert_eq!(
+            controls_at(&registry, "192.168.1.4"),
+            EngineerControls::default(),
+            "another phone inherits nothing"
+        );
+
+        let back = registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            Some(PHONE),
+            &GroupLayout::default(),
+        );
+        assert!(back.controls_changed);
+        assert_eq!(
+            controls_at(&registry, "192.168.1.4"),
+            kept,
+            "the phone gets its own back"
+        );
+        let again = registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            Some(PHONE),
+            &GroupLayout::default(),
+        );
+        assert!(!again.controls_changed, "a rename changes nothing");
+
+        registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            None,
+            &GroupLayout::default(),
+        );
+        assert_eq!(
+            controls_at(&registry, "192.168.1.4"),
+            EngineerControls::default(),
+            "nor does a phone that announces no id"
+        );
+    }
+
     #[test]
     fn a_target_added_where_controls_were_kept_starts_with_them() {
         let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
@@ -1100,6 +1202,7 @@ mod tests {
             Registration {
                 address: address("192.168.1.3:50001"),
                 moved_from: Some(address("192.168.1.10:50000")),
+                controls_changed: false,
             }
         );
         assert_eq!(addresses(&registry), vec![address("192.168.1.3:50001")]);
@@ -1225,6 +1328,7 @@ mod tests {
             Registration {
                 address: address("192.168.1.3:50001"),
                 moved_from: Some(address("192.168.1.10:50000")),
+                controls_changed: false,
             }
         );
         assert_eq!(addresses(&registry), vec![address("192.168.1.3:50001")]);

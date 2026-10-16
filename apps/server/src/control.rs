@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
@@ -16,8 +16,9 @@ use crate::engine::{EngineEvent, EventBus, MixOrigin};
 use crate::health::LinkReport;
 use crate::mix::GroupLayout;
 use crate::protocol::{
-    control_error, control_message_type, mix_ack, mix_state_message, parse_mix_update,
-    parse_register_command, parse_stats_command, registered_name, ControlConfig, GroupConfig,
+    control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
+    parse_mix_update, parse_register_command, parse_stats_command, registered_name, ControlConfig,
+    GroupConfig,
 };
 use crate::targets::TargetRegistry;
 
@@ -266,6 +267,80 @@ fn should_push_mix(event: &EngineEvent, peer: SocketAddr) -> bool {
     }
 }
 
+/// One connection's view of the live event bus: it only ever answers "push the mix now".
+///
+/// It owns the recovery rules, so the connection loop has a single branch for them:
+///
+/// - A change of this musician's mix that this connection did not make asks for a push.
+/// - A feed that lagged behind the bus asks for a push too: an event for this musician may be
+///   among the missed ones, and the push carries the whole mix, so sending it is always correct.
+/// - A closed bus turns the feed off for good. The connection carries on without it, and the feed
+///   parks instead of resolving at once on every poll, so the loop cannot spin on it. The
+///   connection holds a sender of the bus itself, so today this can only follow a refactor.
+struct MixPushFeed {
+    events: broadcast::Receiver<EngineEvent>,
+    peer: SocketAddr,
+    open: bool,
+}
+
+impl MixPushFeed {
+    fn new(events: broadcast::Receiver<EngineEvent>, peer: SocketAddr) -> Self {
+        Self {
+            events,
+            peer,
+            open: true,
+        }
+    }
+
+    /// Resolves when this connection's phone must be sent its musician's whole mix.
+    ///
+    /// Cancel-safe, as a `select!` branch must be: it only awaits the broadcast's own cancel-safe
+    /// `recv`, and it returns as soon as an event asks for a push, so dropping it loses nothing that
+    /// mattered.
+    async fn next_push(&mut self) {
+        while self.open {
+            match self.events.recv().await {
+                Ok(event) if should_push_mix(&event, self.peer) => return,
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => return,
+                Err(RecvError::Closed) => self.open = false,
+            }
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
+/// What became of a write that had to finish by the heartbeat deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundedSend {
+    Sent,
+    /// The socket refused the write: the peer is gone.
+    Failed,
+    /// The write could not finish in time, which is as good as a missed heartbeat.
+    TimedOut,
+}
+
+/// Sends one message on the shared writer, giving up at `deadline`.
+///
+/// A write to a vanished peer can stall once its buffers fill, and so can waiting for the writer
+/// while another write is stuck on it, so both are bounded. The connection loop ends the
+/// connection on anything but [BoundedSend::Sent].
+async fn send_by<S>(
+    writer: &tokio::sync::Mutex<S>,
+    message: Message,
+    deadline: tokio::time::Instant,
+) -> BoundedSend
+where
+    S: Sink<Message> + Unpin,
+{
+    let send = async { writer.lock().await.send(message).await };
+    match tokio::time::timeout_at(deadline, send).await {
+        Ok(Ok(())) => BoundedSend::Sent,
+        Ok(Err(_)) => BoundedSend::Failed,
+        Err(_) => BoundedSend::TimedOut,
+    }
+}
+
 /// Registers a live connection and returns the guard that deregisters it, so the caller never has
 /// to remember to undo this on every exit path.
 fn register_peer(
@@ -306,8 +381,7 @@ async fn handle_control_connection(
     let _peer = register_peer(&peers, &events, &targets, peer);
     // Subscribed before `config` goes out, so a client that has seen `config` cannot miss a mix
     // change made after it.
-    let mut live_events = events.subscribe_live();
-    let mut live_events_open = true;
+    let mut mix_pushes = MixPushFeed::new(events.subscribe_live(), peer);
     let (writer, mut reader) = websocket.split();
 
     // The sink is shared between the read loop and the config watcher through an async mutex. The
@@ -386,56 +460,29 @@ async fn handle_control_connection(
                 log_missed_heartbeat(peer, heartbeat.dead_after);
                 break;
             }
-            event = live_events.recv(), if live_events_open => {
-                let push = match event {
-                    Ok(event) => should_push_mix(&event, peer),
-                    // Events were missed, so one may have been for this musician: sending the
-                    // current mix is always correct, because it is the whole mix, not a delta.
-                    Err(RecvError::Lagged(_)) => true,
-                    Err(RecvError::Closed) => {
-                        live_events_open = false;
-                        false
-                    }
-                };
-                if !push {
-                    continue;
-                }
+            // The feed applies the recovery rules (a lagged feed pushes, a closed one parks).
+            _ = mix_pushes.next_push() => {
                 // A peer whose target is gone has no mix to follow; it keeps its channel as before.
                 let Some(mix_state) = targets.mix_state(peer.ip()) else {
                     continue;
                 };
                 let message = mix_state_message(mix_state.snapshot())?;
                 // Bounded like the ping: a push that cannot be written in time means a dead peer.
-                let send = async {
-                    writer
-                        .lock()
-                        .await
-                        .send(Message::Text(message.into()))
-                        .await
-                };
-                match tokio::time::timeout_at(dead_at, send).await {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(_)) => break,
-                    Err(_) => {
+                match send_by(&writer, Message::Text(message.into()), dead_at).await {
+                    BoundedSend::Sent => continue,
+                    BoundedSend::Failed => break,
+                    BoundedSend::TimedOut => {
                         log_missed_heartbeat(peer, heartbeat.dead_after);
                         break;
                     }
                 }
             }
             _ = ping_timer.tick() => {
-                // A write to a vanished peer can stall once its buffers fill, so the ping is bounded
-                // by the same deadline: a ping that cannot be sent in time is as good as no answer.
-                let ping = async {
-                    writer
-                        .lock()
-                        .await
-                        .send(Message::Ping(Default::default()))
-                        .await
-                };
-                match tokio::time::timeout_at(dead_at, ping).await {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(_)) => break,
-                    Err(_) => {
+                // A ping that cannot be sent in time is as good as no answer.
+                match send_by(&writer, Message::Ping(Default::default()), dead_at).await {
+                    BoundedSend::Sent => continue,
+                    BoundedSend::Failed => break,
+                    BoundedSend::TimedOut => {
                         log_missed_heartbeat(peer, heartbeat.dead_after);
                         break;
                     }
@@ -516,8 +563,16 @@ async fn handle_control_connection(
                     // The join is live: a peer whose target was removed at runtime finds no mix
                     // state here and gets the same error an IP that was never configured has always
                     // received. The control channel itself is deliberately left open.
+                    //
+                    // A `mix` may carry the phone's number for it; the answer, ack or error, carries
+                    // it back. Any other type that ends up here is never numbered.
+                    let seq = if message_type == "mix" {
+                        mix_sequence(&text)
+                    } else {
+                        None
+                    };
                     Some(match targets.mix_state(peer.ip()) {
-                        None => control_error(NO_TARGET_ERROR.to_owned())?,
+                        None => mix_error(NO_TARGET_ERROR.to_owned(), seq)?,
                         Some(mix_state) => {
                             match parse_mix_update(&text)
                                 .and_then(|update| mix_state.apply(&update))
@@ -527,9 +582,9 @@ async fn handle_control_connection(
                                         address: peer,
                                         origin: MixOrigin::Client { peer },
                                     });
-                                    mix_ack(values)?
+                                    mix_ack(values, seq)?
                                 }
-                                Err(error) => control_error(error)?,
+                                Err(error) => mix_error(error, seq)?,
                             }
                         }
                     })
@@ -1355,6 +1410,92 @@ mod tests {
         stop_server(address, &stopped, server).await;
     }
 
+    async fn send_text(client: &mut ClientStream, text: &str) {
+        client
+            .send(Message::Text(text.into()))
+            .await
+            .expect("client should send");
+    }
+
+    /// A phone numbers its mixes with `seq`, and the answer to each one, an ack or an error, carries
+    /// the same number back. A mix without one is answered without one, exactly as before.
+    #[tokio::test]
+    async fn the_answer_to_a_mix_echoes_its_sequence() {
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &GroupLayout::default(),
+            )
+            .expect("registry should build"),
+        );
+        let (address, stopped, server) = start_registration_server(targets);
+        let mut client = connect_client(address).await;
+
+        send_text(
+            &mut client,
+            r#"{"type":"mix","seq":7,"volume_percent":80,"max_level_percent":90,"muted":false}"#,
+        )
+        .await;
+        let ack = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(ack["type"], "mix_ack");
+        assert_eq!(ack["seq"], 7);
+
+        // More channels than the engine mixes, so the mix is refused.
+        let oversized = format!(
+            r#"{{"type":"mix","seq":8,"volume_percent":80,"max_level_percent":90,"muted":false,"channels":[{}]}}"#,
+            vec!["100"; 33].join(",")
+        );
+        send_text(&mut client, &oversized).await;
+        let refused = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["seq"], 8);
+
+        send_text(
+            &mut client,
+            r#"{"type":"mix","volume_percent":70,"max_level_percent":90,"muted":false}"#,
+        )
+        .await;
+        let unnumbered = read_next_reply(&mut client).await.expect("a reply to mix");
+        assert_eq!(unnumbered["type"], "mix_ack");
+        assert!(unnumbered.get("seq").is_none(), "{unnumbered}");
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// Only an answer to a mix carries a sequence. An error answering a registration, a stats report
+    /// or a message of another type never does, whatever that message carried; a mix refused because
+    /// the peer has no target still gets its own number back.
+    #[tokio::test]
+    async fn errors_answering_other_messages_never_carry_a_sequence() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(targets);
+        let mut client = connect_client(address).await;
+
+        for other in [
+            r#"{"type":"stats","seq":4,"interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}"#,
+            r#"{"type":"register","seq":5}"#,
+            r#"{"type":"mix_preview","seq":6}"#,
+        ] {
+            send_text(&mut client, other).await;
+            let reply = read_next_reply(&mut client).await.expect("an error reply");
+            assert_eq!(reply["type"], "error", "{other}");
+            assert!(reply.get("seq").is_none(), "{other} -> {reply}");
+        }
+
+        send_text(
+            &mut client,
+            r#"{"type":"mix","seq":9,"volume_percent":80,"max_level_percent":90,"muted":false}"#,
+        )
+        .await;
+        let refused = read_next_reply(&mut client).await.expect("an error reply");
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["message"], NO_TARGET_ERROR);
+        assert_eq!(refused["seq"], 9);
+
+        stop_server(address, &stopped, server).await;
+    }
+
     /// The grace period over a real socket: dropping the control channel keeps the target, and the
     /// drop is what arms its eventual removal. The exact boundary is covered by the pure tests in
     /// `targets`; this proves the wiring between the connection guard and the sweep.
@@ -1934,5 +2075,214 @@ mod tests {
         assert_eq!(next["max_level_percent"], 90, "the phone's values are kept");
 
         stop_server(address, &stopped, server).await;
+    }
+
+    const PHONE: &str = "192.168.1.3:41000";
+
+    fn engine_change(address: &str) -> EngineEvent {
+        EngineEvent::MixChanged {
+            address: address.parse().unwrap(),
+            origin: MixOrigin::Engine,
+        }
+    }
+
+    /// A feed that fell behind the bus may have missed a change for its musician, so it asks for
+    /// the whole current mix, which is always correct to send.
+    #[tokio::test]
+    async fn a_feed_that_lagged_asks_for_the_whole_mix() {
+        let (bus, receiver) = broadcast::channel(1);
+        let mut feed = MixPushFeed::new(receiver, PHONE.parse().unwrap());
+        for other in [
+            "192.168.1.4:50000",
+            "192.168.1.5:50000",
+            "192.168.1.6:50000",
+        ] {
+            bus.send(engine_change(other))
+                .expect("the feed is subscribed");
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), feed.next_push())
+                .await
+                .is_ok(),
+            "none of the events was for this phone, but some were missed"
+        );
+    }
+
+    /// Events that are not a change of this phone's mix by someone else are passed over, and the
+    /// feed keeps waiting until one is.
+    #[tokio::test]
+    async fn a_feed_waits_through_events_that_are_not_for_its_phone() {
+        let phone: SocketAddr = PHONE.parse().unwrap();
+        let (bus, receiver) = broadcast::channel(16);
+        let mut feed = MixPushFeed::new(receiver, phone);
+        bus.send(EngineEvent::ClientConnected { address: phone })
+            .expect("the feed is subscribed");
+        bus.send(EngineEvent::MixChanged {
+            address: phone,
+            origin: MixOrigin::Client { peer: phone },
+        })
+        .expect("the feed is subscribed");
+        bus.send(engine_change("192.168.1.4:50000"))
+            .expect("the feed is subscribed");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), feed.next_push())
+                .await
+                .is_err(),
+            "nothing so far is a change this phone has to be told about"
+        );
+
+        bus.send(engine_change("192.168.1.3:50000"))
+            .expect("the feed is subscribed");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), feed.next_push())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Counts the times a future asks to be polled again.
+    struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A closed bus turns the feed off for good without ending anything: the feed parks and never
+    /// asks to be polled again, so the connection's loop neither ends nor spins on it.
+    ///
+    /// The connection itself holds a sender of the bus it listens to, so in the server the bus can
+    /// only close if that ever changes; this is the guard for that case.
+    #[test]
+    fn a_closed_feed_parks_for_good_instead_of_spinning() {
+        use std::future::Future;
+
+        let (bus, receiver) = broadcast::channel::<EngineEvent>(16);
+        let mut feed = MixPushFeed::new(receiver, PHONE.parse().unwrap());
+        drop(bus);
+        let wakes = Arc::new(WakeCounter(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        let mut context = std::task::Context::from_waker(&waker);
+
+        for _ in 0..3 {
+            let next = std::pin::pin!(feed.next_push());
+            assert!(
+                next.poll(&mut context).is_pending(),
+                "a closed feed never resolves"
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            0,
+            "a parked feed must not ask to be polled again"
+        );
+    }
+
+    /// A sink whose peer is gone: every write fails.
+    struct BrokenSink;
+
+    impl Sink<Message> for BrokenSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A sink whose peer stopped reading: its buffers are full, so a write never gets going.
+    struct StalledSink;
+
+    impl Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn soon() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_millis(100)
+    }
+
+    /// The outcomes the connection loop acts on: a sent push or ping carries on, and a failed or
+    /// late one ends the connection (the loop maps both to `break`).
+    #[tokio::test]
+    async fn a_bounded_send_reports_sent_failed_and_timed_out() {
+        let open = tokio::sync::Mutex::new(futures_util::sink::drain());
+        let broken = tokio::sync::Mutex::new(BrokenSink);
+        let stalled = tokio::sync::Mutex::new(StalledSink);
+
+        assert_eq!(
+            send_by(&open, Message::Text("{}".into()), soon()).await,
+            BoundedSend::Sent
+        );
+        assert_eq!(
+            send_by(&broken, Message::Text("{}".into()), soon()).await,
+            BoundedSend::Failed
+        );
+        assert_eq!(
+            send_by(&stalled, Message::Text("{}".into()), soon()).await,
+            BoundedSend::TimedOut
+        );
+    }
+
+    /// A write that cannot even take the writer before the deadline (another write holds it, stuck
+    /// on the same dead peer) is late too.
+    #[tokio::test]
+    async fn a_bounded_send_waiting_for_a_stuck_writer_times_out() {
+        let writer = tokio::sync::Mutex::new(futures_util::sink::drain());
+        let _stuck = writer.lock().await;
+
+        assert_eq!(
+            send_by(&writer, Message::Ping(Default::default()), soon()).await,
+            BoundedSend::TimedOut
+        );
     }
 }

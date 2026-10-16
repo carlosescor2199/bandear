@@ -21,14 +21,17 @@ private const val NORMAL_CLOSURE = 1000
  * The WebSocket control channel, its connection state machine, sending and closing.
  *
  * The channel owns its [transport] (OkHttp WebSockets in production) and its [scheduler] (one
- * background thread in production). It reports opened, acknowledged, config, error and closed
- * events through [Listener], so the Activity only renders and wires. [running] is the shared
- * session flag owned by the caller.
+ * background thread in production). It reports opened, acknowledged, config, pushed and answered
+ * mixes, error and closed events through [Listener], so the Activity only renders and wires.
+ * [running] is the shared session flag owned by the caller.
  *
  * While the session runs, a connection that fails or closes is reopened on its own, following
  * [ReconnectPolicy], to the server and control port given to [connect]. Every open re-sends the
  * registration and then the current mix, so the server gets this musician back as they were. The
  * audio receiver is never touched. [close] stops the session and any pending attempt.
+ *
+ * Every mix carries [mixSequence], the number of the phone's newest change, and the server answers
+ * with it. The channel only carries the number both ways; the caller decides which answer counts.
  */
 internal class ControlChannel(
     private val listener: Listener,
@@ -36,6 +39,8 @@ internal class ControlChannel(
     private val currentSnapshot: () -> MixSnapshot,
     private val moreOfMeEnabled: () -> Boolean,
     private val musicianChannel: () -> Int?,
+    /** The number of the phone's newest mix change, sent as `seq`; null sends none. */
+    private val mixSequence: () -> Long? = { null },
     private val transport: ControlTransport = OkHttpControlTransport(),
     private val scheduler: ControlScheduler = ExecutorControlScheduler(),
 ) {
@@ -43,6 +48,21 @@ internal class ControlChannel(
         fun onOpened()
         fun onConfig(channels: Int, groups: List<GroupInfo>)
         fun onAcknowledged()
+
+        /**
+         * The server pushed this musician's whole mix (`mix_state`) because it changed elsewhere,
+         * such as on the desktop. The channel sends nothing back: the server already plays it. A
+         * listener that does not follow the server's mix keeps this default and ignores it.
+         */
+        fun onMixPushed(mix: MixSnapshot) = Unit
+
+        /**
+         * The server answered the phone's mix number [seq]: [applied] is the whole mix it now plays
+         * (its `mix_ack`), or null when it refused the mix (an `error`) or its ack had no readable
+         * mix. Answers without a number (from a server that predates them) are never reported here.
+         */
+        fun onMixAnswered(seq: Long, applied: MixSnapshot?) = Unit
+
         fun onClosed()
         fun onControlError(message: String)
     }
@@ -102,7 +122,12 @@ internal class ControlChannel(
             try {
                 val message = JSONObject(text)
                 when (message.optString("type")) {
-                    "error" -> listener.onControlError(message.optString("message", "unknown control error"))
+                    "error" -> {
+                        // Only an error refusing one of the phone's mixes carries its number; an error
+                        // answering a registration or a stats report never touches the mixes.
+                        message.answeredSequence()?.let { seq -> listener.onMixAnswered(seq, applied = null) }
+                        listener.onControlError(message.optString("message", "unknown control error"))
+                    }
                     "config" -> {
                         val announcedChannels = message.optInt("source_channels", -1)
                         if (announcedChannels in 1..MAX_CHANNELS) {
@@ -112,7 +137,13 @@ internal class ControlChannel(
                     "mix_ack" -> {
                         mixAcknowledged = true
                         listener.onAcknowledged()
+                        // Without a number an ack cannot be matched to a mix, so it only acknowledges.
+                        // An ack whose mix cannot be read still answers its number.
+                        message.answeredSequence()?.let { seq ->
+                            listener.onMixAnswered(seq, runCatching { parseMixReport(message) }.getOrNull())
+                        }
                     }
+                    "mix_state" -> listener.onMixPushed(parseMixReport(message))
                 }
             } catch (error: Exception) {
                 listener.onControlError("Invalid control response: ${error.message ?: "unknown error"}")
@@ -314,14 +345,23 @@ internal class ControlChannel(
         mixAcknowledged = false
     }
 
+    /**
+     * Sends the current mix, on the control scheduler, under the newest change's number. Sends that
+     * pile up behind a busy scheduler each read the mix and the number when they run, so the mix on
+     * the wire is always the newest one.
+     */
     fun sendMixControl() {
         scheduler.execute {
             val webSocket = controlWebSocket ?: return@execute
+            // The number is read before the mix: a change numbers itself after it lands, so the mix
+            // read next is at least as new as the number, and an answer never vouches for a mix older
+            // than the one it names.
+            val sequence = mixSequence()
             val stored = currentSnapshot()
             // `More of me` is derived here, at send time, and never written back. The stored values
             // stay exactly as the musician left them, so turning the control off re-sends them.
             val outgoing = if (moreOfMeEnabled()) stored.moreOfMe(musicianChannel()) ?: stored else stored
-            if (!webSocket.send(buildMixMessage(outgoing)) && running.get()) {
+            if (!webSocket.send(buildMixMessage(outgoing, sequence)) && running.get()) {
                 listener.onControlError("WebSocket rejected mix update")
             }
         }
@@ -370,7 +410,7 @@ internal class ControlChannel(
         transport.shutdown()
     }
 
-    private fun buildMixMessage(snapshot: MixSnapshot): String {
+    private fun buildMixMessage(snapshot: MixSnapshot, sequence: Long?): String {
         val channels = JSONArray()
         for (gain in snapshot.channelGains) {
             channels.put(gain)
@@ -393,6 +433,8 @@ internal class ControlChannel(
         }
         return JSONObject()
             .put("type", "mix")
+            // A null number puts no key at all, so the message is exactly what older servers read.
+            .put("seq", sequence)
             .put("volume_percent", snapshot.volumePercent)
             .put("max_level_percent", snapshot.maxLevelPercent)
             .put("muted", snapshot.muted)
@@ -433,6 +475,32 @@ internal fun buildStatsMessage(report: LinkStatsReport): String =
         .put("underruns", report.underruns)
         .put("receive_timeouts", report.receiveTimeouts)
         .toString()
+
+/**
+ * Reads a whole mix as the server reports it, in the field names of the `mix` message: `mix_state`
+ * carries it, and `mix_ack` shares the shape. The lists are the server's full tables (32 channels,
+ * 16 groups); the client keeps the channels and groups it knows. The server always sends every
+ * field, so a missing or mistyped one throws: such a push is reported as invalid, never applied, and
+ * such an ack still acknowledges but shows nothing.
+ */
+internal fun parseMixReport(message: JSONObject): MixSnapshot =
+    MixSnapshot(
+        channelGains = message.getJSONArray("channels").ints(),
+        channelPans = message.getJSONArray("pans").ints(),
+        channelMutes = message.getJSONArray("mutes").booleans(),
+        channelSolos = message.getJSONArray("solos").booleans(),
+        groupLevels = message.getJSONArray("group_levels").ints(),
+        volumePercent = message.getInt("volume_percent"),
+        maxLevelPercent = message.getInt("max_level_percent"),
+        muted = message.getBoolean("muted"),
+    )
+
+/** The number of the phone's mix this answer names (`seq`), or null when it names none. */
+private fun JSONObject.answeredSequence(): Long? = if (opt("seq") is Number) getLong("seq").takeIf { it >= 0 } else null
+
+private fun JSONArray.ints(): IntArray = IntArray(length()) { getInt(it) }
+
+private fun JSONArray.booleans(): BooleanArray = BooleanArray(length()) { getBoolean(it) }
 
 /**
  * Reads the `groups` array from a `config` message. Missing or malformed entries are skipped, and a

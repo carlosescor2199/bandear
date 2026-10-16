@@ -64,6 +64,18 @@ internal sealed interface MonitorEvent {
     data class MasterMuteChanged(val muted: Boolean) : MonitorEvent
     data class LevelCapChanged(val level: Int) : MonitorEvent
 
+    /**
+     * The server pushed the musician's whole mix (`mix_state`) because it changed elsewhere, such as
+     * on the desktop. [snapshot] holds the server's full tables; the reducer keeps what the phone knows.
+     */
+    data class MixPushed(val snapshot: MixSnapshot) : MonitorEvent
+
+    /**
+     * The server answered the phone's change number [seq]: [applied] is the whole mix it now plays
+     * (its `mix_ack`), or null when it refused the mix (an `error`) or its ack had no readable mix.
+     */
+    data class MixAnswered(val seq: Long, val applied: MixSnapshot?) : MonitorEvent
+
     // More of me.
 
     /** The musician asked to turn More of me [on] or off. */

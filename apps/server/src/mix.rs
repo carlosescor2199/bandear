@@ -63,9 +63,10 @@ pub(crate) struct MixState {
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
-    /// Serializes [MixState::apply], so two writers (the musician's phone and the desktop) never
-    /// interleave a read-merge-store and lose each other's fields. The network thread only loads
-    /// the atomics and never takes it, so the audio path stays lock-free.
+    /// Serializes every writer ([MixState::apply] and [MixState::update]), so two writers (the
+    /// musician's phone and the desktop) never interleave a read-merge-store and lose each other's
+    /// fields. The network thread only loads the atomics and never takes it, so the audio path stays
+    /// lock-free.
     writer: Mutex<()>,
 }
 
@@ -227,7 +228,20 @@ impl MixState {
         }
     }
 
+    /// Replaces the whole stored mix. Tests use it to set a mix up in one step; the server's
+    /// writers (the phone's `mix` and the desktop's `set_mix`) all go through [MixState::apply].
+    ///
+    /// It takes the writer lock like [MixState::apply], so a whole-mix store can never land between
+    /// a partial update's read and its store and undo part of that update.
+    #[cfg(test)]
     pub(crate) fn update(&self, values: MixValues) {
+        let _writer = self.writer.lock().expect("mix writer lock poisoned");
+        self.store(values);
+    }
+
+    /// Stores every client-settable field. The caller holds the writer lock; the group membership
+    /// is server configuration and is left alone.
+    fn store(&self, values: MixValues) {
         store_all(&self.channel_gains, &values.channel_gains);
         store_all(&self.pans, &values.pans);
         store_all_flags(&self.channel_muted, &values.channel_muted);
@@ -249,7 +263,7 @@ impl MixState {
     pub(crate) fn apply(&self, update: &MixUpdate) -> Result<MixValues, String> {
         let _writer = self.writer.lock().expect("mix writer lock poisoned");
         let merged = update.merge_into(self.snapshot())?;
-        self.update(merged);
+        self.store(merged);
         Ok(merged)
     }
 
@@ -409,6 +423,8 @@ mod tests {
     use crate::protocol::parse_mix_command;
     use crate::targets::TargetRegistry;
     use std::net::IpAddr;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     #[test]
     fn independent_mix_states_transform_the_same_input_differently() {
@@ -920,5 +936,81 @@ mod tests {
         assert_eq!(state.snapshot().channel_group[0], None);
         assert_eq!(state.snapshot().group_levels[0], 50);
         assert_eq!(mix_channels(&[10_000], 1, state.snapshot()), [10_000, 0]);
+    }
+
+    /// A whole-mix store waits for a writer in progress instead of slipping in between that
+    /// writer's read and its store.
+    #[test]
+    fn replacing_the_whole_mix_waits_for_the_writer_lock() {
+        let state = Arc::new(MixState::new(&GroupLayout::default()));
+        let held = state.writer.lock().expect("mix writer lock");
+        let writer = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state.update(MixValues {
+                    volume_percent: 10,
+                    ..MixValues::default()
+                })
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            state.snapshot().volume_percent,
+            100,
+            "the store must wait while another writer holds the lock"
+        );
+
+        drop(held);
+        writer
+            .join()
+            .expect("the store finishes once the lock is free");
+        assert_eq!(state.snapshot().volume_percent, 10);
+    }
+
+    /// The phone and the desktop change different parts of one mix at the same moment, round after
+    /// round: neither change is ever lost.
+    #[test]
+    fn concurrent_writers_of_disjoint_fields_never_lose_a_change() {
+        const ROUNDS: usize = 2_000;
+        let state = Arc::new(MixState::new(&GroupLayout::default()));
+        let start = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+        let spawn_writer = |update: fn(usize) -> MixUpdate| {
+            let (state, start, done) = (Arc::clone(&state), Arc::clone(&start), Arc::clone(&done));
+            std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    start.wait();
+                    state.apply(&update(round)).expect("a valid update applies");
+                    done.wait();
+                }
+            })
+        };
+        let phone = spawn_writer(|round| MixUpdate {
+            volume_percent: Some((round % 101) as i32),
+            ..MixUpdate::default()
+        });
+        let desktop = spawn_writer(|round| MixUpdate {
+            channel_gains: Some(vec![(round * 7 % 101) as i32]),
+            ..MixUpdate::default()
+        });
+
+        for round in 0..ROUNDS {
+            start.wait();
+            done.wait();
+            let mix = state.snapshot();
+            assert_eq!(
+                usize::from(mix.volume_percent),
+                round % 101,
+                "the phone's change in round {round} was lost"
+            );
+            assert_eq!(
+                usize::from(mix.channel_gains[0]),
+                round * 7 % 101,
+                "the desktop's change in round {round} was lost"
+            );
+        }
+        phone.join().expect("the phone's writer finishes");
+        desktop.join().expect("the desktop's writer finishes");
     }
 }

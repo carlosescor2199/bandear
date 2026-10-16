@@ -127,10 +127,106 @@ user's decision.
   ok. About 940 changed lines, mostly tests: over the 400-line heuristic because the engine API,
   the push and the desktop command only prove the behaviour together.
   Commit: this commit.
-- [ ] T3 (Android): parse the pushed mix and apply it in the ViewModel without sending it back;
-  JVM tests. Route: delegated writer.
-- [ ] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
-  about 30 Hz; the UI keeps one `engine_status` call for the first paint. Route: delegated writer.
+- [x] T2b (review follow-ups R3-001 and R3-002 of T2): the control connection's live-event
+  recovery lives in `MixPushFeed`, which resolves only when the phone must be sent its whole mix
+  (a change it did not make, or a feed that lagged behind the bus); a closed bus parks the feed for
+  good, so the connection neither ends nor spins. Pushes and pings share `send_by`, bounded by the
+  heartbeat deadline (`Sent`, `Failed`, `TimedOut`); the loop ends the connection on the last two.
+  Tests: lagged asks for a push, unrelated events keep it waiting, closed parks with no wake-ups,
+  and failed, stalled and writer-starved sends. Not covered end to end: a closed bus over a real
+  socket (the connection holds a sender of its own bus, so it cannot close today) and a failed
+  push over a real socket (the biased read sees the close first); the loop's mapping of `Failed`
+  and `TimedOut` to `break` is two match arms. `MixState::update` takes the writer lock and is
+  test-only; every server writer goes through `apply`. Route: delegated writer. RED observed: 16
+  compile errors (`MixPushFeed`, `send_by`, `BoundedSend` missing), then
+  `replacing_the_whole_mix_waits_for_the_writer_lock` failed against the lock-free `update`.
+  Mutation check: with the lock removed from `apply`,
+  `concurrent_writers_of_disjoint_fields_never_lose_a_change` failed in 3 of 3 runs. GREEN:
+  `cargo test -p personal-monitoring` 191 passed (7 new). Commit: this commit.
+- [x] T3 (Android): parse the pushed mix and apply it in the ViewModel without sending it back;
+  JVM tests. Route: delegated writer. `mix_ack` parsed no values before, so nothing was reused:
+  `ControlChannel` reads `mix_state` with `parseMixReport` (every field required; a malformed push
+  is reported as an invalid control response, never applied) and calls the new
+  `Listener.onMixPushed` (default no-op, so other listeners are unaffected). `MonitorViewModel`
+  dispatches `MonitorEvent.MixPushed` and syncs the audio thread's master values, never calling
+  `sendMixControl` (no echo). The reducer maps the server's 32/16 tables onto the announced
+  channels and groups (the strips' count before the first `config`), clamps to 0-100, ignores a
+  push outside a session or one equal to the mix the phone already plays (the server's lagged
+  re-send), leaves saved mixes alone, and turns More of me off with a notice, since the pushed
+  levels are already lifted. A gesture in flight is not held back: the push lands at once and the
+  next gesture step sends its value with the pushed mix around it (last writer wins at the
+  server). RED observed (13 compile errors: `MixPushed`, `onMixPushed`, `MIX_CHANGED_ELSEWHERE`
+  missing). GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 357 tests (14 new),
+  0 failures. Commit: this commit.
+- [x] T3b (Android, review R3-001 of T3): converge the phone's mix on the server's answer.
+  `ControlChannel` counts the phone's unanswered mixes (counted before the send, taken back when
+  the socket refuses it, reset on every open, end and close). The server answers each `mix` in
+  order with `mix_ack` or `error`; both count as an answer, so a refused mix cannot leave the count
+  stuck. Only the ack that leaves nothing unanswered hands its mix on (`Listener.onServerMix`,
+  renamed from `onMixPushed`, through the same `ServerMixReceived` path as a push: no echo, same
+  mapping, clamping and More of me rule); older acks still acknowledge but their values are
+  ignored, and an ack whose mix cannot be read still acknowledges. A `mix_state` that arrives
+  while a mix is unanswered is dropped rather than held: the answer to that mix follows on the same
+  connection and is the server's latest word. `mixAcknowledged` is unchanged. Simultaneous edits of
+  the same mix on the phone and the desktop remain last-writer-wins on the server, because the
+  phone sends whole mixes; per-control sparse updates would need a protocol extension and are a
+  phase-2 candidate. Route: delegated writer. RED observed (after the rename-only step: 6 of 365
+  tests failed, `aNewConnectionStartsWithNoMixUnanswered`,
+  `theAnswerToTheNewestMixIsHandedOnAndAnAnswerToAnOlderOneIsNot`, `aRefusedMixCountsAsAnswered`,
+  `aPushWhileAMixIsUnansweredIsDroppedForTheAnswerThatFollows`,
+  `aPushOlderThanAMixStillInFlightGivesWayToTheAnswerToThatMix`,
+  `withTwoMixesInFlightOnlyTheAnswerToTheNewestIsTaken`). GREEN: `:app:testDebugUnitTest
+  assembleDebug --rerun-tasks` ok, 365 tests (8 new), 0 failures. Commit: this commit.
+- [x] T3c (server and Android, review R3-001 and R3-002 of T3b): correlate the server's answers
+  with the phone's mixes by sequence number instead of counting them. Counting lost a step when an
+  answer arrived before a queued send was counted (R3-001), and counted errors that answered
+  registrations or stats reports (R3-002). Server: a `mix` may carry an unsigned `seq`
+  (`mix_sequence`, read leniently); the `mix_ack` and the `error` (`mix_error`) answering that mix
+  echo it, and nothing else ever carries one (`control_error`, `mix_state`, errors for other
+  types). Android: the number lives in the UI state (`MixSyncState(latest, answered)`) so a change
+  and its number land in one compare-and-set: `reduceChange` numbers every change that is sent
+  (faders, pans, mutes, solos, groups, master, More of me, recall, a `config` that turns More of
+  me off) as it lands, and a queued send reads the number, then the mix, when it runs.
+  `ControlChannel` only carries `seq` both ways (`mixSequence`, `Listener.onMixAnswered`,
+  `Listener.onMixPushed`); the counting is gone. The reducer shows an answer only when it names
+  `latest` (`MixAnswered`), shows a push only when `answered >= latest` (`MixPushed`), and an ack
+  or error without `seq` never touches the mixes (`mixAcknowledged` unchanged). Numbers only grow:
+  every open already re-sends the mix after the registration, under `latest`, so its answer
+  settles whatever a lost connection left outstanding; a push that lands before that answer is
+  dropped. Route: delegated writer. RED observed: server 9 compile errors (`mix_sequence`,
+  `mix_error` missing, `mix_ack` arity); Android compile errors (`mixSequence`, `onMixPushed`,
+  `onMixAnswered`, `MixPushed`, `MixAnswered`, `reduceChange` missing), and against the T3b code 5
+  ViewModel tests failed, among them the R3-001 reproduction with a holding scheduler
+  (`anAnswerArrivingBeforeAQueuedChangeIsSentNeitherUndoesNorLosesIt`) and R3-002
+  (`anErrorWithoutANumberNeverMakesAnOlderAnswerTheNewest`). GREEN: `cargo fmt -p
+  personal-monitoring` clean, `cargo test -p personal-monitoring` 200 passed (4 new);
+  `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 374 tests (14 new, 5 T3b counting
+  tests replaced), 0 failures. Commit: this commit.
+- [x] T4 (desktop events): subscribe to the engine event bus and emit Tauri events; meters at
+  about 30 Hz; the UI keeps one `engine_status` call for the first paint. The network thread
+  meters each musician's mixed stereo output (`OutputMeter` on the target: one pass and two
+  `Relaxed` atomic maxima per packet, no allocation, lock or clock), `EngineHandle::meters()`
+  reads input and output peaks without building the status, and `EngineHandle::musician_mix`
+  is the IP join a mix change needs. The desktop's `EventPump` (`events.rs`, which documents the
+  shapes) runs one thread per engine: `meters` about 30 times a second
+  (`{ channels, musicians: { "<address>": { left, right } } }`), `status` about 4 times a second
+  (the `engine_status` DTO, names applied) and `mix-changed` at once
+  (`{ address, origin: "phone" | "desktop", mix }`, the address joined on IP to the status row).
+  `start_engine` stops the previous pump before it takes the engine lock and starts a new one
+  with the new engine, `stop_engine` stops it first, and the pump lock serializes both, so there
+  is never a second pump; stopping joins the thread. `engine_status` is unchanged. The 7/8 decay
+  per read is kept: at about 30 reads a second a peak falls about 35 dB a second. Output peaks
+  are in the meters payload but not in `EngineStatus`: a field there breaks the struct literal in
+  `apps/desktop/src-tauri/examples/name_precedence_probe.rs`, outside this task's edit surface,
+  so it is a one-line follow-up if wanted. Route: delegated writer. RED observed (server: 13
+  compile errors, `stereo_peak`, `OutputMeter`, `read_meters`, `musician_mix`, `EngineMeters`,
+  `MusicianMeters`, `TargetEntry::output_meter` missing; desktop: 85 compile errors, `EventPump`,
+  `PumpSource`, `PumpSink`, `Schedule`, `mix_changed`, `MetersDto`, `MixChangedDto`,
+  `engine_meters`, `musician_mix` missing). GREEN: `cargo test -p personal-monitoring` 196 passed
+  (5 new), `cargo test -p mixlink-desktop` 41 passed (16 new, 5 repeated runs green),
+  `cargo build -p mixlink-desktop` ok, no new clippy warnings. About 1,230 changed lines, mostly
+  tests and docs: over the 400-line heuristic because the pump's lifecycle is only proven with its
+  thread, fakes and the command layer together. Commit: this commit.
 - [ ] T5 (UI foundation): tokens, atoms as custom elements, the app shell with the sidebar, the
   state store and pure helpers with `node --test` tests; the old UI still runs. Route: delegated
   writer.
@@ -153,7 +249,27 @@ user's decision.
   - R3-002: `MixState::update` is still a lock-free `pub(crate)` store beside the locking
     `apply`; today only tests call it, but route remaining writers through `apply` (or lock in
     `update`) and add a two-thread test with disjoint fields.
+  - Both resolved in T2b.
+- T3 98591c3: assessed medium, `slice_budget_reached`; lineage `review-ce50c64b6cdc565f` over
+  0c4b94e..98591c3 approved and acknowledged. Its WARNING (a stale push can desync the phone
+  screen) was fixed by T3b.
+- T3b a370a41, T2b db3e52a, T4 0f24924: lineage `review-1eaa1107d35a2b32` over 98591c3..0f24924
+  approved and acknowledged. Its two WARNINGs on T3b's counting (an ack arriving before a queued
+  send could undo the last fader step; any `error` lowered the count) were fixed by T3c.
+- T3c f272010: lineage `review-7609fdd2a1f59631` over 0f24924..f272010 approved and acknowledged.
+  Next review base: f272010. Non-blocking notes:
+  - WARNING R3-001 (not actionable): a server that sends `mix_state` but does not echo `seq`
+    would leave the phone unsettled; that server exists only at 0f24924 on this unmerged
+    branch (released servers never send `mix_state`, and from T3c on they always echo `seq`).
+  - SUGGESTION R3-002: Android has no test for a negative or non-numeric `seq` being ignored.
+- Follow-up T4b (before T6): engine meter peaks decay on every read (7/8), so the 30 Hz meter
+  stream, the 4 Hz status events and the old UI's polling together make the falloff depend on
+  how many readers there are. The falloff must depend on time, and status reads must not decay
+  the meters.
+- Follow-up (T3c report): on the first connect the phone sends its mix before `config` arrives,
+  with empty channel lists; the server keeps its earlier levels while the phone shows neutral
+  strips. Adopt the server's answer after `config`.
 
 ## Next step
 
-T3.
+T4b, then T5.

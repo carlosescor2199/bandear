@@ -6,10 +6,12 @@
 
 pub mod commands;
 pub mod dto;
+pub mod events;
 pub mod names;
 
 use commands::DesktopState;
 use dto::{EngineStatusDto, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest, StartSummary};
+use events::EventPump;
 use names::MusicianNames;
 use tauri::{Manager, State};
 
@@ -86,9 +88,15 @@ pub fn run() {
             // The label store is a desktop-app concern and lives in the app's config directory, so
             // it survives a restart without touching the engine or any client protocol.
             let directory = app.path().app_config_dir()?;
-            app.manage(DesktopState::new(MusicianNames::load(
-                directory.join(names::NAMES_FILE),
-            )));
+            // Every engine the window starts streams its meters, status and mix changes as events
+            // (see [events]); the app handle is both where the pump reads and where it emits.
+            let handle = app.handle().clone();
+            app.manage(
+                DesktopState::new(MusicianNames::load(directory.join(names::NAMES_FILE)))
+                    .with_event_pump(move |events| {
+                        EventPump::start(events, handle.clone(), handle.clone())
+                    }),
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

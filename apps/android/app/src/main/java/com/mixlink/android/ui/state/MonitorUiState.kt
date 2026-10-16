@@ -24,7 +24,8 @@ private const val NEUTRAL_LEVEL = 100
  *
  * The screens only read it; every change goes through [reduce], so the same events always give the
  * same screen. Lists here are plain immutable lists and every nested value is a data class, so two
- * states are equal exactly when the screens would look the same.
+ * states are equal exactly when the screens would look the same and [mixSync], the one value no
+ * screen shows, is the same too.
  */
 data class MonitorUiState(
     /** The name this musician registers under, exactly as typed. */
@@ -38,6 +39,11 @@ data class MonitorUiState(
     val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
     /** The tab of the connected app that is showing. */
     val tab: MainTab = MainTab.MIX,
+    /**
+     * Which of the phone's mixes the server has answered. Not shown; it lives here so a change and
+     * its number land in one state, and an answer is judged against the mix it is shown over.
+     */
+    val mixSync: MixSyncState = MixSyncState(),
 ) {
     /** The channels the musician can call theirs: one per source channel the server announced. */
     val musicianChannelChoices: List<Int>
@@ -154,6 +160,28 @@ data class MixUiState(
     )
 }
 
+/**
+ * The phone numbers every change it sends to the server, and the server answers each `mix` in order
+ * with that number (`seq`): with `mix_ack` and the whole mix it now plays, or with an `error`.
+ *
+ * [latest] is the number of the newest change, taken in the same step as the change, so a send that
+ * is still queued already counts. [answered] is the newest number the server answered. Only the
+ * answer to [latest] is the server's latest word on the mix; while an older one is outstanding, any
+ * mix the server reports is overtaken by a mix of the phone's still on its way. Numbers only grow,
+ * across reconnects too: every open sends the mix again under [latest], so its answer settles it.
+ */
+data class MixSyncState(val latest: Long = 0, val answered: Long = 0) {
+    /** True when the server answered the newest change, so nothing of the phone's is on its way. */
+    val settled: Boolean
+        get() = answered >= latest
+
+    /** A new change, numbered as the newest. */
+    fun changed(): MixSyncState = copy(latest = latest + 1)
+
+    /** The server answered change [seq]; it answers in order, so every older one is answered too. */
+    fun answeredUpTo(seq: Long): MixSyncState = copy(answered = maxOf(answered, seq))
+}
+
 /** One channel strip: its fader, pan, Mute and Solo. [index] is 0-based; [label] is "CH 1" up. */
 data class ChannelUiState(
     val index: Int,
@@ -178,6 +206,9 @@ enum class MoreOfMeNotice(val message: String) {
     NEEDS_CHANNEL("Choose your channel first, then turn More of me on"),
     NO_CHANNEL_SELECTED("More of me is off: no channel is chosen"),
     CHANNEL_OUT_OF_RANGE("More of me is off: your channel is no longer in the mix"),
+
+    /** The server pushed a mix changed elsewhere; the phone shows it as played, so nothing is lifted. */
+    MIX_CHANGED_ELSEWHERE("More of me is off: your mix was changed from the desktop"),
 }
 
 /**

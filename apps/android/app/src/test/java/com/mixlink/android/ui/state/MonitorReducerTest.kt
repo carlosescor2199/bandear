@@ -23,9 +23,11 @@ import com.mixlink.android.ui.state.MonitorEvent.ManualAddressEdited
 import com.mixlink.android.ui.state.MonitorEvent.MasterMuteChanged
 import com.mixlink.android.ui.state.MonitorEvent.MasterVolumeChanged
 import com.mixlink.android.ui.state.MonitorEvent.MixAcknowledged
+import com.mixlink.android.ui.state.MonitorEvent.MixAnswered
 import com.mixlink.android.ui.state.MonitorEvent.MixDeleted
 import com.mixlink.android.ui.state.MonitorEvent.MixMissing
 import com.mixlink.android.ui.state.MonitorEvent.MixNotice
+import com.mixlink.android.ui.state.MonitorEvent.MixPushed
 import com.mixlink.android.ui.state.MonitorEvent.MixRecalled
 import com.mixlink.android.ui.state.MonitorEvent.MixRenamed
 import com.mixlink.android.ui.state.MonitorEvent.MixSaved
@@ -462,6 +464,159 @@ class MonitorReducerTest {
 
         assertEquals(state, state.after(MusicianChannelChosen(2), MusicianChannelChosen(-1)))
         assertEquals(idle, idle.after(MusicianChannelChosen(0)))
+    }
+
+    // A mix the server reported: pushed, or answering the phone's newest mix.
+
+    /** A session whose server announced [count] channels and [groups]. */
+    private fun connectedWith(count: Int, groups: List<GroupInfo> = emptyList()): MonitorUiState =
+        running().after(ConfigReceived(count, groups))
+
+    /** The server's whole mix, as `mix_state` carries it: full 32-channel and 16-group tables. */
+    private val serverMix = MixSnapshot(
+        channelGains = IntArray(32) { if (it < 2) 80 - 10 * it else 100 },
+        channelPans = IntArray(32) { if (it == 0) 25 else 100 },
+        channelMutes = BooleanArray(32) { it == 0 },
+        channelSolos = BooleanArray(32) { it == 1 },
+        groupLevels = IntArray(16) { if (it == 0) 60 else 100 },
+        volumePercent = 50,
+        maxLevelPercent = 90,
+        muted = true,
+    )
+
+    @Test
+    fun aPushedMixTakesTheServersValuesForTheAnnouncedChannelsAndGroups() {
+        val groups = listOf(GroupInfo("Band", listOf(0, 1)))
+        val state = connectedWith(2, groups)
+
+        val pushed = state.after(MixPushed(serverMix))
+
+        assertEquals(2, pushed.mix.sourceChannels)
+        assertEquals(listOf(80, 70), pushed.mix.levels)
+        assertEquals(listOf(25, 100), pushed.mix.pans)
+        assertEquals(listOf(true, false), pushed.mix.mutes)
+        assertEquals(listOf(false, true), pushed.mix.solos)
+        assertEquals(groups, pushed.mix.groupDefinitions)
+        assertEquals(listOf(60), pushed.mix.groupLevels)
+        assertEquals(50, pushed.mix.masterVolume)
+        assertEquals(90, pushed.mix.levelCap)
+        assertTrue(pushed.mix.masterMuted)
+    }
+
+    @Test
+    fun aPushedMixIsClampedAndKeepsWhatTheServerDidNotSend() {
+        val state = connectedWith(2, listOf(GroupInfo("Band", listOf(0, 1)))).after(ChannelLevelChanged(1, 40))
+
+        val pushed = state.after(
+            MixPushed(MixSnapshot(channelGains = intArrayOf(140), channelPans = intArrayOf(-5), volumePercent = 120, maxLevelPercent = -1)),
+        )
+
+        assertEquals(listOf(100, 40), pushed.mix.levels)
+        assertEquals(listOf(0, 100), pushed.mix.pans)
+        assertEquals(listOf(100), pushed.mix.groupLevels)
+        assertEquals(100, pushed.mix.masterVolume)
+        assertEquals(0, pushed.mix.levelCap)
+    }
+
+    @Test
+    fun aPushedMixBeforeTheFirstConfigKeepsTheStripsThePhoneShows() {
+        val recalled = running().after(MixRecalled("Old", MixSnapshot(channelGains = intArrayOf(30, 30, 30), groupLevels = intArrayOf(20))))
+
+        val pushed = recalled.after(MixPushed(serverMix))
+
+        assertEquals(listOf(80, 70, 100), pushed.mix.levels)
+        assertEquals(listOf(60), pushed.mix.groupLevels)
+    }
+
+    @Test
+    fun aPushedMixChangesNothingOutsideASession() {
+        val idleWithChannels = withChannels(2)
+        val ended = connectedWith(2).after(SessionEnded)
+
+        assertEquals(idleWithChannels, idleWithChannels.after(MixPushed(serverMix)))
+        assertEquals(ended, ended.after(MixPushed(serverMix)))
+    }
+
+    @Test
+    fun aPushedMixTurnsMoreOfMeOffAndKeepsTheMixAsTheServerPlaysIt() {
+        val on = connectedWith(2).after(MusicianChannelChosen(1), MoreOfMeToggled(true))
+
+        val pushed = on.after(MixPushed(serverMix))
+
+        assertFalse(pushed.moreOfMe.enabled)
+        assertEquals(1, pushed.moreOfMe.musicianChannel)
+        assertEquals(MoreOfMeNotice.MIX_CHANGED_ELSEWHERE, pushed.moreOfMe.notice)
+        assertEquals(listOf(80, 70), pushed.mix.levels)
+    }
+
+    @Test
+    fun aPushOfTheMixThePhoneAlreadyPlaysChangesNothing() {
+        val plain = connectedWith(2).after(ChannelLevelChanged(0, 80))
+        val lifted = plain.after(MusicianChannelChosen(1), MoreOfMeToggled(true))
+
+        assertEquals(plain, plain.after(MixPushed(plain.mix.toSnapshot())))
+        // With More of me on the server plays the lifted mix; hearing it back keeps More of me on.
+        assertEquals(lifted, lifted.after(MixPushed(lifted.mix.toSnapshot().moreOfMe(1)!!)))
+    }
+
+    @Test
+    fun aPushedMixLeavesTheSavedMixesAsTheyWere() {
+        val recalled = connectedWith(2).after(
+            MixesLoaded(listOf("Verse")),
+            MixRecalled("Verse", MixSnapshot(channelGains = intArrayOf(30, 30))),
+        )
+
+        assertEquals(recalled.savedMixes, recalled.after(MixPushed(serverMix)).savedMixes)
+    }
+
+    // The phone's mixes, numbered, and the server's answers to them.
+
+    /** [event] as the musician's change that the phone sends, numbered as its newest mix. */
+    private fun MonitorUiState.sent(event: MonitorEvent): MonitorUiState = reduceChange(this, event) { _, _ -> true }
+
+    @Test
+    fun aChangeThatIsSentIsNumberedAsTheNewestMixAndOneThatIsNotKeepsTheNumber() {
+        val state = connectedWith(2)
+
+        val sent = state.sent(ChannelLevelChanged(0, 40))
+        val kept = reduceChange(sent, ChannelLevelChanged(0, 40)) { before, after -> before.mix != after.mix }
+
+        assertEquals(MixSyncState(latest = 1, answered = 0), sent.mixSync)
+        assertEquals(listOf(40, 100), sent.mix.levels)
+        assertEquals(sent, kept)
+        assertFalse(sent.mixSync.settled)
+    }
+
+    @Test
+    fun aPushWhileAMixOfThePhoneIsUnansweredIsDropped() {
+        val outstanding = connectedWith(2).sent(ChannelLevelChanged(0, 40))
+
+        assertEquals(outstanding, outstanding.after(MixPushed(serverMix)))
+    }
+
+    @Test
+    fun onlyTheAnswerToTheNewestMixIsShown() {
+        val twoInFlight = connectedWith(2).sent(ChannelLevelChanged(0, 40)).sent(ChannelLevelChanged(0, 50))
+
+        val olderAnswered = twoInFlight.after(MixAnswered(1, serverMix))
+
+        assertEquals(listOf(50, 100), olderAnswered.mix.levels)
+        assertEquals(MixSyncState(latest = 2, answered = 1), olderAnswered.mixSync)
+        assertEquals(olderAnswered, olderAnswered.after(MixPushed(serverMix)))
+
+        val newestAnswered = olderAnswered.after(MixAnswered(2, serverMix))
+
+        assertEquals(listOf(80, 70), newestAnswered.mix.levels)
+        assertTrue(newestAnswered.mixSync.settled)
+    }
+
+    @Test
+    fun aRefusedNewestMixSettlesItSoTheNextPushIsShown() {
+        val refused = connectedWith(2).sent(ChannelLevelChanged(0, 40)).after(MixAnswered(1, applied = null))
+
+        assertEquals(listOf(40, 100), refused.mix.levels)
+        assertTrue(refused.mixSync.settled)
+        assertEquals(listOf(80, 70), refused.after(MixPushed(serverMix)).mix.levels)
     }
 
     // Saved mixes.

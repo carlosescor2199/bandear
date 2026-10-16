@@ -3,10 +3,14 @@
 //! The engine's own types are not serialized directly: this module owns the wire shape the window
 //! consumes, so the engine keeps no presentation concerns and can change without breaking the UI.
 
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
-    CaptureFormat, EngineStatus, InputDevice, LinkHealth, MixUpdate, MixValues, MusicianStatus,
+    CaptureFormat, EngineMeters, EngineStatus, InputDevice, LinkHealth, MixOrigin, MixUpdate,
+    MixValues, MusicianStatus,
 };
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
@@ -143,6 +147,68 @@ impl From<&MixValues> for MixDto {
             channel_muted: mix.channel_muted.to_vec(),
             channel_solo: mix.channel_solo.to_vec(),
             group_levels: mix.group_levels.to_vec(),
+        }
+    }
+}
+
+/// The payload of the `mix-changed` event: a musician's whole mix right after a change.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixChangedDto {
+    /// The musician's address as the status rows show it, whoever made the change.
+    pub address: String,
+    /// "phone" for a change from the musician's phone, "desktop" for one made here.
+    pub origin: &'static str,
+    /// The whole mix now stored, nested rather than flat as on a status row.
+    pub mix: MixDto,
+}
+
+impl MixChangedDto {
+    pub fn new(address: SocketAddr, origin: MixOrigin, mix: &MixValues) -> Self {
+        Self {
+            address: address.to_string(),
+            origin: match origin {
+                MixOrigin::Client { .. } => "phone",
+                // The engine API is how this desk changes a mix; nothing else calls it here.
+                MixOrigin::Engine => "desktop",
+            },
+            mix: MixDto::from(mix),
+        }
+    }
+}
+
+/// The payload of the `meters` event: the live levels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetersDto {
+    /// One 0-100 input peak per source channel, index-aligned with the status's `channels`.
+    pub channels: Vec<u8>,
+    /// Each musician's 0-100 output peak, keyed by the address the status rows show.
+    pub musicians: BTreeMap<String, OutputLevelsDto>,
+}
+
+/// The 0-100 peak of the stereo mix one musician is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct OutputLevelsDto {
+    pub left: u8,
+    pub right: u8,
+}
+
+impl From<&EngineMeters> for MetersDto {
+    fn from(meters: &EngineMeters) -> Self {
+        Self {
+            channels: meters.channel_levels.clone(),
+            musicians: meters
+                .musicians
+                .iter()
+                .map(|musician| {
+                    let [left, right] = musician.output_levels;
+                    (
+                        musician.address.to_string(),
+                        OutputLevelsDto { left, right },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -328,7 +394,8 @@ impl From<&EngineStatus> for EngineStatusDto {
 mod tests {
     use super::*;
     use personal_monitoring::{
-        CaptureFormat, EngineStatus, GroupStatus, LinkHealth, LinkStatus, MusicianStatus,
+        CaptureFormat, EngineMeters, EngineStatus, GroupStatus, LinkHealth, LinkStatus, MixOrigin,
+        MusicianMeters, MusicianStatus,
     };
 
     fn status_with(groups: Vec<GroupStatus>, channel_levels: Vec<u8>) -> EngineStatus {
@@ -625,6 +692,64 @@ mod tests {
 
         assert_eq!(dto.name, "Interface");
         assert_eq!(dto.channels, 6);
+    }
+
+    #[test]
+    fn meters_reach_the_window_with_output_peaks_keyed_by_address() {
+        let meters = EngineMeters {
+            channel_levels: vec![50, 0],
+            musicians: vec![
+                MusicianMeters {
+                    address: "192.168.1.4:50000".parse().expect("test address"),
+                    output_levels: [0, 7],
+                },
+                MusicianMeters {
+                    address: "192.168.1.3:50000".parse().expect("test address"),
+                    output_levels: [100, 50],
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(MetersDto::from(&meters)).expect("meters serialize");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "channels": [50, 0],
+                "musicians": {
+                    "192.168.1.3:50000": { "left": 100, "right": 50 },
+                    "192.168.1.4:50000": { "left": 0, "right": 7 },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_mix_change_names_its_origin_and_carries_the_whole_mix_nested() {
+        let mix = MixValues {
+            volume_percent: 42,
+            ..MixValues::default()
+        };
+        let address = "192.168.1.3:50000".parse().expect("test address");
+        let peer = "192.168.1.3:41000".parse().expect("test address");
+
+        let from_phone = MixChangedDto::new(address, MixOrigin::Client { peer }, &mix);
+        let from_desktop = MixChangedDto::new(address, MixOrigin::Engine, &mix);
+        let json = serde_json::to_value(&from_phone).expect("a change serializes");
+
+        assert_eq!(from_phone.origin, "phone");
+        assert_eq!(from_desktop.origin, "desktop");
+        assert_eq!(json["address"], "192.168.1.3:50000");
+        assert_eq!(json["origin"], "phone");
+        assert_eq!(json["mix"]["volumePercent"], 42);
+        assert_eq!(
+            json["mix"]["channelGains"].as_array().map(Vec::len),
+            Some(32)
+        );
+        assert!(
+            json.get("volumePercent").is_none(),
+            "the mix is nested: {json}"
+        );
     }
 
     #[test]

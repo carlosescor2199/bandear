@@ -148,6 +148,35 @@ export function createEngineApi(bridge) {
      */
     setMirror: (address, leader, clientId = null) =>
       bridge.invoke("set_mirror", { address, clientId, leader }),
+    /**
+     * What went wrong or changed when the desk opened its session (a damaged part set aside, a
+     * session from a newer MixLink left alone, labels imported), or null.
+     */
+    sessionNotice: () => bridge.invoke("session_notice"),
+    /**
+     * The engineer's saved sessions, the newest first: `[{ id, name, savedAt, mixes, problem }]`
+     * (see sessions.js); `problem` says why one cannot be loaded.
+     */
+    sessions: () => bridge.invoke("sessions"),
+    /**
+     * Saves the desk's whole session, and every musician's mix while an engine runs, as `name`.
+     * Resolves to `{ session, engineRunning }`; a name that is empty, too long or taken rejects.
+     */
+    saveSession: (name) => bridge.invoke("save_session", { name }),
+    /** Renames the saved session `id`; resolves to it as listed. */
+    renameSession: (id, name) => bridge.invoke("rename_session", { id, name }),
+    /** Deletes the saved session `id`. */
+    deleteSession: (id) => bridge.invoke("delete_session", { id }),
+    /**
+     * Loads the saved session `id` in place of the desk's and, with an engine running, applies it
+     * at once: groups and channel details, then limits, locks and mirrors, then each saved mix
+     * pushed to the musician it was saved for when they are here. Resolves to `{ session,
+     * applied, saved, saveError, mixes: [{ address, follows, mix }], skipped: [{ key, label,
+     * reason, error }], refused, damaged, audio, audioLoaded, audioSkipped, presets }` (see
+     * formatSessionLoaded). Its audio input applies at the next start. A saved session the desk
+     * cannot use rejects, and nothing changed.
+     */
+    loadSession: (id) => bridge.invoke("load_session", { id }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

@@ -20,3 +20,5 @@ import "./master-controls.test.js";
 import "./mixes.test.js";
 import "./mix-tools.test.js";
 import "./mix-tools-logic.test.js";
+import "./sessions.test.js";
+import "./session-console.test.js";

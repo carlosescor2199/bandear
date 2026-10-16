@@ -29,6 +29,14 @@
 //   devices    { host, list, error }: the input devices `list_input_devices` gave for `host`.
 //   presets    the engineer's mix presets as the desk keeps them (see mixes.js), or null until
 //              they were read. They live in the desk's session, so a run's end keeps them.
+//   sessions   { list, error }: the engineer's saved sessions (see sessions.js), null until they
+//              were listed, and why the last listing failed. A run's end keeps them.
+//   sessionNotice what the desk said when it opened its session (a damaged part set aside, a newer
+//              session left alone, labels imported), or null.
+//
+// Loading a saved session replaces the mixes, the groups and the channel details at once, so the
+// edits still waiting are dropped (`dropEdits` when the load is asked for, `sessionLoaded` when it
+// is answered): none of them was meant for the loaded session.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
 // never jumps back to an older value while its change is on the way. Each copy of a musician's mix
@@ -44,7 +52,7 @@
 // run, so its run stays live and the refusal is shown (`commandFailed`).
 
 import { pairUnits } from "./channels.js";
-import { DEFAULT_AUDIO, audioChoice } from "./engine-config.js";
+import { DEFAULT_AUDIO, audioChoice, restoredAudio } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
 import { MIX_FIELDS, applyEdits, mixFromDto, parseEditKey, settleEdits } from "./mix.js";
 
@@ -70,6 +78,8 @@ export const initialState = Object.freeze({
   commandError: null,
   devices: Object.freeze({ host: null, list: Object.freeze([]), error: null }),
   presets: null,
+  sessions: Object.freeze({ list: null, error: null }),
+  sessionNotice: null,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -114,6 +124,20 @@ export const actions = Object.freeze({
   devices: (host, list, error = null) => ({ type: "devices", devices: { host, list, error } }),
   /** The engineer's mix presets as the desk answered them. */
   presets: (presets) => ({ type: "presets", presets }),
+  /** The engineer's saved sessions as the desk listed them. */
+  sessions: (list) => ({ type: "sessions", sessions: { list, error: null } }),
+  /** The saved sessions could not be listed, for `message`; the last list known stays. */
+  sessionsFailed: (message) => ({ type: "sessions-failed", message }),
+  /** What the desk said when it opened its session, or null. */
+  sessionNotice: (notice) => ({ type: "session-notice", notice }),
+  /** Every edit still waiting is dropped: a saved session is about to replace what they change. */
+  dropEdits: () => ({ type: "drop-edits" }),
+  /**
+   * A saved session was loaded (the `load_session` answer): the edits still waiting are dropped,
+   * the presets are the loaded ones, and its audio input, when it was taken, is what the next start
+   * opens.
+   */
+  sessionLoaded: (outcome) => ({ type: "session-loaded", outcome }),
   /**
    * The engine refused `action` ("stop" or "switch") but its run goes on: the phase goes back to
    * what the last status said, and the refusal is kept to be shown.
@@ -398,6 +422,23 @@ function refused(state, { address, sent, error }) {
   };
 }
 
+// Every edit still waiting goes, and so does what was said about the last refused or half-done one.
+function dropEdits(state) {
+  if (state.pending === NO_EDITS && !state.mixError && !state.controlsNotice) {
+    return state;
+  }
+  return { ...state, pending: NO_EDITS, mixError: null, controlsNotice: null };
+}
+
+function sessionLoaded(state, outcome) {
+  const next = dropEdits(state);
+  return {
+    ...next,
+    presets: outcome.presets ?? next.presets,
+    audio: outcome.audioLoaded ? restoredAudio(outcome.audio) : next.audio,
+  };
+}
+
 export function consoleReducer(state, action) {
   switch (action.type) {
     case "status":
@@ -435,6 +476,16 @@ export function consoleReducer(state, action) {
       return { ...state, devices: action.devices };
     case "presets":
       return { ...state, presets: action.presets };
+    case "sessions":
+      return { ...state, sessions: action.sessions };
+    case "sessions-failed":
+      return { ...state, sessions: { ...state.sessions, error: action.message } };
+    case "session-notice":
+      return { ...state, sessionNotice: action.notice ?? null };
+    case "drop-edits":
+      return dropEdits(state);
+    case "session-loaded":
+      return sessionLoaded(state, action.outcome);
     default:
       return state;
   }

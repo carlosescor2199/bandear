@@ -1,10 +1,12 @@
-// The Network and system screen (the phase-1 part of board 5): the musicians table and the audio
-// input. The container joins the console app to the two organisms: it renders what
-// network-view.js works out, keeps the screen's own choices (an ASIO driver not started yet, a
-// device switch waiting for confirmation, the form's error) and turns events into engine calls.
+// The Network and system screen (the phase-1 part of board 5): the musicians table, the audio
+// input and the engineer's named sessions. The container joins the console app to the three
+// organisms: it renders what network-view.js and sessions.js work out, keeps the screen's own
+// choices (an ASIO driver not started yet, a device switch waiting for confirmation, the form's
+// error) and turns events into engine calls (the Session panel's through sessionPanelCommands).
 
 import "../components/audio-setup.js";
 import "../components/musicians-table.js";
+import "../components/session-panel.js";
 import {
   BUFFER_OPTIONS,
   HOST_OPTIONS,
@@ -14,11 +16,12 @@ import {
   validateAddress,
 } from "../lib/network-view.js";
 import { mixMessages } from "../lib/mix-view.js";
+import { sessionPanelCommands, sessionPanelView } from "../lib/sessions.js";
 
 const LAYOUT = `
   <header class="screen-header">
     <h1 tabindex="-1">Network and system</h1>
-    <p>Each phone's link and name, and the audio input the mixes come from.</p>
+    <p>Each phone's link and name, the audio input the mixes come from, and the saved sessions.</p>
   </header>
   <p class="network-note" data-note hidden>
     The engine is not running, so no phone is listed. Start it from the <a href="#/mix">Mix</a>
@@ -30,8 +33,9 @@ const LAYOUT = `
     <section class="network-musicians" aria-label="Musicians">
       <ml-musicians-table></ml-musicians-table>
     </section>
-    <aside class="network-side" aria-label="Audio input">
+    <aside class="network-side" aria-label="Audio input and session">
       <ml-audio-setup></ml-audio-setup>
+      <ml-session-panel></ml-session-panel>
     </aside>
   </div>
 `;
@@ -48,6 +52,7 @@ export function mountNetworkScreen(main, app) {
     audioMessage: screen.querySelector("[data-audio]"),
     table: screen.querySelector("ml-musicians-table"),
     audio: screen.querySelector("ml-audio-setup"),
+    session: screen.querySelector("ml-session-panel"),
   };
   // The screen's own choices, not the engine's: an ASIO driver being picked, a device switch
   // waiting for confirmation, and the errors of the last musician command.
@@ -78,6 +83,7 @@ export function mountNetworkScreen(main, app) {
       buffers: BUFFER_OPTIONS,
       devicesError: state.devices.error ? `Devices could not be listed: ${state.devices.error}` : null,
     };
+    parts.session.data = { ...sessionPanelView(state), unsaved: app.unsavedEdits };
   }
 
   let frame = 0;
@@ -197,6 +203,22 @@ export function mountNetworkScreen(main, app) {
   screen.addEventListener("musician-add", onAdd);
   screen.addEventListener("musician-remove", onRemove);
   screen.addEventListener("musician-rename", onRename);
+  // The Session panel's commands: each outcome is said in the panel at once, with the store's data.
+  const sessions = sessionPanelCommands({
+    app,
+    panel: parts.session,
+    said: (outcome) => {
+      parts.session.say(outcome);
+      render();
+    },
+  });
+  for (const type of sessions.types) {
+    screen.addEventListener(type, ({ detail }) => {
+      sessions.handle(type, detail).catch((error) =>
+        parts.session.say({ ok: false, message: String(error?.message ?? error) }),
+      );
+    });
+  }
   const unsubscribe = app.store.subscribe(scheduleRender);
   render();
   app.loadDevices(app.store.getState().audio.host);

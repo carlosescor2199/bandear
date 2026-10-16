@@ -146,9 +146,11 @@ function editable(table, count, index) {
   return Array.from({ length }, (_, entry) => detailOf(table[entry] ?? defaultChannel()));
 }
 
-function checked(table) {
-  checkChannels(table);
-  return table;
+// `next` when the desk would take it; a kind this build does not know passes where `table` (the
+// table as read) has it for that input, as the desk keeps it while no one changes it.
+function checked(next, table) {
+  checkChannels(next, table);
+  return next;
 }
 
 function unitOf(table, index) {
@@ -159,14 +161,14 @@ function unitOf(table, index) {
 export function renameChannel(table, index, name, count) {
   const next = editable(table, count, index);
   next[index].name = String(name ?? "").trim();
-  return checked(next);
+  return checked(next, table);
 }
 
 /** `table` with input `index` of instrument `kind`. */
 export function setChannelKind(table, index, kind, count) {
   const next = editable(table, count, index);
   next[index].kind = kind;
-  return checked(next);
+  return checked(next, table);
 }
 
 /** `table` with input `index` hidden or shown: both sides of a pair go together. */
@@ -175,7 +177,7 @@ export function setChannelHidden(table, index, hidden, count) {
   for (const side of unitOf(next, index)) {
     next[side].hidden = Boolean(hidden);
   }
-  return checked(next);
+  return checked(next, table);
 }
 
 /**
@@ -190,7 +192,7 @@ export function setChannelLink(table, index, linked, count) {
   } else if (unit.length === 1) {
     next[index].link = true;
   }
-  return checked(next);
+  return checked(next, table);
 }
 
 /** `groups` with a new, empty group at the end, named "Group 3" or the next free number. */

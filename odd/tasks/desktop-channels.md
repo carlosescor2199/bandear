@@ -1142,16 +1142,58 @@ slice. Push and PRs are the user's decision.
   - Size: about 1,390 changed lines in the save commit, 1,240 in the load commit, 1,970 in the UI
     commit (about 600 of them tests) and 520 in the fix commit plus this document; above the
     400-line heuristic mostly in tests, split by work unit under the 2,000-line review budget.
-  - Follow-ups: a control or mirror the loaded session drops for a musician who is not here stays in
-    the running engine's book until the next start (the engine has no way to forget one; a mirror the
-    loaded session adds that would close a circle with such a stale one is refused and named, and the
-    next start applies the session); a load replaces the labels too, so a label set after the snapshot
-    is gone; export and import to arbitrary files is phase 4; live check with the desktop app and the
-    phones (a load while a phone moves a fader: the later writer wins).
+  - Follow-ups: a load replaces the labels too, so a label set after the snapshot is gone; export
+    and import to arbitrary files is phase 4; live check with the desktop app and the phones (a load
+    while a phone moves a fader: the later writer wins). Resolved by T7a-fix: a control or mirror the
+    loaded session dropped for a musician who was not here stayed in the running engine's book until
+    the next start (the engine could not forget one); the engine now replaces its books whole.
   - Commits: c5eacf2 `feat(desktop): save named sessions with every musician's mix`; abcea45
     `feat(desktop): load a named session and push its mixes to the phones`; 196a5a1
-    `feat(desktop-ui): save and load sessions from the console`; this commit (`fix(desktop): keep
-    unknown kinds through edits and test the screen's held boxes`).
+    `feat(desktop-ui): save and load sessions from the console`; 34012d6 `fix(desktop): keep
+    unknown kinds through edits and test the screen's held boxes`.
+- [x] T7a-fix (review fixes for T7a, reviews `review-0c47b67a0faa9250` and
+  `review-65ac6b51cab567d0`, and the reported engine gap). Route: inline writer of the delegated
+  T7a worker (bounded fixes in the engine, the desktop commands and the UI, one commit each).
+  - Engine gap (T7a follow-up): `EngineHandle::replace_kept(controls, mirrors)` replaces both books
+    whole under the registry's locks (table read lock held throughout; the controls book, then the
+    mirror book, each released before any mix writer lock): `TargetRegistry::replace_kept_controls`
+    clears and refills the controls book and resolves every musician here again to the kept controls
+    or the defaults; `replace_mirrors` clears the mirror book, admits each mirror in order as
+    `keep_mirror` does (shared `admitted`: never on oneself, never a circle with those admitted
+    before; a refusal is returned) and puts every musician here on their mirror or frees them
+    (shared `restore_mirrors`); each changed mix is announced as an engine change, the controls'
+    first. `load_session` hands it the loaded session's controls and mirrors in place of the per-key
+    keep and stop calls, so a lock, limit or mirror the loaded session dropped never comes back when
+    a musician who was away registers.
+  - R3-refused-mix-untested: the test stand-in can refuse the hand-over of the controls and mirrors
+    and a push; tests pin a refused hand-over (named, the mixes still pushed, the session saved), a
+    refused mirror (named) and a refused push (`SkippedMixDto { reason: "refused", error }`, the
+    other mixes pushed).
+  - R3-refused-load-drops-waiting-edits: the console no longer drops waiting edits when a load is
+    asked for; while it loads the mix and engineer coalescers send nothing (the edits stay pending),
+    a successful load drops them (`sessionLoaded`) and a refused one sends them as usual
+    (`sendWaiting`). The `dropEdits` action is gone.
+  - R3-explicit-other-cannot-clear-unknown-kind: `channel_table` reads a kind this build does not
+    know as written (the session's; with an engine running, where the engine's table has `other`
+    and the session keeps an unknown kind for that input), so the window sends it back untouched;
+    `channel_details` takes an unknown kind only where the session keeps exactly that kind for that
+    input (kept as written, applied as `other`), and an explicit `other` replaces it. The UI's
+    `checkChannels(channels, kept)` passes such a kind where the table read has it, the edit
+    functions check against the table they were given, and the fake keeps the same rule (its status
+    shows the kind as it applies).
+  - RED: engine 3 of 3 new tests failed against insert-only books (the dropped lock and mirror came
+    back on registration, the rack's limit and mirror stayed); desktop 3 of 166 failed against
+    mutants that drop refusals (the refused hand-over, mirror and push went unnamed); the kind tests
+    2 of 166 failed against the T7a code (the table read `other`); UI 2 of 10 session-console tests
+    failed against the committed console (the edits were dropped before the answer and lost on a
+    refusal), and the two kind tests 2 of 350 against the T7a channel code.
+  - GREEN: `cargo test -p personal-monitoring` 299 passed (3 new), control tests 39 passed in three
+    runs; `cargo test -p mixlink-desktop` 166 passed (3 new, 1 replaced, 2 updated); UI 350 passed (3
+    new, 1 replaced); `cargo fmt` clean; clippy: no new warnings; `cargo build -p mixlink-desktop`
+    after `cargo clean -p mixlink-desktop` ok.
+  - Commits: 44be346 `fix(engine): let a loaded session replace kept controls and mirrors` (about
+    760 changed lines); this commit (`fix(desktop): keep waiting edits when a load is refused and
+    round-trip unknown kinds`).
 - [ ] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
   answer after `config`, R3-config-pairs-musician-channel-moreofme-on-unsent) and whatever the
   phone needs to show a loaded session's pushed mix; docs. Route: delegated writer.
@@ -1327,8 +1369,14 @@ slice. Push and PRs are the user's decision.
   R3-idle-channel-edit-rewrites-unknown-kinds, SUGGESTION R3-screen-pending-hold-wiring-untested,
   the session notice shown in the UI, and the fake's offline mirror check comparing keys as the
   desktop does. Still open for T7b: R3-config-pairs-musician-channel-moreofme-on-unsent (Android).
-  Review base f7cc192; the T7a slice is four commits of about 1,390, 1,240, 1,970 and 520 changed
+  Review base f7cc192; the T7a slice is four commits of about 1,390, 1,240, 1,970 and 640 changed
   lines, so it is reviewed commit by commit.
+- T7a was reviewed in two parts because the whole slice exceeded the reviewer's lens context
+  budget: the backend f7cc192..abcea45 (`review-0c47b67a0faa9250`) and the UI and fixes
+  abcea45..34012d6 (`review-65ac6b51cab567d0`), both approved and acknowledged; next review base
+  34012d6. Their findings (R3-refused-mix-untested, R3-refused-load-drops-waiting-edits,
+  R3-explicit-other-cannot-clear-unknown-kind) and the engine gap reported with T7a (no way to
+  forget kept controls or mirrors) are fixed by T7a-fix.
 
 ## Next step
 

@@ -39,11 +39,13 @@
 //   message }`, the desk's answer in words, and reads the status after it.
 // - Named sessions (the Network and system screen's Session panel): the saved sessions and what the
 //   desk said when it opened its session (both read once connected, `loadSessions` again), save,
-//   rename, delete and load. A load waits for the channel and group edits on their way, drops every
-//   edit still waiting, and from its answer on the groups are the loaded ones (the last group
-//   answer is forgotten), the presets are the loaded ones and, when its audio input was taken, the
-//   next start opens it (the engine is never restarted). `unsavedEdits()` counts the edits a load
-//   would drop, so the panel can ask first. Each answers `{ ok, message }` and reads the list again.
+//   rename, delete and load. A load waits for the channel and group edits on their way and holds
+//   the waiting mix edits back while it loads: once it loaded they are dropped, and if it was
+//   refused they are kept and go out. From its answer on the groups are the loaded ones (the last
+//   group answer is forgotten), the presets are the loaded ones and, when its audio input was
+//   taken, the next start opens it (the engine is never restarted). `unsavedEdits()` counts the
+//   edits a load would drop, so the panel can ask first. Each answers `{ ok, message }` and reads
+//   the list again.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -91,13 +93,17 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   const unlisteners = [];
   let disposed = false;
 
+  // While a saved session is loading, the waiting edits stay where they are: none goes out over
+  // the loaded session; they are dropped once it loaded, and sent as usual if it was refused.
+  let loading = false;
+
   // Sends `address`'s pending mix edits as they are when the send goes out. The coalescer calls it
   // at most once at a time per musician, and again after an answer when edits are still waiting.
   async function sendMix(address) {
     const state = store.getState();
     const musician = musicianByAddress(state, address);
     const sent = splitEdits(pendingEdits(state, address)).mix;
-    if (!musician || Object.keys(sent).length === 0) {
+    if (loading || !musician || Object.keys(sent).length === 0) {
       return;
     }
     try {
@@ -113,7 +119,7 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     const state = store.getState();
     const musician = musicianByAddress(state, address);
     const sent = splitEdits(pendingEdits(state, address)).engineer;
-    if (!musician || Object.keys(sent).length === 0) {
+    if (loading || !musician || Object.keys(sent).length === 0) {
       return;
     }
     try {
@@ -652,29 +658,52 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     return result;
   }
 
-  // Loads the saved session `id` once every edit asked for before it was answered: the edits still
-  // waiting are dropped (when it is asked for, so none goes out over it, and when it is answered),
-  // and the window builds its next group edit on the loaded groups.
+  // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
+  function sendWaiting() {
+    for (const [address, edits] of Object.entries(store.getState().pending)) {
+      const { mix, engineer } = splitEdits(edits);
+      if (Object.keys(mix).length > 0) {
+        sender.push(address, null);
+      }
+      if (Object.keys(engineer).length > 0) {
+        engineerSender.push(address, null);
+      }
+    }
+  }
+
+  // Loads the saved session `id` once every edit asked for before it was answered. The edits still
+  // waiting are held back while it loads; once it loaded they are dropped (none was meant for the
+  // loaded session) and the window builds its next group edit on the loaded groups. A refused load
+  // changed nothing, so they are kept and go out.
   function loadSession(id) {
-    return inTurn(() =>
-      sessionCommand(async () => {
-        store.dispatch(actions.dropEdits());
-        const outcome = await api.loadSession(id);
-        keptGroups = null;
-        if (outcome.audioLoaded) {
-          // The session keeps exactly what the next start opens.
-          choiceKnown = true;
-          choiceUnsaved = false;
+    return inTurn(async () => {
+      loading = true;
+      let loaded = false;
+      try {
+        return await sessionCommand(async () => {
+          const outcome = await api.loadSession(id);
+          loaded = true;
+          keptGroups = null;
+          if (outcome.audioLoaded) {
+            // The session keeps exactly what the next start opens.
+            choiceKnown = true;
+            choiceUnsaved = false;
+          }
+          store.dispatch(actions.sessionLoaded(outcome));
+          await readStatus();
+          const musicians = store.getState().musicians;
+          return formatSessionLoaded(outcome, {
+            labelAt,
+            nameOf: (skipped) => skippedName(skipped, musicians),
+          });
+        }, `"${sessionName(id)}" was not loaded`);
+      } finally {
+        loading = false;
+        if (!loaded) {
+          sendWaiting();
         }
-        store.dispatch(actions.sessionLoaded(outcome));
-        await readStatus();
-        const musicians = store.getState().musicians;
-        return formatSessionLoaded(outcome, {
-          labelAt,
-          nameOf: (skipped) => skippedName(skipped, musicians),
-        });
-      }, `"${sessionName(id)}" was not loaded`),
-    );
+      }
+    });
   }
 
   // The edits a load would drop: every mix edit still waiting and every channel or group edit not

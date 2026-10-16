@@ -35,8 +35,8 @@
 //              session left alone, labels imported), or null.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
-// edits still waiting are dropped (`dropEdits` when the load is asked for, `sessionLoaded` when it
-// is answered): none of them was meant for the loaded session.
+// edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
+// loaded session. A refused load keeps them.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
 // never jumps back to an older value while its change is on the way. Each copy of a musician's mix
@@ -130,8 +130,6 @@ export const actions = Object.freeze({
   sessionsFailed: (message) => ({ type: "sessions-failed", message }),
   /** What the desk said when it opened its session, or null. */
   sessionNotice: (notice) => ({ type: "session-notice", notice }),
-  /** Every edit still waiting is dropped: a saved session is about to replace what they change. */
-  dropEdits: () => ({ type: "drop-edits" }),
   /**
    * A saved session was loaded (the `load_session` answer): the edits still waiting are dropped,
    * the presets are the loaded ones, and its audio input, when it was taken, is what the next start
@@ -482,8 +480,6 @@ export function consoleReducer(state, action) {
       return { ...state, sessions: { ...state.sessions, error: action.message } };
     case "session-notice":
       return { ...state, sessionNotice: action.notice ?? null };
-    case "drop-edits":
-      return dropEdits(state);
     case "session-loaded":
       return sessionLoaded(state, action.outcome);
     default:

@@ -1488,9 +1488,9 @@ fn edit_groups<E: GroupEngine>(
 ///
 /// A refused list is an error and changes nothing. Each edit is one step under the engine lock,
 /// with the session's inside it, so two edits at once never leave the session and the engine with
-/// different details. A kind this build does not know, which the session keeps for an input (a
-/// newer build wrote it), is kept as written while the edit leaves that input's kind as it applies,
-/// `other` (see [keep_unknown_kinds]).
+/// different details. A kind this build does not know is taken for an input only when the session
+/// keeps exactly that kind for it (a newer build wrote it, and [channel_table] read it back as
+/// written): it is kept as written and applies as `other`. An explicit `other` replaces it.
 pub fn set_channels(
     state: &DesktopState,
     channels: Vec<ChannelRequest>,
@@ -1511,8 +1511,10 @@ pub fn set_channels(
 /// the whole table and lose the rest; it reads this instead and sends it back with its change.
 ///
 /// With an engine running this is the engine's table ([EngineHandle::channel_table]), which is
-/// what it took last even when saving it failed; with none, the session's, a kind this build does
-/// not know read as `other`, as a start applies it.
+/// what it took last even when saving it failed; with none, the session's. A kind this build does
+/// not know, kept in the session for an input (a newer build wrote it; it applies as `other`), is
+/// read as written, so the window sends it back untouched with an edit of anything else and only
+/// an explicit choice replaces it (see [set_channels]).
 pub fn channel_table(state: &DesktopState) -> Result<Vec<SessionChannel>, String> {
     read_channel_table(&state.engine, &state.session)
 }
@@ -1526,15 +1528,23 @@ fn read_channel_table<E: ChannelEngine>(
     let guard = engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
-    let table = match guard.as_ref() {
-        Some(engine) => engine.channel_table(),
-        None => session_channels(session),
+    let stored = session.channels();
+    let Some(engine) = guard.as_ref() else {
+        return Ok(stored);
     };
-    Ok(table
+    Ok(engine
+        .channel_table()
         .into_iter()
-        .map(|channel| SessionChannel {
+        .enumerate()
+        .map(|(index, channel)| SessionChannel {
+            kind: stored
+                .get(index)
+                .filter(|kept| {
+                    channel.kind == ChannelKind::Other
+                        && ChannelKind::from_name(&kept.kind).is_none()
+                })
+                .map_or_else(|| channel.kind.name().to_owned(), |kept| kept.kind.clone()),
             name: channel.name,
-            kind: channel.kind.name().to_owned(),
             hidden: channel.hidden,
             link: channel.linked_to_next,
         })
@@ -1561,22 +1571,32 @@ impl ChannelEngine for EngineHandle {
 }
 
 /// The window's channel details as the engine takes them and as the session keeps them, names
-/// trimmed; a kind the engine does not know is an error naming it.
+/// trimmed. A kind the engine does not know is an error naming it, unless `stored` (the session's
+/// details) keeps exactly that kind for that input: a newer build's kind, sent back untouched, is
+/// kept as written and applies as `other`.
 fn channel_details(
     requests: Vec<ChannelRequest>,
+    stored: &[SessionChannel],
 ) -> Result<(Vec<ChannelMeta>, Vec<SessionChannel>), String> {
     let mut details = Vec::with_capacity(requests.len());
     let mut kept = Vec::with_capacity(requests.len());
     for (index, request) in requests.into_iter().enumerate() {
-        let kind = ChannelKind::from_name(&request.kind).ok_or_else(|| {
-            let known: Vec<&str> = ChannelKind::ALL.iter().map(|kind| kind.name()).collect();
-            format!(
-                "CH {} has the instrument kind `{}`, which is none of {}",
-                index + 1,
-                request.kind,
-                known.join(", ")
-            )
-        })?;
+        let untouched = stored
+            .get(index)
+            .is_some_and(|previous| previous.kind == request.kind);
+        let (kind, written) = match ChannelKind::from_name(&request.kind) {
+            Some(kind) => (kind, kind.name().to_owned()),
+            None if untouched => (ChannelKind::Other, request.kind.clone()),
+            None => {
+                let known: Vec<&str> = ChannelKind::ALL.iter().map(|kind| kind.name()).collect();
+                return Err(format!(
+                    "CH {} has the instrument kind `{}`, which is none of {}",
+                    index + 1,
+                    request.kind,
+                    known.join(", ")
+                ));
+            }
+        };
         let name = request.name.trim().to_owned();
         details.push(ChannelMeta {
             name: name.clone(),
@@ -1586,7 +1606,7 @@ fn channel_details(
         });
         kept.push(SessionChannel {
             name,
-            kind: kind.name().to_owned(),
+            kind: written,
             hidden: request.hidden,
             link: request.link,
         });
@@ -1595,35 +1615,18 @@ fn channel_details(
     Ok((details, kept))
 }
 
-/// Keeps, in the details about to be saved, each kind this build does not know that `stored` (the
-/// session's details) has for that input, unless the edit gave the input another kind.
-///
-/// Such a kind (written by a newer build) applies as `other`, so the table the window edits reads it
-/// as `other` and sends it back so with any edit; saving that would rewrite every such kind on the
-/// first edit of anything. An input whose kind still reads as the stored one applies keeps the
-/// stored name; one given another kind takes it.
-fn keep_unknown_kinds(kept: &mut [SessionChannel], stored: &[SessionChannel]) {
-    for (entry, previous) in kept.iter_mut().zip(stored) {
-        let applies_as = ChannelKind::from_name(&previous.kind).unwrap_or_default();
-        if ChannelKind::from_name(&previous.kind).is_none() && entry.kind == applies_as.name() {
-            entry.kind.clone_from(&previous.kind);
-        }
-    }
-}
-
 /// [set_channels] over any engine slot and session.
 fn edit_channels<E: ChannelEngine>(
     engine: &Mutex<Option<E>>,
     session: &SessionStore,
     channels: Vec<ChannelRequest>,
 ) -> Result<ChannelsSetDto, String> {
-    let (details, mut kept) = channel_details(channels)?;
     // One step per edit, in the lock order every command that holds both follows (see
-    // [edit_groups]).
+    // [edit_groups]); the details are checked against the session's under it.
     let mut guard = engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
-    keep_unknown_kinds(&mut kept, &session.channels());
+    let (details, kept) = channel_details(channels, &session.channels())?;
     let applied = match guard.as_mut() {
         // A refusal (an engine that is stopping) returns here, before anything is saved.
         Some(engine) => {
@@ -3413,7 +3416,7 @@ mod tests {
 
     /// The window edits the whole list: with an engine running it reads the engine's, entries for
     /// inputs the device lacks included; with none, the session's, a kind this build does not know
-    /// read as it applies.
+    /// read as written.
     #[test]
     fn the_channel_table_is_the_running_engines_whole_list_else_the_sessions() {
         let session = SessionStore::open(&session_directory("channel-table"));
@@ -3429,7 +3432,7 @@ mod tests {
             read_channel_table(&idle, &session).expect("readable"),
             vec![
                 kept("Kick", "drums", false, false),
-                kept("Theremin", "other", true, false),
+                kept("Theremin", "theremin", true, false),
             ]
         );
 
@@ -3452,9 +3455,10 @@ mod tests {
         );
     }
 
-    /// A kind a newer build wrote reads back as `other`, as it applies; sent back with an edit of
-    /// another entry, or of that entry's name, it is kept as written, with or without an engine.
-    /// Only choosing another kind for that entry replaces it.
+    /// A kind a newer build wrote reads back as written, from the session or from the running
+    /// engine (where it applies as `other`); sent back with an edit of another entry, or of that
+    /// entry's name, it is kept, with or without an engine. Choosing a kind for that entry replaces
+    /// it, an explicit `other` included; an unknown kind the session does not keep there is refused.
     #[test]
     fn an_edit_keeps_a_kind_this_build_does_not_know_until_that_entry_gets_another_kind() {
         let session = SessionStore::open(&session_directory("channel-table-unknown-kind"));
@@ -3495,18 +3499,22 @@ mod tests {
             "a new name for that entry keeps its kind too"
         );
 
-        // A running engine took the details as they apply: the unknown kind is `other` there.
-        let engine = running(StandInEngine::default());
-        edit_channels(
-            &engine,
-            &session,
-            vec![
-                detail("Kick in", "drums", false, false),
-                detail("Theremin (spare)", "other", true, false),
-            ],
-        )
-        .expect("the details are taken");
-        assert_eq!(session.channels()[1].kind, "theremin");
+        // A running engine took the details at start as they apply: the unknown kind is `other`.
+        let engine = running(StandInEngine {
+            applied_channels: Some(session_channels(&session)),
+            ..StandInEngine::default()
+        });
+        round_trip(&engine, &|_| {});
+        assert_eq!(
+            applied_channels(&engine).expect("taken")[1].kind,
+            ChannelKind::Other,
+            "it applies as other"
+        );
+        assert_eq!(
+            read_channel_table(&engine, &session).expect("readable")[1].kind,
+            "theremin",
+            "and reads back as written"
+        );
         round_trip(&engine, &|requests| requests[0].hidden = true);
         assert_eq!(
             session.channels()[1].kind,
@@ -3514,6 +3522,32 @@ mod tests {
             "an edit read from the running engine keeps it as well"
         );
 
+        let refused = edit_channels(
+            &idle,
+            &session,
+            vec![
+                detail("Kick in", "theremin", true, false),
+                detail("Theremin (spare)", "theremin", true, false),
+            ],
+        )
+        .expect_err("an unknown kind the session does not keep for that input");
+        assert!(
+            refused.contains("CH 1") && refused.contains("theremin"),
+            "{refused}"
+        );
+
+        round_trip(&idle, &|requests| requests[1].kind = "other".to_owned());
+        assert_eq!(
+            session.channels()[1],
+            kept("Theremin (spare)", "other", true, false),
+            "an explicit other replaces it"
+        );
+        session
+            .set_channels(vec![
+                kept("Kick in", "drums", true, false),
+                kept("Theremin (spare)", "theremin", true, false),
+            ])
+            .expect("kept");
         round_trip(&idle, &|requests| requests[1].kind = "keys".to_owned());
         assert_eq!(
             session.channels()[1],

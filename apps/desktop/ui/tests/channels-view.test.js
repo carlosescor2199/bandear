@@ -400,3 +400,18 @@ test("a toggle the engineer changed shows their choice until its edit is answere
   assert.deepEqual(shown[1], cards[1], "other groups' boxes are left as the status has them");
   assert.equal(cards[0].choices.find((choice) => choice.key === "4").checked, false);
 });
+
+test("a kind a newer build wrote passes an edit untouched, and only a choice replaces it", () => {
+  const table = [detail("Kick", "drums"), detail("Theremin", "theremin", { hidden: true })];
+
+  const renamed = renameChannel(table, 0, "Kick in", 2);
+  assert.equal(renamed[1].kind, "theremin", "sent back as the desk keeps it");
+  assert.equal(setChannelHidden(table, 1, false, 2)[1].kind, "theremin");
+  assert.equal(setChannelKind(table, 1, "other", 2)[1].kind, "other", "an explicit other");
+  assert.equal(setChannelKind(table, 1, "keys", 2)[1].kind, "keys");
+  assert.throws(
+    () => setChannelKind(table, 0, "theremin", 2),
+    /CH 1 has the instrument kind `theremin`/,
+    "an unknown kind the desk does not keep for that input",
+  );
+});

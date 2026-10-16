@@ -1293,8 +1293,28 @@ slice. Push and PRs are the user's decision.
     no compiler warnings.
   - Size: about 115 authored changed lines in the first commit and 90 in the second plus this
     document.
-  - Commits: 2520b56 `fix(android): take the server's mix after the first config`; this commit
-    (`fix(android): keep More of me consistent when a link moves my channel`).
+  - Commits: 2520b56 `fix(android): take the server's mix after the first config`; 05f3a6a
+    `fix(android): keep More of me consistent when a link moves my channel`.
+- [x] T7b-fix (review fix for T7b, review `review-c9bf544c067c5dbb`). Route: inline writer of the
+  delegated T7b worker (the reducer, the ViewModel and their tests).
+  - R3-paired-moreofme-off-keeps-server-lift: when a link turned More of me off, the server still
+    played the lift the phone had sent, and the link's `mix_state` (taken as the server plays it)
+    baked that lift into the phone's own mix, so the musician heard a lift the screen said was off
+    and a new lift went on top of it. Now the `config` keeps the musician's own levels
+    (`MonitorUiState.ownLevelsToRestore`; the lift is applied at send time and never stored); the
+    first report after it (the link's `mix_state`, or the answer to a change made meanwhile) is
+    taken with those levels put back on every channel the lift touched (`dropLinkedLift`: not a
+    locked channel; a pair's second side at its first side's level, as the link sets it; nothing
+    while following) and its pans as the link moved them, and is numbered as the phone's newest mix
+    when it differs, so the ViewModel sends it once through the `seq` path (`serverMixReported`). A
+    new session clears it. The T7b decision (off with a notice, nothing sent on the `config`) stands.
+  - RED: 2 of 455 failed against the T7b code with non-neutral levels: the reducer kept the lifted
+    `[40, 30, 30, 35, 45]` instead of `[80, 60, 60, 70, 90]`, and the ViewModel sent nothing after
+    the link's push (8 mixes, not 9).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 455 tests, 0 failures, 0 errors
+    (454 before: 1 new; the T7b ViewModel test, which used neutral levels, now checks the restored
+    levels, the moved pans and a single lift afterwards); no compiler warnings.
+  - Commit: this commit (`fix(android): drop the More of me lift when a link turns it off`).
 
 ## Progress
 
@@ -1486,6 +1506,9 @@ slice. Push and PRs are the user's decision.
   names, icons, hidden inputs and pairs on the phone; group edits; limits, locks and mirrors set
   and stopped from the desk; a session saved and loaded with phones connected; a first connect to
   a server that already holds the musician's mix (the phone shows it, no neutral strips).
+- Review `review-c9bf544c067c5dbb` over 2b4ba22..05f3a6a (T7a-fix2 and T7b) approved and
+  acknowledged; next review base 05f3a6a. Its WARNING (R3-paired-moreofme-off-keeps-server-lift)
+  is fixed by T7b-fix; its two desktop SUGGESTIONs go to a desktop follow-up commit.
 
 ## Next step
 

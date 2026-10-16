@@ -460,6 +460,51 @@ class MonitorReducerTest {
     }
 
     @Test
+    fun afterALinkTurnsMoreOfMeOffTheMusiciansOwnLevelsGoBackWithTheMovedPans() {
+        val on = running().after(
+            ConfigReceived(5, emptyList()),
+            ChannelLevelChanged(0, 80),
+            ChannelLevelChanged(1, 60),
+            ChannelLevelChanged(2, 40),
+            ChannelLevelChanged(3, 70),
+            ChannelLevelChanged(4, 90),
+            MusicianChannelChosen(2),
+            MoreOfMeToggled(true),
+        )
+        // The server plays the lift the phone sent: CH 3 at 100, the rest halved.
+        assertEquals(listOf(40, 30, 100, 35, 45), on.mix.toSnapshot().moreOfMeFor(listOf(2))!!.channelGains.toList())
+
+        val paired = on.after(ConfigReceived(5, emptyList(), band))
+
+        assertFalse(paired.moreOfMe.enabled)
+        assertEquals(on.mixSync, paired.mixSync)
+
+        // The link's `mix_state`: the pair's second side took the first's (lifted) level, and its
+        // pans moved apart. The phone keeps those pans and puts its own levels back, once.
+        val linked = MixSnapshot(
+            channelGains = intArrayOf(40, 30, 30, 35, 45),
+            channelPans = intArrayOf(0, 0, 100, 100, 0),
+            channelMutes = BooleanArray(5),
+            channelSolos = BooleanArray(5),
+        )
+        val restored = paired.after(MixPushed(linked))
+
+        assertEquals(listOf(80, 60, 60, 70, 90), restored.mix.levels)
+        assertEquals(listOf(0, 0, 100, 100, 0), restored.mix.pans)
+        assertFalse(restored.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, restored.moreOfMe.notice)
+        assertEquals(paired.mixSync.latest + 1, restored.mixSync.latest)
+
+        // Its answer changes nothing more, and More of me turned on again lifts once.
+        val answered = restored.after(MixAnswered(restored.mixSync.latest, restored.mix.toSnapshot()))
+        assertEquals(restored.mix, answered.mix)
+        assertTrue(answered.mixSync.settled)
+        val again = answered.after(MoreOfMeToggled(true))
+        val played = again.mix.toSnapshot().moreOfMeFor(again.moreOfMeChannels, again.mix.lockedSides)!!
+        assertEquals(listOf(40, 100, 100, 35, 45), played.channelGains.toList())
+    }
+
+    @Test
     fun aHiddenMusicianChannelIsForgottenAndMoreOfMeSaysWhy() {
         val on = withChannels(5).after(MusicianChannelChosen(3), MoreOfMeToggled(true))
         val remembered = withChannels(5).after(MusicianChannelChosen(3))

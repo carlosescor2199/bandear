@@ -365,10 +365,15 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
      *
      * The engineer's controls are part of the mix state, so a report that only moves the engineer's
      * limit republishes the receive thread's ceiling ([MixUiState.effectiveCap]) at once too.
+     *
+     * One report is answered with a send: the first after a link turned More of me off, which the
+     * reducer takes with the musician's own levels put back over the lift the server still plays and
+     * numbers as the phone's newest mix; it is sent once, with the pans the link moved.
      */
     private fun serverMixReported(event: MonitorEvent) {
         val (before, after) = dispatch(event)
         if (before.mix != after.mix) syncPlayerMix()
+        if (after.mixSync.latest != before.mixSync.latest) control.sendMixControl()
     }
 
     /**

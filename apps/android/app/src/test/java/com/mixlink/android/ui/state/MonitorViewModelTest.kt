@@ -490,10 +490,17 @@ class MonitorViewModelTest {
             .toString()
 
     @Test
-    fun aConfigThatPairsTheMusiciansChannelWithMoreOfMeOnTurnsItOffAndSendsNothing() {
+    fun aConfigThatPairsTheMusiciansChannelWithMoreOfMeOnDropsTheLiftOnceTheLinksMixArrives() {
         connected(channels = 3)
+        viewModel.setChannelLevel(0, 80)
+        viewModel.setChannelLevel(1, 60)
+        viewModel.setChannelLevel(2, 40)
+        viewModel.setChannelPan(0, 30)
+        viewModel.setChannelPan(1, 70)
+        viewModel.setChannelPan(2, 50)
         viewModel.setMusicianChannel(1)
         viewModel.setMoreOfMe(true)
+        assertEquals(listOf(40, 100, 20), lastMix().ints("channels"))
         answerMixes()
         val sent = socket().sentOfType("mix").size
 
@@ -507,12 +514,27 @@ class MonitorViewModelTest {
         // old pans back over them.
         assertEquals(sent, socket().sentOfType("mix").size)
 
-        // That push is taken as the server plays it, More of me staying off.
-        socket().receive(mixState(levels = listOf(50, 50, 50)))
+        // That push still carries the lift (the second side took the first's lifted level) and the
+        // pans the link moved apart.
+        socket().receive(
+            JSONObject(mixState(levels = listOf(40, 40, 20)))
+                .put("pans", JSONArray(List(32) { if (it == 1) 100 else if (it == 2) 50 else 0 }))
+                .toString(),
+        )
 
-        assertEquals(listOf(50, 50, 50), state.mix.levels)
+        // One whole mix goes out: the musician's own levels (the pair's at its first side's) with the
+        // moved pans, and the phone keeps the same.
+        assertEquals(sent + 1, socket().sentOfType("mix").size)
+        assertEquals(listOf(80, 80, 40), lastMix().ints("channels"))
+        assertEquals(listOf(0, 100, 50), lastMix().ints("pans"))
+        assertEquals(listOf(80, 80, 40), state.mix.levels)
+        assertEquals(listOf(0, 100, 50), state.mix.pans)
         assertFalse(state.moreOfMe.enabled)
-        assertEquals(sent, socket().sentOfType("mix").size)
+
+        answerMixes()
+        viewModel.setMoreOfMe(true)
+
+        assertEquals(listOf(100, 100, 20), lastMix().ints("channels"))
     }
 
     @Test

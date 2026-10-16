@@ -72,6 +72,8 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
         diagnostics = DiagnosticsUiState(),
         mix = state.mix.copy(engineer = EngineerControls()),
         tab = MainTab.MIX,
+        // A new session sends the phone's own mix when it opens, so no lift waits to be dropped.
+        ownLevelsToRestore = null,
     )
     SessionEnded -> state.copy(
         connection = state.connection.copy(sessionRunning = false, server = null)
@@ -237,7 +239,14 @@ private fun applyConfig(
         channelDetails = details,
     )
     val moreOfMe = state.moreOfMe.fittedTo(announced).offIfNewlyPaired(state.mix, state.moreOfMe.musicianChannel, announced)
-    return state.copy(mix = announced, moreOfMe = moreOfMe.offIfHeld(announced))
+    // The lift is applied at send time and never stored, so the levels here are the musician's own:
+    // kept to be put back once the link's `mix_state` arrives (see [applyServerMix]).
+    val pairedOff = moreOfMe.notice == MoreOfMeNotice.CHANNEL_PAIRED && state.moreOfMe.enabled && !moreOfMe.enabled
+    return state.copy(
+        mix = announced,
+        moreOfMe = moreOfMe.offIfHeld(announced),
+        ownLevelsToRestore = if (pairedOff) announced.levels else state.ownLevelsToRestore,
+    )
 }
 
 /**
@@ -436,6 +445,8 @@ private fun answerMix(
 private fun applyServerMix(state: MonitorUiState, snapshot: MixSnapshot): MonitorUiState {
     if (!state.connection.sessionRunning) return state
     val reported = state.mix.fromServer(snapshot)
+    val own = state.ownLevelsToRestore
+    if (own != null) return dropLinkedLift(state, reported, own)
     if (reported == state.mix.asPlayed(state.moreOfMe)) return state
     val moreOfMe = if (state.moreOfMe.enabled) {
         state.moreOfMe.copy(enabled = false, notice = MoreOfMeNotice.MIX_CHANGED_ELSEWHERE)
@@ -443,6 +454,28 @@ private fun applyServerMix(state: MonitorUiState, snapshot: MixSnapshot): Monito
         state.moreOfMe
     }
     return state.copy(mix = reported, moreOfMe = moreOfMe)
+}
+
+/**
+ * The first report after a link turned More of me off ([MoreOfMeNotice.CHANNEL_PAIRED]). The sequence:
+ * the `config` turned it off, kept the musician's own levels ([MonitorUiState.ownLevelsToRestore])
+ * and sent nothing; the link's `mix_state` (or the answer to a change made meanwhile) arrives with
+ * the pans the link moved and the levels the server plays, still lifted by the mix More of me sent.
+ * The phone takes that report with the [own] levels put back on every channel the lift touched
+ * (not a locked one, which the server keeps; a pair's second side at its first side's level, as
+ * the link sets it) and, when that differs from what the server plays, numbers it as its newest mix
+ * so the ViewModel sends it once, through the usual `seq` path. While the mix follows another's the
+ * server keeps every channel, so the report is taken as it is. Either way nothing waits any more.
+ */
+private fun dropLinkedLift(state: MonitorUiState, reported: MixUiState, own: List<Int>): MonitorUiState {
+    if (reported.following != null) return state.copy(mix = reported, ownLevelsToRestore = null)
+    val locked = reported.lockedSides
+    val levels = reported.levels.indices.map { channel ->
+        if (channel in locked || channel !in own.indices) reported.levels[channel] else own[channel]
+    }.toMutableList()
+    reported.layout.forEach { strip -> strip.second?.let { second -> if (second !in locked) levels[second] = levels[strip.first] } }
+    val restored = state.copy(mix = reported.copy(levels = levels), ownLevelsToRestore = null)
+    return if (levels == reported.levels) restored else restored.copy(mixSync = restored.mixSync.changed())
 }
 
 /**

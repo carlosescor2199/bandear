@@ -27,8 +27,8 @@ private const val NEUTRAL_LEVEL = 100
  *
  * The screens only read it; every change goes through [reduce], so the same events always give the
  * same screen. Lists here are plain immutable lists and every nested value is a data class, so two
- * states are equal exactly when the screens would look the same and [mixSync], the one value no
- * screen shows, is the same too.
+ * states are equal exactly when the screens would look the same and [mixSync] and
+ * [ownLevelsToRestore], the values no screen shows, are the same too.
  */
 data class MonitorUiState(
     /** The name this musician registers under, exactly as typed. */
@@ -47,6 +47,11 @@ data class MonitorUiState(
      * its number land in one state, and an answer is judged against the mix it is shown over.
      */
     val mixSync: MixSyncState = MixSyncState(),
+    /**
+     * The musician's own levels, kept when a link turned More of me off, to put back over the lift
+     * the server still plays once its next report arrives; null when nothing waits. Not shown.
+     */
+    val ownLevelsToRestore: List<Int>? = null,
 ) {
     /** The channels the musician can call theirs: one per strip of the channels the server announced. */
     val musicianChannelChoices: List<Int>

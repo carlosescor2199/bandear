@@ -19,3 +19,4 @@ import "./engineer.test.js";
 import "./master-controls.test.js";
 import "./mixes.test.js";
 import "./mix-tools.test.js";
+import "./mix-tools-logic.test.js";

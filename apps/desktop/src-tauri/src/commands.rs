@@ -25,8 +25,8 @@ use crate::dto::{
 };
 use crate::events::EventPump;
 use crate::session::{
-    address_key, client_key, SessionAudio, SessionChannel, SessionEngineer, SessionGroup,
-    SessionMirror, SessionPreset, SessionPresetChannel, SessionPresetMix, SessionStore,
+    SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionMirror, SessionPreset,
+    SessionPresetChannel, SessionPresetMix, SessionStore,
 };
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
@@ -268,6 +268,50 @@ fn session_engineer(controls: &EngineerControls) -> SessionEngineer {
     }
 }
 
+/// What a start needs from the new engine to put the session's mirrors in force: the engine in
+/// the app, a stand-in in the tests.
+trait MirrorKeeper {
+    fn keep_mirror(
+        &self,
+        follower: &MusicianKey,
+        leader: &MusicianKey,
+        name: &str,
+    ) -> Result<(), String>;
+}
+
+impl MirrorKeeper for EngineHandle {
+    fn keep_mirror(
+        &self,
+        follower: &MusicianKey,
+        leader: &MusicianKey,
+        name: &str,
+    ) -> Result<(), String> {
+        EngineHandle::keep_mirror(self, follower, leader, name).map_err(|error| error.to_string())
+    }
+}
+
+/// Hands every mirror in `mirrors` (see [session_mirrors]) to a new engine, in order, and answers a
+/// line for each one it refused (a circle or a mirror on oneself in a hand-edited session), for
+/// the log: a refused mirror is left out and the engine runs without it.
+fn hand_kept_mirrors<E: MirrorKeeper>(
+    engine: &E,
+    mirrors: Vec<(MusicianKey, MusicianKey, String)>,
+) -> Vec<String> {
+    mirrors
+        .into_iter()
+        .filter_map(|(follower, leader, name)| {
+            engine
+                .keep_mirror(&follower, &leader, &name)
+                .err()
+                .map(|error| {
+                    format!(
+                        "the saved mirror of {follower:?} on {leader:?} was not applied: {error}"
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Maps a window value to a backend. An unknown or absent value falls back to `auto`, which is what
 /// the window sends until the engineer picks something.
 fn parse_host(value: Option<&str>) -> AudioHost {
@@ -352,12 +396,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                     );
                 }
             }
-            for (follower, leader, name) in saved_mirrors {
-                if let Err(error) = handle.keep_mirror(&follower, &leader, &name) {
-                    eprintln!(
-                        "[mixlink-desktop] start_engine: the saved mirror of {follower:?} on {leader:?} was not applied: {error}"
-                    );
-                }
+            for refused in hand_kept_mirrors(&handle, saved_mirrors) {
+                eprintln!("[mixlink-desktop] start_engine: {refused}");
             }
             let summary = StartSummary {
                 run,
@@ -1027,7 +1067,12 @@ fn copy_mix_with<E: MixesEngine>(
 /// - With no engine, it is kept under the strongest key the desk knows for the follower (their
 ///   phone's when the window gave its client id, else the address, which must be a musician
 ///   address) and the leader's (likewise), refusing a mirror on oneself or one that would close a
-///   circle with those kept; it applies at the next start (`applied: false`).
+///   circle with those kept ([closes_circle]: every musician on the way known by all the keys the
+///   desk has for them, compared as the engine compares them, phones by client id and addresses by
+///   IP); it applies at the next start (`applied: false`).
+///
+/// Either way a phone's key is kept with the address the window gave beside it (the leader's and the
+/// follower's), so a later check with no engine knows both keys of that musician.
 ///
 /// Each change is one step under the engine lock, with the session's inside it.
 pub fn set_mirror(
@@ -1050,16 +1095,112 @@ pub fn set_mirror(
     Ok(outcome)
 }
 
-/// Whether following the session's `mirrors` from the leader key `leader` reaches one of
-/// `follower`'s keys: then the follower following the leader would close a circle.
-fn closes_circle(mirrors: &[(String, SessionMirror)], follower: &[String], leader: &str) -> bool {
-    let mut key = leader.to_owned();
-    for _ in 0..=mirrors.len() {
-        if follower.contains(&key) {
+/// Whether two keys name one musician as the engine's book does: two phones by their client id,
+/// two addresses by their IP (the engine keeps an address by its IP and lists one musician per IP).
+/// A phone and an address are told apart.
+fn same_musician(one: &MusicianKey, other: &MusicianKey) -> bool {
+    match (one, other) {
+        (MusicianKey::Client(one), MusicianKey::Client(other)) => one == other,
+        (MusicianKey::Address(one), MusicianKey::Address(other)) => one.ip() == other.ip(),
+        _ => false,
+    }
+}
+
+/// The keys the window gave for one musician, the strongest first: their phone's when it gave a
+/// client id, then their address's.
+fn keys_of(address: SocketAddr, client_id: Option<&str>) -> Vec<MusicianKey> {
+    phone_id(client_id)
+        .map(|id| MusicianKey::Client(id.to_owned()))
+        .into_iter()
+        .chain([MusicianKey::Address(address)])
+        .collect()
+}
+
+/// The keys a kept mirror knows for one musician: the `key` it names them by, and the `address`
+/// kept beside a phone's key. `None` when the key names no phone or address.
+fn kept_keys(key: &str, address: Option<&str>) -> Option<Vec<MusicianKey>> {
+    let address = address
+        .and_then(|address| address.parse().ok())
+        .map(MusicianKey::Address);
+    Some(
+        std::iter::once(musician_key_of(key)?)
+            .chain(address)
+            .collect(),
+    )
+}
+
+/// Adds to `known` every key of each of `groups` (keys that name one musician) that shares a key
+/// with it as the engine's book compares them ([same_musician]), until no group adds more.
+fn widen(known: &mut Vec<MusicianKey>, groups: &[&[MusicianKey]]) {
+    loop {
+        let before = known.len();
+        for group in groups {
+            if group
+                .iter()
+                .any(|key| known.iter().any(|own| same_musician(key, own)))
+            {
+                for key in group.iter() {
+                    if !known.contains(key) {
+                        known.push(key.clone());
+                    }
+                }
+            }
+        }
+        if known.len() == before {
+            return;
+        }
+    }
+}
+
+/// Whether following the session's `mirrors` from the musician known by `leader`'s keys reaches the
+/// musician known by `follower`'s keys: then the follower following that leader would close a
+/// circle.
+///
+/// At every step the musician is known by all the keys the desk has for them: the keys the window
+/// gave for the follower and the leader, and each kept mirror's pairs (the key it is kept under with
+/// the follower's address kept beside a phone's key, and the leader's key with theirs), a pair
+/// joining them when one of its keys names them as the engine's book does ([same_musician]: phones
+/// by client id, addresses by IP). The mirror kept for the musician is then looked up by every one
+/// of those keys, phones first, as a registration resolves it, so a mirror kept under either key of
+/// a musician is followed. A chain longer than the mirrors can only go round already.
+fn closes_circle(
+    mirrors: &[(String, SessionMirror)],
+    follower: &[MusicianKey],
+    leader: &[MusicianKey],
+) -> bool {
+    let kept: Vec<(Vec<MusicianKey>, Vec<MusicianKey>)> = mirrors
+        .iter()
+        .filter_map(|(key, mirror)| {
+            Some((
+                kept_keys(key, mirror.follower_address.as_deref())?,
+                kept_keys(&mirror.leader, mirror.leader_address.as_deref())?,
+            ))
+        })
+        .collect();
+    let groups: Vec<&[MusicianKey]> = [follower, leader]
+        .into_iter()
+        .chain(
+            kept.iter()
+                .flat_map(|(follows, leads)| [follows.as_slice(), leads.as_slice()]),
+        )
+        .collect();
+    let mut known = leader.to_vec();
+    for _ in 0..=kept.len() {
+        widen(&mut known, &groups);
+        if known
+            .iter()
+            .any(|key| follower.iter().any(|own| same_musician(key, own)))
+        {
             return true;
         }
-        match mirrors.iter().find(|(kept_for, _)| *kept_for == key) {
-            Some((_, mirror)) => key = mirror.leader.clone(),
+        known.sort_by_key(|key| matches!(key, MusicianKey::Address(_)));
+        let next = known.iter().find_map(|key| {
+            kept.iter()
+                .find(|(follows, _)| same_musician(&follows[0], key))
+                .map(|(_, leads)| leads.clone())
+        });
+        match next {
+            Some(leads) => known = leads,
             None => return false,
         }
     }
@@ -1084,24 +1225,23 @@ fn edit_mirror<E: MixesEngine>(
         let at = address
             .parse::<SocketAddr>()
             .map_err(|error| format!("invalid musician address `{address}`: {error}"))?;
-        let follower: Vec<String> = client_id
-            .map(client_key)
-            .into_iter()
-            .chain([address_key(&at.to_string())])
-            .collect();
+        let follower = keys_of(at, client_id);
         let kept = match &leader {
             None => None,
             Some(request) => {
                 let leader_at = request.address.parse::<SocketAddr>().map_err(|error| {
                     format!("invalid musician address `{}`: {error}", request.address)
                 })?;
-                let leader_key = phone_id(request.client_id.as_deref())
-                    .map(client_key)
-                    .unwrap_or_else(|| address_key(&leader_at.to_string()));
-                if leader_at.ip() == at.ip() || follower.contains(&leader_key) {
+                let leading = keys_of(leader_at, request.client_id.as_deref());
+                // Kept under the leader's strongest key, as the engine keeps it.
+                let leader_key = session_key(&leading[0]);
+                if leading
+                    .iter()
+                    .any(|key| follower.iter().any(|own| same_musician(key, own)))
+                {
                     return Err(format!("{address} cannot follow their own mix"));
                 }
-                if closes_circle(&session.mirrors(), &follower, &leader_key) {
+                if closes_circle(&session.mirrors(), &follower, &leading) {
                     return Err(format!(
                         "{} already follows {address}'s mix, directly or through another musician: a mirror cannot go round in a circle",
                         request.address
@@ -1115,6 +1255,9 @@ fn edit_mirror<E: MixesEngine>(
                     } else {
                         name.to_owned()
                     },
+                    leader_address: matches!(leading[0], MusicianKey::Client(_))
+                        .then(|| leader_at.to_string()),
+                    follower_address: client_id.map(|_| at.to_string()),
                 })
             }
         };
@@ -1144,12 +1287,25 @@ fn edit_mirror<E: MixesEngine>(
             name: &request.name,
         }),
     )?;
+    // The address the session keys an address entry by, written as the status writes it, so the
+    // entry the phone's replaces is found however the window wrote the address.
+    let at = address
+        .parse::<SocketAddr>()
+        .map_or_else(|_| address.to_owned(), |at| at.to_string());
+    let leader_at = leader
+        .as_ref()
+        .and_then(|request| request.address.parse::<SocketAddr>().ok());
     let kept = outcome.leader.as_ref().map(|key| SessionMirror {
         leader: session_key(key),
         name: outcome.name.clone().unwrap_or_default(),
+        leader_address: match key {
+            MusicianKey::Client(_) => leader_at.map(|at| at.to_string()),
+            MusicianKey::Address(_) => None,
+        },
+        follower_address: matches!(outcome.follower, MusicianKey::Client(_)).then(|| at.clone()),
     });
     let (saved, kept_for) = match &outcome.follower {
-        MusicianKey::Client(id) => (session.set_mirror(Some(id), address, kept), "phone"),
+        MusicianKey::Client(id) => (session.set_mirror(Some(id), &at, kept), "phone"),
         MusicianKey::Address(at) => (session.set_mirror(None, &at.to_string(), kept), "address"),
     };
     // The phone already follows: say that it was not kept.
@@ -1586,6 +1742,7 @@ mod tests {
     use super::*;
     use crate::dto::MusicianDto;
     use crate::events::{EventPump, PumpSink, PumpSource};
+    use crate::session::{address_key, client_key};
 
     fn status_with_musicians(addresses: &[&str]) -> EngineStatusDto {
         EngineStatusDto {
@@ -2099,6 +2256,9 @@ mod tests {
             from: &str,
             to: &[String],
         ) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
             self.key_at(from)?;
             self.copied = Some((from.to_owned(), to.to_vec()));
             Ok(self.mixes(to))
@@ -3402,6 +3562,21 @@ mod tests {
         }
     }
 
+    /// A mirror as the session keeps it, with the addresses kept beside the phones' keys.
+    fn kept_mirror(
+        leader: String,
+        name: &str,
+        leader_address: Option<&str>,
+        follower_address: Option<&str>,
+    ) -> SessionMirror {
+        SessionMirror {
+            leader,
+            name: name.to_owned(),
+            leader_address: leader_address.map(str::to_owned),
+            follower_address: follower_address.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn a_mirror_the_engine_took_is_saved_for_the_followers_phone_and_stopping_drops_it() {
         let session = SessionStore::open(&session_directory("mirror-running"));
@@ -3423,10 +3598,12 @@ mod tests {
         assert_eq!(started.mix.as_ref().map(|mix| mix.revision), Some(9));
         assert_eq!(
             session.mirror_for(Some(PHONE), ANA),
-            Some(SessionMirror {
-                leader: format!("address:{RACK}"),
-                name: "Rack".to_owned(),
-            })
+            Some(kept_mirror(
+                format!("address:{RACK}"),
+                "Rack",
+                None,
+                Some(ANA)
+            ))
         );
         let stopped = edit_mirror(&engine, &session, ANA, Some(PHONE), None).expect("stopped");
         assert!(stopped.applied && stopped.leader.is_none());
@@ -3470,10 +3647,7 @@ mod tests {
             session.mirrors(),
             vec![(
                 format!("client:{PHONE}"),
-                SessionMirror {
-                    leader: format!("address:{RACK}"),
-                    name: "Rack".to_owned(),
-                }
+                kept_mirror(format!("address:{RACK}"), "Rack", None, Some(ANA))
             )]
         );
         let circle = edit_mirror(
@@ -3498,6 +3672,381 @@ mod tests {
         assert_eq!(session.mirrors().len(), 1, "the refusals kept nothing");
     }
 
+    const OTHER_PHONE: &str = "7d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a";
+    const BASS_AT: &str = "192.168.1.12:50000";
+
+    #[test]
+    fn with_no_engine_a_circle_through_a_phone_and_its_address_is_refused() {
+        let idle = Mutex::new(None::<StandInEngine>);
+        // Ana, kept by her address, follows the bass player's phone; the bass player now asks to
+        // follow Ana, named by her phone and her address.
+        let by_address = SessionStore::open(&session_directory("mirror-mixed-address"));
+        by_address
+            .set_mirror(
+                None,
+                ANA,
+                Some(kept_mirror(client_key(OTHER_PHONE), "Bass", None, None)),
+            )
+            .expect("saved");
+        let refused = edit_mirror(
+            &idle,
+            &by_address,
+            BASS_AT,
+            Some(OTHER_PHONE),
+            Some(leader(ANA, Some(PHONE), "Ana")),
+        )
+        .expect_err("Ana follows the bass player already");
+        assert!(refused.contains("circle"), "{refused}");
+
+        // Ana, kept by her phone, follows the bass rack at one port; the rack is asked for at
+        // another port of the same host, which the engine keeps as the same musician.
+        let by_phone = SessionStore::open(&session_directory("mirror-mixed-phone"));
+        by_phone
+            .set_mirror(
+                Some(PHONE),
+                ANA,
+                Some(kept_mirror(address_key(BASS_AT), "Bass", None, None)),
+            )
+            .expect("saved");
+        let refused = edit_mirror(
+            &idle,
+            &by_phone,
+            "192.168.1.12:50001",
+            None,
+            Some(leader(ANA, Some(PHONE), "Ana")),
+        )
+        .expect_err("the rack is the one Ana follows");
+        assert!(refused.contains("circle"), "{refused}");
+        assert_eq!(
+            by_address.mirrors().len() + by_phone.mirrors().len(),
+            2,
+            "nothing more kept"
+        );
+    }
+
+    const KEYS_PHONE: &str = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
+    const KEYS_AT: &str = "192.168.1.17:50000";
+
+    #[test]
+    fn with_no_engine_a_circle_of_three_is_refused_whichever_key_each_mirror_was_kept_under() {
+        let idle = Mutex::new(None::<StandInEngine>);
+
+        // The bass player, kept by address, follows the keys player; Ana follows the bass player
+        // named by their phone. The keys player then asks to follow Ana.
+        let by_address = SessionStore::open(&session_directory("mirror-three-by-address"));
+        edit_mirror(
+            &idle,
+            &by_address,
+            BASS_AT,
+            None,
+            Some(leader(KEYS_AT, Some(KEYS_PHONE), "Keys")),
+        )
+        .expect("kept");
+        edit_mirror(
+            &idle,
+            &by_address,
+            ANA,
+            Some(PHONE),
+            Some(leader(BASS_AT, Some(OTHER_PHONE), "Bass")),
+        )
+        .expect("kept");
+        let refused = edit_mirror(
+            &idle,
+            &by_address,
+            KEYS_AT,
+            Some(KEYS_PHONE),
+            Some(leader(ANA, Some(PHONE), "Ana")),
+        )
+        .expect_err("Ana follows the bass player, who follows the keys player");
+        assert!(refused.contains("circle"), "{refused}");
+        assert_eq!(by_address.mirrors().len(), 2, "nothing more kept");
+
+        // The other way round: the bass player kept by phone, Ana following them by address.
+        let by_phone = SessionStore::open(&session_directory("mirror-three-by-phone"));
+        edit_mirror(
+            &idle,
+            &by_phone,
+            BASS_AT,
+            Some(OTHER_PHONE),
+            Some(leader(KEYS_AT, Some(KEYS_PHONE), "Keys")),
+        )
+        .expect("kept");
+        edit_mirror(
+            &idle,
+            &by_phone,
+            ANA,
+            Some(PHONE),
+            Some(leader(BASS_AT, None, "Bass")),
+        )
+        .expect("kept");
+        let refused = edit_mirror(
+            &idle,
+            &by_phone,
+            KEYS_AT,
+            Some(KEYS_PHONE),
+            Some(leader(ANA, Some(PHONE), "Ana")),
+        )
+        .expect_err("Ana follows the bass player, who follows the keys player");
+        assert!(refused.contains("circle"), "{refused}");
+        assert_eq!(by_phone.mirrors().len(), 2, "nothing more kept");
+    }
+
+    #[test]
+    fn with_no_engine_a_chain_with_mixed_keys_that_does_not_close_is_kept() {
+        let idle = Mutex::new(None::<StandInEngine>);
+        let session = SessionStore::open(&session_directory("mirror-three-chain"));
+        edit_mirror(
+            &idle,
+            &session,
+            BASS_AT,
+            None,
+            Some(leader(KEYS_AT, Some(KEYS_PHONE), "Keys")),
+        )
+        .expect("kept");
+        edit_mirror(
+            &idle,
+            &session,
+            ANA,
+            Some(PHONE),
+            Some(leader(BASS_AT, Some(OTHER_PHONE), "Bass")),
+        )
+        .expect("kept");
+
+        // The rack at another host follows the end of the chain, then its start: no circle.
+        for leading in [
+            leader(KEYS_AT, Some(KEYS_PHONE), "Keys"),
+            leader(ANA, Some(PHONE), "Ana"),
+        ] {
+            let kept = edit_mirror(&idle, &session, RACK, None, Some(leading))
+                .expect("a chain that does not come back is no circle");
+            assert_eq!(kept.kept_for, "address");
+        }
+        // The keys player follows a musician outside the chain.
+        let kept = edit_mirror(
+            &idle,
+            &session,
+            KEYS_AT,
+            Some(KEYS_PHONE),
+            Some(leader("192.168.1.50:50000", None, "Drums")),
+        )
+        .expect("the drums follow nobody in the chain");
+        assert_eq!(kept.kept_for, "phone");
+        assert_eq!(session.mirrors().len(), 4);
+    }
+
+    #[test]
+    fn with_no_engine_a_mirror_on_oneself_is_refused_as_the_engine_refuses_it() {
+        let idle = Mutex::new(None::<StandInEngine>);
+        let session = SessionStore::open(&session_directory("mirror-idle-self"));
+
+        // The engine keeps an address by its IP and lists one musician per IP, so two ports of
+        // one host are one musician to it.
+        for (follower, client_id, leader_at, leader_id) in [
+            ("192.168.1.9:50000", None, "192.168.1.9:50001", None),
+            (ANA, Some(PHONE), "192.168.1.99:50000", Some(PHONE)),
+        ] {
+            let own = edit_mirror(
+                &idle,
+                &session,
+                follower,
+                client_id,
+                Some(leader(leader_at, leader_id, "Me")),
+            )
+            .expect_err("nobody follows their own mix");
+            assert!(own.contains("own mix"), "{follower} on {leader_at}: {own}");
+        }
+        let kept = edit_mirror(
+            &idle,
+            &session,
+            "192.168.1.9:50000",
+            None,
+            Some(leader("192.168.1.10:50000", None, "Ten")),
+        )
+        .expect("another host is another musician");
+        assert_eq!(kept.kept_for, "address");
+    }
+
+    #[test]
+    fn a_mirror_the_engine_took_clears_the_address_entry_however_the_address_was_written() {
+        let session = SessionStore::open(&session_directory("mirror-canonical"));
+        session
+            .set_mirror(
+                None,
+                "[::1]:50000",
+                Some(kept_mirror(address_key(RACK), "Old", None, None)),
+            )
+            .expect("kept for the address");
+        let engine = running(StandInEngine {
+            rows: vec![
+                ("[0:0:0:0:0:0:0:1]:50000".to_owned(), Some(PHONE.to_owned())),
+                (RACK.to_owned(), None),
+            ],
+            ..StandInEngine::default()
+        });
+
+        edit_mirror(
+            &engine,
+            &session,
+            "[0:0:0:0:0:0:0:1]:50000",
+            Some(PHONE),
+            Some(leader(RACK, None, "Rack")),
+        )
+        .expect("the engine took it");
+
+        assert_eq!(
+            session
+                .mirrors()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            [client_key(PHONE)],
+            "the address's entry gave way to the phone's"
+        );
+    }
+
+    #[test]
+    fn a_mirror_the_engine_took_but_the_session_could_not_keep_says_so() {
+        let directory = session_directory("mirror-unsaved");
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(
+            directory.join(crate::session::SESSION_FILE),
+            r#"{"version":99}"#,
+        )
+        .expect("a newer session");
+        let session = SessionStore::open(&directory);
+        let engine = band(MixPreset::default());
+
+        let outcome = edit_mirror(
+            &engine,
+            &session,
+            ANA,
+            Some(PHONE),
+            Some(leader(RACK, None, "Rack")),
+        )
+        .expect("the engine took it");
+
+        assert!(outcome.applied && !outcome.saved, "{outcome:?}");
+        assert!(
+            outcome
+                .save_error
+                .as_deref()
+                .is_some_and(|error| error.contains("newer")),
+            "{outcome:?}"
+        );
+        assert!(outcome.mix.is_some());
+    }
+
+    #[test]
+    fn a_follower_without_a_phone_keeps_its_mirror_by_address_while_the_engine_runs() {
+        let session = SessionStore::open(&session_directory("mirror-running-address"));
+        let engine = band(MixPreset::default());
+
+        let outcome = edit_mirror(
+            &engine,
+            &session,
+            RACK,
+            None,
+            Some(leader(ANA, Some(PHONE), "Ana")),
+        )
+        .expect("the engine took it");
+
+        assert_eq!(outcome.kept_for, "address");
+        assert_eq!(
+            session.mirrors(),
+            vec![(
+                address_key(RACK),
+                kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)
+            )],
+            "kept with the leader's key the engine gave, and the address beside it"
+        );
+    }
+
+    #[test]
+    fn a_stopping_engine_refuses_presets_and_copies_and_takes_nothing() {
+        let session = SessionStore::open(&session_directory("mixes-stopping"));
+        let engine = band(two_inputs());
+        let kept = save_preset_with(&engine, &session, ANA, "Verse")
+            .expect("saved")
+            .preset
+            .expect("kept");
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_mut()
+            .expect("running")
+            .stopping = true;
+
+        let preset = apply_preset_with(&engine, &session, &kept.id, &[RACK.to_owned()])
+            .expect_err("a stopping engine refuses");
+        let copy = copy_mix_with(&engine, ANA, &[RACK.to_owned()]).expect_err("and refuses this");
+
+        for refused in [preset, copy] {
+            assert!(refused.contains("stopping"), "{refused}");
+        }
+        let guard = engine.lock().expect("engine lock");
+        let stand_in = guard.as_ref().expect("running");
+        assert_eq!(stand_in.took_preset, None);
+        assert_eq!(stand_in.copied, None);
+    }
+
+    /// Stands in for a new engine taking the session's mirrors: it records each and refuses the
+    /// one whose follower it is told to.
+    struct MirrorTaker {
+        refuses: MusicianKey,
+        taken: std::cell::RefCell<Vec<(MusicianKey, MusicianKey, String)>>,
+    }
+
+    impl MirrorKeeper for MirrorTaker {
+        fn keep_mirror(
+            &self,
+            follower: &MusicianKey,
+            leader: &MusicianKey,
+            name: &str,
+        ) -> Result<(), String> {
+            if *follower == self.refuses {
+                return Err("a mirror cannot go round in a circle".to_owned());
+            }
+            self.taken
+                .borrow_mut()
+                .push((follower.clone(), leader.clone(), name.to_owned()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_start_hands_every_kept_mirror_to_the_engine_and_names_those_it_refused() {
+        let rack = MusicianKey::Address(RACK.parse().expect("an address"));
+        let ana = MusicianKey::Client(PHONE.to_owned());
+        let bass = MusicianKey::Client(OTHER_PHONE.to_owned());
+        let engine = MirrorTaker {
+            refuses: bass.clone(),
+            taken: std::cell::RefCell::new(Vec::new()),
+        };
+
+        let refused = hand_kept_mirrors(
+            &engine,
+            vec![
+                (ana.clone(), rack.clone(), "Rack".to_owned()),
+                (bass.clone(), ana.clone(), "Ana".to_owned()),
+                (rack.clone(), bass.clone(), "Bass".to_owned()),
+            ],
+        );
+
+        assert_eq!(
+            engine.taken.into_inner(),
+            vec![
+                (ana, rack.clone(), "Rack".to_owned()),
+                (rack, bass, "Bass".to_owned())
+            ],
+            "every other mirror is in force"
+        );
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].contains(OTHER_PHONE) && refused[0].contains("circle"),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn every_start_is_handed_the_sessions_mirrors_by_key() {
         let session = SessionStore::open(&session_directory("mirror-start"));
@@ -3505,20 +4054,14 @@ mod tests {
             .set_mirror(
                 Some(PHONE),
                 ANA,
-                Some(SessionMirror {
-                    leader: format!("address:{RACK}"),
-                    name: "Rack".to_owned(),
-                }),
+                Some(kept_mirror(format!("address:{RACK}"), "Rack", None, None)),
             )
             .expect("saved");
         session
             .set_mirror(
                 None,
                 RACK,
-                Some(SessionMirror {
-                    leader: "somewhere".to_owned(),
-                    name: "?".to_owned(),
-                }),
+                Some(kept_mirror("somewhere".to_owned(), "?", None, None)),
             )
             .expect("saved");
 

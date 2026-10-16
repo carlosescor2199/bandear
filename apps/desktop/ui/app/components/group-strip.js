@@ -8,6 +8,7 @@
 
 import "./fader.js";
 import "./group-chip.js";
+import { followingState } from "../lib/mix-tools.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
@@ -71,15 +72,11 @@ class MlGroupStrip extends HTMLElement {
   set data(data) {
     this.#data = data;
     const parts = this.#parts;
-    const following = data.following ?? null;
-    reflect(
-      parts.strip,
-      "aria-label",
-      following ? `${data.name} group, follows ${following}'s mix` : `${data.name} group`,
-    );
-    parts.follows.hidden = !following;
-    setText(parts.follows, following ? `Follows ${following}` : "");
-    reflect(parts.fader, "disabled", Boolean(following));
+    const mirror = followingState(data.following ?? null, `${data.name} group`);
+    reflect(parts.strip, "aria-label", mirror.label);
+    parts.follows.hidden = !mirror.disabled;
+    setText(parts.follows, mirror.text);
+    reflect(parts.fader, "disabled", mirror.disabled);
     reflect(parts.chip, "name", data.name);
     reflect(parts.chip, "tone", data.tone);
     reflect(parts.chip, "invalid", data.invalid);

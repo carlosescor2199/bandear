@@ -8,6 +8,7 @@
 import "../components/index.js";
 import { editKey } from "../lib/mix.js";
 import { mixToolsView } from "../lib/mixes.js";
+import { mixToolCommands } from "../lib/mix-tools.js";
 import { musicianLabel } from "../lib/format.js";
 import { selectedMusician } from "../lib/console-state.js";
 import {
@@ -240,35 +241,22 @@ export function mountMixScreen(main, app) {
     }
   }
 
-  // Runs one of the tools' commands for the open musician and says how it went.
-  async function tool(kind, run) {
-    const address = app.store.getState().selected;
-    if (!address) {
-      return;
-    }
-    toolsOutcome = await run(address);
-    parts.tools.answered(kind, toolsOutcome.ok);
-    scheduleRender();
+  // The tools' commands for the open musician, each answer said above the strips and handed back
+  // to the tools (mixToolCommands, tested without a browser). The tools take the store's data at
+  // once, before they hear the answer, so the Mirror control never shows the old mirror between
+  // the answer and the next frame.
+  const toolCommands = mixToolCommands({
+    app,
+    tools: parts.tools,
+    said(outcome) {
+      toolsOutcome = outcome;
+      renderTools(app.store.getState());
+      scheduleRender();
+    },
+  });
+  for (const type of toolCommands.types) {
+    screen.addEventListener(type, (event) => toolCommands.handle(type, event.detail));
   }
-
-  screen.addEventListener("mirror-change", (event) =>
-    tool("mirror", (address) => app.setMirror(address, event.detail.leader)),
-  );
-  screen.addEventListener("mix-copy", (event) =>
-    tool("copy", (address) => app.copyMix(address, event.detail.to)),
-  );
-  screen.addEventListener("preset-save", (event) =>
-    tool("save", (address) => app.savePreset(address, event.detail.name)),
-  );
-  screen.addEventListener("preset-apply", (event) =>
-    tool("apply", () => app.applyPreset(event.detail.id, event.detail.to)),
-  );
-  screen.addEventListener("preset-rename", (event) =>
-    tool("rename", () => app.renamePreset(event.detail.id, event.detail.name)),
-  );
-  screen.addEventListener("preset-delete", (event) =>
-    tool("delete", () => app.deletePreset(event.detail.id)),
-  );
   screen.addEventListener("presets-load", () => app.loadPresets());
   screen.addEventListener("engine-start", () => app.start());
   screen.addEventListener("engine-stop", () => app.stop());

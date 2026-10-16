@@ -920,6 +920,92 @@ slice. Push and PRs are the user's decision.
     presets, copies and mirrors in the console`; 413ab3c `feat(desktop-ui): add presets, copy and
     mirror to the mix`; this commit (`fix(desktop): say how to get past an unreadable input and
     check idle edits as the desktop does`).
+- [x] T6a-fix (review fixes for T6a, reviews `review-fa0392e2f0a9b62d`, `review-bad720d5ff930d4c`
+  and `review-c8654069e3cf6af8`). Route: inline writer of the delegated T6a worker (bounded fixes
+  in the engine, the desktop commands and the UI, one commit each).
+  - R3-mirror-propagation-can-apply-stale-leader-values: a follower takes its leader's mix under a
+    registry propagation lock, from the read of the leader's mix to the store of every copy (in
+    `propagate_from` and in `restore_mirror`), so two changes of one leader carried on at the same
+    moment cannot leave the older mix last; lock order: table, propagation, mirrors, mix writer.
+  - R3-ack-following-read-separately-from-applied-values: `MixState::apply_from_phone_report`
+    answers the values and the hold read under the same writer lock, and `mix_ack` uses both
+    (`apply_from_phone` is now a test helper).
+  - R3-row-takeover-clears-mirror-untested: tests for a different phone taking over a follower's
+    row (no hold; the first phone's mirror still kept for it) and a target added where a mirror is
+    kept (it follows at once).
+  - R3-offline-circle-key-mismatch: with no engine each musician is known by every key the window
+    gave (phone and address), keys are compared as the engine's book compares them (phones by client
+    id, addresses by IP) and each step looks the mirror up by every known key, phone first.
+  - R3-offline-same-ip-refusal: checked against the engine, whose book keeps an address by its IP
+    (`BookKey::Ip`) and whose table holds one musician per IP (a second target on one IP is
+    refused), so two ports of one host are one musician to it. The offline check now uses the same
+    comparison (`same_musician`) and keeps refusing that case; tests pin both sides
+    (`kept_mirrors_refuse_two_addresses_on_one_ip_as_one_musician`,
+    `with_no_engine_a_mirror_on_oneself_is_refused_as_the_engine_refuses_it`).
+  - R3-engine-path-raw-address-key: the engine-running path writes the address as the status does
+    before saving, so the follower's address entry is found and cleared.
+  - R3-untested-save-failure-and-start-apply: tests for a save that fails after the engine took a
+    mirror, a follower kept by address while running, a stopping engine refusing presets and
+    copies (the stand-in now refuses copies while stopping, as the engine does), and the start
+    hand-off, now `hand_kept_mirrors` over a `MirrorKeeper` trait, which names each refusal for the
+    log.
+  - R3-mirror-select-stale-after-refusal and R3-mix-tools-component-untested: the tools' rules
+    moved to `lib/mix-tools.js` (`createMixTools`, DOM-free with a stand-in clock and timers):
+    the Mirror control shows a choice only while it is on its way and the desk's mirror after any
+    answer, also after its options were rebuilt; ticks follow the open musician and a follower
+    loses its tick; nothing but a rename goes out without an engine; Escape closes a panel and names
+    the button that takes the focus back; the delete waits `CONFIRM_DELAY_MS` and disarms after 10 s;
+    an answer empties a done save or rename. `followingState` words and disables a follower's
+    strips. `<ml-mix-tools>`, `<ml-channel-strip>` and `<ml-group-strip>` render what it answers.
+  - RED: engine 2 of 296 failed (the held propagation left the follower on `[11, 11]` after the
+    leader's `[22, 22]`; the ack's hold was none); the takeover, add and one-IP tests passed at once
+    (they pin behaviour that held). A first run of the interleaving test passed against the old code
+    because the test hook held its own mutex while parked, which serialised the propagations; the
+    hook now releases it first. Desktop 3 of 141 failed (the stubbed hand-off handed nothing, a
+    non-canonical address left the address's entry, a mixed-key circle was saved); the other four
+    passed at once. UI: `mix-tools-logic.test.js` 8 of 8 failed against a stub controller.
+  - GREEN: `cargo test -p personal-monitoring` 296 passed (5 new), control tests 39 passed in three
+    runs; `cargo test -p mixlink-desktop` 141 passed (7 new); UI 319 passed (8 new); `cargo build -p
+    mixlink-desktop` after `cargo clean -p mixlink-desktop` ok; `cargo fmt` clean; clippy: no new
+    warnings. Preview (`index.html?fake#/mix`): a refused mirror choice on the focused select
+    returns to the desk's mirror, mirrors start and stop, Escape gives the focus back to Presets, the
+    delete waits and confirms.
+  - Commits: 8531b9d `fix(engine): keep mirrors in order and report the hold the ack used` (about
+    190 changed lines); d5e87ac `fix(desktop): check mirror circles and addresses like the engine`
+    (about 420); this commit (`fix(desktop-ui): show the mirror the desk has and test the mix tools`).
+- [x] T6a-fix2 (review fixes for T6a-fix, review `review-af815f7391283cf6`). Route: delegated
+  writer (bounded fixes in the desktop commands and session, and in the UI, one commit each).
+  - R3-offline-circle-later-steps-single-key: with no engine every step of the circle walk knows
+    the musician by all the keys the desk has for them (the window's keys for the follower and the
+    leader, and each kept mirror's pairs), joined as the engine's book compares keys (phones by
+    client id, addresses by IP), and looks the mirror up by each of them, phones first. A mirror
+    kept with a phone's key now keeps the address beside it (`leaderAddress`, `followerAddress` in
+    the session, both optional, written with and without an engine): with no engine that is the
+    only way the desk knows a phone and an address are one musician. Mirrors kept by earlier builds
+    carry no addresses and are joined only through the keys the window gives.
+  - R3-pending-mirror-cleared-only-by-unseen-answer: the screen did call `answered('mirror')` (its
+    `tool("mirror", …)` handed every answer to `<ml-mix-tools>`), but a command that failed or
+    found no musician open left the choice on show, a desk mirror changed by another route did not
+    replace it, and between the answer and the next frame the control showed the old mirror (seen
+    in the preview). The wiring moved to `mixToolCommands` (`lib/mix-tools.js`, DOM-free): every
+    command answers the tools (in a `finally`), the screen hears the outcome first and gives the
+    tools the store's data at once, and `setData` drops a choice on its way when the desk's mirror
+    changes.
+  - RED: desktop 1 of 143 failed (the keys player's mirror on Ana was saved over a three-musician
+    circle with mixed keys); the non-circle guard passed at once. UI 2 of 323 failed against the
+    screen's wiring moved unchanged into `mixToolCommands` (a desk change kept the old choice; a
+    failed command never answered the tools), the done and refused wiring tests passing at once;
+    then the console-level check of what the control shows when the answer lands, 1 of 323 failed
+    (`''`, the old mirror, instead of Keys).
+  - GREEN: `cargo test -p mixlink-desktop` 143 passed (2 new; the session's round-trip test pins
+    the two addresses); UI 323 passed (4 new); `cargo fmt` clean; clippy: no new warnings. Preview
+    (`index.html?fake#/mix`): choosing Bass, Keys and Off goes from the choice straight to the
+    desk's mirror and says it at once; save and copy still answer; no console errors.
+  - Follow-up: the fake bridge's idle circle check still compares keys as strings (not by IP, and
+    without the kept addresses).
+  - Commits: 56b82ed `fix(desktop): follow every key of each musician when checking mirror
+    circles` (about 320 changed lines); this commit (`fix(desktop-ui): clear a pending mirror
+    choice when the desk answers or changes`, about 240 plus this document).
 - [ ] T6b (presets, copy and mirror, Android): read `following` from `mix_ack` and `mix_state`
   (lenient: absent on older servers is null); while it is set say "Following <name>'s mix", show
   every channel strip's level, pan or balance, mute and solo and every group fader disabled (as
@@ -1068,6 +1154,23 @@ slice. Push and PRs are the user's decision.
   three items folded into T6); see its entry for evidence and follow-ups. Review base 39f4b32 (the
   last reviewed boundary; 67c3e7e is this document only). The slice is about 5,900 authored changed
   lines in five commits, so it is reviewed commit by commit (each under about 2,000 lines).
+- T6a was reviewed in three parts because the whole slice exceeded the reviewer's lens context
+  budget: the engine 39f4b32..38317f1 (`review-fa0392e2f0a9b62d`), the desktop session
+  38317f1..62d8ddb (`review-bad720d5ff930d4c`) and the UI 62d8ddb..d0dcdfd
+  (`review-c8654069e3cf6af8`), all approved and acknowledged; next review base d0dcdfd. Their
+  findings are fixed by T6a-fix.
+- Review `review-af815f7391283cf6` over d0dcdfd..97dcc8e (T6a-fix) approved and acknowledged; next
+  review base 97dcc8e. Both WARNINGs (R3-offline-circle-later-steps-single-key,
+  R3-pending-mirror-cleared-only-by-unseen-answer) are fixed by T6a-fix2.
+
+- Review `review-178839bd3ed80301` over 97dcc8e..aaf926b (T6a-fix2) approved and acknowledged;
+  next review base aaf926b. One WARNING kept as a known limitation (no further fix round):
+  R3-stale-kept-address-joins-musicians — with no engine running, the offline circle check joins
+  keys through the `leaderAddress`/`followerAddress` kept when a mirror was set; if an IP later
+  belongs to another musician (a new DHCP lease, or two musicians on one host), the desk can
+  refuse a valid mirror as a circle until the engine runs. The refusal is shown, nothing wrong is
+  saved, and with the engine running the engine's own check decides. Revisit if offline mirror
+  editing becomes common; the fake's offline circle check also still compares keys as strings.
 
 ## Next step
 

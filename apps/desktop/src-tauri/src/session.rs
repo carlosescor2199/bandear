@@ -15,7 +15,11 @@
 //!     },
 //!     "address:192.168.1.40:50000": {
 //!       "label": "Rack A",
-//!       "mirror": { "leader": "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b", "name": "Ana" }
+//!       "mirror": {
+//!         "leader": "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b",
+//!         "name": "Ana",
+//!         "leaderAddress": "192.168.1.30:50000"
+//!       }
 //!     }
 //!   },
 //!   "channels": [
@@ -59,7 +63,11 @@
 //!   the same way) says whose mix this musician's follows: the leader's key (`client:` or
 //!   `address:`, as above) and the name the follower's phone is told ("Following Ana's mix"). It is
 //!   given to every engine the desk starts, which puts it in force whenever the follower registers;
-//!   one that cannot be read costs only itself.
+//!   one that cannot be read costs only itself. When the leader is kept by their phone's key, the
+//!   mirror also keeps the address they had when it was set (`leaderAddress`), and when the
+//!   follower is, theirs (`followerAddress`): with no engine running these are the only way the
+//!   desk knows that a phone and an address are one musician, so a mirror that would go round in a
+//!   circle is refused whichever key each mirror was kept under. Both may be absent.
 //! - `groups` holds the engineer's groups in their order: each with the stable id every musician's
 //!   group level follows, a name and 1-based channel numbers (as the engineer numbers them). They are
 //!   applied to every engine the desk starts (see [crate::commands::start_engine]) and replaced by
@@ -207,12 +215,21 @@ pub struct MusicianEntry {
 
 /// A mirror as the desk keeps it for its follower (see [crate::commands::set_mirror]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionMirror {
     /// The leader's key: [client_key] for a phone that announced a client id, else [address_key].
     pub leader: String,
     /// The name the follower's phone is told it follows.
     #[serde(default)]
     pub name: String,
+    /// The leader's address when the mirror was set, kept when [Self::leader] is their phone's key,
+    /// so the desk knows both keys of the leader with no engine running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_address: Option<String>,
+    /// The follower's address when the mirror was set, kept when the mirror is kept under their
+    /// phone's key, so the desk knows both keys of the follower with no engine running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_address: Option<String>,
 }
 
 /// Reads an entry's `mirror` without ever failing the entry, as [lenient_engineer] does.
@@ -1773,6 +1790,8 @@ mod tests {
         SessionMirror {
             leader: leader.to_owned(),
             name: name.to_owned(),
+            leader_address: None,
+            follower_address: None,
         }
     }
 
@@ -1791,12 +1810,14 @@ mod tests {
             .set_label(Some(PHONE), ADDRESS, "Ana")
             .expect("saved");
 
+        // Both by their phones, with the addresses they had beside.
+        let bass = SessionMirror {
+            leader_address: Some("192.168.1.12:50000".to_owned()),
+            follower_address: Some(ADDRESS.to_owned()),
+            ..follows(&client_key(OTHER_PHONE), "Bass")
+        };
         session
-            .set_mirror(
-                Some(PHONE),
-                ADDRESS,
-                Some(follows(&client_key(OTHER_PHONE), "Bass")),
-            )
+            .set_mirror(Some(PHONE), ADDRESS, Some(bass.clone()))
             .expect("saved");
 
         assert_eq!(
@@ -1804,7 +1825,12 @@ mod tests {
             serde_json::json!({
                 format!("client:{PHONE}"): {
                     "label": "Ana",
-                    "mirror": { "leader": format!("client:{OTHER_PHONE}"), "name": "Bass" }
+                    "mirror": {
+                        "leader": format!("client:{OTHER_PHONE}"),
+                        "name": "Bass",
+                        "leaderAddress": "192.168.1.12:50000",
+                        "followerAddress": ADDRESS
+                    }
                 }
             }),
             "the address's mirror gave way"
@@ -1812,12 +1838,9 @@ mod tests {
         let reloaded = SessionStore::open(&directory);
         assert_eq!(
             reloaded.mirror_for(Some(PHONE), "192.168.1.99:50000"),
-            Some(follows(&client_key(OTHER_PHONE), "Bass"))
+            Some(bass.clone())
         );
-        assert_eq!(
-            reloaded.mirrors(),
-            vec![(client_key(PHONE), follows(&client_key(OTHER_PHONE), "Bass"))]
-        );
+        assert_eq!(reloaded.mirrors(), vec![(client_key(PHONE), bass)]);
         reloaded
             .set_mirror(Some(PHONE), ADDRESS, None)
             .expect("saved");

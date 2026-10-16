@@ -5,9 +5,11 @@
 // Property: `data`, mixToolsView (mixes.js) and the open musician's `address`:
 //   { address, name, mirror: { value, options, note }, copyTargets, presetTargets, presets,
 //   canUse }.
-// Method: `answered(kind, ok)` after the screen's command for `kind` ("save", "rename", "copy",
-//   "apply", "delete") was answered: a done save or rename empties its field, a done copy unticks
-//   its musicians.
+// Method: `answered(kind, ok)` after the screen's command for `kind` ("mirror", "save", "rename",
+//   "copy", "apply", "delete") was answered (the screen answers every command, see
+//   mixToolCommands): a done save or rename empties its field, a done copy unticks its musicians,
+//   and the Mirror control shows the desk's mirror again whatever the answer (a refused choice
+//   never stays on show), as it does as soon as new data changes the desk's mirror.
 // Events (bubbling, composed): `mirror-change` { leader } (an address, or null for none),
 //   `mix-copy` { to }, `preset-save` { name }, `preset-apply` { id, to }, `preset-rename` { id,
 //   name }, `preset-delete` { id } once a deletion is confirmed, `presets-load` {} to read the
@@ -16,12 +18,11 @@
 // Copy and Presets are disclosures: one panel opens under the row at a time, Escape closes it and
 // gives the focus back to its button. A musician whose mix follows another's is offered disabled,
 // with the reason beside it. Delete asks first, as a group's does: "Keep" takes Delete's place and
-// the confirming Delete only works after a short pause.
+// the confirming Delete only works after a short pause. The rules live in createMixTools
+// (mix-tools.js), tested without a browser; this element renders what it answers.
 
-import { CONFIRM_DELAY_MS, confirmReady } from "../lib/network-view.js";
+import { createMixTools } from "../lib/mix-tools.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
-
-const ARMED_FOR_MS = 10000;
 
 const styles = sheet(`
   :host {
@@ -163,11 +164,11 @@ const styles = sheet(`
 class MlMixTools extends HTMLElement {
   #data = null;
   #parts;
-  #open = null;
-  #copyTicks = new Set();
-  #applyTicks = null;
-  #armed = null;
-  #timers = [];
+  #tools = createMixTools({
+    emit: (type, detail) => emit(this, type, detail),
+    // A delete that became confirmable, or disarmed itself.
+    changed: () => this.#renderDelete(),
+  });
 
   constructor() {
     super();
@@ -182,7 +183,7 @@ class MlMixTools extends HTMLElement {
       <p class="note" id="mirror-note" data-mirror-note hidden></p>
       <section class="panel" id="copy-panel" data-for="copy" hidden>
         <h2 data-copy-title></h2>
-        <fieldset><legend>Copy to</legend><div class="choices" data-copy-choices></div></fieldset>
+        <fieldset><legend>Copy to</legend><div class="choices" data-list="copy"></div></fieldset>
         <p class="hint">Channels, pans, mutes, solos and group levels. Never their master, their phone's cap or your limit and locks.</p>
         <p class="hint" data-copy-idle hidden>Start the engine to copy a mix.</p>
         <div class="actions"><button type="button" class="primary" data-copy>Copy</button><button type="button" data-close>Close</button></div>
@@ -201,7 +202,7 @@ class MlMixTools extends HTMLElement {
           <div class="field">
             <label>Preset <select class="preset"></select></label>
           </div>
-          <fieldset><legend data-apply-legend>Apply to</legend><div class="choices" data-apply-choices></div></fieldset>
+          <fieldset><legend>Apply to</legend><div class="choices" data-list="apply"></div></fieldset>
           <div class="actions"><button type="button" class="primary" data-apply>Apply</button></div>
           <div class="field">
             <label for="rename-to">Rename to</label>
@@ -220,7 +221,7 @@ class MlMixTools extends HTMLElement {
       openers: [...root.querySelectorAll("button.open")],
       panels: [...root.querySelectorAll(".panel")],
       copyTitle: pick("[data-copy-title]"),
-      copyChoices: pick("[data-copy-choices]"),
+      copyChoices: pick('[data-list="copy"]'),
       copyIdle: pick("[data-copy-idle]"),
       copy: pick("[data-copy]"),
       saveLabel: pick("[data-save-label]"),
@@ -231,77 +232,66 @@ class MlMixTools extends HTMLElement {
       none: pick("[data-none]"),
       has: pick("[data-has]"),
       preset: pick("select.preset"),
-      applyChoices: pick("[data-apply-choices]"),
+      applyChoices: pick('[data-list="apply"]'),
       apply: pick("[data-apply]"),
       renameTo: pick("#rename-to"),
       rename: pick("[data-rename]"),
       delete: pick(".delete"),
     };
     const parts = this.#parts;
+    const tools = this.#tools;
     parts.mirror.addEventListener("change", () => {
-      const value = parts.mirror.value;
-      // "away" is the leader who is not here: it is what the mix follows, not a new choice.
-      if (value !== "away") {
-        emit(this, "mirror-change", { leader: value || null });
-      }
+      tools.chooseMirror(parts.mirror.value);
+      this.#renderMirror();
     });
     for (const opener of parts.openers) {
-      opener.addEventListener("click", () => this.#toggle(opener.dataset.panel));
+      opener.addEventListener("click", () => this.#focus(tools.toggle(opener.dataset.panel)));
     }
     for (const panel of parts.panels) {
       panel.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
           event.stopPropagation();
-          this.#toggle(null);
+          this.#focus(tools.escape());
         }
       });
     }
     for (const close of root.querySelectorAll("[data-close]")) {
-      close.addEventListener("click", () => this.#toggle(null));
+      close.addEventListener("click", () => this.#focus(tools.escape()));
     }
-    parts.copy.addEventListener("click", () => {
-      const to = [...this.#copyTicks];
-      if (this.#data?.canUse && to.length > 0) {
-        emit(this, "mix-copy", { to });
-      }
-    });
-    parts.copyChoices.addEventListener("change", (event) => {
-      this.#tick(this.#copyTicks, event.target);
-      this.#renderCopyButton();
-    });
-    parts.save.addEventListener("click", () => this.#save());
+    for (const list of [parts.copyChoices, parts.applyChoices]) {
+      list.addEventListener("change", (event) => {
+        const box = event.target;
+        if (box?.type === "checkbox") {
+          tools.tick(list.dataset.list, box.value, box.checked);
+          this.#render();
+        }
+      });
+    }
+    parts.copy.addEventListener("click", () => tools.copy());
+    parts.save.addEventListener("click", () => tools.save(parts.saveName.value));
     parts.saveName.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        this.#save();
+        tools.save(parts.saveName.value);
       }
     });
     root.querySelector("[data-load]").addEventListener("click", () => emit(this, "presets-load", {}));
     parts.preset.addEventListener("change", () => {
-      this.#disarm();
+      tools.keep();
       this.#renderPresets();
     });
-    parts.applyChoices.addEventListener("change", (event) => {
-      this.#tick(this.#applyTicks, event.target);
-      this.#renderPresets();
-    });
-    parts.apply.addEventListener("click", () => {
-      const to = [...(this.#applyTicks ?? [])];
-      if (this.#data?.canUse && parts.preset.value && to.length > 0) {
-        emit(this, "preset-apply", { id: parts.preset.value, to });
-      }
-    });
-    parts.rename.addEventListener("click", () => this.#rename());
+    parts.apply.addEventListener("click", () => tools.apply(parts.preset.value));
+    parts.rename.addEventListener("click", () => tools.rename(parts.preset.value, parts.renameTo.value));
     parts.renameTo.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        this.#rename();
+        tools.rename(parts.preset.value, parts.renameTo.value);
       }
     });
   }
 
   disconnectedCallback() {
-    this.#disarm();
+    this.#tools.dispose();
   }
 
   get data() {
@@ -309,39 +299,46 @@ class MlMixTools extends HTMLElement {
   }
 
   set data(data) {
-    if (this.#data?.address !== data.address) {
-      // Another musician's mix: nothing ticked for the last one stays ticked.
-      this.#copyTicks.clear();
-      this.#applyTicks = null;
-    }
     this.#data = data;
+    this.#tools.setData(data);
+    this.#render();
+  }
+
+  /** The screen's command for `kind` was answered (see createMixTools' `answered`). */
+  answered(kind, ok) {
+    const { clearSave, clearRename } = this.#tools.answered(kind, ok);
+    if (clearSave) {
+      this.#parts.saveName.value = "";
+    }
+    if (clearRename) {
+      this.#parts.renameTo.value = "";
+    }
+    if (this.#data) {
+      this.#render();
+    }
+  }
+
+  #render() {
     const parts = this.#parts;
+    const data = this.#data;
+    if (!data) {
+      return;
+    }
     this.#renderMirror();
     setText(parts.copyTitle, `Copy ${data.name}'s mix`);
     setText(parts.saveLabel, `Save ${data.name}'s mix as`);
-    this.#renderChoices(parts.copyChoices, data.copyTargets, this.#copyTicks, "copy");
+    this.#renderChoices(parts.copyChoices, data.copyTargets);
     parts.copyIdle.hidden = data.canUse;
-    this.#renderCopyButton();
+    reflect(parts.copy, "aria-disabled", this.#tools.copyReady() ? null : "true");
     this.#renderPresets();
   }
 
-  answered(kind, ok) {
-    if (!ok) {
+  // The Mirror control always shows the desk's mirror, or the choice on its way to the desk, also
+  // after its options were rebuilt.
+  #renderMirror() {
+    if (!this.#data) {
       return;
     }
-    if (kind === "save") {
-      this.#parts.saveName.value = "";
-    } else if (kind === "rename") {
-      this.#parts.renameTo.value = "";
-    } else if (kind === "copy") {
-      this.#copyTicks.clear();
-      if (this.#data) {
-        this.data = this.#data;
-      }
-    }
-  }
-
-  #renderMirror() {
     const { mirror } = this.#data;
     const select = this.#parts.mirror;
     const same =
@@ -361,17 +358,16 @@ class MlMixTools extends HTMLElement {
         }),
       );
     }
-    if (this.shadowRoot.activeElement !== select) {
-      select.value = mirror.value;
-    }
+    select.value = this.#tools.mirrorValue();
     reflect(select, "aria-label", `Mirror: whose mix ${this.#data.name}'s follows`);
     this.#parts.mirrorNote.hidden = mirror.note === null;
     setText(this.#parts.mirrorNote, mirror.note ?? "");
     reflect(select, "aria-describedby", mirror.note ? "mirror-note" : null);
   }
 
-  // Keeps one checkbox per target, ticked as `ticks` holds, a disabled one with its reason.
-  #renderChoices(container, targets, ticks, name) {
+  // Keeps one checkbox per target, ticked as the tools say, a disabled one with its reason.
+  #renderChoices(container, targets) {
+    const list = container.dataset.list;
     const same =
       container.children.length === targets.length &&
       targets.every((target, index) => container.children[index].dataset.address === target.address);
@@ -381,7 +377,7 @@ class MlMixTools extends HTMLElement {
           const label = document.createElement("label");
           label.className = "choice";
           label.dataset.address = target.address;
-          label.innerHTML = `<input type="checkbox" name="${name}" /><span class="text"></span><span class="why"></span>`;
+          label.innerHTML = `<input type="checkbox" /><span class="text"></span><span class="why"></span>`;
           label.querySelector("input").value = target.address;
           return label;
         }),
@@ -390,34 +386,18 @@ class MlMixTools extends HTMLElement {
     targets.forEach((target, index) => {
       const label = container.children[index];
       const box = label.querySelector("input");
-      if (target.disabled) {
-        ticks?.delete(target.address);
-      }
       box.disabled = target.disabled;
-      box.checked = Boolean(ticks?.has(target.address));
+      box.checked = this.#tools.isTicked(list, target.address);
       setText(label.querySelector(".text"), target.label);
       setText(label.querySelector(".why"), target.note ? `(${target.note})` : "");
     });
   }
 
-  #tick(ticks, box) {
-    if (!ticks || box?.type !== "checkbox") {
-      return;
-    }
-    if (box.checked) {
-      ticks.add(box.value);
-    } else {
-      ticks.delete(box.value);
-    }
-  }
-
-  #renderCopyButton() {
-    const ready = Boolean(this.#data?.canUse) && this.#copyTicks.size > 0;
-    reflect(this.#parts.copy, "aria-disabled", ready ? null : "true");
-  }
-
   #renderPresets() {
     const data = this.#data;
+    if (!data) {
+      return;
+    }
     const parts = this.#parts;
     const presets = data.presets;
     parts.presetsIdle.hidden = data.canUse;
@@ -426,7 +406,6 @@ class MlMixTools extends HTMLElement {
     parts.none.hidden = presets === null || presets.length > 0;
     parts.has.hidden = !presets || presets.length === 0;
     if (!presets || presets.length === 0) {
-      this.#disarm();
       return;
     }
     const kept = parts.preset.value;
@@ -448,19 +427,9 @@ class MlMixTools extends HTMLElement {
       );
       parts.preset.value = presets.some((preset) => preset.id === kept) ? kept : presets[0].id;
     }
-    // The open musician is ticked to begin with, unless their mix follows another's.
-    this.#applyTicks ??= new Set(
-      data.presetTargets
-        .filter((target) => target.address === data.address && !target.disabled)
-        .map((target) => target.address),
-    );
-    this.#renderChoices(parts.applyChoices, data.presetTargets, this.#applyTicks, "apply");
+    this.#renderChoices(parts.applyChoices, data.presetTargets);
     const name = this.#selectedName();
-    reflect(
-      parts.apply,
-      "aria-disabled",
-      data.canUse && this.#applyTicks.size > 0 ? null : "true",
-    );
+    reflect(parts.apply, "aria-disabled", this.#tools.applyReady(parts.preset.value) ? null : "true");
     reflect(parts.apply, "aria-label", `Apply ${name}`);
     reflect(parts.renameTo, "aria-label", `New name for ${name}`);
     this.#renderDelete();
@@ -471,40 +440,23 @@ class MlMixTools extends HTMLElement {
     return this.#data?.presets?.find((preset) => preset.id === id)?.name ?? "";
   }
 
-  #save() {
-    const name = this.#parts.saveName.value.trim();
-    if (this.#data?.canUse && name) {
-      emit(this, "preset-save", { name });
-    }
-  }
-
-  #rename() {
-    const name = this.#parts.renameTo.value.trim();
-    const id = this.#parts.preset.value;
-    if (id && name) {
-      emit(this, "preset-rename", { id, name });
-    }
-  }
-
-  #toggle(panel) {
-    const next = panel === this.#open ? null : panel;
-    const previous = this.#open;
-    this.#open = next;
+  // Opens or closes the panels as the tools say, and puts the focus where they say.
+  #focus({ focus }) {
+    const open = this.#tools.open();
     for (const opener of this.#parts.openers) {
-      reflect(opener, "aria-expanded", String(opener.dataset.panel === next));
+      reflect(opener, "aria-expanded", String(opener.dataset.panel === open));
     }
-    for (const element of this.#parts.panels) {
-      element.hidden = element.dataset.for !== next;
+    for (const panel of this.#parts.panels) {
+      panel.hidden = panel.dataset.for !== open;
     }
-    if (next === "presets" && this.#data?.presets === null) {
-      emit(this, "presets-load", {});
-    }
-    if (next) {
-      this.#parts.panels.find((element) => element.dataset.for === next).querySelector("input, select, button")?.focus();
-    } else if (previous) {
-      this.#disarm();
-      this.#renderDelete();
-      this.#parts.openers.find((opener) => opener.dataset.panel === previous)?.focus();
+    this.#renderDelete();
+    if (focus === "panel") {
+      this.#parts.panels
+        .find((panel) => panel.dataset.for === open)
+        ?.querySelector("input, select, button")
+        ?.focus();
+    } else if (focus) {
+      this.#parts.openers.find((opener) => opener.dataset.panel === focus)?.focus();
     }
   }
 
@@ -512,7 +464,7 @@ class MlMixTools extends HTMLElement {
     const slot = this.#parts.delete;
     const id = this.#parts.preset.value;
     const name = this.#selectedName();
-    const armed = this.#armed !== null && this.#armed.id === id;
+    const { armed, ready } = this.#tools.deleteState(id);
     if (!armed) {
       if (slot.dataset.state !== "idle") {
         slot.dataset.state = "idle";
@@ -520,13 +472,15 @@ class MlMixTools extends HTMLElement {
         remove.type = "button";
         remove.className = "danger";
         remove.textContent = "Delete preset";
-        remove.addEventListener("click", () => this.#arm());
+        remove.addEventListener("click", () => {
+          this.#tools.arm(this.#parts.preset.value);
+          this.#renderDelete();
+        });
         slot.replaceChildren(remove);
       }
       reflect(slot.firstElementChild, "aria-label", `Delete the preset ${name}`);
       return;
     }
-    const ready = confirmReady(this.#armed.at, performance.now());
     if (slot.dataset.state === "armed") {
       reflect(slot.querySelector(".danger"), "aria-disabled", ready ? null : "true");
       return;
@@ -538,7 +492,7 @@ class MlMixTools extends HTMLElement {
     keep.type = "button";
     keep.textContent = "Keep";
     keep.addEventListener("click", () => {
-      this.#disarm();
+      this.#tools.keep();
       this.#renderDelete();
     });
     const question = document.createElement("span");
@@ -549,9 +503,7 @@ class MlMixTools extends HTMLElement {
     confirm.textContent = "Delete";
     reflect(confirm, "aria-disabled", ready ? null : "true");
     confirm.addEventListener("click", () => {
-      if (this.#armed?.id === id && confirmReady(this.#armed.at, performance.now())) {
-        this.#disarm();
-        emit(this, "preset-delete", { id });
+      if (this.#tools.confirmDelete(id)) {
         this.#renderDelete();
       }
     });
@@ -559,26 +511,6 @@ class MlMixTools extends HTMLElement {
     prompt.append(keep, question, confirm);
     slot.replaceChildren(prompt);
     keep.focus();
-  }
-
-  #arm() {
-    this.#disarm();
-    this.#armed = { id: this.#parts.preset.value, at: performance.now() };
-    this.#timers.push(
-      setTimeout(() => this.#renderDelete(), CONFIRM_DELAY_MS),
-      setTimeout(() => {
-        this.#disarm();
-        this.#renderDelete();
-      }, ARMED_FOR_MS),
-    );
-    this.#renderDelete();
-  }
-
-  #disarm() {
-    this.#armed = null;
-    for (const timer of this.#timers.splice(0)) {
-      clearTimeout(timer);
-    }
   }
 }
 

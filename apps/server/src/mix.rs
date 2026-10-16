@@ -693,9 +693,26 @@ impl MixState {
     /// musician's ([MixState::set_following]) every channel value and group level keeps its stored
     /// value too, and only the master volume, the phone's level cap and the master mute apply. The
     /// mix returned, which the phone is acknowledged with, carries the kept values.
+    ///
+    /// The connection uses [MixState::apply_from_phone_report], which also answers the hold; the
+    /// tests use this when the hold does not matter.
+    #[cfg(test)]
     pub(crate) fn apply_from_phone(&self, update: &MixUpdate) -> Result<MixValues, String> {
+        self.apply_from_phone_report(update)
+            .map(|(values, _)| values)
+    }
+
+    /// Applies a `mix` from the musician's phone (see [MixState::apply_from_phone]), answered with
+    /// the name of the musician the mix followed while it was applied, read under the same writer
+    /// lock: what the phone's `mix_ack` carries, so it never names a hold other than the one its
+    /// values were kept under.
+    pub(crate) fn apply_from_phone_report(
+        &self,
+        update: &MixUpdate,
+    ) -> Result<(MixValues, Option<Arc<str>>), String> {
         let mut revision = self.writer.lock().expect("mix writer lock poisoned");
-        self.apply_locked(update, &mut revision, Writer::Phone)
+        let values = self.apply_locked(update, &mut revision, Writer::Phone)?;
+        Ok((values, self.following()))
     }
 
     /// Puts `preset` on this mix from the desk, as [MixState::apply] does: the preset's channels
@@ -2610,5 +2627,23 @@ mod tests {
             .apply_from_phone(&whole_phone_mix(&[10], &[30], &[true], &[false]))
             .expect("a valid mix applies");
         assert_eq!(free.channel_gains[0], 10, "the phone is free again");
+    }
+
+    #[test]
+    fn a_phones_mix_is_answered_with_the_hold_its_values_were_kept_under() {
+        let state = MixState::new(&trio());
+        let (_, free) = state
+            .apply_from_phone_report(&whole_phone_mix(&[10], &[30], &[false], &[false]))
+            .expect("a valid mix applies");
+        assert_eq!(free, None);
+        state.set_following(Some(Arc::from("Bass")));
+
+        let (values, following) = state
+            .apply_from_phone_report(&whole_phone_mix(&[90], &[30], &[false], &[false]))
+            .expect("a valid mix applies");
+
+        assert_eq!(following.as_deref(), Some("Bass"));
+        assert_eq!(values.channel_gains[0], 10, "kept under that hold");
+        assert_eq!(values, state.current());
     }
 }

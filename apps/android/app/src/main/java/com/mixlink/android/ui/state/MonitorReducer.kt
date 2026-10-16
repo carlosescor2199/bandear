@@ -236,7 +236,26 @@ private fun applyConfig(
         groupLevels = List(groups.size) { mix.groupLevels.getOrElse(it) { NEUTRAL } },
         channelDetails = details,
     )
-    return state.copy(mix = announced, moreOfMe = state.moreOfMe.fittedTo(announced).offIfHeld(announced))
+    val moreOfMe = state.moreOfMe.fittedTo(announced).offIfNewlyPaired(state.mix, state.moreOfMe.musicianChannel, announced)
+    return state.copy(mix = announced, moreOfMe = moreOfMe.offIfHeld(announced))
+}
+
+/**
+ * More of me off, saying why, when it is on and the musician's channel became part of a stereo pair
+ * with this `config` (on either side: on the second, My channel has just moved to the first). The
+ * server plays the lift it was sent, one side's, and the link it just made gives the second side the
+ * first side's level and pans the pair apart; the pair's lift would differ from what it plays, and
+ * the `mix_state` the link sends next would not match. Nothing is sent for it either (see the
+ * ViewModel): that `mix_state` carries the moved pans, which a send now would overwrite with the
+ * phone's old ones. Turned on again, More of me lifts both sides. A pair the musician's strip already
+ * was, or one elsewhere, changes nothing.
+ */
+private fun MoreOfMeUiState.offIfNewlyPaired(before: MixUiState, previousChannel: Int?, after: MixUiState): MoreOfMeUiState {
+    val channel = musicianChannel ?: return this
+    if (!enabled || previousChannel == null) return this
+    val sides = after.stripSides(channel)
+    val newlyPaired = sides.size == 2 && sides != before.stripSides(previousChannel)
+    return if (newlyPaired) copy(enabled = false, notice = MoreOfMeNotice.CHANNEL_PAIRED) else this
 }
 
 /**

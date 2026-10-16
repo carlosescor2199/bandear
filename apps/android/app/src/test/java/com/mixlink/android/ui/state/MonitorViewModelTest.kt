@@ -490,6 +490,32 @@ class MonitorViewModelTest {
             .toString()
 
     @Test
+    fun aConfigThatPairsTheMusiciansChannelWithMoreOfMeOnTurnsItOffAndSendsNothing() {
+        connected(channels = 3)
+        viewModel.setMusicianChannel(1)
+        viewModel.setMoreOfMe(true)
+        answerMixes()
+        val sent = socket().sentOfType("mix").size
+
+        announcePair()
+
+        assertEquals(0, state.moreOfMe.musicianChannel)
+        assertEquals(0, store.channel)
+        assertFalse(state.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, state.moreOfMe.notice)
+        // The link's own `mix_state` follows with the pans it moved; a send now would put the phone's
+        // old pans back over them.
+        assertEquals(sent, socket().sentOfType("mix").size)
+
+        // That push is taken as the server plays it, More of me staying off.
+        socket().receive(mixState(levels = listOf(50, 50, 50)))
+
+        assertEquals(listOf(50, 50, 50), state.mix.levels)
+        assertFalse(state.moreOfMe.enabled)
+        assertEquals(sent, socket().sentOfType("mix").size)
+    }
+
+    @Test
     fun theEngineersLimitHoldsThePhonesOwnPlaybackAndIsNeverSent() {
         connected(channels = 3)
         answerMixes()

@@ -340,6 +340,9 @@ enum class MoreOfMeNotice(val message: String) {
 
     /** The musician's mix follows another's, whose channels the server keeps, so nothing is lifted. */
     FOLLOWING("More of me is off while your mix follows another musician's"),
+
+    /** The engineer made the musician's channel part of a stereo pair; the lift the server plays is one side's. */
+    CHANNEL_PAIRED("More of me is off: your channel is now part of a stereo pair"),
 }
 
 /**

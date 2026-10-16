@@ -80,18 +80,55 @@ shown; group cards) and the Mix board's "Copy mix to…", "Mirror" and "Presets"
 
 ## Acceptance criteria
 
+Status at the close of phase 2 (T7b): every criterion is verified by automated tests; each still
+awaits the live test with the Volt and the Galaxy S23.
+
 - Renaming a channel, changing its icon, hiding it or linking a pair shows on the desktop and on
   every phone at once; a hidden channel is silent in every mix.
+  Verified by tests: engine `after_linking_a_pair_the_phone_gets_the_channel_details_before_its_moved_pans`
+  (real socket), the hidden-silence mixer and every-mix tests, `a_device_switch_restores_the_details_of_inputs_that_come_back`
+  (T3a, T3a-fix); desktop `set_channels` and status-on-`ChannelsChanged` tests and the Channels
+  screen UI tests (T3a, T4); Android `announcedDetailsNameTheStripsShowTheirKindsAndJoinPairs`,
+  `aNewConfigMidSessionRebuildsTheStripsAndKeepsTheMix`, `aPairsPanIsABalanceWrittenAsBothPansAndReadBackAsTheirMean`
+  (T3b). Pending: live test.
 - Creating, renaming, reassigning and deleting groups while running updates every phone, and no
   musician's group levels move to another group.
+  Verified by tests: engine `after_a_group_edit_the_phone_gets_the_new_config_before_its_moved_levels`
+  (real socket) and the remap and regroup tests (T2); desktop `set_groups` and edit-order tests
+  (T2, T2b); Android `announcedGroupsTagTheirChannelsAndKeepTheirLevels`. Pending: live test.
 - After a device switch, phones and newly registered phones get the live groups.
+  Verified by tests: `after_a_device_switch_a_connected_phone_is_sent_the_live_groups` and
+  `a_phone_registering_after_a_device_switch_mixes_with_the_live_groups` (T2). Pending: live test.
 - A musician keeps their label after their phone's IP changes.
+  Verified by tests: `a_musician_keeps_their_label_after_their_phones_ip_changes` (command layer),
+  `a_phone_keeps_its_label_when_its_ip_changes` (session) and the UI's "a musician's label stays on
+  screen when their phone comes back from a new IP" (T1). Pending: live test.
 - An engineer limit caps what the phone can reach; a locked channel cannot be changed from the
   phone and shows as locked there.
+  Verified by tests: engine `a_locked_channel_and_the_engineers_limit_hold_against_the_phones_whole_mix`
+  and `a_registering_phone_is_told_the_engineers_controls_before_it_sends_a_mix` (real socket,
+  T5a, T5a-fix); desktop and UI master-limit and lock tests (T5a, T5a-fix); Android
+  `aLockedChannelCannotBeChangedFromThePhone`, `aPairIsLockedAsOneStripWhenEitherSideIs`,
+  `theMusicianHearsTheLowerOfTheirCapAndTheEngineersLimit`,
+  `aLimitOnlyReportMovesThePhonesOwnCeilingWithNoMasterEdit` and the locked-label text tests (T5b,
+  T5b-fix). Pending: live test.
 - A preset can be saved from one musician and applied to another; copy and mirror behave as
   decided above.
+  Verified by tests: engine preset, copy and mirror tests with
+  `a_followers_phone_is_told_whom_it_follows_and_cannot_move_its_channels` and
+  `a_leaders_phone_change_reaches_its_follower_at_once` (real socket, T6a, T6a-fix); desktop preset,
+  copy and circle tests and the mix-tools UI tests (T6a-T6a-fix2); Android
+  `whileFollowingChannelAndGroupEditsChangeNothing`,
+  `whileFollowingOnlyTheMasterMovesAndTheAnswerBringsTheLeadersChannels` and
+  `whenFollowingStopsTheControlsAreTheMusiciansAgainAndTheMixStaysAsItWas` (T6b). Pending: live test.
 - Saving and loading a session restores channels, groups, presets and labels, and pushes the
   saved mixes to connected phones.
+  Verified by tests: the snapshot-store, save and load command tests (pushes, skipped and refused
+  musicians, controls and mirrors replaced whole) and the session-panel UI tests (T7a-T7a-fix2);
+  Android shows a pushed mix (`aPushedMixTakesTheServersValuesForTheAnnouncedChannelsAndGroups`)
+  and, on a first connect, the mix the server holds
+  (`aConfigArrivingBeforeTheOpeningMixIsSentLeavesTheServersMixAloneAndThePhoneTakesIt`, T7b).
+  Pending: live test.
 
 ## Checks
 
@@ -1219,9 +1256,45 @@ slice. Push and PRs are the user's decision.
   - Commits: 4a688ca `fix(engine): replace kept controls and mirrors in one step` (about 170 changed
     lines); this commit (`fix(desktop): read a stored unknown kind only while the session matches
     the engine`).
-- [ ] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
+- [x] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
   answer after `config`, R3-config-pairs-musician-channel-moreofme-on-unsent) and whatever the
-  phone needs to show a loaded session's pushed mix; docs. Route: delegated writer.
+  phone needs to show a loaded session's pushed mix; docs. Route: delegated writer (two bounded
+  fixes in the control channel, the reducer and the ViewModel). A loaded session's pushed mix
+  needed nothing new: it is a `mix_state`, shown through the push path since phase 1.
+  - First connect (desktop-console T3c follow-up). Found: the opening mix was read when the
+    control thread got to it, and the server's `config` follows the open at once; when `config` was
+    handled first, the opening mix carried the neutral strips `config` had just made over the
+    server's channels and groups. (With the opening mix sent first, it already carried empty lists,
+    the server kept its mix and its answer, which follows `config`, was shown.) Decided: the opening
+    mix is read on the socket's thread when the connection opens, before any of its messages is
+    handled, and only sent on the control scheduler (`ControlChannel.sendOpeningMix`, sharing
+    `outgoingMixMessage` with every other send). A phone with no channels yet sends no channel
+    values and no group levels, so the server keeps what it holds and its answer gives it to the
+    phone; the master volume, level cap and mute are the phone's own and are sent as always. A
+    reconnect still sends the phone's own mix (the phone's mix wins, as decided). The `seq` rules,
+    More of me, locks and following are unchanged (the same message builder and answer path). Known
+    window: a change the musician makes between `config` and the server's first answer (a few
+    milliseconds) is sent whole, as any change is.
+  - R3-config-pairs-musician-channel-moreofme-on-unsent. Decided: with More of me on, a `config`
+    that makes the musician's channel part of a new stereo pair (on the second side, where My channel
+    moves to the first, or on the first) turns More of me off with "More of me is off: your channel
+    is now part of a stereo pair" (`CHANNEL_PAIRED`, `offIfNewlyPaired` beside `offIfHeld`), and
+    nothing is sent: the link's own `mix_state` follows with the pans it moved, which a send would
+    overwrite with the phone's old ones, and it is then taken as the server plays it. Turned on
+    again, More of me lifts both sides. A pair the strip already was, or one elsewhere, changes
+    nothing; a `config` that drops or hides the channel still resends as before.
+  - RED: 3 of 454 failed against the T6b code: the held-scheduler first connect (the opening mix
+    was `[100, 100, 100]`, not `[]`), and the pairing tests in the reducer (More of me stayed on)
+    and the ViewModel. The plain first-connect ordering and the reconnect tests passed (they pin
+    behaviour that held). A mutant that resends when the pairing turned More of me off fails the
+    ViewModel test (one more `mix`).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 454 tests, 0 failures, 0 errors
+    (449 before: 5 new; the T3b test that expected More of me to stay on now pins the move alone);
+    no compiler warnings.
+  - Size: about 115 authored changed lines in the first commit and 90 in the second plus this
+    document.
+  - Commits: 2520b56 `fix(android): take the server's mix after the first config`; this commit
+    (`fix(android): keep More of me consistent when a link moves my channel`).
 
 ## Progress
 
@@ -1406,6 +1479,14 @@ slice. Push and PRs are the user's decision.
   review base 2b4ba22. Both WARNINGs (R3-replace-kept-not-atomic,
   R3-channel-table-stale-session-kind) are fixed by T7a-fix2.
 
+- T7b done (the phone takes the server's mix after the first `config`; More of me goes off when a
+  link pairs the musician's channel); see its entry for evidence. Phase 2's tasks are all done and
+  every acceptance criterion is verified by tests (see Acceptance criteria); the live test with
+  the Volt and the Galaxy S23 is pending for all of them. Live checklist from the follow-ups: channel
+  names, icons, hidden inputs and pairs on the phone; group edits; limits, locks and mirrors set
+  and stopped from the desk; a session saved and loaded with phones connected; a first connect to
+  a server that already holds the musician's mix (the phone shows it, no neutral strips).
+
 ## Next step
 
-T7b (session save and load, Android).
+Live test of phase 2, then PRs (stacked-to-main) on the user's approval.

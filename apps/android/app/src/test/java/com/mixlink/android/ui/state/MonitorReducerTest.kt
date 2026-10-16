@@ -421,14 +421,42 @@ class MonitorReducerTest {
 
     @Test
     fun theMusiciansChannelOnAPairsSecondSideMovesToThePair() {
-        val on = withChannels(5).after(MusicianChannelChosen(2), MoreOfMeToggled(true))
+        val remembered = withChannels(5).after(MusicianChannelChosen(2))
 
-        val paired = on.after(ConfigReceived(5, emptyList(), band))
+        val paired = remembered.after(ConfigReceived(5, emptyList(), band))
 
         assertEquals(1, paired.moreOfMe.musicianChannel)
-        assertTrue(paired.moreOfMe.enabled)
         assertNull(paired.moreOfMe.notice)
         assertEquals(listOf(1, 2), paired.moreOfMeChannels)
+    }
+
+    @Test
+    fun aConfigThatPairsTheMusiciansChannelTurnsMoreOfMeOffAndSaysWhy() {
+        // My channel on what becomes the pair's second side: it moves to the first, and the lift the
+        // server plays (one side) no longer matches the strip's (both sides).
+        val second = withChannels(5).after(MusicianChannelChosen(2), MoreOfMeToggled(true)).after(ConfigReceived(5, emptyList(), band))
+
+        assertEquals(1, second.moreOfMe.musicianChannel)
+        assertFalse(second.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, second.moreOfMe.notice)
+
+        // My channel on what becomes the pair's first side: the same.
+        val first = withChannels(5).after(MusicianChannelChosen(1), MoreOfMeToggled(true)).after(ConfigReceived(5, emptyList(), band))
+
+        assertEquals(1, first.moreOfMe.musicianChannel)
+        assertFalse(first.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_PAIRED, first.moreOfMe.notice)
+
+        // Turned on again it lifts the pair, and a config that keeps the pair as it is leaves it on.
+        val again = second.after(MoreOfMeToggled(true), ConfigReceived(5, emptyList(), band))
+
+        assertTrue(again.moreOfMe.enabled)
+        assertEquals(listOf(1, 2), again.moreOfMeChannels)
+        // A pair elsewhere leaves it alone.
+        val elsewhere = withChannels(5).after(MusicianChannelChosen(0), MoreOfMeToggled(true)).after(ConfigReceived(5, emptyList(), band))
+
+        assertTrue(elsewhere.moreOfMe.enabled)
+        assertNull(elsewhere.moreOfMe.notice)
     }
 
     @Test

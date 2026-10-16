@@ -159,6 +159,39 @@ fn circle_error(leader: &MusicianKey, follower: &MusicianKey) -> String {
     )
 }
 
+/// The mirror `book` would keep for `follower` following `leader`, shown to the follower's phone as
+/// `name` (trimmed; "another musician" when empty), with `entries` the musicians here: never on
+/// oneself (one key, or both naming the follower here) and never closing a circle with `book`.
+fn admitted(
+    book: &HashMap<BookKey, Mirror>,
+    entries: &[TargetEntry],
+    follower: &MusicianKey,
+    leader: &MusicianKey,
+    name: &str,
+) -> Result<Mirror, String> {
+    let follower_entry = entries.iter().find(|entry| names(follower, entry));
+    if BookKey::from(follower) == BookKey::from(leader)
+        || follower_entry.is_some_and(|entry| names(leader, entry))
+    {
+        return Err(format!(
+            "{} cannot follow their own mix",
+            describe_key(follower)
+        ));
+    }
+    if reaches(book, entries, leader, follower, follower_entry) {
+        return Err(circle_error(leader, follower));
+    }
+    let name = name.trim();
+    Ok(Mirror {
+        leader: leader.clone(),
+        name: Arc::from(if name.is_empty() {
+            "another musician"
+        } else {
+            name
+        }),
+    })
+}
+
 /// An address the desk or a phone named, or the error naming it.
 fn parse_address(value: &str) -> Result<SocketAddr, String> {
     value
@@ -508,42 +541,54 @@ impl TargetRegistry {
         let entries = self.read();
         {
             let mut book = self.mirror_book();
-            let follower_entry = entries.iter().find(|entry| names(follower, entry));
-            if BookKey::from(follower) == BookKey::from(leader)
-                || follower_entry.is_some_and(|entry| names(leader, entry))
-            {
-                return Err(format!(
-                    "{} cannot follow their own mix",
-                    describe_key(follower)
-                ));
-            }
-            if reaches(&book, &entries, leader, follower, follower_entry) {
-                return Err(circle_error(leader, follower));
-            }
-            let name = name.trim();
-            book.insert(
-                BookKey::from(follower),
-                Mirror {
-                    leader: leader.clone(),
-                    name: Arc::from(if name.is_empty() {
-                        "another musician"
-                    } else {
-                        name
-                    }),
-                },
-            );
+            let mirror = admitted(&book, &entries, follower, leader, name)?;
+            book.insert(BookKey::from(follower), mirror);
         }
-        // Every musician is resolved again, client id first, as a registration resolves them.
+        Ok(self.restore_mirrors(&entries))
+    }
+
+    /// Replaces every mirror the engine keeps with `kept` (the follower's key, the leader's key and
+    /// the name the follower's phone is told), as a desk loading a saved session does: a mirror kept
+    /// before and not in `kept` is forgotten, also for a musician who is not here, so it never comes
+    /// back when they register. Each of `kept` is admitted in order as [Self::keep_mirror] admits one
+    /// (never on oneself, never closing a circle with those admitted before it); a refused one is
+    /// left out and named. Then every musician here is put on their mirror, or freed from the one
+    /// they lost. Returns the musicians whose stored mix changed and the refusals.
+    pub(crate) fn replace_mirrors(
+        &self,
+        kept: &[(MusicianKey, MusicianKey, String)],
+    ) -> (Vec<SocketAddr>, Vec<String>) {
+        let entries = self.read();
+        let mut refused = Vec::new();
+        {
+            let mut book = self.mirror_book();
+            book.clear();
+            for (follower, leader, name) in kept {
+                match admitted(&book, &entries, follower, leader, name) {
+                    Ok(mirror) => {
+                        book.insert(BookKey::from(follower), mirror);
+                    }
+                    Err(error) => refused.push(error),
+                }
+            }
+        }
+        (self.restore_mirrors(&entries), refused)
+    }
+
+    /// Puts the mirror kept for each musician of `entries` in force, or none (see
+    /// [Self::restore_mirror]), resolving each client id first as a registration does, and carries
+    /// each leader's mix on. Returns the musicians whose stored mix changed, each once.
+    fn restore_mirrors(&self, entries: &[TargetEntry]) -> Vec<SocketAddr> {
         let mut changed: Vec<SocketAddr> = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
-            let (moved, copied) = self.restore_mirror(&entries, entry);
+            let (moved, copied) = self.restore_mirror(entries, entry);
             let mut moved_now = if moved {
                 vec![entry.address]
             } else {
                 Vec::new()
             };
             if copied {
-                moved_now.extend(self.propagate_from(&entries, index));
+                moved_now.extend(self.propagate_from(entries, index));
             }
             for address in moved_now {
                 if !changed.contains(&address) {
@@ -551,7 +596,7 @@ impl TargetRegistry {
                 }
             }
         }
-        Ok(changed)
+        changed
     }
 
     /// Whom each musician of `entries` follows, by IP, for those who follow anyone.
@@ -665,6 +710,33 @@ impl TargetRegistry {
         entries
             .iter()
             .filter(|entry| self.restore_kept_controls(entry))
+            .map(|entry| entry.address)
+            .collect()
+    }
+
+    /// Replaces every control the engine keeps with `kept`, as a desk loading a saved session does:
+    /// controls kept before and not in `kept` are forgotten, also for a musician who is not here, so
+    /// they never come back when that musician registers. Every musician here is resolved again,
+    /// client id first, and takes the controls now kept for them or the defaults (no limit, nothing
+    /// locked). Returns the addresses of the musicians whose stored mix changed.
+    pub(crate) fn replace_kept_controls(
+        &self,
+        kept: &[(MusicianKey, EngineerControls)],
+    ) -> Vec<SocketAddr> {
+        let entries = self.read();
+        {
+            let mut book = self
+                .controls
+                .lock()
+                .expect("engineer controls lock poisoned");
+            book.clear();
+            for (key, controls) in kept {
+                book.insert(BookKey::from(key), *controls);
+            }
+        }
+        entries
+            .iter()
+            .filter(|entry| self.replace_controls(entry))
             .map(|entry| entry.address)
             .collect()
     }
@@ -2157,5 +2229,93 @@ mod tests {
         );
         register_phone(&registry, "192.168.1.30", 50000, "Eva", Some(PHONE_A));
         assert_eq!(gains_at(&registry, "192.168.1.30:50000", 2), [30, 40]);
+    }
+
+    #[test]
+    fn replacing_the_kept_controls_forgets_those_dropped_also_for_a_phone_not_here() {
+        let registry = racks();
+        let locked = EngineerControls {
+            limit_percent: 100,
+            locked: 0b1,
+        };
+        registry.keep_controls(&MusicianKey::Client(PHONE_A.to_owned()), locked);
+        registry.keep_controls(&MusicianKey::Address(address(A)), limit(40));
+        assert_eq!(controls_at(&registry, "192.168.1.3"), limit(40));
+
+        let changed = registry.replace_kept_controls(&[
+            (MusicianKey::Address(address(B)), limit(70)),
+            (MusicianKey::Client(PHONE_B.to_owned()), limit(55)),
+        ]);
+
+        assert_eq!(
+            changed,
+            vec![address(A), address(B)],
+            "A is freed, B limited"
+        );
+        assert_eq!(
+            controls_at(&registry, "192.168.1.3"),
+            EngineerControls::default()
+        );
+        assert_eq!(controls_at(&registry, "192.168.1.4"), limit(70));
+        register_phone(&registry, "192.168.1.30", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(
+            controls_at(&registry, "192.168.1.30"),
+            EngineerControls::default(),
+            "the lock dropped while Ana's phone was away does not come back"
+        );
+        register_phone(&registry, "192.168.1.31", 50000, "Eva", Some(PHONE_B));
+        assert_eq!(
+            controls_at(&registry, "192.168.1.31"),
+            limit(55),
+            "a phone away gets the loaded controls when it registers"
+        );
+    }
+
+    #[test]
+    fn replacing_the_kept_mirrors_frees_a_follower_here_and_forgets_one_not_here() {
+        let registry = racks();
+        desk_gains(&registry, B, &[30, 40]);
+        desk_gains(&registry, C, &[70, 80]);
+        let key = |at: &str| MusicianKey::Address(address(at));
+        registry
+            .keep_mirror(&key(A), &key(B), "Bass")
+            .expect("A follows B");
+        registry
+            .keep_mirror(&MusicianKey::Client(PHONE_A.to_owned()), &key(B), "Bass")
+            .expect("kept for a phone not here");
+
+        let (changed, refused) = registry.replace_mirrors(&[
+            (key(C), key(B), "Bass".to_owned()),
+            (key(B), key(C), "Keys".to_owned()),
+            (
+                MusicianKey::Client(PHONE_B.to_owned()),
+                key(C),
+                "Keys".to_owned(),
+            ),
+        ]);
+
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("circle"), "{refused:?}");
+        assert_eq!(changed, vec![address(A), address(C)]);
+        assert_eq!(mix_at(&registry, A).following(), None, "A is freed");
+        assert_eq!(
+            gains_at(&registry, A, 2),
+            [30, 40],
+            "and keeps the mix it had"
+        );
+        assert_eq!(mix_at(&registry, C).following().as_deref(), Some("Bass"));
+        assert_eq!(gains_at(&registry, C, 2), [30, 40]);
+        let back = register_phone(&registry, "192.168.1.30", 50000, "Ana", Some(PHONE_A));
+        assert!(
+            !back.followed,
+            "the mirror dropped while Ana was away does not come back"
+        );
+        assert_eq!(mix_at(&registry, "192.168.1.30:50000").following(), None);
+        let eva = register_phone(&registry, "192.168.1.31", 50000, "Eva", Some(PHONE_B));
+        assert!(
+            eva.followed,
+            "a phone away is put on the loaded mirror when it registers"
+        );
+        assert_eq!(gains_at(&registry, "192.168.1.31:50000", 2), [30, 40]);
     }
 }

@@ -4,7 +4,7 @@
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +14,7 @@ use std::sync::Mutex;
 use personal_monitoring::{
     check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
     EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition, MirrorOutcome,
-    MirrorSource, MirrorStatus, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
-    PresetChannel,
+    MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus, PresetChannel,
 };
 
 use crate::dto::{
@@ -1815,27 +1814,27 @@ impl DeskReader for EngineHandle {
     }
 }
 
-/// What loading a session needs from the running engine, besides the group, channel and mirror
-/// edits every other command uses.
-trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + MirrorKeeper {
-    /// Keeps `controls` for the musician `key` names ([EngineHandle::keep_engineer_controls]).
-    fn keep_controls(&self, key: &MusicianKey, controls: EngineerControls) -> Result<(), String>;
-    /// Stops the mirror of the musician at `address` ([EngineHandle::set_mirror] with none).
-    fn stop_mirror(&mut self, address: &str) -> Result<(), String>;
+/// What loading a session needs from the running engine, besides the group and channel edits every
+/// other command uses.
+trait SessionEngine: DeskReader + GroupEngine + ChannelEngine {
+    /// Replaces every control and mirror the engine keeps ([EngineHandle::replace_kept]); answers
+    /// the mirrors it refused.
+    fn replace_kept(
+        &self,
+        controls: &[(MusicianKey, EngineerControls)],
+        mirrors: &[(MusicianKey, MusicianKey, String)],
+    ) -> Result<Vec<String>, String>;
     /// Changes the mix of the musician at `address` from the desk ([EngineHandle::set_mix]).
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String>;
 }
 
 impl SessionEngine for EngineHandle {
-    fn keep_controls(&self, key: &MusicianKey, controls: EngineerControls) -> Result<(), String> {
-        self.keep_engineer_controls(key, controls)
-            .map_err(|error| error.to_string())
-    }
-
-    fn stop_mirror(&mut self, address: &str) -> Result<(), String> {
-        self.set_mirror(address, None)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+    fn replace_kept(
+        &self,
+        controls: &[(MusicianKey, EngineerControls)],
+        mirrors: &[(MusicianKey, MusicianKey, String)],
+    ) -> Result<Vec<String>, String> {
+        EngineHandle::replace_kept(self, controls, mirrors).map_err(|error| error.to_string())
     }
 
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
@@ -1960,15 +1959,16 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   controls and the mirrors, so a phone that is held is held before its mix arrives; then each
 ///   saved mix is pushed through the desk's path to the musician the engine lists under the key it
 ///   was saved by (their phone's client id first, then their address), so their phone is sent it
-///   at once (`mix_state`). Only
-///   musicians who are here get it: a phone whose control channel is down is skipped, as is a saved
-///   mix with no musician here, because when a phone connects its own mix wins (as it always has);
-///   a configured target with no phone gets it, since it plays that mix. A musician who follows
+///   at once (`mix_state`). Only musicians who are here get it: a phone whose control channel is
+///   down is skipped, as is a saved mix with no musician here, because when a phone connects its
+///   own mix wins (as it always has); a configured target with no phone gets it, since it plays
+///   that mix. A push the engine refuses is named with its reason. A musician who follows
 ///   another's mix gets only their master volume and mute (their channels and groups follow the
-///   leader's). Controls and mirrors the loaded session no longer keeps are lifted from the
-///   musicians who are here; for one who is not here the engine keeps them until the next start
-///   (it cannot forget them), which then follows the session. A mirror the engine refuses (a
-///   circle) is named in the answer; the session keeps it, as a start would refuse it again.
+///   leader's). The loaded session's controls and mirrors replace every one the engine keeps
+///   ([EngineHandle::replace_kept]): one it no longer keeps is lifted from the musicians who are
+///   here and forgotten for those who are not, so it never comes back when they register. A
+///   mirror the engine refuses (on oneself, or closing a circle) is named in the answer; the
+///   session keeps it, as a start would refuse it again.
 /// - With no engine running, the session is replaced and the saved mixes go to nobody (each is
 ///   named in the answer as not pushed); the rest applies at the next start.
 /// - The audio input of the saved session applies only at the next start: the running engine is
@@ -2086,7 +2086,6 @@ fn load_session_with<E: SessionEngine>(
         // A refusal (an engine that is stopping) returns here, before anything is saved.
         Some(engine) => Some(apply_session(
             engine,
-            &previous,
             &next,
             definitions,
             details,
@@ -2156,11 +2155,10 @@ fn skipped_mix(
     }
 }
 
-/// Applies the session `next` (replacing `previous`) to a running engine, in the order
-/// [load_session] gives: channel details and groups, controls and mirrors, then the saved mixes.
+/// Applies the session `next` to a running engine, in the order [load_session] gives: groups and
+/// channel details, the engineer's controls and the mirrors, then the saved mixes.
 fn apply_session<E: SessionEngine>(
     engine: &mut E,
-    previous: &Session,
     next: &Session,
     definitions: Vec<GroupDefinition>,
     details: Vec<ChannelMeta>,
@@ -2170,109 +2168,23 @@ fn apply_session<E: SessionEngine>(
     // stopping refuses them, and then the first refusal changed nothing.
     engine.set_groups(definitions)?;
     engine.set_channels(details)?;
-    let mut refused = Vec::new();
-    let here = engine.desk().musicians;
-    for (key, controls) in controls_to_keep(previous, next, &here) {
-        if let Err(error) = engine.keep_controls(&key, controls) {
-            refused.push(format!(
-                "the limit and locks for {} were not applied: {error}",
-                who(next, &key)
-            ));
-        }
-    }
-    // A musician here whose mirror the loaded session changes or drops stops following first:
-    // the engine forgets a mirror only when it is stopped, under every key of the musician.
-    for row in &here {
-        let Some(current) = &row.mirror else {
-            continue;
-        };
-        let kept = next.mirror_for(phone_id(row.client_id.as_deref()), &row.address.to_string());
-        if !same_mirror(current, kept.as_ref()) {
-            if let Err(error) = engine.stop_mirror(&row.address.to_string()) {
-                refused.push(format!(
-                    "the mirror of {} was not stopped: {error}",
-                    row.address
-                ));
-            }
-        }
-    }
-    for (follower, leader, name) in mirrors_of(next) {
-        if let Err(error) = engine.keep_mirror(&follower, &leader, &name) {
-            refused.push(format!(
-                "{} following {}'s mix was not applied: {error}",
-                who(next, &follower),
-                who(next, &leader)
-            ));
-        }
-    }
+    // The loaded session's controls and mirrors replace the engine's whole, so one it dropped
+    // never comes back, also for a musician who is not here and registers later.
+    let refused = match engine.replace_kept(&controls_of(next), &mirrors_of(next)) {
+        Ok(refused) => refused
+            .into_iter()
+            .map(|error| format!("a saved mirror was not applied: {error}"))
+            .collect(),
+        Err(error) => vec![format!(
+            "the saved limits, locks and mirrors were not applied: {error}"
+        )],
+    };
     let desk = engine.desk();
     let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
     Ok(LiveLoad {
         pushed,
         skipped,
         refused,
-    })
-}
-
-/// How an answer names the musician `key` names: the label `session` keeps for them, else their
-/// address, else "a phone".
-fn who(session: &Session, key: &MusicianKey) -> String {
-    let label = session
-        .musicians
-        .get(&session_key(key))
-        .and_then(|entry| entry.label.clone());
-    match (label, key) {
-        (Some(label), _) => label,
-        (None, MusicianKey::Address(address)) => address.to_string(),
-        (None, MusicianKey::Client(_)) => "a phone".to_owned(),
-    }
-}
-
-/// The engineer's controls a running engine is given for a loaded session: every key either
-/// session keeps controls under, each with the loaded session's controls, or with what the loaded
-/// session resolves for that musician when it no longer keeps any under that key (the defaults; for
-/// a phone that is here, those kept for their address), so nothing the old session kept stands in
-/// for the new one. A key this build cannot read is skipped.
-fn controls_to_keep(
-    previous: &Session,
-    next: &Session,
-    here: &[MusicianStatus],
-) -> Vec<(MusicianKey, EngineerControls)> {
-    let keys: BTreeSet<String> = previous
-        .engineer_controls()
-        .into_iter()
-        .chain(next.engineer_controls())
-        .map(|(key, _)| key)
-        .collect();
-    keys.into_iter()
-        .filter_map(|key| {
-            let musician = musician_key_of(&key)?;
-            let kept = next
-                .musicians
-                .get(&key)
-                .and_then(|entry| entry.engineer.clone())
-                .or_else(|| match &musician {
-                    MusicianKey::Client(id) => here
-                        .iter()
-                        .find(|row| row.client_id.as_deref() == Some(id.as_str()))
-                        .and_then(|row| next.engineer_for(None, &row.address.to_string())),
-                    MusicianKey::Address(_) => None,
-                });
-            Some((
-                musician,
-                kept.map(|kept| engineer_controls(&kept))
-                    .unwrap_or_default(),
-            ))
-        })
-        .collect()
-}
-
-/// Whether the mirror a musician follows now is the one `kept` describes: the same leader key and
-/// the same name.
-fn same_mirror(current: &MirrorStatus, kept: Option<&SessionMirror>) -> bool {
-    kept.is_some_and(|kept| {
-        musician_key_of(&kept.leader).as_ref() == Some(&current.leader)
-            && kept.name.trim() == current.name
     })
 }
 
@@ -2849,7 +2761,20 @@ mod tests {
         log: Mutex<Vec<String>>,
         /// The mixes pushed to musicians: to whom, and the change.
         pushed: Vec<(String, MixUpdate)>,
+        /// The controls and mirrors it took whole last.
+        kept: KeptBooks,
+        /// Why it refuses to take controls and mirrors whole, when it does.
+        refuses_kept: Option<String>,
+        /// The musician whose mix it refuses to change, when it does.
+        refuses_push_to: Option<String>,
     }
+
+    /// The engineer's controls and the mirrors an engine keeps, as a load hands them over.
+    type Books = (
+        Vec<(MusicianKey, EngineerControls)>,
+        Vec<(MusicianKey, MusicianKey, String)>,
+    );
+    type KeptBooks = Mutex<Option<Books>>;
 
     impl StandInEngine {
         fn note(&self, step: String) {
@@ -3045,55 +2970,45 @@ mod tests {
         }
     }
 
-    impl MirrorKeeper for StandInEngine {
-        fn keep_mirror(
+    impl SessionEngine for StandInEngine {
+        /// Takes the controls and mirrors whole, as the engine does: every musician here follows the
+        /// mirror kept for them now, or none; a mirror on oneself is refused and named.
+        fn replace_kept(
             &self,
-            follower: &MusicianKey,
-            leader: &MusicianKey,
-            name: &str,
-        ) -> Result<(), String> {
-            self.note(format!("keep_mirror {follower:?} on {leader:?}"));
-            if follower == leader {
-                return Err("a musician cannot follow their own mix".to_owned());
+            controls: &[(MusicianKey, EngineerControls)],
+            mirrors: &[(MusicianKey, MusicianKey, String)],
+        ) -> Result<Vec<String>, String> {
+            self.note("replace_kept".to_owned());
+            if let Some(refusal) = &self.refuses_kept {
+                return Err(refusal.clone());
             }
-            for row in self.here.lock().expect("rows lock").iter_mut() {
-                if Self::names(follower, row) {
-                    row.mirror = Some(MirrorStatus {
+            *self.kept.lock().expect("kept lock") = Some((controls.to_vec(), mirrors.to_vec()));
+            let mut refused = Vec::new();
+            let mut rows = self.here.lock().expect("rows lock");
+            for row in rows.iter_mut() {
+                row.mirror = None;
+            }
+            for (follower, leader, name) in mirrors {
+                if follower == leader {
+                    refused.push(format!("{follower:?} cannot follow their own mix"));
+                    continue;
+                }
+                for row in rows.iter_mut().filter(|row| Self::names(follower, row)) {
+                    row.mirror = Some(personal_monitoring::MirrorStatus {
                         leader: leader.clone(),
-                        name: name.to_owned(),
+                        name: name.clone(),
                         leader_address: None,
                     });
                 }
             }
-            Ok(())
-        }
-    }
-
-    impl SessionEngine for StandInEngine {
-        fn keep_controls(
-            &self,
-            key: &MusicianKey,
-            controls: EngineerControls,
-        ) -> Result<(), String> {
-            self.note(format!(
-                "keep_controls {key:?} limit={} locked={:#x}",
-                controls.limit_percent, controls.locked
-            ));
-            Ok(())
-        }
-
-        fn stop_mirror(&mut self, address: &str) -> Result<(), String> {
-            self.note(format!("stop_mirror {address}"));
-            for row in self.here.lock().expect("rows lock").iter_mut() {
-                if row.address.to_string() == address {
-                    row.mirror = None;
-                }
-            }
-            Ok(())
+            Ok(refused)
         }
 
         fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
             self.note(format!("push_mix {address}"));
+            if self.refuses_push_to.as_deref() == Some(address) {
+                return Err(format!("target `{address}` is not configured"));
+            }
             self.pushed.push((address.to_owned(), update.clone()));
             Ok(MixValues {
                 revision: 11,
@@ -5027,6 +4942,16 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The controls and mirrors the stand-in took whole last; none when it took none.
+    fn kept_books(engine: &Mutex<Option<StandInEngine>>) -> Books {
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .and_then(|engine| engine.kept.lock().expect("kept lock").clone())
+            .unwrap_or_default()
+    }
+
     fn pushed_to(engine: &Mutex<Option<StandInEngine>>) -> Vec<(String, MixUpdate)> {
         engine
             .lock()
@@ -5162,15 +5087,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {step} in {log:?}"))
         };
         assert!(at("set_groups") < at("set_channels"), "{log:?}");
-        assert!(at("set_channels") < at("keep_controls"), "{log:?}");
-        assert!(at("keep_controls") < at("keep_mirror"), "{log:?}");
-        assert!(at("keep_mirror") < at("push_mix"), "{log:?}");
-        assert!(
-            log.contains(&format!(
-                "keep_controls {:?} limit=70 locked=0x2",
-                MusicianKey::Client(PHONE.to_owned())
-            )),
-            "{log:?}"
+        assert!(at("set_channels") < at("replace_kept"), "{log:?}");
+        assert!(at("replace_kept") < at("push_mix"), "{log:?}");
+        let (controls, mirrors) = kept_books(&engine);
+        assert_eq!(
+            controls,
+            vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                EngineerControls {
+                    limit_percent: 70,
+                    locked: 0b10,
+                }
+            )]
+        );
+        assert_eq!(
+            mirrors,
+            vec![(
+                MusicianKey::Address(RACK.parse().expect("an address")),
+                MusicianKey::Client(PHONE.to_owned()),
+                "Ana".to_owned()
+            )]
         );
         assert_eq!(
             outcome.mixes[1].follows.as_deref(),
@@ -5491,13 +5427,13 @@ mod tests {
     }
 
     #[test]
-    fn controls_and_mirrors_the_loaded_session_drops_are_lifted_from_musicians_here() {
-        let test = "session-load-lift";
+    fn a_load_replaces_the_engines_kept_controls_and_mirrors_with_the_loaded_ones() {
+        let test = "session-load-replace-kept";
         let (session, snapshots, engine) = desk(
             test,
             Some(StandInEngine {
                 here: Mutex::new(vec![MusicianStatus {
-                    mirror: Some(MirrorStatus {
+                    mirror: Some(personal_monitoring::MirrorStatus {
                         leader: MusicianKey::Address(RACK.parse().expect("an address")),
                         name: "Rack".to_owned(),
                         leader_address: Some(RACK.parse().expect("an address")),
@@ -5507,9 +5443,12 @@ mod tests {
                 ..StandInEngine::default()
             }),
         );
-        // The desk kept Ana's controls and mirror by her phone.
+        // The desk kept Ana's controls and mirror by her phone, and a lock for a phone not here.
         session
             .set_engineer(Some(PHONE), ANA, kept_controls(60, &[1]))
+            .expect("saved");
+        session
+            .set_engineer(Some(OTHER_PHONE), BASS_AT, kept_controls(100, &[2]))
             .expect("saved");
         session
             .set_mirror(
@@ -5518,7 +5457,7 @@ mod tests {
                 Some(kept_mirror(address_key(RACK), "Rack", None, Some(ANA))),
             )
             .expect("saved");
-        // The loaded session keeps controls for her address only, and no mirror.
+        // The loaded session keeps controls for Ana's address only, and no mirror.
         let mut loaded = layout_session(&[], 0);
         loaded.musicians.insert(
             address_key(ANA),
@@ -5531,27 +5470,36 @@ mod tests {
 
         load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
 
-        let log = log_of(&engine);
-        let ana = MusicianKey::Address(ANA.parse().expect("an address"));
-        assert!(
-            log.contains(&format!(
-                "keep_controls {:?} limit=80 locked=0x0",
-                MusicianKey::Client(PHONE.to_owned())
-            )),
-            "her phone's old controls give way to what the loaded session keeps for her: {log:?}"
+        let (controls, mirrors) = kept_books(&engine);
+        assert_eq!(
+            controls,
+            vec![(
+                MusicianKey::Address(ANA.parse().expect("an address")),
+                EngineerControls {
+                    limit_percent: 80,
+                    locked: 0,
+                }
+            )],
+            "only the loaded controls are kept: the phones' old ones, here or away, are gone"
         );
-        assert!(
-            log.contains(&format!("keep_controls {ana:?} limit=80 locked=0x0")),
-            "{log:?}"
-        );
-        assert!(
-            log.contains(&format!("stop_mirror {ANA}")),
-            "her mirror stops: {log:?}"
+        assert_eq!(mirrors, Vec::new(), "and no mirror");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .expect("running")
+                .desk()
+                .musicians[0]
+                .mirror,
+            None,
+            "Ana is freed"
         );
         assert_eq!(
             session.engineer_for(Some(PHONE), ANA),
             Some(kept_controls(80, &[]))
         );
+        assert_eq!(session.engineer_for(Some(OTHER_PHONE), BASS_AT), None);
         assert_eq!(session.mirror_for(Some(PHONE), ANA), None);
     }
 
@@ -5588,7 +5536,8 @@ mod tests {
 
         assert_eq!(outcome.refused.len(), 1, "{:?}", outcome.refused);
         assert!(
-            outcome.refused[0].starts_with("Rack following Rack's mix was not applied"),
+            outcome.refused[0].starts_with("a saved mirror was not applied: ")
+                && outcome.refused[0].contains("own mix"),
             "{:?}",
             outcome.refused
         );
@@ -5596,6 +5545,99 @@ mod tests {
             outcome.mixes.len(),
             1,
             "the rack's mix is pushed all the same"
+        );
+        assert!(outcome.saved);
+    }
+
+    #[test]
+    fn controls_and_mirrors_the_engine_refuses_are_named_and_the_mixes_still_go_out() {
+        let test = "session-load-kept-refused";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                here: Mutex::new(vec![here(RACK, None, false, MixValues::default())]),
+                refuses_kept: Some("the engine is stopping".to_owned()),
+                ..StandInEngine::default()
+            }),
+        );
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                layout_session(&[], 1),
+                &[(&address_key(RACK), saved_mix(&[60], &[], 60, false))],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert_eq!(
+            outcome.refused,
+            vec![
+                "the saved limits, locks and mirrors were not applied: the engine is stopping"
+                    .to_owned()
+            ]
+        );
+        assert_eq!(outcome.mixes.len(), 1);
+        assert!(
+            outcome.saved,
+            "the desk keeps the loaded session; a start applies it"
+        );
+    }
+
+    #[test]
+    fn a_saved_mix_the_engine_refuses_is_named_with_its_reason_and_the_others_go_out() {
+        let test = "session-load-push-refused";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                here: Mutex::new(vec![
+                    here(RACK, None, false, MixValues::default()),
+                    here(ANA, Some(PHONE), true, MixValues::default()),
+                ]),
+                refuses_push_to: Some(RACK.to_owned()),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[], 1);
+        loaded.musicians.insert(
+            address_key(RACK),
+            crate::session::MusicianEntry {
+                label: Some("Rack".to_owned()),
+                ..crate::session::MusicianEntry::default()
+            },
+        );
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                loaded,
+                &[
+                    (&address_key(RACK), saved_mix(&[60], &[], 60, false)),
+                    (&client_key(PHONE), saved_mix(&[70], &[], 70, false)),
+                ],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert_eq!(
+            outcome.skipped,
+            vec![SkippedMixDto {
+                key: address_key(RACK),
+                label: Some("Rack".to_owned()),
+                reason: "refused",
+                error: Some(format!("target `{RACK}` is not configured")),
+            }]
+        );
+        assert_eq!(
+            outcome
+                .mixes
+                .iter()
+                .map(|mix| mix.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![ANA],
+            "Ana's mix goes out all the same"
         );
         assert!(outcome.saved);
     }

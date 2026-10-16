@@ -22,6 +22,7 @@ import "./meter.js";
 import "./pan.js";
 import "./toggle.js";
 import { kindIcon, stereoIcon } from "./kind-icons.js";
+import { followingState } from "../lib/mix-tools.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
@@ -140,15 +141,15 @@ class MlChannelStrip extends HTMLElement {
     this.#data = data;
     const parts = this.#parts;
     const { label, stereo, following } = data;
-    const named = stereo ? `${label}, stereo pair` : label;
-    reflect(parts.strip, "aria-label", following ? `${named}, follows ${following}'s mix` : named);
+    const mirror = followingState(following, stereo ? `${label}, stereo pair` : label);
+    reflect(parts.strip, "aria-label", mirror.label);
     setText(parts.name, label);
     parts.name.title = label;
-    parts.follows.hidden = !following;
-    setText(parts.follows, following ? `Follows ${following}` : "");
+    parts.follows.hidden = !mirror.disabled;
+    setText(parts.follows, mirror.text);
     parts.follows.title = following ? `This mix follows ${following}'s: move ${following}'s instead` : "";
     for (const control of [parts.pan, parts.fader, parts.mute, parts.solo]) {
-      reflect(control, "disabled", Boolean(following));
+      reflect(control, "disabled", mirror.disabled);
     }
     if (kindChanged) {
       parts.kindIcon.innerHTML = kindIcon(data.kind, 14);

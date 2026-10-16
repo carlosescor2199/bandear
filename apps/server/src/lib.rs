@@ -11,6 +11,7 @@ mod output;
 mod pipeline;
 mod protocol;
 mod targets;
+mod wav;
 
 pub use capture::{list_input_devices, list_input_devices_for, AudioHost, InputDevice};
 pub use cli::{check_groups, parse_arguments, EngineConfig, GroupDefinition};
@@ -23,3 +24,4 @@ pub use health::{LinkHealth, LinkStatus};
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
 pub use targets::{MirrorStatus, MusicianKey};
+pub use wav::{SampleFormat, WavError, WavReader, WavSpec, WavTarget, WavWriter};

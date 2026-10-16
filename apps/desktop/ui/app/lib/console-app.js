@@ -92,6 +92,7 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       const outcome = await api.setEngineerControls(
         address,
         buildEngineerRequest(musician.mix, sent),
+        musician.clientId ?? null,
       );
       store.dispatch(actions.engineerApplied(address, sent, outcome));
     } catch (error) {

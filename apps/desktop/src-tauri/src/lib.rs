@@ -110,16 +110,17 @@ async fn set_channels(
 }
 
 /// Sets the engineer's limit and locked channels for one musician (`{ limitPercent?,
-/// lockedChannels? }`, the locks from CH 1 on) and answers what was done: `{ address, limitPercent,
-/// lockedChannels, keptFor, applied, saved, saveError, mix }` (see [commands::set_engineer_controls]
-/// and [dto::EngineerControlsSetDto]).
+/// lockedChannels? }`, the locks from CH 1 on; `clientId`, the row's, when the window knows it) and
+/// answers what was done: `{ address, limitPercent, lockedChannels, keptFor, applied, saved,
+/// saveError, mix }` (see [commands::set_engineer_controls] and [dto::EngineerControlsSetDto]).
 #[tauri::command]
 async fn set_engineer_controls(
     state: State<'_, DesktopState>,
     address: String,
+    client_id: Option<String>,
     controls: EngineerControlsRequest,
 ) -> Result<EngineerControlsSetDto, String> {
-    commands::set_engineer_controls(state.inner(), address, controls)
+    commands::set_engineer_controls(state.inner(), address, client_id, controls)
 }
 
 /// The engineer's whole channel table (`[{ name, kind, hidden, link }]` in channel order, details of

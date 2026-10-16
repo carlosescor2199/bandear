@@ -284,9 +284,13 @@ test("the engine API sends the engineer's controls by the names the desktop comm
     listen: async () => () => {},
   });
 
-  await api.setEngineerControls(LEAD, { limitPercent: 60 });
+  await api.setEngineerControls(LEAD, { limitPercent: 60 }, "phone-1");
+  await api.setEngineerControls(LEAD, { limitPercent: 50 });
 
-  assert.deepEqual(calls, [["set_engineer_controls", { address: LEAD, controls: { limitPercent: 60 } }]]);
+  assert.deepEqual(calls, [
+    ["set_engineer_controls", { address: LEAD, controls: { limitPercent: 60 }, clientId: "phone-1" }],
+    ["set_engineer_controls", { address: LEAD, controls: { limitPercent: 50 }, clientId: null }],
+  ]);
 });
 
 test("the engineer's edits go to set_engineer_controls one at a time, never to set_mix", async () => {
@@ -301,12 +305,14 @@ test("the engineer's edits go to set_engineer_controls one at a time, never to s
   fake.releaseAnswers();
   await until(() => Object.keys(pendingEdits(app.store.getState(), LEAD)).length === 0);
 
+  const clientId = LEAD_PHONE.slice("client:".length);
   assert.deepEqual(
     commands(fake, "set_engineer_controls").map(({ args }) => args),
     [
-      { address: LEAD, controls: { limitPercent: 70 } },
-      { address: LEAD, controls: { limitPercent: 60, lockedChannels: [false, true] } },
+      { address: LEAD, controls: { limitPercent: 70 }, clientId },
+      { address: LEAD, controls: { limitPercent: 60, lockedChannels: [false, true] }, clientId },
     ],
+    "each carries the row's client id, so a desk with no engine keeps it for the phone",
   );
   assert.equal(commands(fake, "set_mix").length, 0);
   const mix = viewMix(app.store.getState(), LEAD);
@@ -442,6 +448,34 @@ test("controls set while the fake engine is stopped are kept for the address and
   assert.equal(lead.engineerLimitPercent, 45, "kept for the phone, given back at the start");
   assert.equal(bass.lockedChannels[0], true);
   assert.ok(fake.engineerKeys().includes(LEAD_PHONE));
+});
+
+test("an idle edit for a known phone is kept for the phone, and that is what the next start gives", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_engineer_controls", { address: LEAD, controls: { limitPercent: 40 } });
+  await fake.invoke("stop_engine");
+  await fake.invoke("set_engineer_controls", {
+    address: LEAD,
+    controls: { limitPercent: 70 },
+  });
+
+  const idle = await fake.invoke("set_engineer_controls", {
+    address: LEAD,
+    controls: { lockedChannels: [true] },
+    clientId: LEAD_PHONE.slice("client:".length),
+  });
+  await fake.invoke("start_engine", { config: {} });
+
+  assert.equal(idle.keptFor, "phone");
+  assert.equal(idle.limitPercent, 40, "built on the phone's own controls");
+  assert.deepEqual(fake.engineerKeys(), [LEAD_PHONE], "those kept for the address are gone");
+  const lead = (await fake.invoke("engine_status")).musicians.find((row) => row.address === LEAD);
+  assert.equal(lead.engineerLimitPercent, 40);
+  assert.equal(lead.lockedChannels[0], true, "the start gives exactly the idle edit");
+  await assert.rejects(
+    fake.invoke("set_engineer_controls", { address: "somewhere", controls: {} }),
+    /somewhere/,
+  );
 });
 
 test("a phone back from a new IP keeps the controls the desk kept for it", async () => {

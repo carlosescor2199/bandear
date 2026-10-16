@@ -16,3 +16,4 @@ import "./mix-view.test.js";
 import "./console-app.test.js";
 import "./network-view.test.js";
 import "./engineer.test.js";
+import "./master-controls.test.js";

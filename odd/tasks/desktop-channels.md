@@ -621,6 +621,43 @@ slice. Push and PRs are the user's decision.
     in tests; not split artificially.
   - Commits: d15c36f `feat(engine): let the engineer limit and lock a musician's mix`; this commit
     (`feat(desktop): keep engineer limits and locks per musician and edit them on the mix`).
+- [x] T5a-fix (review fixes for T5a, reviews `review-0ea360ebfcf62163` over 0408441..d15c36f and
+  `review-dc5567254620fe48` over d15c36f..bd0d75b). Route: inline writer of the delegated T5a
+  worker (bounded fixes in two engine files, three desktop files and the UI).
+  - R3-reused-row-inherits-previous-occupants-locks: a row reused by another musician (a different
+    client id, or none where there was one, or the other way round) gets that musician's kept
+    controls or the defaults (`replace_controls`), never the previous occupant's; the same musician
+    still keeps theirs. `Registration` gains `controls_changed`.
+  - R3-register-restore-not-announced: when a registration changes the controls the connection
+    emits `MixChanged{Engine}`, so the phone is sent `mix_state` with `engineer_limit_percent` and
+    `locked` right after it registers, before anything else it sends is handled, and the desktop
+    follows.
+  - R3-idle-controls-shadowed-by-phone-key: `set_engineer_controls` takes the row's `clientId`
+    (the window sends it; Tauri `client_id: Option<String>`); with no engine the edit builds on the
+    controls kept for the phone and is kept under `client:<id>`, dropping the address's (the key
+    the next engine resolves first, so nothing stands in for it); without one the address must
+    parse as a musician address and is kept under its canonical `address:` key. A running engine
+    still decides the key itself. The fake bridge does the same.
+  - R3-master-limit-change-wiring-untested: the master strip's wiring moved to
+    `lib/master-controls.js` (`wireMasterControls`, `showMasterValues`), tested with stand-in faders
+    on the real slider gesture: a finished limit gesture or key press sends one
+    `engineerLimitPercent` edit and moves send none, a re-render mid-drag does not move the thumb,
+    the level and cap go out as they move.
+  - RED: engine 2 of 272 failed (`a_different_phone_at_a_reused_address_gets_its_own_controls_or_none`:
+    the other phone's mix kept them; `a_registering_phone_is_told_the_engineers_controls_before_it_sends_a_mix`:
+    no `mix_state` came); desktop 2 of 113 (`idle_controls_for_a_known_phone_are_kept_under_its_client_id_for_the_next_start`,
+    `an_idle_edit_must_name_a_musician_address`); UI 7 of 265 against a stub wiring module and the
+    old API (4 master wiring tests, the fake idle test, the API and app argument expectations).
+  - GREEN: `cargo test -p personal-monitoring` 272 passed (2 new), control tests 37 passed in three
+    runs; `cargo test -p mixlink-desktop` 113 passed (2 new); UI 265 passed (5 new, 2 expectations
+    updated); `cargo fmt` clean; clippy: no new warnings. Preview (`?fake#/mix`): PageDown x3 on
+    LIMIT gives "limit 70%" and "at most 70%", no console errors. `cargo build -p mixlink-desktop`:
+    deferred (the app is running).
+  - Size: about 175 authored changed lines in the engine commit and 330 in the desktop commit plus
+    this document.
+  - Commits: 57dd604 `fix(engine): give a new phone at a reused address its own engineer
+    controls`; this commit (`fix(desktop): keep idle engineer edits under the musician's strongest
+    key`).
 - [ ] T5b (engineer limit and locks, Android): read `engineer_limit_percent` and `locked` from
   `mix_ack` and `mix_state` (lenient: absent on older servers means no limit, nothing locked);
   show the engineer's limit apart from the phone's level cap and say the lower one wins; show a
@@ -727,10 +764,15 @@ slice. Push and PRs are the user's decision.
   neutral values and the phone cannot set them, so until T7's session load restores saved mixes the
   engineer sets them again on the desk; an earlier build that saves the session drops the
   `engineer` field; controls set with no engine are not paired (the engine locks a pair whole when
-  it applies them); a restore at registration announces no `MixChanged` (the phone's ack and the
-  next status carry it); the engine keeps the controls by IP for configured targets, so a phone
+  it applies them); the engine keeps the controls by IP for configured targets, so a phone
   that registers at such an IP without controls of its own inherits them, as it inherits the
   address's label. Rebuild the desktop app and check T5a live (deferred while the app ran).
+- T5a was reviewed in two parts because the whole slice exceeded the reviewer's lens context
+  budget: the engine part 0408441..d15c36f (`review-0ea360ebfcf62163`) and the desktop part
+  d15c36f..bd0d75b (`review-dc5567254620fe48`), both approved and acknowledged; next review base
+  bd0d75b. Their findings (R3-reused-row-inherits-previous-occupants-locks,
+  R3-register-restore-not-announced, R3-idle-controls-shadowed-by-phone-key,
+  R3-master-limit-change-wiring-untested) are fixed by T5a-fix.
 
 ## Next step
 

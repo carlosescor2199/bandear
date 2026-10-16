@@ -14,6 +14,7 @@
 import "./fader.js";
 import "./meter.js";
 import "./toggle.js";
+import { showMasterValues, wireMasterControls } from "../lib/master-controls.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
@@ -100,18 +101,8 @@ class MlMasterStrip extends HTMLElement {
       note: root.querySelector(".note"),
       mute: root.querySelector("ml-toggle"),
     };
-    for (const fader of [level, cap]) {
-      fader.addEventListener("input", (event) => {
-        this.#edit(fader.dataset.field, event.detail.value);
-      });
-    }
-    // The desk keeps every limit it is given, so only a finished gesture (or a key press) goes out.
-    limit.addEventListener("change", (event) => {
-      this.#edit(limit.dataset.field, event.detail.value);
-    });
-    this.#parts.mute.addEventListener("change", (event) => {
-      this.#edit("muted", event.detail.pressed);
-    });
+    // The limit goes out when a gesture ends, the rest as it moves (see master-controls.js).
+    wireMasterControls(this.#parts, (field, value) => this.#edit(field, value));
   }
 
   get data() {
@@ -122,12 +113,9 @@ class MlMasterStrip extends HTMLElement {
     this.#data = data;
     const parts = this.#parts;
     reflect(parts.level, "tone", data.muted ? "muted" : "accent");
-    parts.level.value = data.volume;
-    parts.cap.value = data.cap;
-    parts.limit.value = data.limit;
+    showMasterValues(parts, data);
     setText(parts.readout, data.readout);
     setText(parts.note, data.ceilingNote);
-    parts.mute.pressed = data.muted;
   }
 
   setLevels(left, right) {

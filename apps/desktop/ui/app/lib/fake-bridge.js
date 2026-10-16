@@ -719,7 +719,7 @@ export function createFakeBridge({
       // As the desktop answers: the running engine's whole table, else the session's.
       return clone(isRunning ? runningChannels : savedChannels);
     },
-    set_engineer_controls({ address, controls } = {}) {
+    set_engineer_controls({ address, controls, clientId = null } = {}) {
       const outcome = (kept, keptFor, applied, mix) => ({
         address,
         limitPercent: kept.engineerLimitPercent,
@@ -738,12 +738,22 @@ export function createFakeBridge({
         }
       };
       if (!isRunning) {
-        // As the desktop does with no engine: merged into those kept for the address, for the next
-        // start.
-        const key = `address:${address}`;
-        const kept = merge(engineerBook.get(key) ?? defaultMix());
-        engineerBook.set(key, kept);
-        return outcome(kept, "address", false, null);
+        // As the desktop does with no engine: the address must be a musician's, and the controls
+        // are merged into those kept for the musician and kept under the strongest key the window
+        // gave, the phone's (dropping the address's) else the address, for the next start.
+        if (!/:\d+$/.test(String(address ?? ""))) {
+          throw `invalid musician address \`${address}\``;
+        }
+        const phoneKey = clientId ? `client:${clientId}` : null;
+        const addressKey = `address:${address}`;
+        const kept = merge(
+          (phoneKey && engineerBook.get(phoneKey)) ?? engineerBook.get(addressKey) ?? defaultMix(),
+        );
+        if (phoneKey) {
+          engineerBook.delete(addressKey);
+        }
+        engineerBook.set(phoneKey ?? addressKey, kept);
+        return outcome(kept, phoneKey ? "phone" : "address", false, null);
       }
       const row = musicianAt(address);
       const before = mixFromDto(row);

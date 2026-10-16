@@ -614,6 +614,16 @@ slice. Push and PRs are the user's decision.
   R3-kept-groups-roundtrip-shape-unproved, R3-checkbox-reverts-while-edit-in-flight) are fixed by
   T4b.
 
+- Review `review-8f6510a3d9fdca0a` over 5cabdf2..0408441 (T4b) approved and acknowledged; next
+  review base 0408441. Folded into T7 (session work):
+  - WARNING R3-idle-channel-edit-rewrites-unknown-kinds: with no engine, `read_channel_table`
+    returns the session's table with unknown kinds already turned into `other`, and the window
+    sends it back whole, so an idle edit permanently rewrites a kind written by a newer build on
+    every entry. Keep the stored kind string through the round trip unless the engineer changes
+    that entry, and test it.
+  - SUGGESTION R3-screen-pending-hold-wiring-untested: add a screen-level test with a deferred
+    fake answer proving a clicked Shown or group box stays as clicked until the answer.
+
 ## Next step
 
 T5 (engineer limit and locks).

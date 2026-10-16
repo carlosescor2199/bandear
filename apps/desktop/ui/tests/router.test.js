@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 
 import { DEFAULT_ROUTE, ROUTES, documentTitle, resolveRoute } from "../app/lib/router.js";
 
-test("the sidebar holds the two phase-1 sections, Mix first", () => {
+test("the sidebar holds the sections built so far, in the design's order, Mix first", () => {
   assert.deepEqual(
     ROUTES.map(({ id, hash, label }) => [id, hash, label]),
     [
       ["mix", "#/mix", "Mix"],
+      ["channels", "#/channels", "Channels and groups"],
       ["network", "#/network", "Network and system"],
     ],
   );
@@ -16,6 +17,7 @@ test("the sidebar holds the two phase-1 sections, Mix first", () => {
 
 test("a hash opens its section", () => {
   assert.equal(resolveRoute("#/mix").id, "mix");
+  assert.equal(resolveRoute("#/channels").id, "channels");
   assert.equal(resolveRoute("#/network").id, "network");
 });
 

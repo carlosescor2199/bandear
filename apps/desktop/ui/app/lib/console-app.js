@@ -18,6 +18,11 @@
 // - The Network and system screen's commands: list devices, apply a driver or buffer (a
 //   restart; ASIO only on a picked driver), switch the device (live under WASAPI, a restart
 //   otherwise), add, remove and rename musicians. The window's title follows the device.
+// - The Channels and groups screen's edits (`editChannels`, `editGroups`): each replaces the whole
+//   list the desk keeps, so they go out one at a time, each built on the list the last answer
+//   gave (the whole list, details of inputs the device lacks included), or on the status's when
+//   none has been answered yet. Without either the desk does not know the list, and replacing it
+//   blindly would lose what is kept, so the edit is refused. Each answers `{ ok, message }`.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -29,7 +34,9 @@ import {
   musicianByAddress,
   pendingEdits,
 } from "./console-state.js";
+import { channelTableOf, groupDefinitionsOf } from "./channels-view.js";
 import { ASIO_NEEDS_DRIVER, audioChoice, startRequest } from "./engine-config.js";
+import { formatChannelsSet, formatGroupsSet, sentenceWithReason } from "./format.js";
 import { buildMixRequest } from "./mix.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { createStore } from "./store.js";
@@ -284,6 +291,51 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     return { ok: true };
   }
 
+  // The lists the desk keeps, as the last answer to an edit gave them; null until one answered.
+  const kept = { channels: null, groups: null };
+  // Desk edits, one at a time: each starts once the one before it was answered.
+  let editing = Promise.resolve();
+
+  // Replaces one of the lists the desk keeps with `change(list)`. `kind` names the list and how to
+  // send it, read it from a status and word the answer.
+  function editList(kind, change) {
+    const run = async () => {
+      const status = store.getState().engine.status;
+      const base = kept[kind.name] ?? (status ? kind.fromStatus(status) : null);
+      if (base === null) {
+        return { ok: false, message: sentenceWithReason(kind.refused, kind.unknown) };
+      }
+      try {
+        const outcome = await kind.send(change(base));
+        kept[kind.name] = outcome[kind.name];
+        await readStatus();
+        return { ok: true, message: kind.format(outcome) };
+      } catch (error) {
+        return { ok: false, message: sentenceWithReason(kind.refused, message(error)) };
+      }
+    };
+    const result = editing.then(run);
+    editing = result;
+    return result;
+  }
+
+  const CHANNEL_LIST = Object.freeze({
+    name: "channels",
+    fromStatus: channelTableOf,
+    send: (channels) => api.setChannels(channels),
+    format: formatChannelsSet,
+    refused: "The channel details were not changed",
+    unknown: "no engine is running, so this desk does not know them yet; start the engine first",
+  });
+  const GROUP_LIST = Object.freeze({
+    name: "groups",
+    fromStatus: groupDefinitionsOf,
+    send: (groups) => api.setGroups(groups),
+    format: formatGroupsSet,
+    refused: "The groups were not changed",
+    unknown: "no engine is running, so this desk does not know them yet; start the engine first",
+  });
+
   // The window's title follows the input device, as the old window's did.
   let title = windowTitle(initialState);
   store.subscribe((state) => {
@@ -326,6 +378,14 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     addTarget: (address) => musicianCommand(() => api.addTarget(address)),
     removeTarget: (address) => musicianCommand(() => api.removeTarget(address)),
     rename: (address, name) => musicianCommand(() => api.setMusicianName(address, name)),
+    /**
+     * Replaces the channel details with `change(details)`, a pure edit of the whole list in
+     * channel order (see channels-view.js). Answers `{ ok, message }`: the outcome in words
+     * (formatChannelsSet), or why nothing changed.
+     */
+    editChannels: (change) => editList(CHANNEL_LIST, change),
+    /** Replaces the groups with `change(groups)`, as editChannels does (see formatGroupsSet). */
+    editGroups: (change) => editList(GROUP_LIST, change),
     select(address) {
       store.dispatch(actions.select(address));
     },

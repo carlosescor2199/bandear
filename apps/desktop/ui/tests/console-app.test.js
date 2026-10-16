@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import {
+  addGroup,
+  renameChannel,
+  renameGroup,
+  setChannelKind,
+} from "../app/lib/channels-view.js";
 import { createConsoleApp } from "../app/lib/console-app.js";
 import { musicianByAddress, pendingEdits, viewMix } from "../app/lib/console-state.js";
 import { createFakeBridge, sampleStatus } from "../app/lib/fake-bridge.js";
@@ -543,4 +549,100 @@ test("once disposed, the console hears no more events", async () => {
   fake.changeFromPhone(LEAD, { volumePercent: 5 });
 
   assert.equal(app.store.getState(), state);
+});
+
+test("channel edits go out one at a time, each built on what the last one left", async () => {
+  const { fake, app } = await connected();
+  fake.holdAnswers("set_channels");
+
+  const first = app.editChannels((table) => renameChannel(table, 0, "Kick in", 6));
+  const second = app.editChannels((table) => setChannelKind(table, 1, "percussion", 6));
+  await settle();
+  assert.equal(commands(fake, "set_channels").length, 1, "the second waits for the first's answer");
+  fake.releaseAnswers();
+  await until(() => commands(fake, "set_channels").length === 2);
+  fake.releaseAnswers();
+
+  assert.deepEqual(await first, { ok: true, message: "Channel details applied to every phone." });
+  assert.deepEqual(await second, { ok: true, message: "Channel details applied to every phone." });
+  const [kick, snare] = app.store.getState().engine.status.channels;
+  assert.equal(kick.name, "Kick in");
+  assert.equal(snare.kind, "percussion", "the second edit kept the first one's name");
+  app.dispose();
+});
+
+test("a channel edit the desk refuses says why and sends nothing", async () => {
+  const { fake, app } = await connected();
+
+  const result = await app.editChannels((table) => renameChannel(table, 0, "x".repeat(40), 6));
+
+  assert.deepEqual(result, {
+    ok: false,
+    message: "The channel details were not changed: the name of CH 1 is longer than 32 characters.",
+  });
+  assert.equal(commands(fake, "set_channels").length, 0);
+  fake.failNext("set_channels", "the engine is stopping");
+  assert.deepEqual(
+    await app.editChannels((table) => renameChannel(table, 0, "Kick in", 6)),
+    { ok: false, message: "The channel details were not changed: the engine is stopping." },
+  );
+  app.dispose();
+});
+
+test("details of inputs a smaller device lacks survive an edit made while it is in use", async () => {
+  const { app } = await connected();
+  await app.editChannels((table) => renameChannel(table, 5, "Backing vox 2", 6));
+
+  await app.switchDevice("Microphone (USB audio)");
+  await app.editChannels((table) => renameChannel(table, 0, "Kick in", 2));
+  await app.switchDevice("Demo interface");
+
+  assert.deepEqual(
+    app.store.getState().engine.status.channels.map((channel) => channel.name),
+    ["Kick in", "Snare", "Overheads", "Bass", "Lead vox", "Backing vox 2"],
+  );
+  app.dispose();
+});
+
+test("group edits answer in words and the new groups show at once", async () => {
+  const { app } = await connected();
+
+  const result = await app.editGroups((groups) => addGroup(groups));
+
+  assert.deepEqual(result, { ok: true, message: "Groups applied to every phone." });
+  assert.deepEqual(
+    app.store.getState().engine.status.groups.map((group) => group.name),
+    ["Drums", "Vocals", "Group 3"],
+  );
+  assert.deepEqual(await app.editGroups((groups) => renameGroup(groups, "vocals", " ")), {
+    ok: false,
+    message: "The groups were not changed: a group needs a name.",
+  });
+  app.dispose();
+});
+
+test("with no engine running, an edit is kept for the next start once the desk knows the list", async () => {
+  const fake = createFakeBridge();
+  const app = createConsoleApp({ bridge: fake, autoStart: false });
+  await app.ready;
+
+  assert.deepEqual(await app.editGroups((groups) => addGroup(groups)), {
+    ok: false,
+    message:
+      "The groups were not changed: no engine is running, so this desk does not know them yet; start the engine first.",
+  });
+  assert.equal(commands(fake, "set_groups").length, 0, "the kept groups are not replaced blindly");
+
+  await app.start();
+  await app.editGroups((groups) => renameGroup(groups, "vocals", "Voices"));
+  await app.stop();
+  assert.deepEqual(await app.editGroups((groups) => addGroup(groups)), {
+    ok: true,
+    message: "Groups saved; they apply at the next start.",
+  });
+  assert.deepEqual(
+    commands(fake, "set_groups").at(-1).args.groups.map((group) => group.name),
+    ["Drums", "Voices", "Group 3"],
+  );
+  app.dispose();
 });

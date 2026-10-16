@@ -23,6 +23,21 @@ export const CHANNEL_KINDS = Object.freeze([
   "other",
 ]);
 
+/** Each instrument kind as the console names it. */
+export const KIND_LABELS = Object.freeze({
+  voice: "Voice",
+  guitar: "Guitar",
+  bass: "Bass",
+  keys: "Keys",
+  drums: "Drums",
+  percussion: "Percussion",
+  horns: "Horns",
+  strings: "Strings",
+  playback: "Playback",
+  click: "Click",
+  other: "Other",
+});
+
 /** The longest channel name the engine takes, in characters. */
 export const MAX_CHANNEL_NAME_LENGTH = 32;
 
@@ -38,6 +53,26 @@ export function defaultChannel() {
 export function channelLabel(channel) {
   const name = String(channel.name ?? "").trim();
   return name || `CH ${channel.number}`;
+}
+
+/**
+ * A device's inputs as the console treats them, left to right: `[first, second]` for a stereo pair
+ * (a link to a next input that is shown or hidden alike), else `[index]`. `channels` are a
+ * status's channels (or details) in channel order; hidden inputs make units too.
+ */
+export function pairUnits(channels) {
+  const units = [];
+  for (let index = 0; index < channels.length; index += 1) {
+    const channel = channels[index];
+    const next = channels[index + 1];
+    if (channel.link && next && Boolean(next.hidden) === Boolean(channel.hidden)) {
+      units.push([index, index + 1]);
+      index += 1;
+    } else {
+      units.push([index]);
+    }
+  }
+  return units;
 }
 
 /**

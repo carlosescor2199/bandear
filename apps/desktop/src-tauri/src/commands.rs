@@ -4,7 +4,7 @@
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,19 +14,24 @@ use std::sync::Mutex;
 use personal_monitoring::{
     check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
     EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition, MirrorOutcome,
-    MirrorSource, MixPreset, MixValues, MusicianKey, MusicianStatus, PresetChannel,
+    MirrorSource, MirrorStatus, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
+    PresetChannel,
 };
 
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
-    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MetersDto, MirrorRequest,
-    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, StartRequest, StartSummary,
+    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, LoadedMixDto, MetersDto,
+    MirrorRequest, MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto,
+    SessionLoadedDto, SessionSavedDto, SkippedMixDto, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
 use crate::session::{
-    SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionMirror, SessionPreset,
-    SessionPresetChannel, SessionPresetMix, SessionStore,
+    address_key, client_key, Session, SessionAudio, SessionChannel, SessionEngineer, SessionGroup,
+    SessionMirror, SessionPreset, SessionPresetChannel, SessionPresetMix, SessionStore,
+};
+use crate::sessions::{
+    SessionMix, SnapshotRead, SnapshotStore, SnapshotSummary, SESSIONS_DIRECTORY,
 };
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
@@ -53,17 +58,22 @@ pub struct DesktopState {
     pump: Mutex<Option<EventPump>>,
     start_pump: Option<PumpStarter>,
     session: SessionStore,
+    /// The engineer's named sessions, in the `sessions` folder beside the session file (see
+    /// [crate::sessions]).
+    snapshots: SnapshotStore,
 }
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
     pub fn new(session: SessionStore) -> Self {
+        let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
         Self {
             engine: Mutex::new(None),
             run: AtomicU64::new(0),
             pump: Mutex::new(None),
             start_pump: None,
             session,
+            snapshots,
         }
     }
 
@@ -195,6 +205,11 @@ fn session_channels(session: &SessionStore) -> Vec<ChannelMeta> {
 /// the phone's client id and an `address:` key as that address. A limit above 100 reads as 100 and
 /// a channel number outside 1-32 is left out; a key this build cannot read is skipped and logged.
 fn session_engineer_controls(session: &SessionStore) -> Vec<(MusicianKey, EngineerControls)> {
+    controls_of(&session.current())
+}
+
+/// [session_engineer_controls] of a whole session, the one kept or one being loaded.
+fn controls_of(session: &Session) -> Vec<(MusicianKey, EngineerControls)> {
     session
         .engineer_controls()
         .into_iter()
@@ -226,6 +241,11 @@ fn musician_key_of(key: &str) -> Option<MusicianKey> {
 /// phone is told. A mirror whose follower or leader key this build cannot read is skipped and
 /// logged.
 fn session_mirrors(session: &SessionStore) -> Vec<(MusicianKey, MusicianKey, String)> {
+    mirrors_of(&session.current())
+}
+
+/// [session_mirrors] of a whole session, the one kept or one being loaded.
+fn mirrors_of(session: &Session) -> Vec<(MusicianKey, MusicianKey, String)> {
     session
         .mirrors()
         .into_iter()
@@ -1737,6 +1757,598 @@ fn session_audio(settings: AudioSettingsRequest) -> Result<SessionAudio, String>
     })
 }
 
+/// What went wrong or changed when the desk opened its session (a damaged section set aside, a
+/// damaged file moved aside, a session from a newer MixLink left alone, labels imported), for the
+/// window to say; `None` when it simply loaded (see [SessionStore::notice]).
+pub fn session_notice(state: &DesktopState) -> Option<String> {
+    state.session.notice()
+}
+
+/// The engineer's saved sessions, the newest first, each with why it cannot be loaded when it
+/// cannot (see [crate::sessions]).
+pub fn sessions(state: &DesktopState) -> Result<Vec<SnapshotSummary>, String> {
+    state.snapshots.list()
+}
+
+/// What a session save or load reads of the running engine: the device's input count, the ids of
+/// the live groups in their order (every musician's group levels are placed by them) and every
+/// musician the engine lists, with their mix, their phone's client id and whom they follow.
+struct DeskView {
+    inputs: usize,
+    groups: Vec<String>,
+    musicians: Vec<MusicianStatus>,
+}
+
+/// Reads the running engine for a session save or load: the engine in the app, a stand-in in the
+/// tests.
+trait DeskReader {
+    fn desk(&self) -> DeskView;
+}
+
+impl DeskReader for EngineHandle {
+    fn desk(&self) -> DeskView {
+        let status = self.status();
+        DeskView {
+            inputs: usize::from(status.source_channels),
+            groups: status.groups.into_iter().map(|group| group.id).collect(),
+            musicians: status.musicians,
+        }
+    }
+}
+
+/// What loading a session needs from the running engine, besides the group, channel and mirror
+/// edits every other command uses.
+trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + MirrorKeeper {
+    /// Keeps `controls` for the musician `key` names ([EngineHandle::keep_engineer_controls]).
+    fn keep_controls(&self, key: &MusicianKey, controls: EngineerControls) -> Result<(), String>;
+    /// Stops the mirror of the musician at `address` ([EngineHandle::set_mirror] with none).
+    fn stop_mirror(&mut self, address: &str) -> Result<(), String>;
+    /// Changes the mix of the musician at `address` from the desk ([EngineHandle::set_mix]).
+    fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String>;
+}
+
+impl SessionEngine for EngineHandle {
+    fn keep_controls(&self, key: &MusicianKey, controls: EngineerControls) -> Result<(), String> {
+        self.keep_engineer_controls(key, controls)
+            .map_err(|error| error.to_string())
+    }
+
+    fn stop_mirror(&mut self, address: &str) -> Result<(), String> {
+        self.set_mirror(address, None)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
+        self.set_mix(address, update)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The key the desk keeps what it knows about the musician on `row` under: their phone's client id
+/// when it announced one, else their address as the status writes it.
+fn row_key(row: &MusicianStatus) -> String {
+    match phone_id(row.client_id.as_deref()) {
+        Some(id) => client_key(id),
+        None => address_key(&row.address.to_string()),
+    }
+}
+
+/// Every musician's mix as a named session keeps it (see [crate::sessions::SessionMix]), under the
+/// key the desk keeps the musician under: the level, pan, mute and solo of the device's inputs,
+/// the group levels by group id, the master volume and the master mute. Never the phone's own
+/// level cap.
+fn saved_mixes(desk: &DeskView) -> BTreeMap<String, SessionMix> {
+    desk.musicians
+        .iter()
+        .map(|row| {
+            let mix = &row.mix;
+            let inputs = desk.inputs.min(mix.channel_gains.len());
+            let saved = SessionMix {
+                channels: (0..inputs)
+                    .map(|channel| SessionPresetChannel {
+                        gain: mix.channel_gains[channel],
+                        pan: mix.pans[channel],
+                        muted: mix.channel_muted[channel],
+                        solo: mix.channel_solo[channel],
+                    })
+                    .collect(),
+                groups: desk
+                    .groups
+                    .iter()
+                    .zip(mix.group_levels)
+                    .map(|(id, level)| (id.clone(), level))
+                    .collect(),
+                volume_percent: mix.volume_percent,
+                muted: mix.muted,
+            };
+            (row_key(row), saved)
+        })
+        .collect()
+}
+
+/// Saves the desk's whole session as a named session called `name` (trimmed, at most 40
+/// characters, no other saved session's name in any case), with every musician's mix when an
+/// engine runs, and answers what was saved ([SessionSavedDto]).
+///
+/// The session is everything the desk keeps (labels, the engineer's controls and mirrors, channel
+/// details, groups, presets and the audio input); each musician's mix is read from the running
+/// engine under the key the desk keeps them by (see [saved_mixes]). With no engine running the
+/// session is saved without mixes. A refused name, or a save that fails, saves nothing.
+pub fn save_session(state: &DesktopState, name: String) -> Result<SessionSavedDto, String> {
+    let outcome = save_session_with(&state.engine, &state.session, &state.snapshots, &name)?;
+    println!(
+        "[mixlink-desktop] save_session: \"{}\" ({}) with {} mixes",
+        outcome.session.name, outcome.session.id, outcome.session.mixes
+    );
+    Ok(outcome)
+}
+
+/// [save_session] over any engine slot, session and folder of named sessions.
+fn save_session_with<E: DeskReader>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    snapshots: &SnapshotStore,
+    name: &str,
+) -> Result<SessionSavedDto, String> {
+    // The mixes and the session are read under the engine lock (the session's inside it), so no
+    // edit lands between them.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let desk = guard.as_ref().map(DeskReader::desk);
+    let mixes = desk.as_ref().map(saved_mixes).unwrap_or_default();
+    let saved = snapshots.save(name, session.current(), mixes, |taken| new_id('s', taken))?;
+    Ok(SessionSavedDto {
+        session: saved,
+        engine_running: desk.is_some(),
+    })
+}
+
+/// Renames the saved session `id` (the name checked as [save_session] checks it) and answers it as
+/// listed. Only its name changes; one that cannot be loaded is not renamed.
+pub fn rename_session(
+    state: &DesktopState,
+    id: String,
+    name: String,
+) -> Result<SnapshotSummary, String> {
+    let renamed = state.snapshots.rename(&id, &name)?;
+    println!(
+        "[mixlink-desktop] rename_session: {id} -> \"{}\"",
+        renamed.name
+    );
+    Ok(renamed)
+}
+
+/// Deletes the saved session `id`, whether or not it can be read. The window asks the engineer to
+/// confirm first.
+pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
+    state.snapshots.delete(&id)?;
+    println!("[mixlink-desktop] delete_session: {id}");
+    Ok(())
+}
+
+/// Loads the saved session `id`: it replaces the desk's session (labels, the engineer's controls
+/// and mirrors, channel details, groups, presets and the audio input) and, with an engine running,
+/// is applied live. Answers what was applied, saved and skipped ([SessionLoadedDto]).
+///
+/// - Before anything changes, the saved groups and channel details are checked as the engine
+///   checks them, and a session file this build must not replace (one a newer MixLink wrote) is
+///   refused: an error, and nothing changed. A section of the saved session that cannot be read is
+///   left out (it loads empty) and named in the answer.
+/// - With an engine running, in this order: the groups and the channel details, as a start applies
+///   them (every phone is sent its `config` before any mix the change moves); then the engineer's
+///   controls and the mirrors, so a phone that is held is held before its mix arrives; then each
+///   saved mix is pushed through the desk's path to the musician the engine lists under the key it
+///   was saved by (their phone's client id first, then their address), so their phone is sent it
+///   at once (`mix_state`). Only
+///   musicians who are here get it: a phone whose control channel is down is skipped, as is a saved
+///   mix with no musician here, because when a phone connects its own mix wins (as it always has);
+///   a configured target with no phone gets it, since it plays that mix. A musician who follows
+///   another's mix gets only their master volume and mute (their channels and groups follow the
+///   leader's). Controls and mirrors the loaded session no longer keeps are lifted from the
+///   musicians who are here; for one who is not here the engine keeps them until the next start
+///   (it cannot forget them), which then follows the session. A mirror the engine refuses (a
+///   circle) is named in the answer; the session keeps it, as a start would refuse it again.
+/// - With no engine running, the session is replaced and the saved mixes go to nobody (each is
+///   named in the answer as not pushed); the rest applies at the next start.
+/// - The audio input of the saved session applies only at the next start: the running engine is
+///   never restarted. It is taken only as the engineer could choose it (a known driver, and ASIO
+///   only with the ASIO driver the engineer picked); one that is not is skipped and said, and the
+///   desk keeps its own, as it does when the saved session has none.
+///
+/// The load is one step under the engine lock, with the session's inside it. A save that fails
+/// after the engine took the session is reported in the answer, not as an error.
+pub fn load_session(state: &DesktopState, id: String) -> Result<SessionLoadedDto, String> {
+    let outcome = load_session_with(&state.engine, &state.session, &state.snapshots, &id)?;
+    println!(
+        "[mixlink-desktop] load_session: \"{}\" ({id}) applied={} saved={} pushed={} skipped={} refused={}",
+        outcome.session.name,
+        outcome.applied,
+        outcome.saved,
+        outcome.mixes.len(),
+        outcome.skipped.len(),
+        outcome.refused.len()
+    );
+    for line in outcome.damaged.iter().chain(&outcome.refused) {
+        eprintln!("[mixlink-desktop] load_session: {line}");
+    }
+    Ok(outcome)
+}
+
+/// The engine's definitions of a session's groups.
+fn definitions_of(groups: &[SessionGroup]) -> Vec<GroupDefinition> {
+    groups
+        .iter()
+        .map(|group| GroupDefinition {
+            id: group.id.clone(),
+            name: group.name.clone(),
+            channels: group.channels.clone(),
+        })
+        .collect()
+}
+
+/// The engine's details of a session's channels, a kind this build does not know as
+/// [ChannelKind::Other] (see [session_channels]).
+fn details_of(channels: &[SessionChannel]) -> Vec<ChannelMeta> {
+    channels
+        .iter()
+        .map(|channel| ChannelMeta {
+            name: channel.name.clone(),
+            kind: ChannelKind::from_name(&channel.kind).unwrap_or_default(),
+            hidden: channel.hidden,
+            linked_to_next: channel.link,
+        })
+        .collect()
+}
+
+/// The audio input a loaded session leaves the desk with: the saved session's when the engineer
+/// could have chosen it (see [session_audio]: a known driver, and ASIO only with a picked driver),
+/// else `current`, with why the saved one was skipped. Answers the audio input, whether it is the
+/// saved session's, and the reason it was skipped.
+fn loaded_audio(
+    saved: Option<SessionAudio>,
+    current: Option<SessionAudio>,
+) -> (Option<SessionAudio>, bool, Option<String>) {
+    let Some(saved) = saved else {
+        return (current, false, None);
+    };
+    let request = AudioSettingsRequest {
+        host: saved.host,
+        device: saved.device,
+        buffer_frames: saved.buffer_frames,
+        asio_driver: saved.asio_driver,
+    };
+    match session_audio(request) {
+        Ok(audio) => (Some(audio), true, None),
+        Err(why) => (current, false, Some(why)),
+    }
+}
+
+/// [load_session] over any engine slot, session and folder of named sessions.
+fn load_session_with<E: SessionEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    snapshots: &SnapshotStore,
+    id: &str,
+) -> Result<SessionLoadedDto, String> {
+    let SnapshotRead {
+        id,
+        snapshot,
+        damaged,
+    } = snapshots.read(id)?;
+    let definitions = definitions_of(&snapshot.session.groups);
+    check_groups(&definitions)
+        .map_err(|error| format!("the saved groups cannot be used: {error}"))?;
+    let details = details_of(&snapshot.session.channels);
+    check_channels(&details)
+        .map_err(|error| format!("the saved channel details cannot be used: {error}"))?;
+    let summary = SnapshotSummary {
+        id: id.clone(),
+        name: snapshot.name.clone(),
+        saved_at: snapshot.saved_at,
+        mixes: snapshot.mixes.len(),
+        problem: None,
+    };
+    // One step, in the lock order every command that holds both follows (see [edit_groups]).
+    let mut guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    // A session the desk must not replace refuses the load before the engine takes anything.
+    session.check_saves()?;
+    let previous = session.current();
+    let (audio, audio_loaded, audio_skipped) =
+        loaded_audio(snapshot.session.audio.clone(), previous.audio.clone());
+    let next = Session {
+        audio: audio.clone(),
+        ..snapshot.session.clone()
+    };
+    let live = match guard.as_mut() {
+        // A refusal (an engine that is stopping) returns here, before anything is saved.
+        Some(engine) => Some(apply_session(
+            engine,
+            &previous,
+            &next,
+            definitions,
+            details,
+            &snapshot.mixes,
+        )?),
+        None => None,
+    };
+    let applied = live.is_some();
+    let save_error = match session.replace(next.clone()) {
+        Ok(()) => None,
+        // The engine already runs the loaded session: say that it was not kept.
+        Err(error) if applied => Some(error),
+        // Nothing took it, so nothing changed.
+        Err(error) => return Err(error),
+    };
+    let (mixes, skipped, refused) = match live {
+        Some(live) => (live.pushed, live.skipped, live.refused),
+        None => (
+            Vec::new(),
+            snapshot
+                .mixes
+                .keys()
+                .map(|key| skipped_mix(&next, key, "notRunning", None))
+                .collect(),
+            Vec::new(),
+        ),
+    };
+    Ok(SessionLoadedDto {
+        session: summary,
+        applied,
+        saved: save_error.is_none(),
+        save_error,
+        mixes,
+        skipped,
+        refused,
+        damaged,
+        audio,
+        audio_loaded,
+        audio_skipped,
+        presets: next.presets,
+    })
+}
+
+/// What a running engine did with a loaded session.
+struct LiveLoad {
+    pushed: Vec<LoadedMixDto>,
+    skipped: Vec<SkippedMixDto>,
+    refused: Vec<String>,
+}
+
+/// A saved mix that went to nobody, named by the musician's key and the label `session` keeps for
+/// them.
+fn skipped_mix(
+    session: &Session,
+    key: &str,
+    reason: &'static str,
+    error: Option<String>,
+) -> SkippedMixDto {
+    SkippedMixDto {
+        key: key.to_owned(),
+        label: session
+            .musicians
+            .get(key)
+            .and_then(|entry| entry.label.clone()),
+        reason,
+        error,
+    }
+}
+
+/// Applies the session `next` (replacing `previous`) to a running engine, in the order
+/// [load_session] gives: channel details and groups, controls and mirrors, then the saved mixes.
+fn apply_session<E: SessionEngine>(
+    engine: &mut E,
+    previous: &Session,
+    next: &Session,
+    definitions: Vec<GroupDefinition>,
+    details: Vec<ChannelMeta>,
+    mixes: &BTreeMap<String, SessionMix>,
+) -> Result<LiveLoad, String> {
+    // In the order a start applies them. Both were checked already, so only an engine that is
+    // stopping refuses them, and then the first refusal changed nothing.
+    engine.set_groups(definitions)?;
+    engine.set_channels(details)?;
+    let mut refused = Vec::new();
+    let here = engine.desk().musicians;
+    for (key, controls) in controls_to_keep(previous, next, &here) {
+        if let Err(error) = engine.keep_controls(&key, controls) {
+            refused.push(format!(
+                "the limit and locks for {} were not applied: {error}",
+                who(next, &key)
+            ));
+        }
+    }
+    // A musician here whose mirror the loaded session changes or drops stops following first:
+    // the engine forgets a mirror only when it is stopped, under every key of the musician.
+    for row in &here {
+        let Some(current) = &row.mirror else {
+            continue;
+        };
+        let kept = next.mirror_for(phone_id(row.client_id.as_deref()), &row.address.to_string());
+        if !same_mirror(current, kept.as_ref()) {
+            if let Err(error) = engine.stop_mirror(&row.address.to_string()) {
+                refused.push(format!(
+                    "the mirror of {} was not stopped: {error}",
+                    row.address
+                ));
+            }
+        }
+    }
+    for (follower, leader, name) in mirrors_of(next) {
+        if let Err(error) = engine.keep_mirror(&follower, &leader, &name) {
+            refused.push(format!(
+                "{} following {}'s mix was not applied: {error}",
+                who(next, &follower),
+                who(next, &leader)
+            ));
+        }
+    }
+    let desk = engine.desk();
+    let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
+    Ok(LiveLoad {
+        pushed,
+        skipped,
+        refused,
+    })
+}
+
+/// How an answer names the musician `key` names: the label `session` keeps for them, else their
+/// address, else "a phone".
+fn who(session: &Session, key: &MusicianKey) -> String {
+    let label = session
+        .musicians
+        .get(&session_key(key))
+        .and_then(|entry| entry.label.clone());
+    match (label, key) {
+        (Some(label), _) => label,
+        (None, MusicianKey::Address(address)) => address.to_string(),
+        (None, MusicianKey::Client(_)) => "a phone".to_owned(),
+    }
+}
+
+/// The engineer's controls a running engine is given for a loaded session: every key either
+/// session keeps controls under, each with the loaded session's controls, or with what the loaded
+/// session resolves for that musician when it no longer keeps any under that key (the defaults; for
+/// a phone that is here, those kept for their address), so nothing the old session kept stands in
+/// for the new one. A key this build cannot read is skipped.
+fn controls_to_keep(
+    previous: &Session,
+    next: &Session,
+    here: &[MusicianStatus],
+) -> Vec<(MusicianKey, EngineerControls)> {
+    let keys: BTreeSet<String> = previous
+        .engineer_controls()
+        .into_iter()
+        .chain(next.engineer_controls())
+        .map(|(key, _)| key)
+        .collect();
+    keys.into_iter()
+        .filter_map(|key| {
+            let musician = musician_key_of(&key)?;
+            let kept = next
+                .musicians
+                .get(&key)
+                .and_then(|entry| entry.engineer.clone())
+                .or_else(|| match &musician {
+                    MusicianKey::Client(id) => here
+                        .iter()
+                        .find(|row| row.client_id.as_deref() == Some(id.as_str()))
+                        .and_then(|row| next.engineer_for(None, &row.address.to_string())),
+                    MusicianKey::Address(_) => None,
+                });
+            Some((
+                musician,
+                kept.map(|kept| engineer_controls(&kept))
+                    .unwrap_or_default(),
+            ))
+        })
+        .collect()
+}
+
+/// Whether the mirror a musician follows now is the one `kept` describes: the same leader key and
+/// the same name.
+fn same_mirror(current: &MirrorStatus, kept: Option<&SessionMirror>) -> bool {
+    kept.is_some_and(|kept| {
+        musician_key_of(&kept.leader).as_ref() == Some(&current.leader)
+            && kept.name.trim() == current.name
+    })
+}
+
+/// The desk's change that puts the `saved` mix on a musician whose mix is `current`, placed for the
+/// live groups `groups` (their ids in order): each saved input from CH 1 on, every live group's
+/// level by its id (a live group the saved mix does not name keeps its own), the master volume and
+/// the master mute. For a musician who `follows` another's mix only the master volume and mute: the
+/// rest follows the leader. The phone's own level cap and the engineer's controls are left alone.
+fn saved_update(
+    saved: &SessionMix,
+    current: &MixValues,
+    groups: &[String],
+    follows: bool,
+) -> MixUpdate {
+    let master = MixUpdate {
+        volume_percent: Some(i32::from(saved.volume_percent)),
+        muted: Some(saved.muted),
+        ..MixUpdate::default()
+    };
+    if follows {
+        return master;
+    }
+    let channels = &saved.channels[..saved.channels.len().min(current.channel_gains.len())];
+    let values = |value: fn(&SessionPresetChannel) -> i32| channels.iter().map(value).collect();
+    let flags = |flag: fn(&SessionPresetChannel) -> bool| channels.iter().map(flag).collect();
+    MixUpdate {
+        channel_gains: Some(values(|channel| i32::from(channel.gain))),
+        pans: Some(values(|channel| i32::from(channel.pan))),
+        channel_muted: Some(flags(|channel| channel.muted)),
+        channel_solo: Some(flags(|channel| channel.solo)),
+        group_levels: Some(
+            groups
+                .iter()
+                .take(current.group_levels.len())
+                .enumerate()
+                .map(|(position, id)| {
+                    i32::from(
+                        saved
+                            .groups
+                            .get(id)
+                            .copied()
+                            .unwrap_or(current.group_levels[position]),
+                    )
+                })
+                .collect(),
+        ),
+        ..master
+    }
+}
+
+/// Pushes each saved mix in `mixes` to the musician `desk` lists under its key (their phone's
+/// client id first, then their address), through the desk's path, and answers the mixes pushed and
+/// the saved mixes that went to nobody (see [load_session] for who is skipped).
+fn push_saved_mixes<E: SessionEngine>(
+    engine: &mut E,
+    desk: &DeskView,
+    next: &Session,
+    mixes: &BTreeMap<String, SessionMix>,
+) -> (Vec<LoadedMixDto>, Vec<SkippedMixDto>) {
+    let mut pushed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut used = HashSet::new();
+    for row in &desk.musicians {
+        let address = row.address.to_string();
+        let phone = phone_id(row.client_id.as_deref());
+        let key = phone
+            .map(client_key)
+            .into_iter()
+            .chain([address_key(&address)])
+            .find(|key| mixes.contains_key(key));
+        let Some(key) = key else {
+            continue;
+        };
+        used.insert(key.clone());
+        if phone.is_some() && !row.control_connected {
+            skipped.push(skipped_mix(next, &key, "notConnected", None));
+            continue;
+        }
+        let follows = row.mirror.as_ref().map(|mirror| mirror.name.clone());
+        let update = saved_update(&mixes[&key], &row.mix, &desk.groups, follows.is_some());
+        match engine.push_mix(&address, &update) {
+            Ok(mix) => pushed.push(LoadedMixDto {
+                address,
+                follows,
+                mix: MixDto::from(&mix),
+            }),
+            Err(error) => skipped.push(skipped_mix(next, &key, "refused", Some(error))),
+        }
+    }
+    for key in mixes.keys().filter(|key| !used.contains(*key)) {
+        skipped.push(skipped_mix(next, key, "notHere", None));
+    }
+    (pushed, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2209,9 +2821,30 @@ mod tests {
         copied: Option<(String, Vec<String>)>,
         /// The mirror it took last: the follower and the leader's address and name.
         mirrored: Option<(String, Option<(String, String)>)>,
+        /// What a session save or load reads of it: the device's inputs, the live groups' ids
+        /// (those of the groups it took last, once it took any) and the musicians here.
+        inputs: usize,
+        live_groups: Vec<String>,
+        here: Mutex<Vec<MusicianStatus>>,
+        /// Every step a session load took, in order.
+        log: Mutex<Vec<String>>,
+        /// The mixes pushed to musicians: to whom, and the change.
+        pushed: Vec<(String, MixUpdate)>,
     }
 
     impl StandInEngine {
+        fn note(&self, step: String) {
+            self.log.lock().expect("log lock").push(step);
+        }
+
+        /// Whether `key` names the musician on `row`, as the engine's book does.
+        fn names(key: &MusicianKey, row: &MusicianStatus) -> bool {
+            match key {
+                MusicianKey::Client(id) => row.client_id.as_deref() == Some(id.as_str()),
+                MusicianKey::Address(at) => row.address.ip() == at.ip(),
+            }
+        }
+
         /// The key the stand-in keeps what it knows about the musician at `address` under.
         fn key_at(&self, address: &str) -> Result<MusicianKey, String> {
             let (at, client_id) = self
@@ -2356,6 +2989,7 @@ mod tests {
                 return Err("the engine is stopping".to_owned());
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
+            self.note(format!("set_groups {}", definitions.len()));
             self.applied = Some(definitions);
             if let Some(park) = self.park.take() {
                 park.hold();
@@ -2369,12 +3003,84 @@ mod tests {
             if self.stopping {
                 return Err("the engine is stopping".to_owned());
             }
+            self.note(format!("set_channels {}", channels.len()));
             self.applied_channels = Some(channels);
             Ok(())
         }
 
         fn channel_table(&self) -> Vec<ChannelMeta> {
             self.applied_channels.clone().unwrap_or_default()
+        }
+    }
+
+    impl DeskReader for StandInEngine {
+        fn desk(&self) -> DeskView {
+            DeskView {
+                inputs: self.inputs,
+                groups: self.applied.as_ref().map_or_else(
+                    || self.live_groups.clone(),
+                    |groups| groups.iter().map(|group| group.id.clone()).collect(),
+                ),
+                musicians: self.here.lock().expect("rows lock").clone(),
+            }
+        }
+    }
+
+    impl MirrorKeeper for StandInEngine {
+        fn keep_mirror(
+            &self,
+            follower: &MusicianKey,
+            leader: &MusicianKey,
+            name: &str,
+        ) -> Result<(), String> {
+            self.note(format!("keep_mirror {follower:?} on {leader:?}"));
+            if follower == leader {
+                return Err("a musician cannot follow their own mix".to_owned());
+            }
+            for row in self.here.lock().expect("rows lock").iter_mut() {
+                if Self::names(follower, row) {
+                    row.mirror = Some(MirrorStatus {
+                        leader: leader.clone(),
+                        name: name.to_owned(),
+                        leader_address: None,
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl SessionEngine for StandInEngine {
+        fn keep_controls(
+            &self,
+            key: &MusicianKey,
+            controls: EngineerControls,
+        ) -> Result<(), String> {
+            self.note(format!(
+                "keep_controls {key:?} limit={} locked={:#x}",
+                controls.limit_percent, controls.locked
+            ));
+            Ok(())
+        }
+
+        fn stop_mirror(&mut self, address: &str) -> Result<(), String> {
+            self.note(format!("stop_mirror {address}"));
+            for row in self.here.lock().expect("rows lock").iter_mut() {
+                if row.address.to_string() == address {
+                    row.mirror = None;
+                }
+            }
+            Ok(())
+        }
+
+        fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
+            self.note(format!("push_mix {address}"));
+            self.pushed.push((address.to_owned(), update.clone()));
+            Ok(MixValues {
+                revision: 11,
+                volume_percent: update.volume_percent.map_or(100, |volume| volume as u8),
+                ..MixValues::default()
+            })
         }
     }
 
@@ -4074,5 +4780,756 @@ mod tests {
             )],
             "a leader key this build cannot read is skipped"
         );
+    }
+
+    const GONE_PHONE: &str = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+    const AWAY_PHONE: &str = "1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9";
+
+    /// A musician the engine lists: at `address`, with `client_id`, their control channel up or
+    /// down, and `mix`.
+    fn here(
+        address: &str,
+        client_id: Option<&str>,
+        connected: bool,
+        mix: MixValues,
+    ) -> MusicianStatus {
+        MusicianStatus {
+            control_connected: connected,
+            mix,
+            ..engine_row(address, client_id)
+        }
+    }
+
+    /// A mix with the first channels at `gains` (pans centred), the first groups at `levels`, and
+    /// this master volume, mute and phone cap.
+    fn mix_of(gains: &[u8], levels: &[u8], volume: u8, muted: bool, cap: u8) -> MixValues {
+        let mut mix = MixValues {
+            volume_percent: volume,
+            muted,
+            max_level_percent: cap,
+            ..MixValues::default()
+        };
+        mix.channel_gains[..gains.len()].copy_from_slice(gains);
+        mix.pans[..gains.len()].fill(50);
+        mix.group_levels[..levels.len()].copy_from_slice(levels);
+        mix
+    }
+
+    fn saved_mix(gains: &[u8], groups: &[(&str, u8)], volume: u8, muted: bool) -> SessionMix {
+        SessionMix {
+            channels: gains
+                .iter()
+                .map(|&gain| SessionPresetChannel {
+                    gain,
+                    pan: 50,
+                    muted: false,
+                    solo: false,
+                })
+                .collect(),
+            groups: groups
+                .iter()
+                .map(|(id, level)| ((*id).to_owned(), *level))
+                .collect(),
+            volume_percent: volume,
+            muted,
+        }
+    }
+
+    /// A desk's session, a folder of named sessions beside it, and an engine slot.
+    fn desk(
+        test: &str,
+        engine: Option<StandInEngine>,
+    ) -> (SessionStore, SnapshotStore, Mutex<Option<StandInEngine>>) {
+        let directory = session_directory(test);
+        let session = SessionStore::open(&directory);
+        let snapshots = SnapshotStore::new(directory.join(SESSIONS_DIRECTORY));
+        (session, snapshots, Mutex::new(engine))
+    }
+
+    /// The desk's session with a label, groups, channels, controls, a mirror, a preset and an
+    /// audio input.
+    fn working_session(session: &SessionStore) {
+        session.set_label(Some(PHONE), ANA, "Ana").expect("saved");
+        session
+            .set_groups(vec![SessionGroup {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1],
+            }])
+            .expect("saved");
+        session
+            .set_channels(vec![kept("Kick", "drums", false, false)])
+            .expect("saved");
+        session
+            .set_engineer(Some(PHONE), ANA, kept_controls(60, &[1]))
+            .expect("saved");
+        session
+            .set_mirror(
+                None,
+                RACK,
+                Some(kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)),
+            )
+            .expect("saved");
+        session
+            .set_audio(SessionAudio {
+                host: "wasapi".to_owned(),
+                device: Some("INPUT 1/2 (Volt 4)".to_owned()),
+                buffer_frames: Some(256),
+                asio_driver: None,
+            })
+            .expect("saved");
+    }
+
+    /// Writes `snapshot` straight into the named sessions' folder of `test` as `id`, as a saved
+    /// session from an earlier save would be.
+    fn saved_session(test: &str, id: &str, snapshot: &crate::sessions::Snapshot) {
+        let folder = session_directory_kept(test).join(SESSIONS_DIRECTORY);
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join(format!("{id}.json")),
+            serde_json::to_string(snapshot).expect("serializes"),
+        )
+        .expect("written");
+    }
+
+    /// The scratch directory of `test`, as it is (not emptied).
+    fn session_directory_kept(test: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("mixlink-command-tests")
+            .join(test)
+    }
+
+    fn snapshot(session: Session, mixes: &[(&str, SessionMix)]) -> crate::sessions::Snapshot {
+        crate::sessions::Snapshot {
+            session,
+            name: "Show".to_owned(),
+            saved_at: Some(1_000),
+            mixes: mixes
+                .iter()
+                .map(|(key, mix)| ((*key).to_owned(), mix.clone()))
+                .collect(),
+        }
+    }
+
+    /// A session with only these groups and channels.
+    fn layout_session(groups: &[(&str, &[usize])], channels: usize) -> Session {
+        Session {
+            groups: groups
+                .iter()
+                .map(|(id, members)| SessionGroup {
+                    id: (*id).to_owned(),
+                    name: id.to_uppercase(),
+                    channels: members.to_vec(),
+                })
+                .collect(),
+            channels: (0..channels)
+                .map(|index| kept(&format!("In {}", index + 1), "other", false, false))
+                .collect(),
+            ..Session::default()
+        }
+    }
+
+    fn log_of(engine: &Mutex<Option<StandInEngine>>) -> Vec<String> {
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .map(|engine| engine.log.lock().expect("log lock").clone())
+            .unwrap_or_default()
+    }
+
+    fn pushed_to(engine: &Mutex<Option<StandInEngine>>) -> Vec<(String, MixUpdate)> {
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .map(|engine| engine.pushed.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_saved_session_keeps_the_whole_desk_session_and_every_musicians_mix_by_key() {
+        let (session, snapshots, engine) = desk(
+            "session-save",
+            Some(StandInEngine {
+                inputs: 2,
+                live_groups: vec!["kit".to_owned(), "vox".to_owned()],
+                here: Mutex::new(vec![
+                    here(
+                        ANA,
+                        Some(PHONE),
+                        true,
+                        mix_of(&[80, 40, 7], &[70, 30], 85, false, 90),
+                    ),
+                    here(
+                        RACK,
+                        None,
+                        false,
+                        mix_of(&[100, 90], &[100, 55], 60, true, 100),
+                    ),
+                ]),
+                ..StandInEngine::default()
+            }),
+        );
+        working_session(&session);
+
+        let saved = save_session_with(&engine, &session, &snapshots, " Show ").expect("saved");
+
+        assert_eq!(saved.session.name, "Show");
+        assert_eq!(saved.session.mixes, 2);
+        assert!(saved.engine_running);
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(
+            read.snapshot.session,
+            session.current(),
+            "every section the desk keeps"
+        );
+        assert_eq!(
+            read.snapshot.mixes,
+            BTreeMap::from([
+                (
+                    client_key(PHONE),
+                    saved_mix(&[80, 40], &[("kit", 70), ("vox", 30)], 85, false)
+                ),
+                (
+                    address_key(RACK),
+                    saved_mix(&[100, 90], &[("kit", 100), ("vox", 55)], 60, true)
+                ),
+            ]),
+            "the device's inputs, group levels by id, master volume and mute, by the musician's key"
+        );
+    }
+
+    #[test]
+    fn with_no_engine_the_session_is_saved_without_mixes() {
+        let (session, snapshots, engine) = desk("session-save-idle", None);
+        working_session(&session);
+
+        let saved = save_session_with(&engine, &session, &snapshots, "Rehearsal").expect("saved");
+
+        assert!(!saved.engine_running);
+        assert_eq!(saved.session.mixes, 0);
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(read.snapshot.session, session.current());
+        assert!(read.snapshot.mixes.is_empty());
+    }
+
+    #[test]
+    fn a_load_applies_groups_and_channels_then_controls_and_mirrors_then_the_mixes() {
+        let test = "session-load-order";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 2,
+                here: Mutex::new(vec![
+                    here(ANA, Some(PHONE), true, MixValues::default()),
+                    here(RACK, None, false, MixValues::default()),
+                ]),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[("kit", &[1])], 2);
+        loaded.musicians.insert(
+            client_key(PHONE),
+            crate::session::MusicianEntry {
+                label: Some("Ana".to_owned()),
+                engineer: Some(kept_controls(70, &[2])),
+                mirror: None,
+            },
+        );
+        loaded.musicians.insert(
+            address_key(RACK),
+            crate::session::MusicianEntry {
+                label: Some("Rack".to_owned()),
+                engineer: None,
+                mirror: Some(kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)),
+            },
+        );
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                loaded,
+                &[
+                    (
+                        &client_key(PHONE),
+                        saved_mix(&[80], &[("kit", 70)], 85, false),
+                    ),
+                    (
+                        &address_key(RACK),
+                        saved_mix(&[10], &[("kit", 10)], 50, true),
+                    ),
+                ],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert!(outcome.applied && outcome.saved, "{outcome:?}");
+        let log = log_of(&engine);
+        let at = |step: &str| {
+            log.iter()
+                .position(|line| line.starts_with(step))
+                .unwrap_or_else(|| panic!("no {step} in {log:?}"))
+        };
+        assert!(at("set_groups") < at("set_channels"), "{log:?}");
+        assert!(at("set_channels") < at("keep_controls"), "{log:?}");
+        assert!(at("keep_controls") < at("keep_mirror"), "{log:?}");
+        assert!(at("keep_mirror") < at("push_mix"), "{log:?}");
+        assert!(
+            log.contains(&format!(
+                "keep_controls {:?} limit=70 locked=0x2",
+                MusicianKey::Client(PHONE.to_owned())
+            )),
+            "{log:?}"
+        );
+        assert_eq!(
+            outcome.mixes[1].follows.as_deref(),
+            Some("Ana"),
+            "the rack follows Ana once the mirrors are in force"
+        );
+        assert_eq!(
+            pushed_to(&engine)[1],
+            (
+                RACK.to_owned(),
+                MixUpdate {
+                    volume_percent: Some(50),
+                    muted: Some(true),
+                    ..MixUpdate::default()
+                }
+            ),
+            "a follower gets only their own master: their channels and groups follow the leader"
+        );
+    }
+
+    #[test]
+    fn a_saved_mix_goes_only_to_musicians_here_by_key_and_the_rest_are_named() {
+        let test = "session-load-mixes";
+        let moved = "192.168.1.22:50000";
+        let away_at = "192.168.1.31:50000";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 3,
+                // The groups were reordered and one added since the session was saved.
+                live_groups: vec!["vox".to_owned(), "kit".to_owned(), "keys".to_owned()],
+                here: Mutex::new(vec![
+                    // Ana's phone came back from another IP.
+                    here(
+                        moved,
+                        Some(PHONE),
+                        true,
+                        mix_of(&[1, 1, 1], &[1, 1, 55], 1, true, 90),
+                    ),
+                    here(away_at, Some(AWAY_PHONE), false, MixValues::default()),
+                    here(RACK, None, false, MixValues::default()),
+                    here(BASS_AT, Some(OTHER_PHONE), true, MixValues::default()),
+                ]),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[("vox", &[3]), ("kit", &[1]), ("keys", &[2])], 3);
+        for (key, label) in [
+            (client_key(GONE_PHONE), "Gone"),
+            (client_key(AWAY_PHONE), "Away"),
+        ] {
+            loaded.musicians.insert(
+                key,
+                crate::session::MusicianEntry {
+                    label: Some(label.to_owned()),
+                    ..crate::session::MusicianEntry::default()
+                },
+            );
+        }
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                loaded,
+                &[
+                    (
+                        &client_key(PHONE),
+                        saved_mix(&[80, 40], &[("kit", 70), ("vox", 30)], 85, false),
+                    ),
+                    (&client_key(AWAY_PHONE), saved_mix(&[5], &[], 5, false)),
+                    (&address_key(RACK), saved_mix(&[60], &[], 60, false)),
+                    (&client_key(GONE_PHONE), saved_mix(&[9], &[], 9, false)),
+                ],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        let pushed = pushed_to(&engine);
+        assert_eq!(
+            pushed.iter().map(|(at, _)| at.as_str()).collect::<Vec<_>>(),
+            vec![moved, RACK],
+            "Ana by her phone wherever it is, and the rack that plays its mix with no phone"
+        );
+        assert_eq!(
+            pushed[0].1,
+            MixUpdate {
+                channel_gains: Some(vec![80, 40]),
+                pans: Some(vec![50, 50]),
+                channel_muted: Some(vec![false, false]),
+                channel_solo: Some(vec![false, false]),
+                group_levels: Some(vec![30, 70, 55]),
+                volume_percent: Some(85),
+                max_level_percent: None,
+                muted: Some(false),
+            },
+            "group levels land on their groups by id, a group the mix does not name keeps its \
+             level, and the phone's own cap is never pushed"
+        );
+        assert_eq!(
+            outcome
+                .mixes
+                .iter()
+                .map(|mix| mix.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![moved, RACK]
+        );
+        assert_eq!(
+            outcome.skipped,
+            vec![
+                SkippedMixDto {
+                    key: client_key(AWAY_PHONE),
+                    label: Some("Away".to_owned()),
+                    reason: "notConnected",
+                    error: None,
+                },
+                SkippedMixDto {
+                    key: client_key(GONE_PHONE),
+                    label: Some("Gone".to_owned()),
+                    reason: "notHere",
+                    error: None,
+                },
+            ],
+            "a phone that is away keeps its own mix for when it connects, and nobody is here for \
+             the other"
+        );
+        assert!(
+            !log_of(&engine).iter().any(|line| line.contains(BASS_AT)),
+            "a musician with no saved mix is left alone"
+        );
+    }
+
+    #[test]
+    fn a_load_replaces_the_desk_session_and_takes_its_audio_only_as_the_engineer_could_choose_it() {
+        let asio_without_driver = SessionAudio {
+            host: "asio".to_owned(),
+            device: None,
+            buffer_frames: Some(128),
+            asio_driver: None,
+        };
+        let asio_picked = SessionAudio {
+            asio_driver: Some(" Focusrite USB ASIO ".to_owned()),
+            ..asio_without_driver.clone()
+        };
+        for (case, saved, loaded, skipped) in [
+            ("none", None, false, false),
+            ("asio-no-driver", Some(asio_without_driver), false, true),
+            (
+                "bad-host",
+                Some(SessionAudio {
+                    host: "jack".to_owned(),
+                    ..asio_picked.clone()
+                }),
+                false,
+                true,
+            ),
+            ("asio-picked", Some(asio_picked.clone()), true, false),
+        ] {
+            let test = format!("session-load-audio-{case}");
+            let (session, snapshots, engine) = desk(&test, None);
+            working_session(&session);
+            let before = session.audio();
+            let mut kept = layout_session(&[], 0);
+            kept.audio = saved;
+            kept.presets = vec![SessionPreset {
+                id: "p1".to_owned(),
+                name: "Verse".to_owned(),
+                mix: SessionPresetMix::default(),
+            }];
+            saved_session(&test, "show", &snapshot(kept.clone(), &[]));
+
+            let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+            assert_eq!(outcome.audio_loaded, loaded, "{case}");
+            assert_eq!(
+                outcome.audio_skipped.is_some(),
+                skipped,
+                "{case}: {outcome:?}"
+            );
+            let expected = if loaded {
+                Some(SessionAudio {
+                    asio_driver: Some("Focusrite USB ASIO".to_owned()),
+                    ..asio_picked.clone()
+                })
+            } else {
+                before.clone()
+            };
+            assert_eq!(
+                session.audio(),
+                expected,
+                "{case}: ASIO only with a picked driver"
+            );
+            assert_eq!(outcome.audio, expected, "{case}");
+            assert_eq!(
+                session.current(),
+                Session {
+                    audio: expected,
+                    ..kept
+                },
+                "{case}: the loaded session replaces the desk's, labels and mirrors included"
+            );
+            assert_eq!(outcome.presets.len(), 1, "{case}");
+        }
+    }
+
+    #[test]
+    fn with_no_engine_a_load_replaces_the_session_and_pushes_no_mix() {
+        let test = "session-load-idle";
+        let (session, snapshots, engine) = desk(test, None);
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                layout_session(&[("kit", &[1])], 1),
+                &[(&client_key(PHONE), saved_mix(&[80], &[], 85, false))],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert!(!outcome.applied && outcome.saved, "{outcome:?}");
+        assert!(outcome.mixes.is_empty());
+        assert_eq!(
+            outcome.skipped,
+            vec![SkippedMixDto {
+                key: client_key(PHONE),
+                label: None,
+                reason: "notRunning",
+                error: None,
+            }]
+        );
+        assert_eq!(
+            session.groups().len(),
+            1,
+            "the groups apply at the next start"
+        );
+        assert_eq!(outcome.session.name, "Show");
+    }
+
+    #[test]
+    fn a_saved_session_the_engine_would_refuse_is_not_loaded_and_nothing_changes() {
+        let test = "session-load-refused";
+        let (session, snapshots, engine) = desk(test, Some(StandInEngine::default()));
+        working_session(&session);
+        let before = session.current();
+        let mut overlapping = layout_session(&[("kit", &[1, 2]), ("vox", &[2])], 2);
+        saved_session(test, "groups", &snapshot(overlapping.clone(), &[]));
+        overlapping.groups.clear();
+        overlapping.channels[1].link = true;
+        saved_session(test, "channels", &snapshot(overlapping, &[]));
+
+        for (id, says) in [("groups", "groups"), ("channels", "channel details")] {
+            let error = load_session_with(&engine, &session, &snapshots, id).expect_err("refused");
+            assert!(error.contains(says), "{id}: {error}");
+        }
+
+        assert_eq!(session.current(), before, "the desk's session is unchanged");
+        assert_eq!(
+            log_of(&engine),
+            Vec::<String>::new(),
+            "the engine took nothing"
+        );
+    }
+
+    #[test]
+    fn a_load_over_a_session_the_desk_must_not_replace_is_refused_before_the_engine_takes_anything()
+    {
+        let test = "session-load-newer";
+        let directory = session_directory(test);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let newer = r#"{"version":99}"#;
+        std::fs::write(directory.join(crate::session::SESSION_FILE), newer).expect("written");
+        let session = SessionStore::open(&directory);
+        let snapshots = SnapshotStore::new(directory.join(SESSIONS_DIRECTORY));
+        let engine = running(StandInEngine::default());
+        saved_session(
+            test,
+            "show",
+            &snapshot(layout_session(&[("kit", &[1])], 1), &[]),
+        );
+
+        let error = load_session_with(&engine, &session, &snapshots, "show").expect_err("refused");
+
+        assert!(error.contains("newer"), "{error}");
+        assert_eq!(
+            log_of(&engine),
+            Vec::<String>::new(),
+            "the engine took nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join(crate::session::SESSION_FILE)).expect("kept"),
+            newer
+        );
+    }
+
+    #[test]
+    fn a_stopping_engine_refuses_a_load_and_nothing_is_saved() {
+        let test = "session-load-stopping";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                stopping: true,
+                ..StandInEngine::default()
+            }),
+        );
+        working_session(&session);
+        let before = session.current();
+        saved_session(
+            test,
+            "show",
+            &snapshot(layout_session(&[("kit", &[1])], 1), &[]),
+        );
+
+        let error = load_session_with(&engine, &session, &snapshots, "show").expect_err("refused");
+
+        assert!(error.contains("stopping"), "{error}");
+        assert_eq!(session.current(), before);
+    }
+
+    #[test]
+    fn controls_and_mirrors_the_loaded_session_drops_are_lifted_from_musicians_here() {
+        let test = "session-load-lift";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                here: Mutex::new(vec![MusicianStatus {
+                    mirror: Some(MirrorStatus {
+                        leader: MusicianKey::Address(RACK.parse().expect("an address")),
+                        name: "Rack".to_owned(),
+                        leader_address: Some(RACK.parse().expect("an address")),
+                    }),
+                    ..here(ANA, Some(PHONE), true, MixValues::default())
+                }]),
+                ..StandInEngine::default()
+            }),
+        );
+        // The desk kept Ana's controls and mirror by her phone.
+        session
+            .set_engineer(Some(PHONE), ANA, kept_controls(60, &[1]))
+            .expect("saved");
+        session
+            .set_mirror(
+                Some(PHONE),
+                ANA,
+                Some(kept_mirror(address_key(RACK), "Rack", None, Some(ANA))),
+            )
+            .expect("saved");
+        // The loaded session keeps controls for her address only, and no mirror.
+        let mut loaded = layout_session(&[], 0);
+        loaded.musicians.insert(
+            address_key(ANA),
+            crate::session::MusicianEntry {
+                engineer: Some(kept_controls(80, &[])),
+                ..crate::session::MusicianEntry::default()
+            },
+        );
+        saved_session(test, "show", &snapshot(loaded, &[]));
+
+        load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        let log = log_of(&engine);
+        let ana = MusicianKey::Address(ANA.parse().expect("an address"));
+        assert!(
+            log.contains(&format!(
+                "keep_controls {:?} limit=80 locked=0x0",
+                MusicianKey::Client(PHONE.to_owned())
+            )),
+            "her phone's old controls give way to what the loaded session keeps for her: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("keep_controls {ana:?} limit=80 locked=0x0")),
+            "{log:?}"
+        );
+        assert!(
+            log.contains(&format!("stop_mirror {ANA}")),
+            "her mirror stops: {log:?}"
+        );
+        assert_eq!(
+            session.engineer_for(Some(PHONE), ANA),
+            Some(kept_controls(80, &[]))
+        );
+        assert_eq!(session.mirror_for(Some(PHONE), ANA), None);
+    }
+
+    #[test]
+    fn a_mirror_the_engine_refuses_is_named_and_the_rest_of_the_load_goes_on() {
+        let test = "session-load-mirror-refused";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                here: Mutex::new(vec![here(RACK, None, false, MixValues::default())]),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[], 1);
+        loaded.musicians.insert(
+            address_key(RACK),
+            crate::session::MusicianEntry {
+                label: Some("Rack".to_owned()),
+                engineer: None,
+                // A hand-edited session: a mirror on oneself, which the engine refuses.
+                mirror: Some(kept_mirror(address_key(RACK), "Rack", None, None)),
+            },
+        );
+        saved_session(
+            test,
+            "show",
+            &snapshot(
+                loaded,
+                &[(&address_key(RACK), saved_mix(&[60], &[], 60, false))],
+            ),
+        );
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert_eq!(outcome.refused.len(), 1, "{:?}", outcome.refused);
+        assert!(
+            outcome.refused[0].starts_with("Rack following Rack's mix was not applied"),
+            "{:?}",
+            outcome.refused
+        );
+        assert_eq!(
+            outcome.mixes.len(),
+            1,
+            "the rack's mix is pushed all the same"
+        );
+        assert!(outcome.saved);
+    }
+
+    #[test]
+    fn a_damaged_saved_session_loads_what_it_can_and_names_the_rest() {
+        let test = "session-load-damaged";
+        let (session, snapshots, engine) = desk(test, None);
+        let folder = session_directory_kept(test).join(SESSIONS_DIRECTORY);
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join("show.json"),
+            format!(
+                r#"{{"version":1,"name":"Show","musicians":{{"client:{PHONE}":{{"label":"Ana"}}}},"groups":7,"mixes":{{"client:{PHONE}":{{"channels":"loud"}}}}}}"#
+            ),
+        )
+        .expect("written");
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert_eq!(outcome.damaged.len(), 2, "{:?}", outcome.damaged);
+        assert_eq!(session.label_for(Some(PHONE), ANA), Some("Ana".to_owned()));
+        assert!(session.groups().is_empty());
+        assert!(outcome.skipped.is_empty(), "the unreadable mix is no mix");
     }
 }

@@ -8,15 +8,18 @@ pub mod commands;
 pub mod dto;
 pub mod events;
 pub mod session;
+pub mod sessions;
 
 use commands::DesktopState;
 use dto::{
     AudioSettingsRequest, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
     EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MirrorRequest,
-    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, StartRequest, StartSummary,
+    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, SessionLoadedDto,
+    SessionSavedDto, StartRequest, StartSummary,
 };
 use events::EventPump;
 use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
+use sessions::SnapshotSummary;
 use tauri::{Manager, State};
 
 /// Fails to compile rather than at runtime if the shared state ever gains a non-`Send` field,
@@ -219,6 +222,57 @@ async fn set_mirror(
     commands::set_mirror(state.inner(), address, client_id, leader)
 }
 
+/// What went wrong or changed when the desk opened its session, or null (see
+/// [commands::session_notice]).
+#[tauri::command]
+async fn session_notice(state: State<'_, DesktopState>) -> Result<Option<String>, String> {
+    Ok(commands::session_notice(state.inner()))
+}
+
+/// The engineer's saved sessions, the newest first: `[{ id, name, savedAt, mixes, problem }]` (see
+/// [commands::sessions]).
+#[tauri::command]
+async fn sessions(state: State<'_, DesktopState>) -> Result<Vec<SnapshotSummary>, String> {
+    commands::sessions(state.inner())
+}
+
+/// Saves the desk's session, with every musician's mix when an engine runs, as `name` and answers
+/// `{ session, engineRunning }` (see [commands::save_session]).
+#[tauri::command]
+async fn save_session(
+    state: State<'_, DesktopState>,
+    name: String,
+) -> Result<SessionSavedDto, String> {
+    commands::save_session(state.inner(), name)
+}
+
+/// Renames the saved session `id` and answers it as listed (see [commands::rename_session]).
+#[tauri::command]
+async fn rename_session(
+    state: State<'_, DesktopState>,
+    id: String,
+    name: String,
+) -> Result<SnapshotSummary, String> {
+    commands::rename_session(state.inner(), id, name)
+}
+
+/// Deletes the saved session `id` (see [commands::delete_session]).
+#[tauri::command]
+async fn delete_session(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    commands::delete_session(state.inner(), id)
+}
+
+/// Loads the saved session `id` in place of the desk's and, with an engine running, applies it
+/// live; answers `{ session, applied, saved, saveError, mixes, skipped, refused, damaged, audio,
+/// audioLoaded, audioSkipped, presets }` (see [commands::load_session]).
+#[tauri::command]
+async fn load_session(
+    state: State<'_, DesktopState>,
+    id: String,
+) -> Result<SessionLoadedDto, String> {
+    commands::load_session(state.inner(), id)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -227,7 +281,7 @@ pub fn run() {
             // and the audio input) is a desktop-app concern and
             // lives in the app's config directory, so it survives a restart without touching the
             // engine or any client protocol. Opening it never fails: a damaged file is set aside
-            // and logged.
+            // and logged. The engineer's named sessions live beside it, in `sessions`.
             let directory = app.path().app_config_dir()?;
             // Every engine the window starts streams its meters, status and mix changes as events
             // (see [events]); the app handle is both where the pump reads and where it emits.
@@ -263,7 +317,13 @@ pub fn run() {
             delete_preset,
             apply_preset,
             copy_mix,
-            set_mirror
+            set_mirror,
+            session_notice,
+            sessions,
+            save_session,
+            rename_session,
+            delete_session,
+            load_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

@@ -115,6 +115,10 @@
 //! `musicians.json`, the address-to-label map earlier versions kept, is imported once: when there
 //! is no session yet, its labels become `address:` entries and the session is written. The old
 //! file is left in place untouched, and once the session exists it is no longer read.
+//!
+//! The engineer's named sessions are snapshots of this session, with each musician's mix, kept in
+//! the `sessions` folder beside it (see [crate::sessions]); loading one replaces this session whole
+//! ([SessionStore::replace]).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -165,6 +169,52 @@ impl Default for Session {
             presets: Vec::new(),
             audio: None,
         }
+    }
+}
+
+impl Session {
+    /// What the session keeps for the musician with this client id at this address, read with
+    /// `kept`: the entry kept for the phone first, then the one kept for the address.
+    fn resolve<T>(
+        &self,
+        client_id: Option<&str>,
+        address: &str,
+        kept: impl Fn(&MusicianEntry) -> Option<T>,
+    ) -> Option<T> {
+        let at = |key: String| self.musicians.get(&key).and_then(&kept);
+        client_id
+            .and_then(|id| at(client_key(id)))
+            .or_else(|| at(address_key(address)))
+    }
+
+    /// The engineer's controls for the musician with this client id at this address: those kept
+    /// for the phone first, then those kept for the address.
+    pub fn engineer_for(&self, client_id: Option<&str>, address: &str) -> Option<SessionEngineer> {
+        self.resolve(client_id, address, |entry| entry.engineer.clone())
+    }
+
+    /// Every musician's controls the session keeps, each with its key ([client_key] or
+    /// [address_key]), in key order.
+    pub fn engineer_controls(&self) -> Vec<(String, SessionEngineer)> {
+        self.musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.engineer.clone()?)))
+            .collect()
+    }
+
+    /// The mirror kept for the musician with this client id at this address: the one kept for the
+    /// phone first, then the one kept for the address.
+    pub fn mirror_for(&self, client_id: Option<&str>, address: &str) -> Option<SessionMirror> {
+        self.resolve(client_id, address, |entry| entry.mirror.clone())
+    }
+
+    /// Every mirror the session keeps, each with its follower's key ([client_key] or
+    /// [address_key]), in key order.
+    pub fn mirrors(&self) -> Vec<(String, SessionMirror)> {
+        self.musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.mirror.clone()?)))
+            .collect()
     }
 }
 
@@ -410,6 +460,45 @@ impl SessionStore {
         self.lock().notice.clone()
     }
 
+    /// The config directory the session file lives in.
+    pub fn directory(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    /// The whole session as the desk keeps it now, for a named snapshot of it (see
+    /// [crate::sessions]).
+    pub fn current(&self) -> Session {
+        self.lock().session.clone()
+    }
+
+    /// `Ok` when a change may be saved, else why the session file must not be replaced (one
+    /// written by a newer version, or one that could not be set aside), so a change that touches
+    /// more than the session can be refused before anything else changes.
+    pub fn check_saves(&self) -> Result<(), String> {
+        match &self.lock().refusal {
+            Some(refusal) => Err(refusal.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Replaces the whole session with `session` (a named snapshot loaded, see
+    /// [crate::commands::load_session]), at this build's version. The file is written before
+    /// success is reported; a save that fails, or is refused over a session this build must not
+    /// replace, changes nothing.
+    pub fn replace(&self, session: Session) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            version: SESSION_VERSION,
+            ..session
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     /// The local label of the musician with this client id at this address: the one kept for the
     /// phone first, then the one kept for the address.
     pub fn label_for(&self, client_id: Option<&str>, address: &str) -> Option<String> {
@@ -455,23 +544,13 @@ impl SessionStore {
     /// The engineer's controls for the musician with this client id at this address: those kept for
     /// the phone first, then those kept for the address.
     pub fn engineer_for(&self, client_id: Option<&str>, address: &str) -> Option<SessionEngineer> {
-        let loaded = self.lock();
-        let musicians = &loaded.session.musicians;
-        let kept = |key: String| musicians.get(&key).and_then(|entry| entry.engineer.clone());
-        client_id
-            .and_then(|id| kept(client_key(id)))
-            .or_else(|| kept(address_key(address)))
+        self.lock().session.engineer_for(client_id, address)
     }
 
     /// Every musician's controls the session keeps, each with its key ([client_key] or
     /// [address_key]), in key order.
     pub fn engineer_controls(&self) -> Vec<(String, SessionEngineer)> {
-        self.lock()
-            .session
-            .musicians
-            .iter()
-            .filter_map(|(key, entry)| Some((key.clone(), entry.engineer.clone()?)))
-            .collect()
+        self.lock().session.engineer_controls()
     }
 
     /// Keeps the engineer's controls for the musician with this client id at this address, as
@@ -512,23 +591,13 @@ impl SessionStore {
     /// The mirror kept for the musician with this client id at this address: the one kept for the
     /// phone first, then the one kept for the address.
     pub fn mirror_for(&self, client_id: Option<&str>, address: &str) -> Option<SessionMirror> {
-        let loaded = self.lock();
-        let musicians = &loaded.session.musicians;
-        let kept = |key: String| musicians.get(&key).and_then(|entry| entry.mirror.clone());
-        client_id
-            .and_then(|id| kept(client_key(id)))
-            .or_else(|| kept(address_key(address)))
+        self.lock().session.mirror_for(client_id, address)
     }
 
     /// Every mirror the session keeps, each with its follower's key ([client_key] or
     /// [address_key]), in key order.
     pub fn mirrors(&self) -> Vec<(String, SessionMirror)> {
-        self.lock()
-            .session
-            .musicians
-            .iter()
-            .filter_map(|(key, entry)| Some((key.clone(), entry.mirror.clone()?)))
-            .collect()
+        self.lock().session.mirrors()
     }
 
     /// Keeps the mirror of the musician with this client id at this address, or drops it with
@@ -704,54 +773,82 @@ enum Parsed {
 }
 
 /// A section of the session, other than the labels, that could not be read, as the file had it.
-struct DamagedSection {
-    name: &'static str,
-    raw: Value,
-    problem: String,
+pub(crate) struct DamagedSection {
+    pub(crate) name: &'static str,
+    pub(crate) raw: Value,
+    pub(crate) problem: String,
+}
+
+/// What a versioned file of this format holds once its version was checked: its fields, or why it
+/// cannot be used.
+pub(crate) enum Versioned {
+    Current(Map<String, Value>),
+    Newer(u64),
+    Invalid(String),
+}
+
+/// Reads `bytes` as a JSON object written at [SESSION_VERSION]: the session file and every named
+/// snapshot of it (see [crate::sessions]) share the check.
+pub(crate) fn versioned_fields(bytes: &[u8]) -> Versioned {
+    let value: Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(error) => return Versioned::Invalid(format!("is not valid JSON ({error})")),
+    };
+    let Some(version) = value.get("version").and_then(Value::as_u64) else {
+        return Versioned::Invalid("has no version".to_owned());
+    };
+    if version > SESSION_VERSION {
+        return Versioned::Newer(version);
+    }
+    if version != SESSION_VERSION {
+        return Versioned::Invalid(format!("has version {version}, which no MixLink writes"));
+    }
+    match value {
+        Value::Object(fields) => Versioned::Current(fields),
+        _ => Versioned::Invalid("is not a session object".to_owned()),
+    }
+}
+
+/// Reads a session out of a file's `fields`. Each section besides the labels is read on its own,
+/// so one that is damaged costs only itself (it starts empty and is listed in `damaged`); fields
+/// that are no part of a session are ignored. A file whose labels cannot be read is not a session
+/// this build can use: that is the error.
+pub(crate) fn read_session(
+    mut fields: Map<String, Value>,
+    damaged: &mut Vec<DamagedSection>,
+) -> Result<Session, String> {
+    let groups = take_section(&mut fields, "groups", damaged);
+    let channels = take_section(&mut fields, "channels", damaged);
+    let presets = take_section(&mut fields, "presets", damaged);
+    let audio = take_section(&mut fields, "audio", damaged);
+    serde_json::from_value::<Session>(Value::Object(fields))
+        .map(|session| Session {
+            groups,
+            channels,
+            presets,
+            audio,
+            ..session
+        })
+        .map_err(|error| format!("is not a session ({error})"))
 }
 
 fn parse(bytes: &[u8]) -> Parsed {
-    let value: Value = match serde_json::from_slice(bytes) {
-        Ok(value) => value,
-        Err(error) => return Parsed::Invalid(format!("is not valid JSON ({error})")),
-    };
-    let Some(version) = value.get("version").and_then(Value::as_u64) else {
-        return Parsed::Invalid("has no version".to_owned());
-    };
-    if version > SESSION_VERSION {
-        return Parsed::Newer(version);
-    }
-    if version != SESSION_VERSION {
-        return Parsed::Invalid(format!("has version {version}, which no MixLink writes"));
-    }
-    let Value::Object(mut fields) = value else {
-        return Parsed::Invalid("is not a session object".to_owned());
-    };
-    // Each section besides the labels is read on its own, so one that is damaged costs only
-    // itself; a file whose labels cannot be read is not a session this build can use.
-    let mut damaged = Vec::new();
-    let groups = take_section(&mut fields, "groups", &mut damaged);
-    let channels = take_section(&mut fields, "channels", &mut damaged);
-    let presets = take_section(&mut fields, "presets", &mut damaged);
-    let audio = take_section(&mut fields, "audio", &mut damaged);
-    match serde_json::from_value::<Session>(Value::Object(fields)) {
-        Ok(session) => Parsed::Current(
-            Session {
-                groups,
-                channels,
-                presets,
-                audio,
-                ..session
-            },
-            damaged,
-        ),
-        Err(error) => Parsed::Invalid(format!("is not a session ({error})")),
+    match versioned_fields(bytes) {
+        Versioned::Current(fields) => {
+            let mut damaged = Vec::new();
+            match read_session(fields, &mut damaged) {
+                Ok(session) => Parsed::Current(session, damaged),
+                Err(problem) => Parsed::Invalid(problem),
+            }
+        }
+        Versioned::Newer(version) => Parsed::Newer(version),
+        Versioned::Invalid(problem) => Parsed::Invalid(problem),
     }
 }
 
 /// Takes the section `name` out of the session's fields and reads it on its own. A section that
 /// cannot be read starts empty and is listed in `damaged` with its raw JSON.
-fn take_section<T: DeserializeOwned + Default>(
+pub(crate) fn take_section<T: DeserializeOwned + Default>(
     fields: &mut Map<String, Value>,
     name: &'static str,
     damaged: &mut Vec<DamagedSection>,
@@ -824,7 +921,7 @@ fn set_sections_aside(path: &Path, session: Session, damaged: Vec<DamagedSection
     }
 }
 
-fn unix_millis() -> u128 {
+pub(crate) fn unix_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
@@ -915,9 +1012,10 @@ fn import_legacy(path: &Path, legacy: &Path) -> Loaded {
     }
 }
 
-/// Replaces the session file with `session`: a temporary file in the same directory, flushed to
-/// disk, then renamed over the old one. On failure the old file is untouched.
-fn write_atomically(path: &Path, session: &Session) -> Result<(), String> {
+/// Replaces the file at `path` with `value` as JSON (the session, or a named snapshot of it): a
+/// temporary file `<name>.tmp` in the same directory, flushed to disk, then renamed over the old
+/// one. On failure the old file is untouched.
+pub(crate) fn write_atomically(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory).map_err(|error| {
             format!(
@@ -926,9 +1024,12 @@ fn write_atomically(path: &Path, session: &Session) -> Result<(), String> {
             )
         })?;
     }
-    let json = serde_json::to_string_pretty(session)
+    let json = serde_json::to_string_pretty(value)
         .map_err(|error| format!("could not serialize the session: {error}"))?;
-    let temporary = path.with_file_name(format!("{SESSION_FILE}.tmp"));
+    let name = path
+        .file_name()
+        .map_or_else(|| SESSION_FILE.into(), |name| name.to_string_lossy());
+    let temporary = path.with_file_name(format!("{name}.tmp"));
     let written = (|| -> io::Result<()> {
         let mut file = File::create(&temporary)?;
         file.write_all(json.as_bytes())?;

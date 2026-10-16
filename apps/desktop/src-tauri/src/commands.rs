@@ -588,9 +588,47 @@ pub fn set_channels(
     Ok(outcome)
 }
 
+/// The engineer's whole channel table, as the window edits it: every entry kept, in channel order
+/// (the first is CH 1), details of inputs the current device lacks included. The engine status
+/// lists only the device's inputs, so a window that edited from it would send a shorter list as
+/// the whole table and lose the rest; it reads this instead and sends it back with its change.
+///
+/// With an engine running this is the engine's table ([EngineHandle::channel_table]), which is
+/// what it took last even when saving it failed; with none, the session's, a kind this build does
+/// not know read as `other`, as a start applies it.
+pub fn channel_table(state: &DesktopState) -> Result<Vec<SessionChannel>, String> {
+    read_channel_table(&state.engine, &state.session)
+}
+
+/// [channel_table] over any engine slot and session.
+fn read_channel_table<E: ChannelEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+) -> Result<Vec<SessionChannel>, String> {
+    // The lock order every command that holds both follows: the engine's, then the session's.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let table = match guard.as_ref() {
+        Some(engine) => engine.channel_table(),
+        None => session_channels(session),
+    };
+    Ok(table
+        .into_iter()
+        .map(|channel| SessionChannel {
+            name: channel.name,
+            kind: channel.kind.name().to_owned(),
+            hidden: channel.hidden,
+            link: channel.linked_to_next,
+        })
+        .collect())
+}
+
 /// What a channel edit needs from the running engine, as [GroupEngine] is for a group edit.
 trait ChannelEngine {
     fn set_channels(&mut self, channels: Vec<ChannelMeta>) -> Result<(), String>;
+    /// The whole table the engine keeps (see [channel_table]).
+    fn channel_table(&self) -> Vec<ChannelMeta>;
 }
 
 impl ChannelEngine for EngineHandle {
@@ -598,6 +636,10 @@ impl ChannelEngine for EngineHandle {
         EngineHandle::set_channels(self, channels)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn channel_table(&self) -> Vec<ChannelMeta> {
+        EngineHandle::channel_table(self)
     }
 }
 
@@ -1230,6 +1272,10 @@ mod tests {
             self.applied_channels = Some(channels);
             Ok(())
         }
+
+        fn channel_table(&self) -> Vec<ChannelMeta> {
+            self.applied_channels.clone().unwrap_or_default()
+        }
     }
 
     fn running(engine: StandInEngine) -> Mutex<Option<StandInEngine>> {
@@ -1622,6 +1668,86 @@ mod tests {
                     linked_to_next: false,
                 },
             ]
+        );
+    }
+
+    /// The window edits the whole list: with an engine running it reads the engine's, entries for
+    /// inputs the device lacks included; with none, the session's, a kind this build does not know
+    /// read as it applies.
+    #[test]
+    fn the_channel_table_is_the_running_engines_whole_list_else_the_sessions() {
+        let session = SessionStore::open(&session_directory("channel-table"));
+        session
+            .set_channels(vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "theremin", true, false),
+            ])
+            .expect("kept");
+        let idle: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        assert_eq!(
+            read_channel_table(&idle, &session).expect("readable"),
+            vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "other", true, false),
+            ]
+        );
+
+        let engine = running(StandInEngine::default());
+        let whole = vec![
+            detail("Kick", "drums", false, false),
+            detail("Keys L", "keys", false, true),
+            detail("Keys R", "keys", false, false),
+            detail("Spare", "other", true, false),
+        ];
+        edit_channels(&engine, &session, whole).expect("the details are taken");
+        assert_eq!(
+            read_channel_table(&engine, &session).expect("readable"),
+            vec![
+                kept("Kick", "drums", false, false),
+                kept("Keys L", "keys", false, true),
+                kept("Keys R", "keys", false, false),
+                kept("Spare", "other", true, false),
+            ]
+        );
+    }
+
+    /// What the window reads is what it sends back: with one entry changed on the table it read,
+    /// every other entry (the details of inputs a smaller device lacks among them) is kept by the
+    /// engine and the session.
+    #[test]
+    fn an_edit_of_the_table_read_back_keeps_every_other_entry() {
+        let session = SessionStore::open(&session_directory("channel-table-edit"));
+        let engine = running(StandInEngine::default());
+        edit_channels(
+            &engine,
+            &session,
+            vec![
+                detail("Kick", "drums", false, false),
+                detail("Snare", "drums", false, false),
+                detail("Spare", "other", true, false),
+            ],
+        )
+        .expect("the details are taken");
+
+        let read = serde_json::to_string(&read_channel_table(&engine, &session).expect("readable"))
+            .expect("serializes");
+        let mut requests: Vec<ChannelRequest> =
+            serde_json::from_str(&read).expect("the window can send back what it reads");
+        requests[0].name = "Kick in".to_owned();
+        edit_channels(&engine, &session, requests).expect("the details are taken");
+
+        assert_eq!(
+            session.channels(),
+            vec![
+                kept("Kick in", "drums", false, false),
+                kept("Snare", "drums", false, false),
+                kept("Spare", "other", true, false),
+            ]
+        );
+        assert_eq!(
+            applied_channels(&engine).map(|channels| channels.len()),
+            Some(3)
         );
     }
 }

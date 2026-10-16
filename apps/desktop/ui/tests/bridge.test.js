@@ -804,3 +804,20 @@ test("synthetic meters cover every channel and musician with whole 0-100 peaks",
   assert.ok(peaks.every((peak) => Number.isInteger(peak) && peak >= 0 && peak <= 100), String(peaks));
   assert.deepEqual(syntheticMeters(status, 1234), payload, "the same time gives the same levels");
 });
+
+test("the fake engine reads back its whole channel table, the inputs a device lacks included", async () => {
+  const fake = createFakeBridge({ running: true });
+  await fake.invoke("set_channels", { channels: [...KEYS, { name: "Spare", hidden: true }] });
+  await fake.invoke("switch_device", { device: "Microphone (USB audio)" });
+
+  assert.deepEqual(details(await fake.invoke("channel_table")), [
+    ["Kick", "drums", false, false],
+    ["Keys L", "keys", false, true],
+    ["Keys R", "keys", false, false],
+    ["Spare", "other", true, false],
+  ]);
+
+  await fake.invoke("stop_engine");
+  await fake.invoke("set_channels", { channels: [{ name: "Click", kind: "click" }] });
+  assert.deepEqual(details(await fake.invoke("channel_table")), [["Click", "click", false, false]]);
+});

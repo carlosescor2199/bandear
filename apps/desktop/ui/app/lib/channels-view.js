@@ -121,11 +121,6 @@ function detailOf(entry) {
   };
 }
 
-/** The channel details a status shows, as the desk sends them; none without a status. */
-export function channelTableOf(status) {
-  return deviceChannels(status).map(detailOf);
-}
-
 /** The groups a status shows, as the desk sends them (1-based channels); none without a status. */
 export function groupDefinitionsOf(status) {
   return (status?.groups ?? []).map(({ id, name, channels }) => ({

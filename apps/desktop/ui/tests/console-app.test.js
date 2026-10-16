@@ -646,3 +646,33 @@ test("with no engine running, an edit is kept for the next start once the desk k
   );
   app.dispose();
 });
+
+test("a window's first channel edit on a smaller device keeps the details of the inputs it lacks", async () => {
+  const { fake, app } = await connected();
+  await app.switchDevice("Microphone (USB audio)");
+  assert.equal(app.store.getState().engine.status.channels.length, 2, "the status lists two inputs");
+
+  const result = await app.editChannels((table) => renameChannel(table, 0, "Kick in", 2));
+  assert.equal(result.ok, true, result.message);
+  assert.equal(commands(fake, "channel_table").length, 1, "the edit is built on the whole table");
+  assert.equal(commands(fake, "set_channels").at(-1).args.channels.length, 6);
+  await app.switchDevice("Demo interface");
+
+  assert.deepEqual(
+    app.store.getState().engine.status.channels.map((channel) => channel.name),
+    ["Kick in", "Snare", "Overheads", "Bass", "Lead vox", "Backing vox"],
+  );
+  app.dispose();
+});
+
+test("a channel edit says why when the whole table cannot be read, and sends nothing", async () => {
+  const { fake, app } = await connected();
+  fake.failNext("channel_table", "engine state lock was poisoned");
+
+  assert.deepEqual(await app.editChannels((table) => renameChannel(table, 0, "Kick in", 6)), {
+    ok: false,
+    message: "The channel details were not changed: engine state lock was poisoned.",
+  });
+  assert.equal(commands(fake, "set_channels").length, 0);
+  app.dispose();
+});

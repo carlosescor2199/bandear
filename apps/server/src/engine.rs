@@ -999,6 +999,14 @@ pub(crate) fn edit_channels(
     Ok(config.snapshot().channels.clone())
 }
 
+/// The engineer's channel details as `config` keeps them, whole: the list last set, in channel
+/// order, entries for inputs the device lacks included (see
+/// [crate::control::ConfigSnapshot::requested_channels]). What clients see is the part of it the
+/// device has ([EngineStatus::channels]).
+pub(crate) fn channel_table(config: &ConfigState) -> Vec<ChannelMeta> {
+    config.snapshot().requested_channels.clone()
+}
+
 /// Replaces the engineer's groups with `definitions` on a device with `source_channels` inputs, as
 /// [EngineHandle::set_groups] does, and returns the groups now in force.
 ///
@@ -1292,6 +1300,14 @@ impl EngineHandle {
             &self.events,
             &channels,
         )?)
+    }
+
+    /// The engineer's channel details the engine keeps, whole: the list last set with
+    /// [Self::set_channels], entries for inputs the current device lacks included, so an editor
+    /// that changes one entry can send the whole list back without losing the others.
+    /// [EngineStatus::channels] holds only the details of the device's inputs.
+    pub fn channel_table(&self) -> Vec<ChannelMeta> {
+        channel_table(&self.config_state)
     }
 
     /// Adds a UDP target while the engine runs.
@@ -2790,6 +2806,39 @@ mod tests {
             live[4..],
             [ChannelMeta::default(), ChannelMeta::default()],
             "only inputs that never had details show the defaults"
+        );
+    }
+
+    /// An editor reads the details back whole on a smaller device, entries for the inputs it lacks
+    /// included, so sending the list back with one entry changed loses nothing; clients still see
+    /// only the device's part.
+    #[test]
+    fn the_whole_channel_table_reads_back_on_a_smaller_device() {
+        let (registry, config) = duo();
+        let events = EventBus::default();
+        edit_channels(&registry, &config, &events, &keys_and_spare())
+            .expect("the details are valid");
+        switch_to(&registry, &config, &events, 2);
+
+        let mut table = channel_table(&config);
+        assert_eq!(
+            table,
+            keys_and_spare(),
+            "the inputs the device lacks are in it"
+        );
+        assert_eq!(
+            config.snapshot().channels.len(),
+            2,
+            "clients see the device's part"
+        );
+
+        table[0].name = "Kick in".to_owned();
+        edit_channels(&registry, &config, &events, &table).expect("the details are valid");
+        assert_eq!(channel_table(&config)[1..], keys_and_spare()[1..]);
+        switch_to(&registry, &config, &events, 4);
+        assert_eq!(
+            config.snapshot().channels[3],
+            hidden(channel("Spare", ChannelKind::Other))
         );
     }
 

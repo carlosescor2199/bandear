@@ -6,7 +6,6 @@ import {
   KIND_OPTIONS,
   addGroup,
   channelRows,
-  channelTableOf,
   deleteGroup,
   groupCards,
   groupDefinitionsOf,
@@ -218,12 +217,9 @@ test("linking pairs an input with the next; unlinking works from either side", (
   assert.throws(() => setChannelLink(table, 3, true, 4), /CH 4/, "the last input");
 });
 
-test("a status's details and groups are what the desk sends back", () => {
+test("a status's groups are what the desk sends back", () => {
   const status = sampleStatus();
 
-  assert.deepEqual(channelTableOf(status)[0], detail("Kick", "drums"));
-  assert.equal(channelTableOf(status).length, 6);
-  assert.deepEqual(channelTableOf(null), []);
   assert.deepEqual(groupDefinitionsOf(status), [
     { id: "drums", name: "Drums", channels: [1, 2, 3] },
     { id: "vocals", name: "Vocals", channels: [5, 6] },

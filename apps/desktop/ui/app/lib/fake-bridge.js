@@ -345,7 +345,8 @@ function withPort(address) {
  * groups are announced in a status before the moved mixes), answers `{ groups, applied, saved,
  * saveError }` as the desktop does, and every start that names no groups takes them. Channel
  * details too: `set_channels` keeps them, applies them while the engine runs and answers `{
- * channels, applied, saved, saveError }`; every start takes them, and the engine keeps them whole
+ * channels, applied, saved, saveError }` and `channel_table` reads them back whole; every start takes
+ * them, and the engine keeps them whole
  * while a status shows those of the inputs the device has, so a device switch shows the details of
  * inputs that come back again, as the engine does. A hidden input is heard in no musician's meter; a new
  * pair is panned apart (0 and 100) in every mix, announced in a status before the moved mixes; and
@@ -666,6 +667,10 @@ export function createFakeBridge({
         }
       }
       return outcome;
+    },
+    channel_table() {
+      // As the desktop answers: the running engine's whole table, else the session's.
+      return clone(isRunning ? runningChannels : savedChannels);
     },
   };
 

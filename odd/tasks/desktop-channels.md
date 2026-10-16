@@ -1163,6 +1163,15 @@ slice. Push and PRs are the user's decision.
   review base 97dcc8e. Both WARNINGs (R3-offline-circle-later-steps-single-key,
   R3-pending-mirror-cleared-only-by-unseen-answer) are fixed by T6a-fix2.
 
+- Review `review-178839bd3ed80301` over 97dcc8e..aaf926b (T6a-fix2) approved and acknowledged;
+  next review base aaf926b. One WARNING kept as a known limitation (no further fix round):
+  R3-stale-kept-address-joins-musicians — with no engine running, the offline circle check joins
+  keys through the `leaderAddress`/`followerAddress` kept when a mirror was set; if an IP later
+  belongs to another musician (a new DHCP lease, or two musicians on one host), the desk can
+  refuse a valid mirror as a circle until the engine runs. The refusal is shown, nothing wrong is
+  saved, and with the engine running the engine's own check decides. Revisit if offline mirror
+  editing becomes common; the fake's offline circle check also still compares keys as strings.
+
 ## Next step
 
 T6b (presets, copy and mirror on Android: the `following` field).

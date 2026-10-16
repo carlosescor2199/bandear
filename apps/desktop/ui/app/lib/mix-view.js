@@ -143,18 +143,22 @@ export function mixNotice(state) {
   return state.musicians.length === 0 ? { kind: "no-musicians" } : null;
 }
 
-const COMMAND_WORDS = Object.freeze({ stop: "stopped", start: "started" });
+const COMMAND_FAILURES = Object.freeze({
+  stop: "The engine could not be stopped",
+  start: "The engine could not be started",
+  switch: "The input device could not be switched",
+});
 
 /**
  * The sentences above the strips: `departed` when the open musician was removed and another one
- * opened, `error` when a change was refused, `command` when the engine refused a stop while it
- * went on running. Each is null when there is nothing to say.
+ * opened, `error` when a change was refused, `command` when the engine refused a stop or a device
+ * switch while it went on running. Each is null when there is nothing to say.
  */
 export function mixMessages(state) {
   let command = null;
   if (state.commandError) {
     const { action, message } = state.commandError;
-    command = `The engine could not be ${COMMAND_WORDS[action] ?? action}: ${message}.`;
+    command = `${COMMAND_FAILURES[action] ?? `The engine refused to ${action}`}: ${message}.`;
   }
   return { ...musicianMessages(state), command };
 }

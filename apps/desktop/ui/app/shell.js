@@ -7,13 +7,15 @@
 // heading stands in.
 //
 // In the MixLink app the console talks to the engine through Tauri. Opened in a browser as
-// `console.html?fake`, it runs against the simulated engine of lib/fake-bridge.js instead.
+// `index.html?fake` (served by dev/serve.mjs), it runs against the simulated engine of
+// lib/fake-bridge.js instead.
 
 import { createTauriBridge } from "./lib/bridge.js";
 import { createConsoleApp } from "./lib/console-app.js";
 import { createFakeBridge } from "./lib/fake-bridge.js";
 import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
+import { mountNetworkScreen } from "./screens/network-screen.js";
 
 const ICONS = Object.freeze({
   mix: `<path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 14h4M10 8h4M16 12h4"/>`,
@@ -115,7 +117,7 @@ function unavailableScreen(main) {
   );
   const link = document.createElement("a");
   link.href = "?fake";
-  link.textContent = "console.html?fake";
+  link.textContent = "index.html?fake";
   note.append(link, ".");
   header.append(heading, note);
   main.append(header);
@@ -146,6 +148,7 @@ if (nav && main) {
     skipLink: document.querySelector("[data-skip-link]"),
     screens: {
       mix: app ? (screenMain) => mountMixScreen(screenMain, app) : unavailableScreen,
+      network: app ? (screenMain) => mountNetworkScreen(screenMain, app) : unavailableScreen,
     },
   });
   if (simulated) {

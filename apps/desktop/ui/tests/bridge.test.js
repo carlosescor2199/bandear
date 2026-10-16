@@ -1,13 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  ENGINE_NOT_RUNNING,
-  EVENTS,
-  createEngineApi,
-  createTauriBridge,
-  isEngineNotRunning,
-} from "../app/lib/bridge.js";
+import { EVENTS, createEngineApi, createTauriBridge } from "../app/lib/bridge.js";
 import { createFakeBridge, sampleStatus, syntheticMeters } from "../app/lib/fake-bridge.js";
 import { applyEdits, buildMixRequest, mixFromDto } from "../app/lib/mix.js";
 
@@ -68,6 +62,19 @@ test("the Tauri bridge hands listeners the payload and returns the unlisten func
   assert.equal(result, unlisten);
 });
 
+test("the Tauri bridge titles the app's window", async () => {
+  const titles = [];
+  const tauri = {
+    core: { invoke: async () => null },
+    event: { listen: async () => () => {} },
+    window: { getCurrentWindow: () => ({ setTitle: async (title) => titles.push(title) }) },
+  };
+
+  await createTauriBridge(tauri).setTitle("MixLink Server — Volt 4");
+
+  assert.deepEqual(titles, ["MixLink Server — Volt 4"]);
+});
+
 test("without the Tauri globals the bridge says so", () => {
   assert.throws(() => createTauriBridge(undefined), /Tauri/);
   assert.throws(() => createTauriBridge({ core: {} }), /Tauri/);
@@ -116,33 +123,31 @@ test("the engine API listens for the three engine events", async () => {
   assert.deepEqual(EVENTS, { meters: "meters", status: "status", mixChanged: "mix-changed" });
 });
 
-test("only the desktop's own words mean that no engine runs", () => {
-  assert.equal(ENGINE_NOT_RUNNING, "the engine is not running");
-  assert.equal(isEngineNotRunning("the engine is not running"), true);
-  assert.equal(isEngineNotRunning(new Error("the engine is not running")), true);
-  assert.equal(isEngineNotRunning("engine state lock was poisoned"), false);
-  assert.equal(isEngineNotRunning(undefined), false);
-});
-
-test("the fake engine can fail a command once, before or after it takes effect", async () => {
+test("the fake engine can fail a command once or a few times, before or after it takes effect", async () => {
   const fake = createFakeBridge({ running: true });
 
   fake.failNext("stop_engine", "could not stop the capture");
   await assert.rejects(fake.invoke("stop_engine"), /could not stop the capture/);
-  assert.equal((await fake.invoke("engine_status")).run, 1, "the engine still runs");
+  assert.equal((await fake.invoke("engine_status")).state, "running", "the engine still runs");
+
+  fake.failNext("engine_status", "busy", { times: 2 });
+  await assert.rejects(fake.invoke("engine_status"), /busy/);
+  await assert.rejects(fake.invoke("engine_status"), /busy/);
+  assert.equal((await fake.invoke("engine_status")).state, "running");
 
   fake.failNext("stop_engine", "stopped, but late", { afterEffect: true });
   await assert.rejects(fake.invoke("stop_engine"), /stopped, but late/);
-  await assert.rejects(fake.invoke("engine_status"), /not running/, "this time it did stop");
+  assert.equal((await fake.invoke("engine_status")).state, "notRunning", "this time it stopped");
 });
 
-test("the fake engine answers engine_status only while it runs, as the real one does", async () => {
+test("the fake engine says whether it runs, with its status when it does, as the desktop does", async () => {
   const fake = createFakeBridge();
 
-  await assert.rejects(fake.invoke("engine_status"), /not running/);
+  assert.deepEqual(await fake.invoke("engine_status"), { state: "notRunning", run: 0 });
   await fake.invoke("start_engine", { config: {} });
   const status = await fake.invoke("engine_status");
 
+  assert.equal(status.state, "running");
   assert.equal(status.musicians.length, sampleStatus().musicians.length);
   assert.equal(status.stopped, false);
   assert.deepEqual(
@@ -161,7 +166,17 @@ test("starting the fake engine announces a status and stopping it ends engine_st
 
   assert.equal(summary.deviceName, sampleStatus().deviceName);
   assert.equal(statuses.length, 1);
-  await assert.rejects(fake.invoke("engine_status"), /not running/);
+  assert.deepEqual(await fake.invoke("engine_status"), { state: "notRunning", run: 1 });
+});
+
+test("a fake engine can start without announcing a status, as a window without a pump", async () => {
+  const fake = createFakeBridge({ statusOnStart: false });
+  const statuses = [];
+  await fake.listen("status", (payload) => statuses.push(payload));
+
+  await fake.invoke("start_engine", { config: {} });
+
+  assert.deepEqual(statuses, []);
 });
 
 test("the fake engine names its run on every payload, and each start begins the next", async () => {
@@ -193,7 +208,7 @@ test("a failed start of the fake engine still ends the run before it", async () 
   const fake = createFakeBridge({ running: true, failStart: "No input device is available." });
 
   await assert.rejects(fake.invoke("start_engine", { config: {} }), /No input device/);
-  await assert.rejects(fake.invoke("engine_status"), /not running/);
+  assert.deepEqual(await fake.invoke("engine_status"), { state: "notRunning", run: 2 });
   fake.failStart(null);
   const summary = await fake.invoke("start_engine", { config: {} });
 

@@ -2,7 +2,7 @@
 name = "mixlink-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "Read-only desktop shell for the MixLink server engine."
+description = "Desktop mixing console for the MixLink server engine: every musician's mix, the phones and the audio input."
 publish = false
 
 [lib]

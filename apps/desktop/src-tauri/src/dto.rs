@@ -27,7 +27,8 @@ pub struct StartRequest {
     pub control_port: Option<u16>,
     #[serde(default)]
     pub groups: Vec<GroupRequest>,
-    /// The capture backend: "auto", "asio" or "wasapi". `None` means "auto", which prefers ASIO.
+    /// The capture backend: "auto", "asio" or "wasapi". `None` means "auto", the platform's own
+    /// host; only an explicit "asio" loads an ASIO driver.
     #[serde(default)]
     pub host: Option<String>,
     /// The capture buffer size in frames. `None` means the engine default.
@@ -340,6 +341,21 @@ fn link_health_name(health: LinkHealth) -> &'static str {
         LinkHealth::Warning => "warning",
         LinkHealth::Bad => "bad",
     }
+}
+
+/// What the `engine_status` command answers: whether an engine runs, and if so its status.
+///
+/// No engine running is an answer, not an error, so the window can tell it apart from a real
+/// failure without matching error text: `{ "state": "notRunning", "run": n }` or the whole
+/// [EngineStatusDto] with `"state": "running"`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum EngineStateDto {
+    /// No engine runs; `run` is the last run begun (0 before the first start).
+    NotRunning {
+        run: u64,
+    },
+    Running(EngineStatusDto),
 }
 
 /// A snapshot of the engine, ready for the webview.
@@ -827,6 +843,22 @@ mod tests {
         ] {
             assert_eq!(json["run"], 3, "{json}");
         }
+    }
+
+    #[test]
+    fn a_running_engines_state_is_its_status_marked_running() {
+        let mut status = EngineStatusDto::from(&status_with(Vec::new(), vec![0, 0]));
+        status.run = 2;
+
+        let json = serde_json::to_value(EngineStateDto::Running(status)).expect("serializes");
+
+        assert_eq!(json["state"], "running");
+        assert_eq!(json["run"], 2);
+        assert_eq!(json["deviceName"], "Test device", "the whole status, flat");
+        assert_eq!(
+            serde_json::to_value(EngineStateDto::NotRunning { run: 2 }).expect("serializes"),
+            serde_json::json!({ "state": "notRunning", "run": 2 })
+        );
     }
 
     #[test]

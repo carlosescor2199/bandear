@@ -10,7 +10,7 @@ pub mod events;
 pub mod names;
 
 use commands::DesktopState;
-use dto::{EngineStatusDto, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest, StartSummary};
+use dto::{EngineStateDto, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest, StartSummary};
 use events::EventPump;
 use names::MusicianNames;
 use tauri::{Manager, State};
@@ -30,9 +30,11 @@ async fn start_engine(
     commands::start_engine(state.inner(), config)
 }
 
+/// Whether an engine runs and its status: `{ state: "notRunning", run }` or the status with
+/// `state: "running"` (see [dto::EngineStateDto]).
 #[tauri::command]
-async fn engine_status(state: State<'_, DesktopState>) -> Result<EngineStatusDto, String> {
-    commands::engine_status(state.inner())
+async fn engine_status(state: State<'_, DesktopState>) -> Result<EngineStateDto, String> {
+    commands::engine_state(state.inner())
 }
 
 #[tauri::command]

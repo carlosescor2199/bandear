@@ -482,6 +482,46 @@ class MonitorViewModelTest {
         assertEquals(sent, socket().sentOfType("mix").size)
     }
 
+    /** A `mix_state` of neutral levels carrying the engineer's [limit] and [locked] channels. */
+    private fun engineerState(limit: Int, vararg locked: Int): String =
+        JSONObject(mixState(levels = emptyList()))
+            .put("engineer_limit_percent", limit)
+            .put("locked", JSONArray(List(32) { it in locked }))
+            .toString()
+
+    @Test
+    fun theEngineersLimitHoldsThePhonesOwnPlaybackAndIsNeverSent() {
+        connected(channels = 3)
+        answerMixes()
+
+        socket().receive(engineerState(60))
+        viewModel.setLevelCap(90)
+
+        assertEquals(60, state.mix.effectiveCap)
+        assertEquals(60, receiver.mixState.maxLevelPercent)
+        assertEquals(90, lastMix().getInt("max_level_percent"))
+        assertFalse(lastMix().has("engineer_limit_percent"))
+        assertFalse(lastMix().has("locked"))
+    }
+
+    @Test
+    fun aLockedChannelsEditSendsNothingAndMoreOfMeLeavesIt() {
+        connected(channels = 3)
+        answerMixes()
+        socket().receive(engineerState(100, 0))
+        val sent = socket().sentOfType("mix").size
+
+        viewModel.setChannelLevel(0, 40)
+        viewModel.setChannelMuted(0, true)
+
+        assertEquals(sent, socket().sentOfType("mix").size)
+
+        viewModel.setMusicianChannel(1)
+        viewModel.setMoreOfMe(true)
+
+        assertEquals(listOf(100, 100, 50), lastMix().ints("channels"))
+    }
+
     @Test
     fun masterChangesReachTheAudioThreadAndTheServer() {
         connected()

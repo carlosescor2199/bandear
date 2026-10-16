@@ -9,9 +9,10 @@ import com.mixlink.android.ClientMixState
 import com.mixlink.android.ControlChannel
 import com.mixlink.android.ControlState
 import com.mixlink.android.DiscoveredServer
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
-import com.mixlink.android.MixSnapshot
+import com.mixlink.android.MixReport
 import com.mixlink.android.PmonPlayer
 import com.mixlink.android.ServerDiscovery
 import com.mixlink.android.ui.components.MainTab
@@ -166,9 +167,10 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             dispatch(MixAcknowledged(control.controlState))
         }
 
-        override fun onMixPushed(mix: MixSnapshot) = serverMixReported(MixPushed(mix))
+        override fun onMixPushed(report: MixReport) = serverMixReported(MixPushed(report.mix, report.engineer))
 
-        override fun onMixAnswered(seq: Long, applied: MixSnapshot?) = serverMixReported(MixAnswered(seq, applied))
+        override fun onMixAnswered(seq: Long, applied: MixReport?) =
+            serverMixReported(MixAnswered(seq, applied?.mix, applied?.engineer ?: EngineerControls()))
 
         override fun onClosed() = publishControlState()
 
@@ -194,6 +196,7 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         mixSequence = { _state.value.mixSync.latest },
         transport = collaborators.controlTransport,
         scheduler = collaborators.controlScheduler,
+        lockedChannels = { _state.value.mix.engineer.lockedChannels },
     )
     private val receiver: AudioReceiver = collaborators.receiverFactory(receiverEvents, running, playerMix)
     private val scanner: ServerScanner = collaborators.scannerFactory(scannerEvents)
@@ -371,7 +374,8 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         synchronized(playerMixLock) {
             val mix = _state.value.mix
             playerMix.volumePercent = mix.masterVolume
-            playerMix.maxLevelPercent = mix.levelCap
+            // The lower of the phone's cap and the engineer's limit, as the server plays it.
+            playerMix.maxLevelPercent = mix.effectiveCap
             playerMix.muted = mix.masterMuted
         }
     }

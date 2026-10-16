@@ -3,6 +3,7 @@ package com.mixlink.android.ui.state
 import com.mixlink.android.ChannelInfo
 import com.mixlink.android.ChannelKind
 import com.mixlink.android.ControlState
+import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
 import com.mixlink.android.MixSnapshot
@@ -758,6 +759,164 @@ class MonitorReducerTest {
         assertEquals(listOf(40, 100), refused.mix.levels)
         assertTrue(refused.mixSync.settled)
         assertEquals(listOf(80, 70), refused.after(MixPushed(serverMix)).mix.levels)
+    }
+
+    // The engineer's limit and locks.
+
+    /** The engineer's controls: a limit of [limit] and [locked] channels. */
+    private fun engineer(limit: Int = 100, locked: Set<Int> = emptySet()) = EngineerControls(limit, locked)
+
+    /** A session of three channels whose server reported the engineer's [controls] with its mix. */
+    private fun lockedBy(controls: EngineerControls, details: List<ChannelInfo>? = null): MonitorUiState =
+        running().after(ConfigReceived(3, emptyList(), details), MixPushed(neutralMix, controls))
+
+    /** The server's whole mix at the neutral values a fresh three-channel session already shows. */
+    private val neutralMix = MixSnapshot(
+        channelGains = IntArray(32) { 100 },
+        channelPans = IntArray(32) { if (it % 2 == 0) 0 else 100 },
+        channelMutes = BooleanArray(32),
+        channelSolos = BooleanArray(32),
+        groupLevels = IntArray(16) { 100 },
+    )
+
+    @Test
+    fun theReportedLimitAndLocksAreKeptAndShowOnTheStrips() {
+        val state = lockedBy(engineer(60, setOf(1)))
+
+        assertEquals(engineer(60, setOf(1)), state.mix.engineer)
+        assertEquals(listOf(false, true, false), state.mix.channels.map { it.locked })
+        assertTrue(state.mix.stripLocked(1))
+        assertFalse(state.mix.stripLocked(0))
+    }
+
+    @Test
+    fun anOlderServerLeavesEverythingOpenAndUnlimited() {
+        val state = connectedWith(3).after(MixPushed(serverMix))
+
+        assertEquals(EngineerControls(), state.mix.engineer)
+        assertEquals(listOf(false, false, false), state.mix.channels.map { it.locked })
+        assertEquals(state.mix.levelCap, state.mix.effectiveCap)
+    }
+
+    @Test
+    fun theMusicianHearsTheLowerOfTheirCapAndTheEngineersLimit() {
+        val limited = lockedBy(engineer(60))
+
+        assertEquals(100, limited.mix.levelCap)
+        assertEquals(60, limited.mix.effectiveCap)
+        // The phone's own cap still moves, and wins when it is lower.
+        val lowerCap = limited.after(LevelCapChanged(50))
+        assertEquals(50, lowerCap.mix.levelCap)
+        assertEquals(50, lowerCap.mix.effectiveCap)
+        assertEquals(50, lowerCap.mix.toSnapshot().maxLevelPercent)
+    }
+
+    @Test
+    fun aLockedChannelCannotBeChangedFromThePhone() {
+        val state = lockedBy(engineer(locked = setOf(1)))
+
+        val tried = state.after(
+            ChannelLevelChanged(1, 40),
+            ChannelPanChanged(1, 50),
+            ChannelMuteChanged(1, true),
+            ChannelSoloChanged(1, true),
+        )
+
+        assertEquals(state, tried)
+        // The other channels still move.
+        assertEquals(listOf(30, 100, 100), tried.after(ChannelLevelChanged(0, 30)).mix.levels)
+    }
+
+    @Test
+    fun aPairIsLockedAsOneStripWhenEitherSideIs() {
+        val pair = listOf(ChannelInfo("Keys", ChannelKind.KEYS, link = true), ChannelInfo(), ChannelInfo("Vox"))
+        val state = lockedBy(engineer(locked = setOf(1)), pair)
+
+        assertEquals(listOf(true, false), state.mix.channels.map { it.locked })
+        assertTrue(state.mix.stripLocked(0))
+        assertEquals(state, state.after(ChannelLevelChanged(0, 40), ChannelPanChanged(0, 25), ChannelMuteChanged(0, true)))
+    }
+
+    @Test
+    fun recallingASavedMixLeavesLockedChannelsAsTheyAre() {
+        val state = lockedBy(engineer(locked = setOf(1)))
+        val saved = MixSnapshot(
+            channelGains = intArrayOf(10, 20, 30),
+            channelPans = intArrayOf(50, 50, 50),
+            channelMutes = booleanArrayOf(true, true, true),
+            channelSolos = booleanArrayOf(true, true, true),
+        )
+
+        val recalled = state.after(MixRecalled("Verse", saved)).mix
+
+        assertEquals(listOf(10, 100, 30), recalled.levels)
+        assertEquals(listOf(50, 100, 50), recalled.pans)
+        assertEquals(listOf(true, false, true), recalled.mutes)
+        assertEquals(listOf(true, false, true), recalled.solos)
+    }
+
+    @Test
+    fun moreOfMeNeitherLiftsNorLowersALockedChannel() {
+        val on = lockedBy(engineer(locked = setOf(2))).after(ChannelLevelChanged(0, 80), MusicianChannelChosen(1), MoreOfMeToggled(true))
+        val played = on.mix.toSnapshot().moreOfMeFor(on.moreOfMeChannels, on.mix.engineer.lockedChannels)!!
+
+        assertTrue(on.moreOfMe.enabled)
+        assertEquals(listOf(40, 100, 100), played.channelGains.take(3))
+        // The server plays exactly that; hearing it back keeps More of me on.
+        assertEquals(on, on.after(MixPushed(played, on.mix.engineer)))
+    }
+
+    @Test
+    fun moreOfMeIsOffWhileTheEngineerLocksTheMusiciansChannel() {
+        val on = connectedWith(3).after(MusicianChannelChosen(1), MoreOfMeToggled(true))
+
+        val locked = on.after(MixPushed(on.mix.toSnapshot().moreOfMe(1)!!, engineer(locked = setOf(1))))
+
+        assertFalse(locked.moreOfMe.enabled)
+        assertEquals(1, locked.moreOfMe.musicianChannel)
+        assertEquals(MoreOfMeNotice.CHANNEL_LOCKED, locked.moreOfMe.notice)
+        // Turning it on again is refused while the channel is locked, and says why.
+        val asked = locked.after(MoreOfMeToggled(false), MoreOfMeToggled(true))
+        assertFalse(asked.moreOfMe.enabled)
+        assertEquals(MoreOfMeNotice.CHANNEL_LOCKED, asked.moreOfMe.notice)
+        // Choosing a locked channel while More of me is on turns it off too.
+        val moved = lockedBy(engineer(locked = setOf(2))).after(MusicianChannelChosen(0), MoreOfMeToggled(true), MusicianChannelChosen(2))
+        assertFalse(moved.moreOfMe.enabled)
+        assertEquals(2, moved.moreOfMe.musicianChannel)
+        assertEquals(MoreOfMeNotice.CHANNEL_LOCKED, moved.moreOfMe.notice)
+    }
+
+    @Test
+    fun aLockArrivingWhileAMixIsOutstandingHoldsAtOnceAndSettlesWithTheAnswer() {
+        val outstanding = connectedWith(3).sent(ChannelLevelChanged(0, 40))
+        val kept = neutralMix.copy(channelGains = IntArray(32) { if (it == 0) 70 else 100 })
+
+        // The push is overtaken by the phone's mix still on its way, but the lock holds at once.
+        val pushed = outstanding.after(MixPushed(kept, engineer(locked = setOf(0))))
+        assertEquals(listOf(40, 100, 100), pushed.mix.levels)
+        assertTrue(pushed.mix.stripLocked(0))
+        assertEquals(pushed, pushed.after(ChannelLevelChanged(0, 20)))
+
+        // The answer to that mix carries the value the server kept, and settles it.
+        val answered = pushed.after(MixAnswered(1, kept, engineer(locked = setOf(0))))
+        assertEquals(listOf(70, 100, 100), answered.mix.levels)
+        assertTrue(answered.mixSync.settled)
+        assertTrue(answered.mix.stripLocked(0))
+    }
+
+    @Test
+    fun aRefusedMixLeavesTheEngineersControlsAsTheyWere() {
+        val state = lockedBy(engineer(60, setOf(1))).sent(ChannelLevelChanged(0, 40))
+
+        assertEquals(engineer(60, setOf(1)), state.after(MixAnswered(1, applied = null)).mix.engineer)
+    }
+
+    @Test
+    fun aNewSessionStartsUnlockedAndReportsOutsideOneChangeNothing() {
+        val ended = lockedBy(engineer(60, setOf(1))).after(SessionEnded)
+
+        assertEquals(ended, ended.after(MixPushed(serverMix, engineer(40, setOf(0)))))
+        assertEquals(EngineerControls(), ended.after(SessionStarted(server, DEFAULT_AUDIO_PORT)).mix.engineer)
     }
 
     // Saved mixes.

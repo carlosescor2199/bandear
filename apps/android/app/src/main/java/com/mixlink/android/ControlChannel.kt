@@ -47,6 +47,8 @@ internal class ControlChannel(
     private val mixSequence: () -> Long? = { null },
     private val transport: ControlTransport = OkHttpControlTransport(),
     private val scheduler: ControlScheduler = ExecutorControlScheduler(),
+    /** The channels the engineer locked, which More of me leaves as they are. */
+    private val lockedChannels: () -> Set<Int> = { emptySet() },
 ) {
     interface Listener {
         fun onOpened()
@@ -60,17 +62,19 @@ internal class ControlChannel(
 
         /**
          * The server pushed this musician's whole mix (`mix_state`) because it changed elsewhere,
-         * such as on the desktop. The channel sends nothing back: the server already plays it. A
-         * listener that does not follow the server's mix keeps this default and ignores it.
+         * such as on the desktop, with the engineer's controls. The channel sends nothing back: the
+         * server already plays it. A listener that does not follow the server's mix keeps this
+         * default and ignores it.
          */
-        fun onMixPushed(mix: MixSnapshot) = Unit
+        fun onMixPushed(report: MixReport) = Unit
 
         /**
          * The server answered the phone's mix number [seq]: [applied] is the whole mix it now plays
-         * (its `mix_ack`), or null when it refused the mix (an `error`) or its ack had no readable
-         * mix. Answers without a number (from a server that predates them) are never reported here.
+         * (its `mix_ack`) with the engineer's controls, or null when it refused the mix (an `error`)
+         * or its ack had no readable mix. Answers without a number (from a server that predates
+         * them) are never reported here.
          */
-        fun onMixAnswered(seq: Long, applied: MixSnapshot?) = Unit
+        fun onMixAnswered(seq: Long, applied: MixReport?) = Unit
 
         fun onClosed()
         fun onControlError(message: String)
@@ -373,7 +377,7 @@ internal class ControlChannel(
             val stored = currentSnapshot()
             // `More of me` is derived here, at send time, and never written back. The stored values
             // stay exactly as the musician left them, so turning the control off re-sends them.
-            val outgoing = if (moreOfMeEnabled()) stored.moreOfMeFor(musicianChannels()) ?: stored else stored
+            val outgoing = if (moreOfMeEnabled()) stored.moreOfMeFor(musicianChannels(), lockedChannels()) ?: stored else stored
             if (!webSocket.send(buildMixMessage(outgoing, sequence)) && running.get()) {
                 listener.onControlError("WebSocket rejected mix update")
             }
@@ -494,10 +498,11 @@ internal fun buildStatsMessage(report: LinkStatsReport): String =
  * carries it, and `mix_ack` shares the shape. The lists are the server's full tables (32 channels,
  * 16 groups); the client keeps the channels and groups it knows. The server always sends every
  * field, so a missing or mistyped one throws: such a push is reported as invalid, never applied, and
- * such an ack still acknowledges but shows nothing.
+ * such an ack still acknowledges but shows nothing. The engineer's controls came later and are read
+ * leniently ([parseEngineerControls]).
  */
-internal fun parseMixReport(message: JSONObject): MixSnapshot =
-    MixSnapshot(
+internal fun parseMixReport(message: JSONObject): MixReport = MixReport(
+    mix = MixSnapshot(
         channelGains = message.getJSONArray("channels").ints(),
         channelPans = message.getJSONArray("pans").ints(),
         channelMutes = message.getJSONArray("mutes").booleans(),
@@ -506,7 +511,22 @@ internal fun parseMixReport(message: JSONObject): MixSnapshot =
         volumePercent = message.getInt("volume_percent"),
         maxLevelPercent = message.getInt("max_level_percent"),
         muted = message.getBoolean("muted"),
-    )
+    ),
+    engineer = parseEngineerControls(message),
+)
+
+/**
+ * Reads the engineer's controls from a mix report: `engineer_limit_percent` (held to 0-100) and
+ * `locked` (one entry per channel, `true` for a locked one). Both are lenient: a server that predates
+ * them sends neither, which reads as no limit and nothing locked; a limit that is not a number is no
+ * limit, a short list leaves the rest open, and an entry that is not a boolean is open.
+ */
+internal fun parseEngineerControls(message: JSONObject): EngineerControls {
+    val limit = (message.opt("engineer_limit_percent") as? Number)?.toInt()?.coerceIn(0, 100) ?: 100
+    val locked = message.optJSONArray("locked")
+    val lockedChannels = if (locked == null) emptySet() else (0 until locked.length()).filter { locked.opt(it) == true }.toSet()
+    return EngineerControls(limit, lockedChannels)
+}
 
 /** The number of the phone's mix this answer names (`seq`), or null when it names none. */
 private fun JSONObject.answeredSequence(): Long? = if (opt("seq") is Number) getLong("seq").takeIf { it >= 0 } else null

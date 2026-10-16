@@ -1311,6 +1311,22 @@ pub(crate) struct OpenedCapture {
     pub(crate) format: CaptureFormat,
 }
 
+impl OpenedCapture {
+    /// The channel count the session would switch to: the reported format's, which must be the
+    /// layout of the frames in the ring, or every block would be read with the wrong stride.
+    fn channels(&self) -> Result<u16, Box<dyn Error>> {
+        let ring = self.reader.format().channels;
+        if usize::from(self.format.channels) != ring {
+            return Err(format!(
+                "the capture reports {} channels but its frames carry {ring}",
+                self.format.channels
+            )
+            .into());
+        }
+        Ok(self.format.channels)
+    }
+}
+
 impl EngineHandle {
     /// The flag the caller sets to stop the engine, for use from a signal handler.
     pub fn stop_signal(&self) -> Arc<AtomicBool> {
@@ -1474,12 +1490,14 @@ impl EngineHandle {
     /// Makes an opened, running capture the engine's: the engine thread reads its ring from the
     /// next block on, the previous stream is dropped, and the session takes its channel count.
     ///
-    /// A plan that cannot be made leaves everything as it was (the new capture is dropped).
+    /// A plan that cannot be made (a capture whose format and frames disagree), or an engine
+    /// thread that is no longer running, leaves everything as it was: the running capture keeps
+    /// feeding the engine and the new one is dropped.
     pub(crate) fn install_capture(
         &mut self,
         capture: OpenedCapture,
     ) -> Result<CaptureFormat, Box<dyn Error>> {
-        let plan = plan_switch_from_attempt(&self.group_definitions, Ok(capture.format.channels))?;
+        let plan = plan_switch_from_attempt(&self.group_definitions, capture.channels())?;
         let pipeline = self.pipeline.as_ref().ok_or("the engine is stopping")?;
 
         // Commit: the engine thread moves to the new ring between two blocks, then the old stream,
@@ -3900,7 +3918,8 @@ mod tests {
     }
 
     /// A running engine with no audio device: the engine thread and the network sink run as in a
-    /// session, with one phone at `phone`, and the capture is a stereo source the test drives.
+    /// session, with one phone at `phone`, and the capture is a stereo source the test drives. One
+    /// group spans both inputs, so a switch to a mono device would invalidate it.
     fn engine_without_device(phone: SocketAddr) -> (EngineHandle, crate::pipeline::CaptureWriter) {
         let targets = Arc::new(
             TargetRegistry::new(&[phone], &GroupLayout::default()).expect("registry should build"),
@@ -3922,7 +3941,7 @@ mod tests {
             buffer_frames: Some(64),
             host: AudioHost::Auto,
             source_channels: 0,
-            group_definitions: Vec::new(),
+            group_definitions: vec![definition("pair", "Pair", &[1, 2])],
             levels,
             targets,
             stopped: Arc::new(AtomicBool::new(false)),
@@ -4019,5 +4038,112 @@ mod tests {
         );
 
         engine.stop().expect("the engine stops");
+    }
+
+    /// What a switch would change: the device, its format, the channel count and the groups.
+    fn session(engine: &EngineHandle) -> (String, CaptureFormat, u8, Vec<GroupStatus>) {
+        (
+            engine.device_name().to_owned(),
+            engine.capture_format().clone(),
+            engine.source_channels,
+            engine.config_state.snapshot().groups.clone(),
+        )
+    }
+
+    /// A switch whose plan is refused (here a capture whose format reports one channel while its
+    /// frames carry two) changes nothing: the device, format, channel count and groups stay, the
+    /// running capture keeps feeding the phones, and the refused capture's audio goes nowhere. A
+    /// stopped engine then refuses `switch_device` before it touches any audio device.
+    #[test]
+    fn a_refused_switch_leaves_the_running_capture_untouched() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        phone
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout should set");
+        let (mut engine, mut running) = engine_without_device(phone.local_addr().expect("address"));
+        let before = session(&engine);
+        assert_eq!(before.2, 2);
+        assert!(before.3.iter().all(|group| !group.invalid));
+        let (mut refused, mut opened) = test_capture(&engine, 2);
+        opened.format = test_format(1);
+
+        let error = engine
+            .install_capture(opened)
+            .expect_err("a capture whose format and frames disagree is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reports 1 channels but its frames carry 2"),
+            "{error}"
+        );
+        assert_eq!(session(&engine), before);
+        refused.write(&[-0.25f32; 2 * 64]);
+        running.write(&[0.5f32; 2 * 64]);
+        let mut packet = [0u8; 1_024];
+        phone
+            .recv(&mut packet)
+            .expect("the running capture still reaches the phone");
+        assert_eq!(i16::from_le_bytes([packet[20], packet[21]]), 16_384);
+
+        engine.stop().expect("the engine stops");
+        let error = engine
+            .switch_device(None)
+            .expect_err("a stopped engine does not switch");
+        assert!(error.to_string().contains("stopping"), "{error}");
+        assert_eq!(session(&engine), before);
+    }
+
+    /// A sink that fails on its first block, which ends the engine thread.
+    struct Failing;
+
+    impl crate::pipeline::Sink for Failing {
+        fn process(&mut self, _block: &crate::pipeline::Block<'_>) {
+            panic!("a sink failed (expected by this test)");
+        }
+    }
+
+    /// When the engine thread is no longer running (here a sink panicked and ended it), a switch
+    /// fails without committing anything: the device, format, channel count and groups stay, so a
+    /// mono device that would invalidate the stereo group leaves it valid.
+    #[test]
+    fn a_switch_fails_without_committing_when_the_engine_thread_has_ended() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (mut engine, _running) = engine_without_device(phone.local_addr().expect("address"));
+        let failing = PipelineHandle::spawn(Pipeline::new(
+            vec![Box::new(Failing)],
+            Arc::clone(&engine.levels),
+        ))
+        .expect("the engine thread starts");
+        engine
+            .pipeline
+            .replace(failing)
+            .expect("the engine was running")
+            .stop()
+            .expect("the first engine thread stops");
+        let (mut doomed, opened) = test_capture(&engine, 2);
+        let pipeline = engine.pipeline.as_ref().expect("the failing engine thread");
+        pipeline
+            .set_source(opened.reader)
+            .expect("the failing thread takes a source");
+        doomed.write(&[0.1f32; 2 * 64]);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !pipeline.has_ended() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            pipeline.has_ended(),
+            "the failing sink ended the engine thread"
+        );
+        let before = session(&engine);
+
+        let (_mono, mono) = test_capture(&engine, 1);
+        let error = engine
+            .install_capture(mono)
+            .expect_err("no engine thread takes the new capture");
+
+        assert!(error.to_string().contains("has stopped"), "{error}");
+        assert_eq!(session(&engine), before);
+        assert!(session(&engine).3.iter().all(|group| !group.invalid));
     }
 }

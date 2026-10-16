@@ -143,7 +143,18 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     one block when the driver's callback length differs from the block (WASAPI), plus 0.32 ms of
     filter delay at 96/192 kHz only. Documented in the `pipeline.rs` module comment.
   - Earlier commits: cdb5d84 (capture, ring, decimator, engine thread), ebadce2 (float network
-    sink). Commit: this commit (meter fixes R3-001..R3-003).
+    sink). Commit: f4ffdbe (meter fixes R3-001..R3-003).
+  - [x] T1-fix (review findings): device switches driven through `EngineHandle` with the
+    `CaptureWriter` seam; a capture whose format and frames disagree is now refused by the plan;
+    the two timing-bound pipeline tests wait on conditions; tests that need several musician IPs
+    skip with a message when 127.0.0.2/3 cannot be bound (macOS), and the allocation test runs
+    with the phones that bind. RED (by mutation: the plan fed the format unchecked, and the commit
+    made before the engine thread took the source):
+    `a_refused_switch_leaves_the_running_capture_untouched` accepted the mismatched capture, and
+    `a_switch_fails_without_committing_when_the_engine_thread_has_ended` committed
+    ("Test input (1)", 1 channel) on a dead engine thread. GREEN: server unit tests 327 -> 329,
+    passing on 3 runs. The timing and loopback changes have no RED: they remove dependence on the
+    machine (timer granularity, loopback aliases) and pass the same here. Commit: this commit.
 - [ ] T2 (local mix and output): the engine-owned local mix, the cpal output sink with drift
   handling and the ASIO rules, session persistence, Tauri commands, the Local mix tab and the
   "Local mix out" select. Route: delegated writer.
@@ -162,9 +173,13 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 
 - Branch `feat/desktop-recording` from main 0bb278b (phases 1 and 2 merged as PRs #17-#38).
 - The user approved adding the `rtrb` crate (a download from crates.io); `rtrb` 0.3.5 is in.
-- T1 done in three work units: cdb5d84, ebadce2 and the meter-fix commit. T2 plugs the local
-  output in as a `Sink` (fed by `process`, sized in `source_changed`) and T4 the recorder the same
-  way; neither touches the capture path.
+- T1 done in three work units: cdb5d84, ebadce2 and f4ffdbe. T2 plugs the local output in as a
+  `Sink` (fed by `process`, sized in `source_changed`) and T4 the recorder the same way; neither
+  touches the capture path.
+- T1 was reviewed in two parts because of the lens context budget, both approved and
+  acknowledged: review-bd3440d2b6f6bfc9 (0bb278b..cdb5d84) and review-4f74b5710abf87fc
+  (cdb5d84..f4ffdbe). Part 1's R3-001 (the network sink still allocating) was resolved by
+  ebadce2; the rest (part 1 R3-002 and R3-003, part 2 R3-001) by T1-fix. Next review base: f4ffdbe.
 
 ## Next step
 

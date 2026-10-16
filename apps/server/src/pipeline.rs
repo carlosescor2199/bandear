@@ -151,6 +151,13 @@ pub(crate) struct SourceReader {
     format: SourceFormat,
 }
 
+impl SourceReader {
+    /// The layout of the frames in this ring.
+    pub(crate) fn format(&self) -> SourceFormat {
+        self.format
+    }
+}
+
 impl CaptureWriter {
     /// Builds both halves of a capture stream at `source_sample_rate` with `format`'s channels.
     ///
@@ -411,6 +418,12 @@ impl PipelineHandle {
         self.thread
             .join()
             .map_err(|_| "the engine thread panicked".to_owned())
+    }
+
+    /// Whether the engine thread has ended (stopped, or ended by a panic in a sink).
+    #[cfg(test)]
+    pub(crate) fn has_ended(&self) -> bool {
+        self.thread.is_finished()
     }
 }
 
@@ -700,10 +713,25 @@ pub(crate) mod tests {
         );
     }
 
+    /// Waits until `done` holds for the blocks a [Recorder] has seen; false after five seconds.
+    fn seen_until(seen: &Mutex<Vec<Seen>>, done: impl Fn(&[Seen]) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done(&seen.lock().unwrap()) {
+                return true;
+            }
+            thread::yield_now();
+        }
+        false
+    }
+
     /// Two capture streams run at once during a switch, as they do while the new device starts
     /// and the old one is being closed. Each has its own ring, and the engine thread reads one at
     /// a time, so the sinks see the old device's blocks, then only the new device's, and never a
     /// block that holds both.
+    ///
+    /// Both devices keep writing throughout; the switch happens once the old device has been heard
+    /// and the run ends once the new one has, so no sleep or timer decides the outcome.
     #[test]
     fn a_switch_never_interleaves_two_devices() {
         let levels = Arc::new(LevelMeter::new());
@@ -726,15 +754,23 @@ pub(crate) mod tests {
                 let buffer = [value; 2 * 48];
                 while running.load(Ordering::Relaxed) {
                     writer.write(&buffer);
-                    thread::sleep(Duration::from_micros(500));
+                    thread::yield_now();
                 }
             })
         };
         let old_device = produce(old, 0.25);
         let new_device = produce(new, -0.5);
-        thread::sleep(Duration::from_millis(60));
+        assert!(
+            seen_until(&seen, |blocks| blocks.len() >= 4),
+            "the old device was never heard"
+        );
         handle.set_source(new_reader).unwrap();
-        thread::sleep(Duration::from_millis(60));
+        assert!(
+            seen_until(&seen, |blocks| {
+                blocks.iter().filter(|block| block.value == -0.5).count() >= 4
+            }),
+            "the new device was never heard"
+        );
         running.store(false, Ordering::Relaxed);
         old_device.join().unwrap();
         new_device.join().unwrap();
@@ -792,15 +828,17 @@ pub(crate) mod tests {
         assert_eq!((allocations, frees), (0, 0));
     }
 
+    /// Stopping wakes the idle engine thread and waits for it to end. The bound is ten idle
+    /// waits, far beyond any timer granularity: a thread that missed the stop would never end.
     #[test]
-    fn a_stopped_engine_thread_ends_promptly() {
+    fn a_stopped_engine_thread_ends() {
         let handle = PipelineHandle::spawn(Pipeline::new(Vec::new(), Arc::new(LevelMeter::new())))
             .expect("the engine thread starts");
         let started = Instant::now();
 
         handle.stop().unwrap();
 
-        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(started.elapsed() < 10 * METER_IDLE_WAIT);
     }
 
     /// A mono pipeline with `block_frames` blocks, its input meters and the silence its sink was

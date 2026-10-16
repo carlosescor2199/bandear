@@ -30,11 +30,34 @@ fun stripFillFor(muted: Boolean, mine: Boolean, moreOfMeOn: Boolean): StripFill 
     else -> StripFill.IDLE
 }
 
-/** What a screen reader says for a strip's fader: the channel, whether it is yours, whether muted. */
-fun stripFaderDescription(label: String, mine: Boolean, muted: Boolean): String = buildString {
+/**
+ * What a screen reader says for a strip's fader: the channel, whether it is yours, whether muted,
+ * and whether the engineer locked it.
+ */
+fun stripFaderDescription(label: String, mine: Boolean, muted: Boolean, locked: Boolean = false): String = buildString {
     append("$label level")
     if (mine) append(", your channel")
     if (muted) append(", muted")
+    if (locked) append(", locked by the engineer")
+}
+
+/** The words a locked strip shows in place of its group, with the lock, so it is not told by a fade. */
+const val LOCKED_TAG = "Locked"
+
+/** A control's channel [label] for a screen reader, saying the engineer locked it when [locked]. */
+fun lockedLabel(label: String, locked: Boolean): String = if (locked) "$label, locked by the engineer" else label
+
+/**
+ * The engineer's limit under the Master card's level cap, with what the musician hears at most (the
+ * lower of the phone's [cap] and the [limit]); null when the engineer set no limit.
+ */
+fun engineerLimitText(cap: Int, limit: Int): String? =
+    if (limit >= 100) null else "Limited to $limit% by the engineer · at most ${minOf(cap, limit)}%"
+
+/** What a screen reader calls the level cap control; it says when the engineer's limit applies too. */
+fun levelCapDescription(cap: Int, limit: Int): String = buildString {
+    append("Level cap, the loudest this phone plays")
+    if (limit < 100) append(". The engineer's limit of $limit% also applies: at most ${minOf(cap, limit)}%")
 }
 
 /** The channels of a group, as their strips name them ([com.mixlink.android.ui.state.GroupUiState.members]). */

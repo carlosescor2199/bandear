@@ -658,12 +658,54 @@ slice. Push and PRs are the user's decision.
   - Commits: 57dd604 `fix(engine): give a new phone at a reused address its own engineer
     controls`; this commit (`fix(desktop): keep idle engineer edits under the musician's strongest
     key`).
-- [ ] T5b (engineer limit and locks, Android): read `engineer_limit_percent` and `locked` from
+- [x] T5b (engineer limit and locks, Android): read `engineer_limit_percent` and `locked` from
   `mix_ack` and `mix_state` (lenient: absent on older servers means no limit, nothing locked);
   show the engineer's limit apart from the phone's level cap and say the lower one wins; show a
   locked channel's controls disabled with the state in words (a pair as one strip); keep sending
   whole mixes (the server keeps the locked values and the ack carries them). Route: delegated
-  writer.
+  writer (trigger: 2+ non-trivial files across the control channel, the UI state and the screens).
+  - Parsing: `EngineerControls { limitPercent = 100, lockedChannels: Set<Int> = {} }` and
+    `MixReport(mix, engineer)` next to `ChannelInfo`; `parseMixReport` returns a `MixReport` and
+    `parseEngineerControls` reads leniently (a limit that is not a number is no limit, out of range
+    is held to 0-100; `locked` absent or not an array is none, a short list leaves the rest open, a
+    non-boolean entry is open). `Listener.onMixPushed(report)` / `onMixAnswered(seq, report?)`;
+    `MixPushed`/`MixAnswered` gain `engineer` (default: open). The `mix` message never carries them.
+  - State: `MixUiState.engineer` (never sent, never saved), `effectiveCap` = min(level cap, limit),
+    `stripLocked(channel)` (a pair when either side is), `ChannelUiState.locked`. The controls of any
+    readable report hold at once (`withEngineer`), even from a push a pending change overtakes: the
+    phone never sends them and the server reports them in order; the values settle through the
+    existing `seq` rules (the answer to the newest change carries the kept values). A refusal
+    carries none; a report outside a session changes nothing; `SessionStarted` resets them to open
+    (a new server reports its own, an older one never does).
+  - Locks in the reducer: `withStrip` refuses any edit (level, pan/balance, mute, solo) of a locked
+    strip, so a whole-mix send never carries a changed locked value and nothing is sent; a recalled
+    saved mix keeps a locked channel's level, pan, mute and solo (`recalled`).
+  - More of me (decided): a locked channel is neither lifted nor lowered (`moreOfMeFor(channels,
+    locked)`, used at send time through the channel's new `lockedChannels` and by the echo check, so
+    the server's kept values do not turn it off); when the musician's own channel is locked More of
+    me goes off with "More of me is off: the engineer locked your channel" (`CHANNEL_LOCKED`), turning
+    it on is refused with that notice while it stays locked, and choosing a locked channel while it
+    is on turns it off (My channel can still be a locked channel). When the lock comes in a report,
+    nothing is sent and the mix stays as the server plays it, as for any desktop change.
+  - Playback: the receiver's local ceiling is `effectiveCap`; the phone sends its own cap.
+  - UI: a locked strip shows a "Locked" tag with a padlock (`LineIcons.Lock`) where its group chip
+    was, its fader and Mute/Solo keys fade and take no input, and TalkBack hears "Vox level, locked
+    by the engineer", "Mute Vox, locked by the engineer" and "Vox settings, locked by the engineer".
+    The sheet shows "Locked by the engineer" with the padlock over its disabled pan/balance, level and
+    keys. The Master card keeps the phone's Level cap and adds "Limited to 60% by the engineer · at
+    most 60%" (the lower of the two) when the engineer set a limit; the cap control is described
+    with it. Previews: drums locked and a 60% limit under an 80% cap; a locked channel's sheet.
+  - RED: (a) against stubs (controls never read or adopted, edits and recall unaware of locks, the
+    lift ignoring them, the effective cap the phone's cap), 13 of 421 failed: parsing 2 of 4 (the
+    older-server and never-sent guards passed), reducer 9 of 11 (the older-server and session-reset
+    tests passed vacuously), ViewModel 2 of 2. (b) against stub wording, 4 of 425 failed (three
+    Mix-screen text tests and the locked label button).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 426 tests, 0 failures, 0 errors
+    (404 before: 22 new); no compiler warnings.
+  - Size: about 485 authored changed lines in the first commit (about 260 of them tests) and 185 in
+    the second plus this document.
+  - Commits: 2c01a83 `feat(android): read the engineer's limit and locks`; this commit
+    (`feat(android): show locked channels and the engineer's limit`).
 - [ ] T6 (presets, copy and mirror): presets in the session; apply to a musician; copy; one-way
   mirror with the follower locked; the Mix screen's controls. Route: delegated writer.
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
@@ -781,6 +823,12 @@ slice. Push and PRs are the user's decision.
   address while the desktop keys `Some("")` under the phone; make the desktop treat an empty
   client id as none and make the fake validate exactly like the desktop.
 
+- T5b done (engineer limit and locks on Android); see its entry for evidence. Follow-ups: live
+  check on the Galaxy S23 against the engine (lock and limit from the desktop while the phone moves
+  the locked fader, the registration `mix_state`, the Locked tag and the limit line on the 390 dp
+  Master card); with the musician's channel locked More of me stays off and the levels it lowered
+  stay as the server plays them until the musician moves them back (as after a desktop change).
+
 ## Next step
 
-T5b (engineer limit and locks on Android).
+T6 (presets, copy and mirror).

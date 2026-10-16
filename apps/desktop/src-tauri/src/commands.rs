@@ -397,6 +397,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                     }
                 }
             }
+            // The new engine runs the session's channel details: the session is not behind it.
+            state.session.set_channels_behind(false);
             if !saved_channels.is_empty() {
                 let count = saved_channels.len();
                 match handle.set_channels(saved_channels) {
@@ -1514,7 +1516,9 @@ pub fn set_channels(
 /// what it took last even when saving it failed; with none, the session's. A kind this build does
 /// not know, kept in the session for an input (a newer build wrote it; it applies as `other`), is
 /// read as written, so the window sends it back untouched with an edit of anything else and only
-/// an explicit choice replaces it (see [set_channels]).
+/// an explicit choice replaces it (see [set_channels]). With an engine running that holds only
+/// while the session holds what the engine took last ([SessionStore::channels_behind]): after a
+/// save that failed, the engine's `other` is read, so a kind it replaced never comes back.
 pub fn channel_table(state: &DesktopState) -> Result<Vec<SessionChannel>, String> {
     read_channel_table(&state.engine, &state.session)
 }
@@ -1531,6 +1535,13 @@ fn read_channel_table<E: ChannelEngine>(
     let stored = session.channels();
     let Some(engine) = guard.as_ref() else {
         return Ok(stored);
+    };
+    // The session's kinds stand in for the engine's `other` only while the session holds what the
+    // engine took last: after a save that failed, the engine's are the newer.
+    let stored = if session.channels_behind() {
+        Vec::new()
+    } else {
+        stored
     };
     Ok(engine
         .channel_table()
@@ -1626,7 +1637,14 @@ fn edit_channels<E: ChannelEngine>(
     let mut guard = engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
-    let (details, kept) = channel_details(channels, &session.channels())?;
+    // A kind the session keeps stands for an untouched input only while the session holds what a
+    // running engine took last (see [read_channel_table]).
+    let trusted = if guard.is_some() && session.channels_behind() {
+        Vec::new()
+    } else {
+        session.channels()
+    };
+    let (details, kept) = channel_details(channels, &trusted)?;
     let applied = match guard.as_mut() {
         // A refusal (an engine that is stopping) returns here, before anything is saved.
         Some(engine) => {
@@ -1637,8 +1655,12 @@ fn edit_channels<E: ChannelEngine>(
     };
     let save_error = match session.set_channels(kept.clone()) {
         Ok(()) => None,
-        // The phones already have the details: say that they were not kept.
-        Err(error) if applied => Some(error),
+        // The phones already have the details: say that they were not kept, and from now on the
+        // engine's are the newer.
+        Err(error) if applied => {
+            session.set_channels_behind(true);
+            Some(error)
+        }
         // Nothing took them, so nothing changed.
         Err(error) => return Err(error),
     };
@@ -2099,8 +2121,12 @@ fn load_session_with<E: SessionEngine>(
     let applied = live.is_some();
     let save_error = match session.replace(next.clone()) {
         Ok(()) => None,
-        // The engine already runs the loaded session: say that it was not kept.
-        Err(error) if applied => Some(error),
+        // The engine already runs the loaded session: say that it was not kept, and from now on
+        // the engine's channel details are the newer.
+        Err(error) if applied => {
+            session.set_channels_behind(true);
+            Some(error)
+        }
         // Nothing took it, so nothing changed.
         Err(error) => return Err(error),
     };
@@ -3554,6 +3580,63 @@ mod tests {
             kept("Theremin (spare)", "keys", true, false),
             "choosing another kind for that entry replaces it"
         );
+    }
+
+    /// An explicit `other` the running engine took while the session could not be saved is what
+    /// the table reads back: the stale kind the session still holds never returns with the next
+    /// edit of another input.
+    #[test]
+    fn after_a_failed_save_the_engines_explicit_other_is_read_back_not_the_stale_kind() {
+        let directory = session_directory("channel-table-stale-kind");
+        let session = SessionStore::open(&directory);
+        session
+            .set_channels(vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "theremin", true, false),
+            ])
+            .expect("kept");
+        let engine = running(StandInEngine {
+            applied_channels: Some(session_channels(&session)),
+            ..StandInEngine::default()
+        });
+        let edit = |change: &dyn Fn(&mut Vec<ChannelRequest>)| {
+            let read =
+                serde_json::to_string(&read_channel_table(&engine, &session).expect("readable"))
+                    .expect("serializes");
+            let mut requests: Vec<ChannelRequest> =
+                serde_json::from_str(&read).expect("the window can send back what it reads");
+            change(&mut requests);
+            edit_channels(&engine, &session, requests).expect("the engine takes them")
+        };
+        // A folder where the temporary file goes makes every save fail.
+        let blocker = directory.join(format!("{}.tmp", crate::session::SESSION_FILE));
+        std::fs::create_dir(&blocker).expect("blocker");
+
+        let other = edit(&|requests| requests[1].kind = "other".to_owned());
+
+        assert!(other.applied && !other.saved, "{other:?}");
+        assert_eq!(
+            session.channels()[1].kind,
+            "theremin",
+            "the session is behind"
+        );
+        assert_eq!(
+            read_channel_table(&engine, &session).expect("readable")[1].kind,
+            "other",
+            "the engine's newer other, not the stale kind"
+        );
+        std::fs::remove_dir(&blocker).expect("the disk saves again");
+        let renamed = edit(&|requests| requests[0].name = "Kick in".to_owned());
+        assert!(renamed.saved, "{renamed:?}");
+        assert_eq!(
+            session.channels(),
+            vec![
+                kept("Kick in", "drums", false, false),
+                kept("Theremin", "other", true, false),
+            ],
+            "the replaced kind does not come back with an edit of another input"
+        );
+        assert!(!session.channels_behind());
     }
 
     /// What the window reads is what it sends back: with one entry changed on the table it read,

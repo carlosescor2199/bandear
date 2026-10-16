@@ -1192,8 +1192,33 @@ slice. Push and PRs are the user's decision.
     new, 1 replaced); `cargo fmt` clean; clippy: no new warnings; `cargo build -p mixlink-desktop`
     after `cargo clean -p mixlink-desktop` ok.
   - Commits: 44be346 `fix(engine): let a loaded session replace kept controls and mirrors` (about
-    760 changed lines); this commit (`fix(desktop): keep waiting edits when a load is refused and
-    round-trip unknown kinds`).
+    760 changed lines); 2b4ba22 `fix(desktop): keep waiting edits when a load is refused and
+    round-trip unknown kinds` (about 420).
+- [x] T7a-fix2 (review fixes for T7a-fix, review `review-386947d3e30791b9`). Route: inline writer of
+  the delegated T7a worker (one engine fix, one desktop fix).
+  - R3-replace-kept-not-atomic: `TargetRegistry::replace_kept(controls, mirrors)` holds one read of
+    the table from the controls' replacement through the last musician resolved for the mirrors
+    (the books' locks taken and released inside it, before any mix writer lock, as before), so a
+    registration meets both old books or both new ones; `replace_target_kept` makes one call and
+    announces the controls' changes, then the mirrors'. A test hook (`between_replacements`) tries
+    a registration between the two steps.
+  - R3-channel-table-stale-session-kind: `SessionStore::channels_behind` (set when a running engine
+    took channel details, or a loaded session, whose save then failed; cleared by every save of the
+    details and by a start, whose engine takes the session's) gates the raw kind: with an engine
+    running and the session behind, `read_channel_table` reads the engine's kinds and
+    `channel_details` takes no unknown kind as untouched, so an explicit `other` the engine took is
+    not undone by the stale kind on the next edit. With no engine the session is the truth.
+  - RED: the hooked test failed against a mutant that releases the table between the two steps (the
+    registration got in and met the dropped mirror); the failed-save test failed against a mutant
+    that ignores the flag (`"theremin"` read back instead of `"other"`).
+  - GREEN: `cargo test -p personal-monitoring` 300 passed (1 new), control tests 39 passed in three
+    runs; `cargo test -p mixlink-desktop` 167 passed (1 new); `cargo fmt` clean; clippy: no new
+    warnings; `cargo build -p mixlink-desktop` ok. The desktop crate's incremental cache hit a rustc
+    panic once (`dep_graph` `try_mark_green`, index out of bounds); `cargo clean -p
+    mixlink-desktop` cleared it (likely the transient build failure seen in T7a-fix too).
+  - Commits: 4a688ca `fix(engine): replace kept controls and mirrors in one step` (about 170 changed
+    lines); this commit (`fix(desktop): read a stored unknown kind only while the session matches
+    the engine`).
 - [ ] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
   answer after `config`, R3-config-pairs-musician-channel-moreofme-on-unsent) and whatever the
   phone needs to show a loaded session's pushed mix; docs. Route: delegated writer.
@@ -1377,6 +1402,9 @@ slice. Push and PRs are the user's decision.
   34012d6. Their findings (R3-refused-mix-untested, R3-refused-load-drops-waiting-edits,
   R3-explicit-other-cannot-clear-unknown-kind) and the engine gap reported with T7a (no way to
   forget kept controls or mirrors) are fixed by T7a-fix.
+- Review `review-386947d3e30791b9` over 34012d6..2b4ba22 (T7a-fix) approved and acknowledged; next
+  review base 2b4ba22. Both WARNINGs (R3-replace-kept-not-atomic,
+  R3-channel-table-stale-session-kind) are fixed by T7a-fix2.
 
 ## Next step
 

@@ -124,6 +124,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -436,6 +437,9 @@ impl Loaded {
 pub struct SessionStore {
     path: PathBuf,
     loaded: Mutex<Loaded>,
+    /// The channel details a running engine took last could not be saved, so the session's are
+    /// behind the engine's (see [Self::channels_behind]).
+    channels_behind: AtomicBool,
 }
 
 impl SessionStore {
@@ -451,7 +455,23 @@ impl SessionStore {
         Self {
             path,
             loaded: Mutex::new(loaded),
+            channels_behind: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the channel details a running engine took last could not be saved, so the
+    /// session's are behind the engine's and the session's kinds must not stand in for the
+    /// engine's (see [crate::commands::channel_table]). Every save of the channel details (an edit
+    /// or a loaded session) clears it; [Self::set_channels_behind] sets it, and a start, whose
+    /// engine takes the session's details, clears it.
+    pub fn channels_behind(&self) -> bool {
+        self.channels_behind.load(Ordering::SeqCst)
+    }
+
+    /// Records whether the session's channel details are behind the running engine's (see
+    /// [Self::channels_behind]).
+    pub fn set_channels_behind(&self, behind: bool) {
+        self.channels_behind.store(behind, Ordering::SeqCst);
     }
 
     /// What went wrong or changed when the session was opened (a file moved aside, a newer
@@ -496,6 +516,7 @@ impl SessionStore {
         };
         write_atomically(&self.path, &session)?;
         loaded.session = session;
+        self.set_channels_behind(false);
         Ok(())
     }
 
@@ -692,6 +713,7 @@ impl SessionStore {
         };
         write_atomically(&self.path, &session)?;
         loaded.session = session;
+        self.set_channels_behind(false);
         Ok(())
     }
 

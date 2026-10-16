@@ -160,6 +160,15 @@ export function channelEdits({ sides, stereo }, field, value) {
   return Object.fromEntries(sides.map((side) => [editKey(field, side), value]));
 }
 
+/**
+ * The master meter's `{ left, right }` from a `meters` payload for the mix open (`selected`): the
+ * local mix's peak on the Local mix tab, a musician's output on theirs, silence otherwise.
+ */
+export function masterLevels(meters, selected) {
+  const output = selected === LOCAL_MIX ? meters.local : meters.musicians?.[selected];
+  return { left: output?.left ?? 0, right: output?.right ?? 0 };
+}
+
 /** The level a strip's meter shows: its input's peak, or the louder side of a pair. */
 export function stripLevel(sides, levels) {
   return Math.max(...sides.map((side) => levels[side] ?? 0));

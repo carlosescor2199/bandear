@@ -16,6 +16,7 @@
 // device list offers the ASIO drivers with nothing picked, and "Start on this driver" stays off
 // until one is.
 
+import { localOutputParts } from "../lib/local-mix.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
 const styles = sheet(`
@@ -268,27 +269,29 @@ class MlAudioSetup extends HTMLElement {
     this.#showLocalOutput(data.localOutput);
   }
 
+  // Shows what localOutputParts (local-mix.js) works out; the choices live there, tested without
+  // a browser.
   #showLocalOutput(local) {
     const parts = this.#parts;
     if (!local) {
       return;
     }
-    fill(parts.localOut, local.options, local.value);
-    parts.localOut.disabled = local.disabled;
-    reflect(parts.localState, "data-kind", local.state.kind);
-    setText(parts.localState, local.state.text);
-    for (const [part, text] of [
-      [parts.localAlert, local.state.alert],
-      [parts.localNotice, local.notice],
-      [parts.localError, local.error],
+    const shown = localOutputParts(local);
+    fill(parts.localOut, shown.select.options, shown.select.value);
+    parts.localOut.disabled = shown.select.disabled;
+    reflect(parts.localState, "data-kind", shown.state.kind);
+    setText(parts.localState, shown.state.text);
+    for (const [part, line] of [
+      [parts.localAlert, shown.alert],
+      [parts.localNotice, shown.notice],
+      [parts.localError, shown.error],
     ]) {
-      part.hidden = !text;
-      setText(part, text ?? "");
+      part.hidden = line.hidden;
+      setText(part, line.text);
     }
-    const said = local.said ?? null;
-    reflect(parts.localSaid, "data-ok", said ? String(said.ok) : null);
-    setText(parts.localSaid, said?.message ?? "");
-    setText(parts.localHint, local.hint ?? "");
+    reflect(parts.localSaid, "data-ok", shown.said.ok);
+    setText(parts.localSaid, shown.said.text);
+    setText(parts.localHint, shown.hint);
   }
 }
 

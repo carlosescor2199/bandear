@@ -10,7 +10,7 @@
 import "../components/audio-setup.js";
 import "../components/musicians-table.js";
 import "../components/session-panel.js";
-import { localOutputView, parseOutputValue } from "../lib/local-mix.js";
+import { followOutputs, localOutputChoice, localOutputView } from "../lib/local-mix.js";
 import {
   BUFFER_OPTIONS,
   HOST_OPTIONS,
@@ -201,21 +201,15 @@ export function mountNetworkScreen(main, app) {
     update({ tableError: result.ok ? null : `Could not save the name: ${result.message}` });
   }
 
-  async function onLocalOutput({ detail: { value } }) {
-    update({ outputSaid: await app.setLocalOutput(parseOutputValue(value)) });
-  }
+  // A choice of the local mix's output goes to the console, which sends one at a time; only the
+  // last choice's outcome is said (localOutputChoice).
+  const chooseOutput = localOutputChoice({
+    app,
+    said: (outcome) => update({ outputSaid: outcome }),
+  });
 
   // The outputs depend on the driver an engine runs, so each run lists them again.
-  let listedRun = null;
-  function followRun(state) {
-    const run = state.engine.status ? state.engine.run : null;
-    if (run !== listedRun) {
-      listedRun = run;
-      if (run !== null) {
-        app.loadOutputs();
-      }
-    }
-  }
+  const followRun = followOutputs(() => app.loadOutputs());
 
   screen.addEventListener("audio-host", onHost);
   screen.addEventListener("audio-device", onDevice);
@@ -226,7 +220,7 @@ export function mountNetworkScreen(main, app) {
   screen.addEventListener("musician-add", onAdd);
   screen.addEventListener("musician-remove", onRemove);
   screen.addEventListener("musician-rename", onRename);
-  screen.addEventListener("local-output", onLocalOutput);
+  screen.addEventListener("local-output", ({ detail: { value } }) => chooseOutput(value));
   // The Session panel's commands: each outcome is said in the panel at once, with the store's data.
   const sessions = sessionPanelCommands({
     app,

@@ -26,8 +26,10 @@
 //   `set_engineer_controls`; an answer that did not both apply and save is kept to be said. The
 //   engineer's local mix (LOCAL_MIX) goes the same way with `set_local_mix`.
 // - The local mix's output (the Network and system screen's "Local mix out"): `loadOutputs` lists
-//   the outputs the running engine offers, `setLocalOutput` plays the local mix on one or none and
-//   answers `{ ok, message }` (formatLocalOutputSet), reading the status after it.
+//   the outputs the running engine offers (an answer for a run that has ended is not taken),
+//   `setLocalOutput` plays the local mix on one or none, one choice at a time with the last one
+//   winning, and answers `{ ok, message, superseded }` (formatLocalOutputSet), reading the status
+//   after it.
 // - Meters skip the store: `onMeters` listeners get each `meters` payload of the live run.
 // - The Network and system screen's commands: list devices, apply a driver or buffer (a
 //   restart; ASIO only on a picked driver), switch the device (live under WASAPI, a restart
@@ -460,31 +462,50 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
 
   // Lists the outputs the running engine offers for the local mix. Resolves to null, or to the
   // error of a failed listing (with no engine running there is nothing to list), which is kept to
-  // be said.
+  // be said. The answer names the run it was asked for, so one that comes back after another
+  // engine started is not taken (see console-state.js).
   async function loadOutputs() {
+    const { run } = store.getState().engine;
     try {
-      store.dispatch(actions.outputs(await api.outputDevices()));
+      store.dispatch(actions.outputs(await api.outputDevices(), run));
       return null;
     } catch (error) {
-      store.dispatch(actions.outputsFailed(message(error)));
+      store.dispatch(actions.outputsFailed(message(error), run));
       return error;
     }
   }
 
+  // Output choices go out one at a time: a choice waits for the one in flight, and a choice
+  // overtaken while it waits never goes out. `outputChoice` counts them, so each answer knows
+  // whether a newer choice came after it.
+  let outputLane = Promise.resolve();
+  let outputChoice = 0;
+
   // Plays the local mix on `output` (`{ device, firstChannel }`) or nowhere with null, then reads
-  // the status, which says where it plays. Answers `{ ok, message }`.
-  async function setLocalOutput(output) {
-    let result;
-    try {
-      result = { ok: true, message: formatLocalOutputSet(await api.setLocalOutput(output)) };
-    } catch (error) {
-      result = {
-        ok: false,
-        message: sentenceWithReason("The local mix output was not changed", message(error)),
-      };
-    }
-    await readStatus();
-    return result;
+  // the status, which says where it plays. Answers `{ ok, message, superseded }`; `superseded`
+  // says a newer choice came after this one (it may not even have gone out), so only the last
+  // choice's outcome is worth saying.
+  function setLocalOutput(output) {
+    const choice = ++outputChoice;
+    const overtaken = () => choice !== outputChoice;
+    const send = async () => {
+      if (overtaken()) {
+        return { ok: true, message: null, superseded: true };
+      }
+      let result;
+      try {
+        result = { ok: true, message: formatLocalOutputSet(await api.setLocalOutput(output)) };
+      } catch (error) {
+        result = {
+          ok: false,
+          message: sentenceWithReason("The local mix output was not changed", message(error)),
+        };
+      }
+      await readStatus();
+      return { ...result, superseded: overtaken() };
+    };
+    outputLane = outputLane.then(send);
+    return outputLane;
   }
 
   // Applies a driver or buffer change by restarting the engine, as a DAW does: on the device in
@@ -792,7 +813,10 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     loadDevices,
     /** Lists the outputs the running engine offers for the local mix; see loadOutputs. */
     loadOutputs,
-    /** Plays the local mix on `{ device, firstChannel }`, or nowhere with null; `{ ok, message }`. */
+    /**
+     * Plays the local mix on `{ device, firstChannel }`, or nowhere with null, one choice at a
+     * time; answers `{ ok, message, superseded }`.
+     */
     setLocalOutput,
     applyAudio,
     /**

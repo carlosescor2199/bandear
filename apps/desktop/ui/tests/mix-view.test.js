@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import { actions, consoleReducer, initialState } from "../app/lib/console-state.js";
 import { sampleStatus } from "../app/lib/fake-bridge.js";
 import {
+  channelEdits,
   channelStrips,
   groupStrips,
+  stripLevel,
   masterStrip,
   mixMessages,
   mixNotice,
@@ -64,13 +66,16 @@ test("a tab per musician, in the engine's order, with the link in words", () => 
   assert.equal(tabs[1].link.level, "warning");
 });
 
-test("a channel strip per input, named by number, with its group, levels and buttons", () => {
+test("a channel strip per input, named as the engineer named it, with its kind, group, levels and buttons", () => {
   const strips = channelStrips(running, LEAD);
 
   assert.equal(strips.length, 6);
   assert.deepEqual(strips[0], {
     index: 0,
-    label: "CH 1",
+    sides: [0],
+    stereo: false,
+    label: "Kick",
+    kind: "drums",
     group: { id: "drums", name: "Drums", tone: "teal", invalid: false },
     gain: 62,
     pan: 50,
@@ -79,9 +84,79 @@ test("a channel strip per input, named by number, with its group, levels and but
     tone: "default",
     readout: "62%",
   });
+  assert.deepEqual(
+    strips.map((strip) => strip.label),
+    ["Kick", "Snare", "Overheads", "Bass", "Lead vox", "Backing vox"],
+  );
   assert.equal(strips[3].group, null, "CH 4 is in no group");
   assert.deepEqual(strips[4].group, { id: "vocals", name: "Vocals", tone: "blue", invalid: false });
   assert.equal(strips[5].pan, 40);
+});
+
+// The sample with Keys on CH 2-3 as a pair panned `pans`, a hidden spare on CH 4 and CH 5 unnamed.
+function pairedState(pans = [0, 100]) {
+  const status = sampleStatus();
+  const details = [
+    ["Kick", "drums", false, false],
+    ["Keys L", "keys", false, true],
+    ["Keys R", "keys", false, false],
+    ["Spare", "other", true, false],
+    ["", "other", false, false],
+    ["Backing vox", "voice", false, false],
+  ];
+  status.channels = status.channels.map((channel, index) => {
+    const [name, kind, hidden, link] = details[index];
+    return { ...channel, name, kind, hidden, link };
+  });
+  const lead = status.musicians[0];
+  lead.pans = [50, ...pans, ...lead.pans.slice(3)];
+  lead.channelGains = [62, 70, 70, 58, 88, 52, ...lead.channelGains.slice(6)];
+  lead.channelMuted = [false, true, true, ...lead.channelMuted.slice(3)];
+  return reduce([actions.status(status)]);
+}
+
+test("a hidden input has no strip, and a pair is one stereo strip whose pan is its balance", () => {
+  const strips = channelStrips(pairedState([20, 100]), LEAD);
+
+  assert.deepEqual(
+    strips.map(({ index, sides, stereo, label }) => [index, sides, stereo, label]),
+    [
+      [0, [0], false, "Kick"],
+      [1, [1, 2], true, "Keys L"],
+      [4, [4], false, "CH 5"],
+      [5, [5], false, "Backing vox"],
+    ],
+  );
+  const keys = strips[1];
+  assert.equal(keys.kind, "keys");
+  assert.equal(keys.pan, 60, "the balance the two pans make");
+  assert.equal(keys.gain, 70);
+  assert.equal(keys.muted, true, "the pair's level, mute and solo are its first side's");
+  assert.equal(keys.readout, "muted");
+  assert.equal(channelStrips(pairedState([0, 100]), LEAD)[1].pan, 50, "a new pair is centred");
+});
+
+test("a stereo strip's level, mute and solo write both inputs, and its balance both pans", () => {
+  const pair = { sides: [1, 2], stereo: true };
+  const single = { sides: [3], stereo: false };
+
+  assert.deepEqual(channelEdits(pair, "channelGains", 40), {
+    "channelGains.1": 40,
+    "channelGains.2": 40,
+  });
+  assert.deepEqual(channelEdits(pair, "channelSolo", true), {
+    "channelSolo.1": true,
+    "channelSolo.2": true,
+  });
+  assert.deepEqual(channelEdits(pair, "pans", 70), { "pans.1": 40, "pans.2": 100 });
+  assert.deepEqual(channelEdits(single, "pans", 30), { "pans.3": 30 });
+  assert.deepEqual(channelEdits(single, "channelMuted", true), { "channelMuted.3": true });
+});
+
+test("a strip's meter shows its input, or the louder side of a pair", () => {
+  assert.equal(stripLevel([0], [10, 20, 30]), 10);
+  assert.equal(stripLevel([1, 2], [10, 20, 30]), 30);
+  assert.equal(stripLevel([4], [10, 20, 30]), 0, "an input the meters do not cover yet");
 });
 
 test("a channel strip finds its group by id, so two groups may share a name", () => {

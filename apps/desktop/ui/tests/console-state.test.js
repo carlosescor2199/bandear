@@ -12,6 +12,7 @@ import {
   selectedMusician,
   viewMix,
 } from "../app/lib/console-state.js";
+import { sampleStatus } from "../app/lib/fake-bridge.js";
 import { defaultMix } from "../app/lib/mix.js";
 
 const ANA = "192.168.1.3:50000";
@@ -514,4 +515,82 @@ test("an action the console does not know leaves the state as it was", () => {
   const state = reduce([twoMusicians]);
 
   assert.equal(consoleReducer(state, { type: "something-else" }), state);
+});
+
+// The sample engine's status with `change` applied to a copy of it.
+function sampleWith(change) {
+  const status = sampleStatus();
+  change(status);
+  return status;
+}
+
+test("edits to group levels are dropped when the groups move, and kept when one is only renamed", () => {
+  const lead = sampleStatus().musicians[0].address;
+  const edited = [
+    actions.status(sampleStatus()),
+    actions.mixEdit(lead, { "groupLevels.0": 30, "groupLevels.1": 80, "channelGains.0": 50 }),
+  ].reduce(consoleReducer, initialState);
+
+  const renamed = consoleReducer(
+    edited,
+    actions.status(sampleWith((status) => (status.groups[0].name = "Kit"))),
+  );
+  assert.deepEqual(pendingEdits(renamed, lead), {
+    "groupLevels.0": 30,
+    "groupLevels.1": 80,
+    "channelGains.0": 50,
+  });
+
+  // Reordered: a level kept by position would land on the other group.
+  const reordered = consoleReducer(
+    edited,
+    actions.status(sampleWith((status) => status.groups.reverse())),
+  );
+  assert.deepEqual(pendingEdits(reordered, lead), { "channelGains.0": 50 });
+  const deleted = consoleReducer(
+    edited,
+    actions.status(sampleWith((status) => status.groups.pop())),
+  );
+  assert.deepEqual(pendingEdits(deleted, lead), { "channelGains.0": 50 });
+});
+
+test("edits to an input are dropped when it joins or leaves a pair or is hidden, others are kept", () => {
+  const lead = sampleStatus().musicians[0].address;
+  const edited = [
+    actions.status(sampleStatus()),
+    actions.mixEdit(lead, {
+      "pans.1": 30,
+      "channelGains.2": 40,
+      "channelMuted.4": true,
+      "channelSolo.5": true,
+      volumePercent: 70,
+    }),
+  ].reduce(consoleReducer, initialState);
+
+  const linked = consoleReducer(
+    edited,
+    actions.status(sampleWith((status) => (status.channels[1].link = true))),
+  );
+  assert.deepEqual(pendingEdits(linked, lead), {
+    "channelMuted.4": true,
+    "channelSolo.5": true,
+    volumePercent: 70,
+  });
+
+  const hidden = consoleReducer(
+    edited,
+    actions.status(sampleWith((status) => (status.channels[4].hidden = true))),
+  );
+  assert.deepEqual(pendingEdits(hidden, lead), {
+    "pans.1": 30,
+    "channelGains.2": 40,
+    "channelSolo.5": true,
+    volumePercent: 70,
+  });
+
+  const renamed = consoleReducer(
+    edited,
+    actions.status(sampleWith((status) => (status.channels[1].name = "Snare top"))),
+  );
+  assert.equal(pendingEdits(renamed, lead), pendingEdits(edited, lead), "a name moves nothing");
 });

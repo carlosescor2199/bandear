@@ -10,10 +10,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -29,17 +31,20 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mixlink.android.ui.components.GroupChip
 import com.mixlink.android.ui.components.HorizontalFader
+import com.mixlink.android.ui.components.LineIcons
 import com.mixlink.android.ui.components.PAN_CENTRE
 import com.mixlink.android.ui.components.PAN_LEFT
 import com.mixlink.android.ui.components.PAN_RIGHT
 import com.mixlink.android.ui.components.PanControl
 import com.mixlink.android.ui.components.SecondaryButton
 import com.mixlink.android.ui.components.groupToneFor
+import com.mixlink.android.ui.components.kindIcon
 import com.mixlink.android.ui.components.panText
 import com.mixlink.android.ui.state.ChannelUiState
 import com.mixlink.android.ui.theme.MixLinkShapes
@@ -123,11 +128,12 @@ internal fun ChannelSheetContent(
     ) {
         SheetHeader(channel, mine)
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            ValueRow(title = "PAN", value = panText(channel.pan), dim = false)
+            // A stereo pair's pan is its balance: the same control, written as both pans.
+            ValueRow(title = panTitle(channel.stereo), value = panText(channel.pan), dim = false)
             PanControl(
                 pan = channel.pan,
                 onPanChange = onPan,
-                contentDescription = channelPanDescription(channel.label),
+                contentDescription = channelPanDescription(channel.label, channel.stereo),
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -163,22 +169,40 @@ internal fun ChannelSheetContent(
     }
 }
 
-/** The channel, its group, and whether it is the musician's own. */
+/**
+ * The channel with the icon of what it carries, its group, whether it is a stereo pair (in words,
+ * with the stereo rings) and whether it is the musician's own. A long name takes what room is left
+ * and wraps to a second line rather than pushing the rest away.
+ */
 @Composable
 private fun SheetHeader(channel: ChannelUiState, mine: Boolean) {
     val colors = MixLinkTheme.colors
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        val kind = channel.kind
+        if (kind != null) {
+            Icon(kindIcon(kind), contentDescription = kind.label, tint = colors.textSecondary, modifier = Modifier.size(20.dp))
+        }
         Text(
             text = channel.label,
-            modifier = Modifier.semantics { heading() },
+            modifier = Modifier
+                .weight(1f, fill = false)
+                .semantics { heading() },
             style = MixLinkType.NumberLarge.copy(fontSize = 20.sp),
             color = colors.text,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
         )
         val group = channel.group
         if (group != null) {
             GroupChip(group.name, groupToneFor(group.index))
         } else {
             Text("No group", style = MaterialTheme.typography.labelSmall, color = colors.textSecondary)
+        }
+        if (channel.stereo) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(LineIcons.Stereo, contentDescription = null, tint = colors.textSecondary, modifier = Modifier.size(14.dp))
+                Text(STEREO_TAG, style = MaterialTheme.typography.labelMedium, color = colors.textSecondary)
+            }
         }
         if (mine) {
             Text("Your channel", style = MaterialTheme.typography.labelMedium, color = colors.accent)

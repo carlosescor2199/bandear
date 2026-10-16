@@ -440,6 +440,48 @@ class MonitorViewModelTest {
         assertEquals("Band", state.mix.groups.single().name)
     }
 
+    /** The server announces a keys pair on channels 0 and 1 and a voice on channel 2, as a `config`. */
+    private fun announcePair() {
+        socket().receive(
+            """{"type":"config","source_channels":3,"groups":[],"channels":[
+                {"name":"Keys","kind":"keys","hidden":false,"link":true},
+                {"name":"","kind":"keys","hidden":false,"link":false},
+                {"name":"Vox","kind":"voice","hidden":false,"link":false}]}""",
+        )
+    }
+
+    @Test
+    fun aPairsStripSendsBothSidesAndMoreOfMeLiftsBoth() {
+        connected(channels = 3)
+        announcePair()
+
+        viewModel.setChannelLevel(0, 60)
+        viewModel.setChannelPan(0, 75)
+
+        assertEquals(listOf("Keys", "Vox"), state.mix.channels.map { it.label })
+        assertEquals(listOf(60, 60, 100), lastMix().ints("channels"))
+        assertEquals(listOf(50, 100, 0), lastMix().ints("pans"))
+
+        viewModel.setMusicianChannel(0)
+        viewModel.setMoreOfMe(true)
+
+        assertEquals(listOf(100, 100, 50), lastMix().ints("channels"))
+    }
+
+    @Test
+    fun aConfigThatPairsTheMusiciansChannelRemembersThePairAndSendsNothing() {
+        connected(channels = 3)
+        viewModel.setMusicianChannel(1)
+        val sent = socket().sentOfType("mix").size
+
+        announcePair()
+
+        assertEquals(0, state.moreOfMe.musicianChannel)
+        assertEquals(0, store.channel)
+        // The server panned the new pair apart; its `mix_state` follows, so the phone's mix stays put.
+        assertEquals(sent, socket().sentOfType("mix").size)
+    }
+
     @Test
     fun masterChangesReachTheAudioThreadAndTheServer() {
         connected()

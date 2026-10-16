@@ -29,7 +29,7 @@ class ControlChannelTest {
         running = AtomicBoolean(true),
         currentSnapshot = { MixSnapshot() },
         moreOfMeEnabled = { false },
-        musicianChannel = { null },
+        musicianChannels = { emptyList() },
         mixSequence = { newestMix },
         transport = transport,
         scheduler = FakeControlScheduler(),
@@ -96,6 +96,75 @@ class ControlChannelTest {
 
         assertTrue(events.pushed.isEmpty())
         assertTrue(events.errors.single(), events.errors.single().startsWith("Invalid control response"))
+    }
+
+    // The channel details a `config` carries.
+
+    @Test
+    fun aConfigHandsOnTheChannelDetailsInChannelOrder() {
+        val socket = openChannel()
+
+        socket.receive(
+            """{"type":"config","source_channels":4,"groups":[],"channels":[
+                {"name":"Vox","kind":"voice","hidden":false,"link":false},
+                {"name":"Keys","kind":"keys","hidden":false,"link":true},
+                {"name":"","kind":"keys","hidden":false,"link":false},
+                {"name":"Spare","kind":"other","hidden":true,"link":false}]}""",
+        )
+
+        assertEquals(
+            listOf(
+                ChannelInfo("Vox", ChannelKind.VOICE),
+                ChannelInfo("Keys", ChannelKind.KEYS, link = true),
+                ChannelInfo("", ChannelKind.KEYS),
+                ChannelInfo("Spare", ChannelKind.OTHER, hidden = true),
+            ),
+            events.details.last(),
+        )
+    }
+
+    @Test
+    fun aConfigFromAnOlderServerHandsOnNoDetails() {
+        openChannel()
+
+        // The opening config of [openChannel] has no `channels`, as an older server's.
+        assertEquals(listOf<List<ChannelInfo>?>(null), events.details)
+    }
+
+    @Test
+    fun channelDetailsAreReadLeniently() {
+        val details = parseChannelDetails(
+            JSONArray(
+                """[{"name":"Gtr","kind":"theremin","hidden":true,"link":true},
+                    "not an entry",
+                    {"name":7,"kind":null},
+                    {"name":"Extra","kind":"bass"}]""",
+            ),
+            count = 3,
+        )
+
+        // An unknown kind reads as other; an entry that is not an object, or a field of the wrong
+        // type, reads as the default; an entry past the announced count is dropped.
+        assertEquals(
+            listOf(ChannelInfo("Gtr", ChannelKind.OTHER, hidden = true, link = true), ChannelInfo(), ChannelInfo()),
+            details,
+        )
+        // Fewer entries than channels: the rest are channels the engineer never touched.
+        assertEquals(listOf(ChannelInfo("Bass", ChannelKind.BASS), ChannelInfo()), parseChannelDetails(JSONArray("""[{"name":"Bass","kind":"bass"}]"""), 2))
+        // Anything but an array is no details at all.
+        assertEquals(null, parseChannelDetails(null, 2))
+        assertEquals(null, parseChannelDetails("voice", 2))
+    }
+
+    @Test
+    fun everyKindIsReadByItsWireName() {
+        for (kind in ChannelKind.entries) {
+            assertEquals(kind, ChannelKind.fromWire(kind.wire))
+        }
+        assertEquals(
+            listOf("voice", "guitar", "bass", "keys", "drums", "percussion", "horns", "strings", "playback", "click", "other"),
+            ChannelKind.entries.map { it.wire },
+        )
     }
 
     // The numbers that match the server's answers to the phone's mixes.
@@ -229,11 +298,14 @@ class ControlChannelTest {
         val pushed = mutableListOf<MixSnapshot>()
         val answers = mutableListOf<Pair<Long, MixSnapshot?>>()
         val errors = mutableListOf<String>()
+        val details = mutableListOf<List<ChannelInfo>?>()
         var acknowledged = 0
 
         override fun onOpened() = Unit
 
-        override fun onConfig(channels: Int, groups: List<GroupInfo>) = Unit
+        override fun onConfig(channels: Int, groups: List<GroupInfo>, details: List<ChannelInfo>?) {
+            this.details += details
+        }
 
         override fun onAcknowledged() {
             acknowledged++

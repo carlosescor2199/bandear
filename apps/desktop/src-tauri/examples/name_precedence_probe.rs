@@ -48,6 +48,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         sample_rate: 48_000,
         source_channels: 2,
         groups: Vec::new(),
+        channels: Vec::new(),
         channel_levels: vec![0, 0],
         stopped: false,
         samples_received: 0,

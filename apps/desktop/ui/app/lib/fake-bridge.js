@@ -4,6 +4,7 @@
 // events. Like a Tauri command, a refused call rejects with the error text, not an Error. Every
 // start, even a failed one, begins a new engine run, and every payload names its run.
 
+import { checkChannels, defaultChannel, fitChannels, keepPairsEqual } from "./channels.js";
 import { MAX_GROUPS, defaultMix, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { clampLevel } from "./values.js";
 
@@ -43,15 +44,65 @@ function clone(value) {
   return structuredClone(value);
 }
 
-function channelRows(count, groups) {
+// The status's channels on a device with `count` inputs: each with the engineer's `details` (fitted
+// to the device, see fitChannels) and its group.
+function channelRows(count, groups, details = []) {
+  const fitted = fitChannels(details, count);
   return Array.from({ length: count }, (_, index) => {
     // As the desktop does: an invalid group owns no channel.
     const group = groups.find(
       (candidate) => !candidate.invalid && candidate.channels.includes(index),
     );
-    return { number: index + 1, group: group?.name ?? null, groupId: group?.id ?? null, level: 0 };
+    return {
+      number: index + 1,
+      ...fitted[index],
+      group: group?.name ?? null,
+      groupId: group?.id ?? null,
+      level: 0,
+    };
   });
 }
+
+// The engineer's details of a status's channels, as the desk keeps them; a status from before
+// channel details has the defaults.
+function channelDetails(channels) {
+  return channels.map((channel) => ({
+    name: channel.name ?? "",
+    kind: channel.kind ?? "other",
+    hidden: Boolean(channel.hidden),
+    link: Boolean(channel.link),
+  }));
+}
+
+const CHANNEL_FIELDS = Object.freeze(["name", "kind", "hidden", "link"]);
+
+// The details the window sent, as the desktop reads them: every field may be left out and takes
+// its default, names are trimmed, and a field the desk does not know is refused.
+function channelRequests(channels) {
+  return channels.map((channel) => {
+    for (const field of Object.keys(channel ?? {})) {
+      if (!CHANNEL_FIELDS.includes(field)) {
+        throw `unknown field \`${field}\`, expected one of \`${CHANNEL_FIELDS.join("`, `")}\``;
+      }
+    }
+    return {
+      name: String(channel?.name ?? "").trim(),
+      kind: channel?.kind ?? "other",
+      hidden: Boolean(channel?.hidden),
+      link: Boolean(channel?.link),
+    };
+  });
+}
+
+/** The sample engine's inputs, as the engineer named them. */
+const SAMPLE_CHANNELS = Object.freeze([
+  ["Kick", "drums"],
+  ["Snare", "drums"],
+  ["Overheads", "drums"],
+  ["Bass", "bass"],
+  ["Lead vox", "voice"],
+  ["Backing vox", "voice"],
+]);
 
 // The status's groups for the engineer's `definitions` (1-based channels) on a device with
 // `count` inputs, as the engine reports them: 0-based channels, and a group naming an input the
@@ -134,7 +185,8 @@ function labelKey(row) {
 }
 
 /**
- * A running six-channel engine with two groups (Drums on CH 1-3 and Vocals on CH 5-6, by ids
+ * A running six-channel engine with named inputs (Kick, Snare, Overheads, Bass, Lead vox and
+ * Backing vox, none hidden or linked), two groups (Drums on CH 1-3 and Vocals on CH 5-6, by ids
  * `drums` and `vocals`) and four
  * musicians whose links are good, a warning, unreported and lost. All four are phones with client
  * ids; the last announced no name and shows the desk's local label.
@@ -144,6 +196,7 @@ export function sampleStatus() {
     { id: "drums", name: "Drums", channels: [0, 1, 2], invalid: false },
     { id: "vocals", name: "Vocals", channels: [4, 5], invalid: false },
   ];
+  const details = SAMPLE_CHANNELS.map(([name, kind]) => ({ ...defaultChannel(), name, kind }));
   return {
     run: 1,
     deviceName: "Demo interface",
@@ -152,7 +205,7 @@ export function sampleStatus() {
     sampleRate: 48000,
     sourceChannels: 6,
     groups,
-    channels: channelRows(6, groups),
+    channels: channelRows(6, groups, details),
     stopped: false,
     samplesReceived: 0,
     packetsSent: 0,
@@ -219,21 +272,48 @@ function wave(seconds, seed) {
   return clampLevel(75 * swell * (0.35 + 0.65 * flutter));
 }
 
-/** A `meters` payload for `status` at `time` milliseconds; the same time gives the same levels. */
+// The peak of what `musician` hears of inputs at `levels`, as the engine mixes it: a hidden input
+// is heard by no one and its solo counts for nothing; a muted input, or one left out by another's
+// solo, is silent; the rest are scaled by their gain and the master and placed by their pan (the
+// equal-power law), and the louder input on each side sets its peak.
+function heardLevels(musician, hidden, levels) {
+  const shown = levels.map((_, index) => !hidden[index]);
+  const soloed = shown.some((audible, index) => audible && musician.channelSolo?.[index]);
+  let left = 0;
+  let right = 0;
+  if (!musician.muted) {
+    levels.forEach((level, index) => {
+      if (!shown[index] || musician.channelMuted?.[index]) {
+        return;
+      }
+      if (soloed && !musician.channelSolo?.[index]) {
+        return;
+      }
+      const gain = ((musician.channelGains?.[index] ?? 100) / 100) * ((musician.volumePercent ?? 100) / 100);
+      const angle = ((musician.pans?.[index] ?? 50) / 100) * (Math.PI / 2);
+      left = Math.max(left, level * gain * Math.cos(angle));
+      right = Math.max(right, level * gain * Math.sin(angle));
+    });
+  }
+  // The level cap is the ceiling of what the musician is sent.
+  const cap = musician.maxLevelPercent ?? 100;
+  return { left: clampLevel(Math.min(left, cap)), right: clampLevel(Math.min(right, cap)) };
+}
+
+/**
+ * A `meters` payload for `status` at `time` milliseconds; the same time gives the same levels.
+ * Each musician's output is mixed from the inputs as the engine mixes them, so a hidden input is
+ * heard in no one's meter.
+ */
 export function syntheticMeters(status, time) {
   const seconds = time / 1000;
+  const channels = Array.from({ length: status.sourceChannels }, (_, index) => wave(seconds, index));
+  const hidden = channels.map((_, index) => Boolean(status.channels?.[index]?.hidden));
   const musicians = {};
-  status.musicians.forEach((musician, index) => {
-    musicians[musician.address] = {
-      left: wave(seconds, 10 + index * 2),
-      right: wave(seconds, 11 + index * 2),
-    };
-  });
-  return {
-    run: status.run,
-    channels: Array.from({ length: status.sourceChannels }, (_, index) => wave(seconds, index)),
-    musicians,
-  };
+  for (const musician of status.musicians) {
+    musicians[musician.address] = heardLevels(musician, hidden, channels);
+  }
+  return { run: status.run, channels, musicians };
 }
 
 function hostOf(address) {
@@ -263,8 +343,13 @@ function withPort(address) {
  * one, else for the address. Groups too: `set_groups` keeps them (a new group gets an id), applies
  * them while the engine runs (every musician's group levels follow their groups by id, and the new
  * groups are announced in a status before the moved mixes), answers `{ groups, applied, saved,
- * saveError }` as the desktop does, and every start that names no groups takes them. Besides
- * `invoke` and `listen` it offers
+ * saveError }` as the desktop does, and every start that names no groups takes them. Channel
+ * details too: `set_channels` keeps them, applies them while the engine runs and answers `{
+ * channels, applied, saved, saveError }`; every start takes them and a device switch keeps those of
+ * the inputs that remain, as the engine does. A hidden input is heard in no musician's meter; a new
+ * pair is panned apart (0 and 100) in every mix, announced in a status before the moved mixes; and
+ * every change of a pair's level, mute or solo, from the desk or a phone, moves both sides (see
+ * keepPairsEqual). Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
@@ -299,6 +384,10 @@ export function createFakeBridge({
   let savedGroups = groupDefinitions(engine.groups);
   let runningGroups = savedGroups;
   let lastGroupId = 0;
+  // The engineer's channel details as the session keeps them (every start takes them and
+  // `set_channels` replaces them), and the ones the engine has now, fitted to its inputs.
+  let savedChannels = channelDetails(engine.channels);
+  let runningChannels = fitChannels(savedChannels, engine.sourceChannels);
 
   // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
   // and names are trimmed.
@@ -320,7 +409,36 @@ export function createFakeBridge({
   function showGroups(definitions) {
     runningGroups = definitions;
     engine.groups = groupStatuses(definitions, engine.sourceChannels);
-    engine.channels = channelRows(engine.sourceChannels, engine.groups);
+    engine.channels = channelRows(engine.sourceChannels, engine.groups, runningChannels);
+  }
+
+  // Gives the running engine the channel `details`, fitted to the current device.
+  function showChannels(details) {
+    runningChannels = fitChannels(details, engine.sourceChannels);
+    engine.channels = channelRows(engine.sourceChannels, engine.groups, runningChannels);
+  }
+
+  // As the engine does when pairs are linked: every musician's new pairs are panned apart (0 and
+  // 100) and take the first side's level, mute and solo, each mix under a new revision. Returns the
+  // rows that moved: every row when a pair was linked that `previous` did not have, else none.
+  function linkMixes(previous) {
+    const linked = runningChannels.map((channel, index) => channel.link && !previous[index]?.link);
+    if (!linked.some(Boolean)) {
+      return [];
+    }
+    return engine.musicians.map((row) => {
+      const before = mixFromDto(row);
+      const panned = mixFromDto(row);
+      linked.forEach((link, first) => {
+        if (link) {
+          panned.pans[first] = 0;
+          panned.pans[first + 1] = 100;
+        }
+      });
+      revision += 1;
+      Object.assign(row, keepPairsEqual(before, panned, runningChannels), { revision });
+      return row;
+    });
   }
 
   // Shows on `row` the label kept for its phone, else the one kept for its address. A name the
@@ -357,12 +475,14 @@ export function createFakeBridge({
   }
 
   // Captures from `device`; one whose channel count is unknown keeps the current count. As in the
-  // engine, the groups are re-checked against the new inputs, never rewritten.
+  // engine, the groups are re-checked against the new inputs, never rewritten, and the channel
+  // details of the inputs that remain are kept and the rest dropped.
   function useDevice(device) {
     engine.deviceName = device.name;
     if (device.channels > 0) {
       engine.captureFormat = { ...engine.captureFormat, channels: device.channels };
       engine.sourceChannels = device.channels;
+      runningChannels = fitChannels(runningChannels, device.channels);
       showGroups(runningGroups);
     }
   }
@@ -380,7 +500,8 @@ export function createFakeBridge({
   function mergeInto(row, update) {
     let merged;
     try {
-      merged = mergeMixUpdate(mixFromDto(row), update ?? {});
+      const before = mixFromDto(row);
+      merged = keepPairsEqual(before, mergeMixUpdate(before, update ?? {}), runningChannels);
     } catch (error) {
       throw error.message;
     }
@@ -413,7 +534,11 @@ export function createFakeBridge({
       if (wanted) {
         useDevice(wanted);
       }
+      // As the desktop does: every start takes the kept channel details, so a new engine pans
+      // every kept pair apart before the window hears of it.
+      runningChannels = fitChannels(savedChannels, engine.sourceChannels);
       showGroups(runningGroups);
+      linkMixes([]);
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
@@ -508,6 +633,32 @@ export function createFakeBridge({
             row.revision = revision;
             announceMix(row.address, "desktop", mixFromDto(row));
           }
+        }
+      }
+      return outcome;
+    },
+    set_channels({ channels } = {}) {
+      const next = channelRequests(channels ?? []);
+      try {
+        checkChannels(next);
+      } catch (error) {
+        throw error.message;
+      }
+      savedChannels = next;
+      // As the desktop answers: a running engine took them, or they apply at the next start.
+      const outcome = { channels: clone(next), applied: isRunning, saved: true, saveError: null };
+      if (isRunning) {
+        const previous = runningChannels;
+        const shown = JSON.stringify(engine.channels);
+        showChannels(next);
+        if (JSON.stringify(engine.channels) === shown) {
+          // As in the engine, the same details change nothing and announce nothing.
+          return outcome;
+        }
+        // As the desktop does: the new details go out first, then every mix a new pair moved.
+        emit("status", clone(engine));
+        for (const row of linkMixes(previous)) {
+          announceMix(row.address, "desktop", mixFromDto(row));
         }
       }
       return outcome;

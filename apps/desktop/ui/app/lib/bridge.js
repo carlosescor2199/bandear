@@ -69,6 +69,15 @@ export function createEngineApi(bridge) {
      * nothing changed.
      */
     setGroups: (groups) => bridge.invoke("set_groups", { groups }),
+    /**
+     * Replaces the channel details: the whole list in channel order (the first entry is CH 1),
+     * `[{ name, kind, hidden, link }]`, any field left out taking its default (see channels.js).
+     * Resolves to `{ channels, applied, saved, saveError }` as setGroups does (see
+     * `formatChannelsSet`): a running engine sends them to every phone at once, silences hidden
+     * inputs in every mix and pans a new pair apart in every mix. A refused list rejects, and
+     * nothing changed.
+     */
+    setChannels: (channels) => bridge.invoke("set_channels", { channels }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

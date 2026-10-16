@@ -11,8 +11,8 @@ pub mod session;
 
 use commands::DesktopState;
 use dto::{
-    EngineStateDto, GroupRequest, GroupsSetDto, InputDeviceDto, MixDto, MixUpdateRequest,
-    StartRequest, StartSummary,
+    ChannelRequest, ChannelsSetDto, EngineStateDto, GroupRequest, GroupsSetDto, InputDeviceDto,
+    MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use events::EventPump;
 use session::SessionStore;
@@ -97,11 +97,23 @@ async fn set_groups(
     commands::set_groups(state.inner(), groups)
 }
 
+/// Replaces the engineer's channel details (`[{ name, kind, hidden, link }]` in channel order, the
+/// first entry CH 1) and answers what was done: `{ channels, applied, saved, saveError }` (see
+/// [commands::set_channels] and [dto::ChannelsSetDto]).
+#[tauri::command]
+async fn set_channels(
+    state: State<'_, DesktopState>,
+    channels: Vec<ChannelRequest>,
+) -> Result<ChannelsSetDto, String> {
+    commands::set_channels(state.inner(), channels)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // The session (musician labels and the engineer's groups) is a desktop-app concern and
+            // The session (musician labels, the engineer's channel details and groups) is a
+            // desktop-app concern and
             // lives in the app's config directory, so it survives a restart without touching the
             // engine or any client protocol. Opening it never fails: a damaged file is set aside
             // and logged.
@@ -128,7 +140,8 @@ pub fn run() {
             remove_target,
             set_mix,
             set_musician_name,
-            set_groups
+            set_groups,
+            set_channels
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

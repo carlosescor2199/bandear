@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
@@ -126,6 +126,23 @@ impl Membership for GroupLayout {
     }
 }
 
+/// The engineer's channel flags the mixer and every mix writer act on, one bit per source channel
+/// (bit `k` is channel `k`, 0-based), so each set is one atomic word in every mix.
+///
+/// `hidden` channels are never heard. `linked` marks the first channel of each stereo pair: a set
+/// bit `k` links channels `k` and `k + 1`, which the channel details guarantee are both within the
+/// mixer's 32 channels and in no other pair (see [crate::engine::check_channels]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChannelFlags {
+    pub(crate) hidden: u32,
+    pub(crate) linked: u32,
+}
+
+/// The first channel of every pair `linked` marks, in channel order.
+fn pairs(linked: u32) -> impl Iterator<Item = usize> {
+    (0..MAX_MIX_CHANNELS - 1).filter(move |&first| linked & (1 << first) != 0)
+}
+
 pub(crate) struct MixState {
     channel_gains: [AtomicU8; MAX_MIX_CHANNELS],
     pans: [AtomicU8; MAX_MIX_CHANNELS],
@@ -135,6 +152,11 @@ pub(crate) struct MixState {
     /// Channel-to-group membership, one atomic slot per channel so a device switch can replace the
     /// mapping while the network thread keeps reading it lock-free. `NO_GROUP` means no group.
     channel_group: [AtomicU8; MAX_MIX_CHANNELS],
+    /// The hidden channels ([ChannelFlags::hidden]), one word the network thread loads with the
+    /// rest of the mix, so hiding an input silences it without a lock on the audio path.
+    hidden: AtomicU32,
+    /// The stereo pairs ([ChannelFlags::linked]). Only writers read it, under the writer lock.
+    linked: AtomicU32,
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
@@ -192,9 +214,10 @@ impl MixUpdate {
                 self.group_levels.as_ref(),
                 &current.group_levels,
             )?,
-            // Membership is server configuration, never client input: preserve whatever the source
-            // snapshot carried.
+            // Membership and hidden channels are server configuration, never client input:
+            // preserve whatever the source snapshot carried.
             channel_group: current.channel_group,
+            hidden_channels: current.hidden_channels,
             // The store that keeps the merge gives it its revision.
             revision: current.revision,
             volume_percent: self
@@ -224,6 +247,10 @@ pub struct MixValues {
     pub channel_solo: [bool; MAX_MIX_CHANNELS],
     pub group_levels: [u8; MAX_GROUPS],
     pub channel_group: [Option<usize>; MAX_MIX_CHANNELS],
+    /// The source channels the engineer hid, one bit per channel (bit `k` is channel `k`): a hidden
+    /// channel is never heard and its solo counts for nothing. Server configuration, like
+    /// `channel_group`: a change of it is not a change of the stored mix and takes no revision.
+    pub hidden_channels: u32,
     pub volume_percent: u8,
     pub max_level_percent: u8,
     pub muted: bool,
@@ -252,6 +279,8 @@ impl Default for MixState {
             channel_solo: std::array::from_fn(|_| AtomicBool::new(false)),
             group_levels: std::array::from_fn(|_| AtomicU8::new(NEUTRAL_GROUP_LEVEL)),
             channel_group: std::array::from_fn(|_| AtomicU8::new(NO_GROUP)),
+            hidden: AtomicU32::new(0),
+            linked: AtomicU32::new(0),
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
@@ -270,6 +299,7 @@ impl Default for MixValues {
             channel_solo: [false; MAX_MIX_CHANNELS],
             group_levels: [NEUTRAL_GROUP_LEVEL; MAX_GROUPS],
             channel_group: [None; MAX_MIX_CHANNELS],
+            hidden_channels: 0,
             volume_percent: 100,
             max_level_percent: 100,
             muted: false,
@@ -297,6 +327,54 @@ impl MixState {
         let state = Self::default();
         state.set_group_layout(layout);
         state
+    }
+
+    /// Builds a state for a musician who joins with `flags` in force: their hidden channels are
+    /// silent and each linked pair starts panned apart (the first channel hard left, the second
+    /// hard right), as every mix already there was panned when the pair was linked. Every other
+    /// value starts neutral, so both sides of a pair start equal.
+    pub(crate) fn configured(layout: &GroupLayout, flags: ChannelFlags) -> Self {
+        let state = Self::new(layout);
+        state.hidden.store(flags.hidden, Ordering::Relaxed);
+        state.linked.store(flags.linked, Ordering::Relaxed);
+        for first in pairs(flags.linked) {
+            state.pans[first].store(0, Ordering::Relaxed);
+            state.pans[first + 1].store(100, Ordering::Relaxed);
+        }
+        state
+    }
+
+    /// Takes the engineer's channel flags: the hidden channels go silent at once and every writer
+    /// from now on keeps both sides of each linked pair equal. Returns the mix now stored when it
+    /// changed, `None` when no stored value moved.
+    ///
+    /// Hiding or showing a channel and unlinking a pair change no stored value. Linking a pair is a
+    /// change of the mix, made under the writer lock like [MixState::apply] and with a new
+    /// revision, so the musician's phone is sent it: the pair is panned apart (first channel 0,
+    /// second 100) and its second side takes the first side's level, mute and solo.
+    pub(crate) fn set_channel_flags(&self, flags: ChannelFlags) -> Option<MixValues> {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        let newly_linked = flags.linked & !self.linked.load(Ordering::Relaxed);
+        self.hidden.store(flags.hidden, Ordering::Relaxed);
+        self.linked.store(flags.linked, Ordering::Relaxed);
+        if newly_linked == 0 {
+            return None;
+        }
+        let mut pans = self.snapshot().pans;
+        for first in pairs(newly_linked) {
+            pans[first] = 0;
+            pans[first + 1] = 100;
+        }
+        // Through the writers' own merge, which also gives each new pair's second side the first
+        // side's level, mute and solo (see [keep_pairs_equal]).
+        let update = MixUpdate {
+            pans: Some(pans.iter().copied().map(i32::from).collect()),
+            ..MixUpdate::default()
+        };
+        Some(
+            self.apply_locked(&update, &mut revision)
+                .expect("a whole table of pans always fits the mix"),
+        )
     }
 
     /// Replaces the channel-to-group membership the mixer reads, leaving the client's stored group
@@ -355,8 +433,18 @@ impl MixState {
     /// the mix exactly as it was, revision included.
     pub(crate) fn apply(&self, update: &MixUpdate) -> Result<MixValues, String> {
         let mut revision = self.writer.lock().expect("mix writer lock poisoned");
-        let mut merged = update.merge_into(self.snapshot())?;
-        merged.revision = self.store(merged, &mut revision);
+        self.apply_locked(update, &mut revision)
+    }
+
+    /// [MixState::apply] for a caller that holds the writer lock and passes its revision.
+    ///
+    /// Every linked pair leaves it with both sides equal (see [keep_pairs_equal]); the pairs are
+    /// read under the lock, so a writer never merges against pairs an edit is replacing.
+    fn apply_locked(&self, update: &MixUpdate, revision: &mut u64) -> Result<MixValues, String> {
+        let current = self.snapshot();
+        let mut merged = update.merge_into(current)?;
+        keep_pairs_equal(&current, &mut merged, self.linked.load(Ordering::Relaxed));
+        merged.revision = self.store(merged, revision);
         Ok(merged)
     }
 
@@ -410,6 +498,7 @@ impl MixState {
                     group => Some(usize::from(group)),
                 }
             }),
+            hidden_channels: self.hidden.load(Ordering::Relaxed),
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
@@ -470,6 +559,33 @@ pub(crate) fn merge_flags(
     Ok(merged)
 }
 
+/// Keeps both sides of every pair in `linked` (see [ChannelFlags::linked]) at the same level, mute
+/// and solo after a merge from `before` to `merged`.
+///
+/// A side the update changed carries the other with it: a phone that shows the pair as one strip
+/// writes both sides, and one that shows them apart moves one. When the update changed both sides
+/// to different values, or the second side alone was not what changed, the first channel's value
+/// wins, which also evens out a pair that was just linked. Pans are left alone: a pair's balance is
+/// the client's, which writes both pans.
+pub(crate) fn keep_pairs_equal(before: &MixValues, merged: &mut MixValues, linked: u32) {
+    for first in pairs(linked) {
+        follow(&before.channel_gains, &mut merged.channel_gains, first);
+        follow(&before.channel_muted, &mut merged.channel_muted, first);
+        follow(&before.channel_solo, &mut merged.channel_solo, first);
+    }
+}
+
+/// Makes the pair at `first` equal in one table: the second side's new value when only the second
+/// side changed, the first side's otherwise.
+fn follow<T: Copy + PartialEq>(before: &[T], merged: &mut [T], first: usize) {
+    let second = first + 1;
+    if merged[second] != before[second] && merged[first] == before[first] {
+        merged[first] = merged[second];
+    } else {
+        merged[second] = merged[first];
+    }
+}
+
 /// Equal-power pan law, the console standard: `theta` runs from 0 at hard left to `PI/2` at
 /// hard right, so a centred source contributes about `0.707` to each output.
 fn pan_gains(pan: u8) -> (f32, f32) {
@@ -492,9 +608,11 @@ fn clamp_sample(value: f32, ceiling: f32) -> i16 {
 /// reproduces the pre-pan output exactly, apart from the full-scale ceiling clamp that also
 /// applied before. Master volume, mute and the ceiling are applied after the sum.
 ///
-/// A channel contributes only when it is not muted and either nothing is soloed or it is one of
-/// the soloed channels. Solo is applied here rather than by zeroing gains, so coming out of solo
-/// restores exactly the levels the musician had set.
+/// A channel contributes only when it is not hidden, not muted and either nothing is soloed or it
+/// is one of the soloed channels. Solo is applied here rather than by zeroing gains, so coming out
+/// of solo restores exactly the levels the musician had set. A hidden channel's solo counts for
+/// nothing: a spare input the engineer hid cannot leave a musician hearing nothing. Like the rest of
+/// the mix, the hidden channels are one value read from `values`, so this stays free of locks.
 pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -> Vec<i16> {
     if channels == 0 || source.len() < channels {
         return source.to_vec();
@@ -502,7 +620,8 @@ pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -
 
     let frames = source.len() / channels;
     let active = channels.min(MAX_MIX_CHANNELS);
-    let any_solo = (0..active).any(|channel| values.channel_solo[channel]);
+    let audible = |channel: usize| values.hidden_channels & (1 << channel) == 0;
+    let any_solo = (0..active).any(|channel| values.channel_solo[channel] && audible(channel));
     let ceiling = (i32::from(i16::MAX) * i32::from(values.max_level_percent) / 100) as f32;
     let master = f32::from(values.volume_percent) / 100.0;
     let mut output = vec![0i16; frames * usize::from(OUTPUT_CHANNELS)];
@@ -511,7 +630,7 @@ pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -
         let mut left = 0.0f32;
         let mut right = 0.0f32;
         for channel in 0..active {
-            if values.channel_muted[channel] {
+            if !audible(channel) || values.channel_muted[channel] {
                 continue;
             }
             if any_solo && !values.channel_solo[channel] {
@@ -1356,5 +1475,181 @@ mod tests {
         }
         phone.join().expect("the phone's writer finishes");
         desktop.join().expect("the desktop's writer finishes");
+    }
+
+    /// The flags for stereo pairs starting at the channels `linked` and the hidden channels
+    /// `hidden`, all 0-based.
+    fn flags(linked: &[usize], hidden: &[usize]) -> ChannelFlags {
+        let mask = |channels: &[usize]| {
+            channels
+                .iter()
+                .fold(0, |mask, &channel| mask | 1 << channel)
+        };
+        ChannelFlags {
+            hidden: mask(hidden),
+            linked: mask(linked),
+        }
+    }
+
+    fn gains(values: &[i32]) -> MixUpdate {
+        MixUpdate {
+            channel_gains: Some(values.to_vec()),
+            ..MixUpdate::default()
+        }
+    }
+
+    #[test]
+    fn a_hidden_channel_is_silent_and_showing_it_again_restores_it() {
+        let source = [10_000, 20_000];
+        let hidden = MixValues {
+            hidden_channels: 0b10,
+            ..MixValues::default()
+        };
+
+        assert_eq!(mix_channels(&source, 2, hidden), [10_000, 0]);
+        assert_eq!(mix_channels(&source, 2, MixValues::default()), source);
+    }
+
+    /// A spare input the engineer hid cannot leave a musician hearing nothing because the phone
+    /// soloed it before it was hidden: its solo counts for nothing.
+    #[test]
+    fn a_hidden_channels_solo_silences_no_other_channel() {
+        let values = MixValues {
+            channel_solo: std::array::from_fn(|index| index == 1),
+            hidden_channels: 0b10,
+            ..MixValues::default()
+        };
+
+        assert_eq!(mix_channels(&[10_000, 20_000], 2, values), [10_000, 0]);
+    }
+
+    #[test]
+    fn a_change_to_one_side_of_a_linked_pair_moves_the_other() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[0], &[]));
+
+        let first = state.apply(&gains(&[80])).expect("a valid update applies");
+        assert_eq!(&first.channel_gains[..3], &[80, 80, 100]);
+
+        // An older phone shows the two sides apart and moves the second one only.
+        let second = state
+            .apply(&gains(&[80, 40]))
+            .expect("a valid update applies");
+        assert_eq!(&second.channel_gains[..2], &[40, 40]);
+
+        let muted = state
+            .apply(&MixUpdate {
+                channel_muted: Some(vec![false, true]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        assert_eq!(&muted.channel_muted[..2], &[true, true]);
+        let soloed = state
+            .apply(&MixUpdate {
+                channel_solo: Some(vec![true]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        assert_eq!(&soloed.channel_solo[..2], &[true, true]);
+        assert_eq!(soloed, state.current(), "what it answers is what is stored");
+    }
+
+    #[test]
+    fn when_both_sides_of_a_pair_change_and_disagree_the_first_channel_wins() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[2], &[]));
+
+        // Only a level can change on both sides to different values: a flag of an equal pair that
+        // changes on both sides changes to the same value.
+        let applied = state
+            .apply(&gains(&[100, 100, 30, 60]))
+            .expect("a valid update applies");
+
+        assert_eq!(&applied.channel_gains[2..4], &[30, 30]);
+    }
+
+    /// A pair's balance is the phone's: it writes both pans, and the server keeps each as sent.
+    #[test]
+    fn the_pans_of_a_pair_and_the_channels_outside_it_move_on_their_own() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[0], &[]));
+
+        let applied = state
+            .apply(&MixUpdate {
+                pans: Some(vec![20, 70]),
+                channel_gains: Some(vec![100, 100, 50]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        assert_eq!(&applied.pans[..2], &[20, 70]);
+        assert_eq!(
+            &applied.channel_gains[2..4],
+            &[50, 100],
+            "CH 3 and CH 4 are no pair"
+        );
+    }
+
+    #[test]
+    fn linking_a_pair_pans_it_apart_and_evens_it_out_under_a_new_revision() {
+        let state = MixState::new(&GroupLayout::default());
+        state
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![100, 70, 40]),
+                channel_muted: Some(vec![false, false, true]),
+                pans: Some(vec![0, 30, 60]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let before = state.current();
+
+        let linked = state
+            .set_channel_flags(flags(&[1], &[]))
+            .expect("linking moves the pair");
+
+        assert_eq!(linked, state.current(), "what it answers is what is stored");
+        assert!(
+            linked.revision > before.revision,
+            "the phone is sent the change"
+        );
+        assert_eq!(
+            &linked.pans[..3],
+            &[0, 0, 100],
+            "CH 2 hard left, CH 3 hard right"
+        );
+        assert_eq!(
+            &linked.channel_gains[..3],
+            &[100, 70, 70],
+            "the first side's level"
+        );
+        assert_eq!(&linked.channel_muted[..3], &[false, false, false]);
+        assert_eq!(
+            state.set_channel_flags(flags(&[1], &[])),
+            None,
+            "a pair already linked is not moved again"
+        );
+    }
+
+    #[test]
+    fn hiding_a_channel_or_unlinking_a_pair_changes_no_stored_value() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[0], &[]));
+        let before = state.current();
+
+        assert_eq!(state.set_channel_flags(flags(&[], &[3])), None);
+
+        let after = state.current();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.hidden_channels, 0b1000);
+        let apart = state.apply(&gains(&[50])).expect("a valid update applies");
+        assert_eq!(
+            &apart.channel_gains[..2],
+            &[50, 100],
+            "the sides move apart again"
+        );
+    }
+
+    #[test]
+    fn a_new_mix_starts_with_its_pairs_panned_apart_and_its_hidden_channels_silent() {
+        let mix = MixState::configured(&GroupLayout::default(), flags(&[1], &[4])).current();
+
+        assert_eq!(&mix.pans[..4], &[0, 0, 100, 100]);
+        assert_eq!(mix.hidden_channels, 0b1_0000);
     }
 }

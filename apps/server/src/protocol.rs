@@ -254,6 +254,35 @@ pub(crate) struct GroupConfig {
     pub(crate) channels: Vec<usize>,
 }
 
+/// One source channel's details as they appear in the `config` message's `channels`: one entry per
+/// source channel, in channel order (entry 0 is CH 1).
+///
+/// - `name`: what the engineer called the input, at most 32 characters; empty when it has no name,
+///   and a client then labels it by its number ("CH 3").
+/// - `kind`: what the input carries, one of `voice`, `guitar`, `bass`, `keys`, `drums`,
+///   `percussion`, `horns`, `strings`, `playback`, `click` and `other` (the default). A client
+///   shows the kind's icon; one that meets a kind it does not know shows it as `other`.
+/// - `hidden`: the engineer hid the input. The server mixes it into no one's audio and ignores its
+///   solo, and a client does not show it.
+/// - `link`: this channel and the next one are one stereo pair; only the pair's first channel
+///   carries it, and both sides are hidden or shown together. A client shows the pair as one strip
+///   named after the first channel. The strip's level, mute and solo write both channels; the
+///   server keeps them equal whoever writes them (a change to one side moves the other, and when
+///   one `mix` sets both sides to different values the first channel's value wins). The strip's
+///   pan is a balance the client writes as both pans: balance `b` (0 left, 50 centre, 100 right)
+///   is first pan `max(0, 2b - 100)` and second pan `min(100, 2b)`, and reads back as the mean of
+///   the two pans. Linking a pair sets its pans to 0 and 100 (balance centre) in every mix.
+///
+/// The field was added after the groups: a phone that predates it ignores it, as it ignores every
+/// field it does not know, and keeps showing every channel by number.
+#[derive(Serialize)]
+pub(crate) struct ChannelConfig {
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) hidden: bool,
+    pub(crate) link: bool,
+}
+
 #[derive(Serialize)]
 pub(crate) struct ControlConfig {
     #[serde(rename = "type")]
@@ -261,6 +290,8 @@ pub(crate) struct ControlConfig {
     pub(crate) source_channels: u8,
     pub(crate) sample_rate: u32,
     pub(crate) groups: Vec<GroupConfig>,
+    /// One [ChannelConfig] per source channel.
+    pub(crate) channels: Vec<ChannelConfig>,
 }
 
 /// An `error` reply. It carries `seq` only when it refuses a numbered `mix`, so a phone can tell
@@ -694,10 +725,44 @@ mod tests {
                 name: "Drums".to_owned(),
                 channels: vec![0, 1],
             }],
+            channels: Vec::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
 
         assert!(json.contains(r#""groups":[{"id":"kit","name":"Drums","channels":[0,1]}]"#));
+    }
+
+    #[test]
+    fn config_carries_the_details_of_every_input_in_channel_order() {
+        let config = ControlConfig {
+            message_type: "config",
+            source_channels: 2,
+            sample_rate: 48_000,
+            groups: Vec::new(),
+            channels: vec![
+                ChannelConfig {
+                    name: "Keys L".to_owned(),
+                    kind: "keys",
+                    hidden: false,
+                    link: true,
+                },
+                ChannelConfig {
+                    name: "Keys R".to_owned(),
+                    kind: "keys",
+                    hidden: false,
+                    link: false,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(
+            json.contains(
+                r#""channels":[{"name":"Keys L","kind":"keys","hidden":false,"link":true},{"name":"Keys R","kind":"keys","hidden":false,"link":false}]"#
+            ),
+            "{json}"
+        );
     }
 }

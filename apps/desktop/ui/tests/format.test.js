@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   formatBuffer,
   formatCaptureFormat,
+  formatChannelsSet,
   formatDb,
   formatGroupsSet,
   formatPercent,
@@ -31,6 +32,31 @@ test("a group edit says whether the phones have it now, later, or have it but it
     formatGroupsSet({ groups, applied: true, saved: false, saveError: "the disk is full" }),
     "Groups applied to every phone, but not saved: the disk is full.",
   );
+});
+
+test("a channel edit says whether the phones have it now, later, or have it but it was not kept", () => {
+  const channels = [{ name: "Kick", kind: "drums", hidden: false, link: false }];
+
+  assert.equal(
+    formatChannelsSet({ channels, applied: true, saved: true, saveError: null }),
+    "Channel details applied to every phone.",
+  );
+  assert.equal(
+    formatChannelsSet({ channels, applied: false, saved: true, saveError: null }),
+    "Channel details saved; they apply at the next start.",
+  );
+  assert.equal(
+    formatChannelsSet({ channels, applied: true, saved: false, saveError: "the disk is full." }),
+    "Channel details applied to every phone, but not saved: the disk is full.",
+    "one full stop, whatever the reason ends with",
+  );
+  for (const saveError of [null, undefined, "", "  "]) {
+    assert.equal(
+      formatChannelsSet({ channels, applied: true, saved: false, saveError }),
+      "Channel details applied to every phone, but not saved.",
+      `no reason to give: ${saveError}`,
+    );
+  }
 });
 
 function reporting(extra = {}) {

@@ -1254,8 +1254,24 @@ slice. Push and PRs are the user's decision.
     panic once (`dep_graph` `try_mark_green`, index out of bounds); `cargo clean -p
     mixlink-desktop` cleared it (likely the transient build failure seen in T7a-fix too).
   - Commits: 4a688ca `fix(engine): replace kept controls and mirrors in one step` (about 170 changed
-    lines); this commit (`fix(desktop): read a stored unknown kind only while the session matches
-    the engine`).
+    lines); 262942b `fix(desktop): read a stored unknown kind only while the session matches the
+    engine` (about 150).
+- [x] T7a-fix3 (tests; review `review-c9bf544c067c5dbb` over 2b4ba22..05f3a6a, two SUGGESTIONs on
+  T7a-fix2). Route: inline writer of the delegated T7a worker (one desktop file).
+  - R3-channels-behind-load-and-start-untested: the start's hand-over of the session's groups and
+    details moved to `hand_session_layout` (generic over the group and channel stand-ins) and is
+    tested to clear the flag; a load the engine took but the desk could not save is tested to set it
+    (and the next save that works to clear it).
+  - R3-behind-drops-unrelated-unknown-kinds: decided to pin the current behaviour. A per-input
+    comparison cannot tell an untouched unknown kind from the explicit `other` the earlier WARNING
+    was about (the engine reports both as `other`, every other field equal), so while the session is
+    behind every input reads as the engine applies it; a one-line comment in `read_channel_table`
+    says so and a test pins it (an unedited unknown kind reads, and is saved next, as `other`).
+  - Evidence: `cargo test -p mixlink-desktop` 170 passed (3 new); against a mutant that neither sets
+    the flag on a failed load save nor clears it at start, the two flag tests fail (2 of 170); the
+    pinned test passes against the T7a-fix2 code by design; `cargo fmt -p mixlink-desktop --
+    --check` clean.
+  - Commit: this commit (`test(desktop): cover the session-behind flag on load and start`).
 - [x] T7b (session save and load, Android): the deferred Android follow-up (adopt the server's
   answer after `config`, R3-config-pairs-musician-channel-moreofme-on-unsent) and whatever the
   phone needs to show a loaded session's pushed mix; docs. Route: delegated writer (two bounded

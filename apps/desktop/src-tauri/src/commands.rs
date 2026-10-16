@@ -386,30 +386,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
 
     match start(config).map_err(|error| error.to_string())? {
         Some(mut handle) => {
-            if !saved_groups.is_empty() {
-                let count = saved_groups.len();
-                match handle.set_groups(saved_groups) {
-                    Ok(_) => {
-                        println!("[mixlink-desktop] start_engine: {count} saved groups applied")
-                    }
-                    Err(error) => {
-                        eprintln!("[mixlink-desktop] start_engine: the saved groups were not applied: {error}")
-                    }
-                }
-            }
-            // The new engine runs the session's channel details: the session is not behind it.
-            state.session.set_channels_behind(false);
-            if !saved_channels.is_empty() {
-                let count = saved_channels.len();
-                match handle.set_channels(saved_channels) {
-                    Ok(_) => println!(
-                        "[mixlink-desktop] start_engine: {count} saved channel details applied"
-                    ),
-                    Err(error) => eprintln!(
-                        "[mixlink-desktop] start_engine: the saved channel details were not applied: {error}"
-                    ),
-                }
-            }
+            hand_session_layout(&mut handle, &state.session, saved_groups, saved_channels);
             for (key, controls) in saved_controls {
                 if let Err(error) = handle.keep_engineer_controls(&key, controls) {
                     eprintln!(
@@ -442,6 +419,39 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
         None => Err(
             "No input device is available. Connect an audio interface and try again.".to_owned(),
         ),
+    }
+}
+
+/// Hands a new engine the session's `groups` and channel `details`, as every start does (see
+/// [start_engine]); one the engine refuses (a hand-edited session) is logged and the engine runs
+/// without it. The new engine runs the session's details, so the session is no longer behind the
+/// engine's ([SessionStore::channels_behind]).
+fn hand_session_layout<E: GroupEngine + ChannelEngine>(
+    engine: &mut E,
+    session: &SessionStore,
+    groups: Vec<GroupDefinition>,
+    details: Vec<ChannelMeta>,
+) {
+    if !groups.is_empty() {
+        let count = groups.len();
+        match engine.set_groups(groups) {
+            Ok(()) => println!("[mixlink-desktop] start_engine: {count} saved groups applied"),
+            Err(error) => eprintln!(
+                "[mixlink-desktop] start_engine: the saved groups were not applied: {error}"
+            ),
+        }
+    }
+    session.set_channels_behind(false);
+    if !details.is_empty() {
+        let count = details.len();
+        match engine.set_channels(details) {
+            Ok(()) => println!(
+                "[mixlink-desktop] start_engine: {count} saved channel details applied"
+            ),
+            Err(error) => eprintln!(
+                "[mixlink-desktop] start_engine: the saved channel details were not applied: {error}"
+            ),
+        }
     }
 }
 
@@ -1537,7 +1547,9 @@ fn read_channel_table<E: ChannelEngine>(
         return Ok(stored);
     };
     // The session's kinds stand in for the engine's `other` only while the session holds what the
-    // engine took last: after a save that failed, the engine's are the newer.
+    // engine took last: after a save that failed, the engine's are the newer. Accepted: while
+    // behind, every input reads as the engine applies it, also one no one edited, since an
+    // untouched unknown kind and an explicit `other` look alike to the engine.
     let stored = if session.channels_behind() {
         Vec::new()
     } else {
@@ -3636,6 +3648,111 @@ mod tests {
             ],
             "the replaced kind does not come back with an edit of another input"
         );
+        assert!(!session.channels_behind());
+    }
+
+    /// Pinned, as accepted: while the session is behind, an unknown kind on an input no one edited
+    /// reads as the engine applies it, `other`, and the next save keeps that.
+    #[test]
+    fn while_the_session_is_behind_every_unknown_kind_reads_as_the_engine_applies_it() {
+        let directory = session_directory("channel-table-behind-untouched");
+        let session = SessionStore::open(&directory);
+        session
+            .set_channels(vec![
+                kept("Kick", "drums", false, false),
+                kept("Pad", "synthpad", false, false),
+            ])
+            .expect("kept");
+        let engine = running(StandInEngine {
+            applied_channels: Some(session_channels(&session)),
+            ..StandInEngine::default()
+        });
+        let blocker = directory.join(format!("{}.tmp", crate::session::SESSION_FILE));
+        std::fs::create_dir(&blocker).expect("blocker");
+        edit_channels(
+            &engine,
+            &session,
+            vec![
+                detail("Kick", "voice", false, false),
+                detail("Pad", "synthpad", false, false),
+            ],
+        )
+        .expect("the engine takes them, the save fails");
+        assert!(session.channels_behind());
+
+        assert_eq!(
+            read_channel_table(&engine, &session).expect("readable")[1].kind,
+            "other",
+            "the input no one edited reads as the engine applies it"
+        );
+        std::fs::remove_dir(&blocker).expect("the disk saves again");
+        let read = read_channel_table(&engine, &session).expect("readable");
+        let requests: Vec<ChannelRequest> =
+            serde_json::from_str(&serde_json::to_string(&read).expect("serializes"))
+                .expect("the window sends back what it reads");
+        edit_channels(&engine, &session, requests).expect("saved");
+        assert_eq!(session.channels()[1].kind, "other");
+    }
+
+    /// Every start hands the new engine the session's groups and details, so the session is no
+    /// longer behind it.
+    #[test]
+    fn a_start_hands_the_engine_the_sessions_layout_and_the_session_is_no_longer_behind() {
+        let session = SessionStore::open(&session_directory("start-not-behind"));
+        session.set_channels_behind(true);
+        let mut engine = StandInEngine::default();
+
+        hand_session_layout(
+            &mut engine,
+            &session,
+            vec![GroupDefinition {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1],
+            }],
+            vec![ChannelMeta {
+                name: "Kick".to_owned(),
+                kind: ChannelKind::Drums,
+                hidden: false,
+                linked_to_next: false,
+            }],
+        );
+
+        assert!(!session.channels_behind());
+        assert_eq!(engine.applied.map(|groups| groups.len()), Some(1));
+        assert_eq!(
+            engine
+                .applied_channels
+                .map(|channels| channels[0].name.clone()),
+            Some("Kick".to_owned())
+        );
+    }
+
+    /// A loaded session the running engine took but the desk could not save leaves the session
+    /// behind the engine; the next save that works clears it.
+    #[test]
+    fn a_loaded_session_the_desk_could_not_save_leaves_the_session_behind() {
+        let test = "session-load-behind";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                here: Mutex::new(vec![here(RACK, None, false, MixValues::default())]),
+                ..StandInEngine::default()
+            }),
+        );
+        saved_session(test, "show", &snapshot(layout_session(&[], 2), &[]));
+        let blocker =
+            session_directory_kept(test).join(format!("{}.tmp", crate::session::SESSION_FILE));
+        std::fs::create_dir_all(&blocker).expect("blocker");
+
+        let outcome = load_session_with(&engine, &session, &snapshots, "show").expect("loaded");
+
+        assert!(outcome.applied && !outcome.saved, "{outcome:?}");
+        assert!(session.channels_behind());
+        std::fs::remove_dir(&blocker).expect("the disk saves again");
+        session
+            .set_channels(vec![kept("In 1", "other", false, false)])
+            .expect("saved");
         assert!(!session.channels_behind());
     }
 

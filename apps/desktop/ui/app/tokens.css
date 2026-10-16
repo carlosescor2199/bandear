@@ -119,7 +119,8 @@
   --ml-target: 32px;
   --ml-target-primary: 40px;
 
-  --ml-sidebar-width: 200px;
+  /* Wide enough for "Network and system" on one line in the bundled font. */
+  --ml-sidebar-width: 212px;
 }
 
 *,

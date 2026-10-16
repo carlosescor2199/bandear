@@ -7,3 +7,4 @@ import "./mix.test.js";
 import "./console-state.test.js";
 import "./coalesce.test.js";
 import "./bridge.test.js";
+import "./router.test.js";

@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Console components · MixLink</title>
+    <link rel="stylesheet" href="../app/tokens.css" />
+    <style>
+      .gallery {
+        display: flex;
+        flex-direction: column;
+        gap: var(--ml-space-5);
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: var(--ml-space-6) 28px 48px;
+      }
+      .intro p {
+        max-width: 72ch;
+        margin-top: 6px;
+        color: var(--ml-text-muted);
+      }
+      .gallery section {
+        display: flex;
+        flex-direction: column;
+        gap: var(--ml-space-3);
+        padding: 14px var(--ml-space-4);
+        border: 1px solid var(--ml-border);
+        border-radius: var(--ml-radius-xl);
+        background: var(--ml-surface);
+      }
+      .section-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--ml-space-3);
+      }
+      .section-head p {
+        color: var(--ml-text-muted);
+        font-size: var(--ml-text-md);
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        gap: var(--ml-space-4);
+      }
+      figure {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        min-width: 72px;
+        margin: 0;
+      }
+      figcaption {
+        color: var(--ml-text-muted);
+        font-size: var(--ml-text-sm);
+        text-align: center;
+      }
+      .fader-box {
+        display: flex;
+        height: 220px;
+      }
+      .meter-box {
+        display: flex;
+        gap: 6px;
+        height: 160px;
+      }
+      .wide-box {
+        width: 220px;
+      }
+      .readout {
+        font-family: var(--ml-font-mono);
+        font-size: var(--ml-text-sm);
+        font-weight: var(--ml-weight-bold);
+      }
+      .plain-button {
+        min-height: var(--ml-target);
+        padding: 0 var(--ml-space-3);
+        border: 1px solid var(--ml-border);
+        border-radius: var(--ml-radius-md);
+        background: var(--ml-surface-raised);
+        color: var(--ml-text);
+        font-size: var(--ml-text-md);
+      }
+      .log {
+        min-height: 120px;
+        margin: 0;
+        padding-left: var(--ml-space-5);
+        color: var(--ml-text-secondary);
+        font-family: var(--ml-font-mono);
+        font-size: var(--ml-text-xs);
+      }
+    </style>
+    <script type="module" src="gallery.js"></script>
+  </head>
+  <body>
+    <main class="gallery">
+      <header class="intro">
+        <h1>Console components</h1>
+        <p>
+          Every atom of the console in its states, fed by the fake engine, so no MixLink app is
+          needed. Try the pointer and the keyboard; what each control sends shows in the event log.
+        </p>
+      </header>
+
+      <section aria-labelledby="fader-title">
+        <h2 id="fader-title">Fader</h2>
+        <div class="row">
+          <figure>
+            <div class="fader-box"><ml-fader value="100" label="Unity fader"></ml-fader></div>
+            <output class="readout">100%</output>
+            <figcaption>Unity</figcaption>
+          </figure>
+          <figure>
+            <div class="fader-box"><ml-fader value="62" label="Kick level"></ml-fader></div>
+            <output class="readout">62%</output>
+            <figcaption>62%</figcaption>
+          </figure>
+          <figure>
+            <div class="fader-box"><ml-fader value="0" label="Silent fader"></ml-fader></div>
+            <output class="readout">0%</output>
+            <figcaption>Down</figcaption>
+          </figure>
+          <figure>
+            <div class="fader-box">
+              <ml-fader value="88" tone="accent" label="Vox 1 level"></ml-fader>
+            </div>
+            <output class="readout">88%</output>
+            <figcaption>Their own channel</figcaption>
+          </figure>
+          <figure>
+            <div class="fader-box">
+              <ml-fader value="55" tone="muted" label="Click level, muted"></ml-fader>
+            </div>
+            <output class="readout" data-muted>muted</output>
+            <figcaption>Muted channel</figcaption>
+          </figure>
+          <figure>
+            <div class="fader-box">
+              <ml-fader value="40" disabled label="Disabled fader"></ml-fader>
+            </div>
+            <output class="readout">40%</output>
+            <figcaption>Disabled</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section aria-labelledby="meter-title">
+        <div class="section-head">
+          <h2 id="meter-title">Meter</h2>
+          <button type="button" class="plain-button" data-pause-meters aria-pressed="false">
+            Pause meters
+          </button>
+        </div>
+        <div class="row">
+          <figure>
+            <div class="meter-box">
+              <ml-meter data-channel="0" label="CH 1 input"></ml-meter>
+              <ml-meter data-channel="1" label="CH 2 input"></ml-meter>
+              <ml-meter data-channel="2" label="CH 3 input"></ml-meter>
+              <ml-meter data-channel="3" label="CH 4 input"></ml-meter>
+            </div>
+            <figcaption>Inputs, live</figcaption>
+          </figure>
+          <figure>
+            <div class="meter-box">
+              <ml-meter data-output="192.168.1.3:50000" data-side="left" label="Output left"></ml-meter>
+              <ml-meter data-output="192.168.1.3:50000" data-side="right" label="Output right"></ml-meter>
+            </div>
+            <figcaption>Output L/R, live</figcaption>
+          </figure>
+          <figure data-zone-specimen="0">
+            <div class="meter-box"><ml-meter level="0" label="Silent meter"></ml-meter></div>
+            <figcaption></figcaption>
+          </figure>
+          <figure data-zone-specimen="10">
+            <div class="meter-box"><ml-meter level="10" label="Quiet meter"></ml-meter></div>
+            <figcaption></figcaption>
+          </figure>
+          <figure data-zone-specimen="50">
+            <div class="meter-box"><ml-meter level="50" label="Safe meter"></ml-meter></div>
+            <figcaption></figcaption>
+          </figure>
+          <figure data-zone-specimen="80">
+            <div class="meter-box"><ml-meter level="80" label="Hot meter"></ml-meter></div>
+            <figcaption></figcaption>
+          </figure>
+          <figure data-zone-specimen="100">
+            <div class="meter-box"><ml-meter level="100" label="Clipping meter"></ml-meter></div>
+            <figcaption></figcaption>
+          </figure>
+          <figure>
+            <div class="wide-box">
+              <ml-meter data-channel="0" orientation="horizontal" label="CH 1 input"></ml-meter>
+            </div>
+            <figcaption>Horizontal, live</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section aria-labelledby="pan-title">
+        <h2 id="pan-title">Pan</h2>
+        <div class="row">
+          <figure><ml-pan value="0" label="Hard left pan"></ml-pan><figcaption>Hard left</figcaption></figure>
+          <figure><ml-pan value="40" label="Vox 2 pan"></ml-pan><figcaption>20% left</figcaption></figure>
+          <figure><ml-pan value="50" label="Kick pan"></ml-pan><figcaption>Centre</figcaption></figure>
+          <figure><ml-pan value="65" label="Guitar pan"></ml-pan><figcaption>30% right</figcaption></figure>
+          <figure><ml-pan value="100" label="Hard right pan"></ml-pan><figcaption>Hard right</figcaption></figure>
+          <figure>
+            <ml-pan value="35" disabled label="Disabled pan"></ml-pan><figcaption>Disabled</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section aria-labelledby="toggle-title">
+        <h2 id="toggle-title">Toggle</h2>
+        <div class="row">
+          <figure><ml-toggle kind="mute" label="Mute Kick">M</ml-toggle><figcaption>Mute off</figcaption></figure>
+          <figure>
+            <ml-toggle kind="mute" pressed label="Mute Click">M</ml-toggle><figcaption>Mute on</figcaption>
+          </figure>
+          <figure><ml-toggle kind="solo" label="Solo Kick">S</ml-toggle><figcaption>Solo off</figcaption></figure>
+          <figure>
+            <ml-toggle kind="solo" pressed label="Solo Vox 1">S</ml-toggle><figcaption>Solo on</figcaption>
+          </figure>
+          <figure>
+            <ml-toggle kind="mute" wide label="Mute master">Mute</ml-toggle>
+            <figcaption>Master</figcaption>
+          </figure>
+          <figure>
+            <ml-toggle kind="mute" disabled label="Mute, disabled">M</ml-toggle>
+            <figcaption>Disabled</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section aria-labelledby="chip-title">
+        <h2 id="chip-title">Group chip</h2>
+        <div class="row">
+          <ml-group-chip name="Drums" tone="teal"></ml-group-chip>
+          <ml-group-chip name="Bass" tone="blue"></ml-group-chip>
+          <ml-group-chip name="Keys" tone="violet"></ml-group-chip>
+          <ml-group-chip name="Vocals" tone="orange"></ml-group-chip>
+          <ml-group-chip tone="none"></ml-group-chip>
+          <ml-group-chip name="Horns" tone="teal" invalid></ml-group-chip>
+        </div>
+      </section>
+
+      <section aria-labelledby="pill-title">
+        <h2 id="pill-title">Status pill</h2>
+        <div class="row">
+          <ml-status-pill state="idle"></ml-status-pill>
+          <ml-status-pill state="starting"></ml-status-pill>
+          <ml-status-pill state="running"></ml-status-pill>
+          <ml-status-pill state="stopping"></ml-status-pill>
+          <ml-status-pill state="stopped"></ml-status-pill>
+          <ml-status-pill state="error"></ml-status-pill>
+        </div>
+      </section>
+
+      <section aria-labelledby="link-title">
+        <h2 id="link-title">Link state</h2>
+        <div class="row" data-link-states></div>
+      </section>
+
+      <section aria-labelledby="log-title">
+        <h2 id="log-title">Event log</h2>
+        <ol class="log" data-event-log></ol>
+      </section>
+    </main>
+  </body>
+</html>

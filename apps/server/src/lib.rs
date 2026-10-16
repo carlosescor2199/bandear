@@ -1,11 +1,13 @@
 mod capture;
 mod cli;
 mod control;
+mod decimate;
 mod discovery;
 mod engine;
 mod health;
 mod mix;
 mod network;
+mod pipeline;
 mod protocol;
 mod targets;
 

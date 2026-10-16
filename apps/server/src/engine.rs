@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -21,11 +21,9 @@ use crate::mix::{
     group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, MixPreset,
     MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
 };
-use crate::network::{spawn_network_thread, PacketStats};
-use crate::protocol::AudioPacket;
+use crate::network::{NetworkSink, PacketStats};
+use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
 use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
-
-const CHANNEL_CAPACITY: usize = 8;
 
 /// The capture buffer the engine requests when the caller did not choose one.
 ///
@@ -790,6 +788,13 @@ fn peak_to_level(peak: u16) -> u8 {
     ((u32::from(peak) * 100) / 32767).min(100) as u8
 }
 
+/// The 16-bit magnitude of a float peak, the scale the meters have always read: `|x|` times
+/// 32768, rounded. A 16-bit source reads exactly its own samples' magnitudes, so the levels are
+/// unchanged by the float path.
+fn pcm16_magnitude(peak: f32) -> u16 {
+    (peak.clamp(0.0, 1.0) * 32_768.0).round() as u16
+}
+
 /// Per-source-channel peak levels, measured on the audio thread and held for the UI to read.
 ///
 /// The audio callback raises and lowers each channel's held level with [observe], which is
@@ -812,20 +817,17 @@ impl LevelMeter {
     /// Memory order is `Relaxed` on both sides: a meter reading that lags one callback is
     /// irrelevant, and the value carries no other state, so no synchronisation is warranted. The
     /// scan is one pass over `samples` with no allocation and no clock or logarithm.
-    pub(crate) fn observe(&self, samples: &[i16], channels: usize) {
+    pub(crate) fn observe(&self, samples: &[f32], channels: usize) {
         if channels == 0 || channels > MAX_MIX_CHANNELS || samples.len() % channels != 0 {
             return;
         }
         let frames = samples.len() / channels;
         for (channel, level) in self.levels.iter().enumerate().take(channels) {
-            let mut peak = 0u16;
-            for frame in 0..frames {
-                let magnitude = samples[frame * channels + channel].unsigned_abs();
-                if magnitude > peak {
-                    peak = magnitude;
-                }
+            let mut peak = 0.0f32;
+            for frame in samples.chunks_exact(channels) {
+                peak = peak.max(frame[channel].abs());
             }
-            hold_peak(level, peak_to_level(peak), frames);
+            hold_peak(level, peak_to_level(pcm16_magnitude(peak)), frames);
         }
     }
 
@@ -1275,21 +1277,31 @@ pub struct EngineHandle {
     /// and removed while both keep running.
     targets: Arc<TargetRegistry>,
     stopped: Arc<AtomicBool>,
-    samples_seen: Arc<AtomicU64>,
-    /// The packet sequence shared with whichever capture stream is currently running, so a switch
-    /// continues the numbering instead of restarting it.
-    sequence: Arc<AtomicU64>,
+    /// What every capture stream counts: samples delivered and frames dropped.
+    capture_stats: Arc<CaptureStats>,
     packet_stats: Arc<PacketStats>,
     peers: ControlPeers,
     /// The live configuration (channel count and groups), shared with the control connections:
     /// what every phone is sent as `config`, and the membership a new musician's mix starts with.
     config_state: Arc<ConfigState>,
     events: EventBus,
+    /// The running capture stream. Dropping it stops its callback, the only producer of its ring.
     stream: Option<cpal::Stream>,
-    packet_sender: Option<SyncSender<AudioPacket>>,
-    network_thread: Option<JoinHandle<()>>,
+    /// The engine thread: it reads the current stream's ring and feeds the sinks, and keeps the
+    /// block numbering going across device switches.
+    pipeline: Option<PipelineHandle>,
     control_thread: Option<JoinHandle<()>>,
     discovery_thread: Option<JoinHandle<()>>,
+}
+
+/// A capture source opened and started, not yet the engine's: what [EngineHandle::install_capture]
+/// commits. A device opens one through cpal; a test opens one with a [crate::pipeline::CaptureWriter]
+/// it drives itself, with no stream.
+pub(crate) struct OpenedCapture {
+    pub(crate) stream: Option<cpal::Stream>,
+    pub(crate) reader: SourceReader,
+    pub(crate) device_name: String,
+    pub(crate) format: CaptureFormat,
 }
 
 impl EngineHandle {
@@ -1360,9 +1372,11 @@ impl EngineHandle {
             channels: config.channels.clone(),
             channel_levels: self.levels.read(usize::from(self.source_channels)),
             stopped: self.is_stopped(),
-            samples_received: self.samples_seen.load(Ordering::Relaxed),
+            samples_received: self.capture_stats.samples.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
-            packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
+            // Audio the phones never got: capture the ring had no room for, and failed sends.
+            packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed)
+                + self.capture_stats.dropped_blocks.load(Ordering::Relaxed),
             musicians: join_musicians(
                 &targets, &connected, &counters, &mixes, &announced, &links, &mirrors,
             ),
@@ -1391,13 +1405,15 @@ impl EngineHandle {
 
     /// Switches the input device while the rest of the engine keeps running.
     ///
-    /// Only the capture stream is rebuilt: the UDP network thread, the control WebSocket server and
-    /// the discovery beacon are untouched, and the packet sequence continues from where it was. The
+    /// Only the capture stream is rebuilt: the engine thread, the control WebSocket server and the
+    /// discovery beacon are untouched, and the block numbering continues from where it was. The
     /// new stream is built and started before the old one is dropped, so a device that has vanished
     /// or a format that cannot be opened leaves the previous capture exactly as it was and returns
-    /// the error. On success, groups are re-validated (never rewritten), the channel details are
-    /// shown for the inputs the new device has and kept for the rest ([Self::set_channels]), and
-    /// connected clients are sent the new `config` when any of it changed.
+    /// the error. The new stream feeds its own ring, and the engine thread moves to it between two
+    /// blocks, so the phones never get a block that mixes the two devices. On success, groups are
+    /// re-validated (never rewritten), the channel details are shown for the inputs the new device
+    /// has and kept for the rest ([Self::set_channels]), and connected clients are sent the new
+    /// `config` when any of it changed.
     pub fn switch_device(&mut self, filter: Option<&str>) -> Result<CaptureFormat, Box<dyn Error>> {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
@@ -1414,36 +1430,57 @@ impl EngineHandle {
             }
         };
         let supported_config = select_input_config(&device)?;
-        let packet_sender = self.packet_sender.clone().ok_or("the engine is stopping")?;
+        let links = self.capture_links()?;
 
         // Build and start the replacement before touching the current capture, so any failure below
         // is a no-op for the running session.
-        let (new_stream, effective_buffer) = build_input_stream(
-            &device,
-            &supported_config,
-            self.buffer_frames,
-            packet_sender,
-            Arc::clone(&self.samples_seen),
-            Arc::clone(&self.packet_stats),
-            Arc::clone(&self.levels),
-            Arc::clone(&self.sequence),
-        )?;
-        new_stream
+        let opened = build_input_stream(&device, &supported_config, self.buffer_frames, &links)?;
+        opened
+            .stream
             .play()
             .map_err(|error| format!("could not start input capture: {error}"))?;
 
-        let plan =
-            plan_switch_from_attempt(&self.group_definitions, Ok(supported_config.channels()))?;
+        self.install_capture(OpenedCapture {
+            stream: Some(opened.stream),
+            reader: opened.reader,
+            device_name: device.to_string(),
+            format: CaptureFormat {
+                channels: supported_config.channels(),
+                sample_rate: supported_config.sample_rate(),
+                sample_format: format!("{:?}", supported_config.sample_format()),
+                buffer_size: describe_buffer(opened.buffer_frames),
+            },
+        })
+    }
 
-        // Commit: the new capture is confirmed working.
-        self.stream = Some(new_stream);
-        self.device_name = device.to_string();
-        self.capture_format = CaptureFormat {
-            channels: supported_config.channels(),
-            sample_rate: supported_config.sample_rate(),
-            sample_format: format!("{:?}", supported_config.sample_format()),
-            buffer_size: describe_buffer(effective_buffer),
-        };
+    /// What a new capture stream writes to: the input meters, the capture counters and the engine
+    /// thread to wake.
+    fn capture_links(&self) -> Result<CaptureLinks, Box<dyn Error>> {
+        let pipeline = self.pipeline.as_ref().ok_or("the engine is stopping")?;
+        Ok(CaptureLinks {
+            levels: Arc::clone(&self.levels),
+            stats: Arc::clone(&self.capture_stats),
+            wake: Some(pipeline.waker()),
+        })
+    }
+
+    /// Makes an opened, running capture the engine's: the engine thread reads its ring from the
+    /// next block on, the previous stream is dropped, and the session takes its channel count.
+    ///
+    /// A plan that cannot be made leaves everything as it was (the new capture is dropped).
+    pub(crate) fn install_capture(
+        &mut self,
+        capture: OpenedCapture,
+    ) -> Result<CaptureFormat, Box<dyn Error>> {
+        let plan = plan_switch_from_attempt(&self.group_definitions, Ok(capture.format.channels))?;
+        let pipeline = self.pipeline.as_ref().ok_or("the engine is stopping")?;
+
+        // Commit: the engine thread moves to the new ring between two blocks, then the old stream,
+        // the only producer of the old ring, is stopped.
+        pipeline.set_source(capture.reader)?;
+        self.stream = capture.stream;
+        self.device_name = capture.device_name;
+        self.capture_format = capture.format;
         self.source_channels = plan.source_channels;
         // Every phone is sent the new `config` (channel count and groups) when it differs, and every
         // musician, connected now or registering later, mixes with the new membership.
@@ -1804,14 +1841,13 @@ impl EngineHandle {
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
-        // Stop producing before draining: drop the capture stream first, then the sender, so the
-        // network thread sees the channel close and exits.
+        // Stop producing before the engine thread: drop the capture stream first, then stop the
+        // thread that reads its ring and feeds the phones.
         self.stream = None;
-        self.packet_sender = None;
-        if let Some(thread) = self.network_thread.take() {
-            thread.join().map_err(|_| "UDP network thread panicked")?;
+        if let Some(pipeline) = self.pipeline.take() {
+            pipeline.stop()?;
         }
-        // Capture and the send loop have ended, so nothing would ever lower the last levels.
+        // Capture and the engine thread have ended, so nothing would ever lower the last levels.
         clear_meters(&self.levels, &self.targets.read());
         if let Some(thread) = self.control_thread.take() {
             thread
@@ -1872,7 +1908,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     );
     if supported_config.sample_rate() != TARGET_SAMPLE_RATE {
         println!(
-            "Input is {} Hz; applying integer decimation to {TARGET_SAMPLE_RATE} Hz before packaging.",
+            "Input is {} Hz; low-pass filtering and decimating to {TARGET_SAMPLE_RATE} Hz before packaging.",
             supported_config.sample_rate()
         );
     }
@@ -1903,31 +1939,24 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         TARGET_SAMPLE_RATE,
         Arc::clone(&stopped),
     );
-    let (packet_sender, packet_receiver) = sync_channel(CHANNEL_CAPACITY);
     let packet_stats = Arc::new(PacketStats {
         sent: AtomicU64::new(0),
         discarded: AtomicU64::new(0),
     });
     let levels = Arc::new(LevelMeter::new());
-    let network_thread = spawn_network_thread(
-        packet_receiver,
-        Arc::clone(&target_registry),
-        Arc::clone(&packet_stats),
-        Arc::clone(&levels),
-    )?;
-    let samples_seen = Arc::new(AtomicU64::new(0));
-    let sequence = Arc::new(AtomicU64::new(0));
-    let (stream, effective_buffer) = build_input_stream(
-        &device,
-        &supported_config,
-        buffer_frames,
-        packet_sender.clone(),
-        Arc::clone(&samples_seen),
-        Arc::clone(&packet_stats),
-        Arc::clone(&levels),
-        Arc::clone(&sequence),
-    )?;
-    stream
+    let capture_stats = Arc::new(CaptureStats::default());
+    let network = NetworkSink::new(Arc::clone(&target_registry), Arc::clone(&packet_stats))?;
+    let pipeline =
+        PipelineHandle::spawn(Pipeline::new(vec![Box::new(network)], Arc::clone(&levels)))?;
+    let links = CaptureLinks {
+        levels: Arc::clone(&levels),
+        stats: Arc::clone(&capture_stats),
+        wake: Some(pipeline.waker()),
+    };
+    let opened = build_input_stream(&device, &supported_config, buffer_frames, &links)?;
+    pipeline.set_source(opened.reader)?;
+    opened
+        .stream
         .play()
         .map_err(|error| format!("could not start input capture: {error}"))?;
 
@@ -1935,7 +1964,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         channels: supported_config.channels(),
         sample_rate: supported_config.sample_rate(),
         sample_format: format!("{:?}", supported_config.sample_format()),
-        buffer_size: describe_buffer(effective_buffer),
+        buffer_size: describe_buffer(opened.buffer_frames),
     };
 
     Ok(Some(EngineHandle {
@@ -1949,15 +1978,13 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         levels,
         targets: target_registry,
         stopped,
-        samples_seen,
-        sequence,
+        capture_stats,
         packet_stats,
         peers,
         config_state,
         events,
-        stream: Some(stream),
-        packet_sender: Some(packet_sender),
-        network_thread: Some(network_thread),
+        stream: Some(opened.stream),
+        pipeline: Some(pipeline),
         control_thread: Some(control_thread),
         discovery_thread: Some(discovery_thread),
     }))
@@ -1970,6 +1997,12 @@ mod tests {
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("test IP should parse")
+    }
+
+    /// 16-bit samples as the float frames capture produces from them.
+    fn pcm(samples: &[i16]) -> Vec<f32> {
+        use crate::pipeline::CaptureSample;
+        samples.iter().map(|sample| sample.to_f32()).collect()
     }
 
     const PHONE_ID: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
@@ -2565,7 +2598,7 @@ mod tests {
         let meter = LevelMeter::new();
 
         // Two frames, two channels: channel 0 peaks at half scale, channel 1 at full scale.
-        meter.observe(&[16_384, 32_767, -16_384, -1], 2);
+        meter.observe(&pcm(&[16_384, 32_767, -16_384, -1]), 2);
 
         assert_eq!(meter.read(2), vec![50, 100]);
     }
@@ -2575,7 +2608,7 @@ mod tests {
     #[test]
     fn reading_a_meter_never_lowers_it() {
         let inputs = LevelMeter::new();
-        inputs.observe(&[16_384, 32_767], 2);
+        inputs.observe(&pcm(&[16_384, 32_767]), 2);
         let output = OutputMeter::default();
         output.observe(&[32_767, 16_384]);
 
@@ -2591,20 +2624,20 @@ mod tests {
     fn a_held_level_falls_one_step_every_720_frames_of_audio() {
         let inputs = LevelMeter::new();
         let output = OutputMeter::default();
-        inputs.observe(&[32_767], 1);
+        inputs.observe(&pcm(&[32_767]), 1);
         output.observe(&[32_767, 32_767]);
 
-        inputs.observe(&vec![0; 7_200], 1);
+        inputs.observe(&vec![0.0; 7_200], 1);
         output.observe(&vec![0; 2 * 7_200]);
         assert_eq!(inputs.read(1), vec![90], "0.15 s after a full-scale peak");
         assert_eq!(output.read(), [90, 90]);
 
-        inputs.observe(&vec![0; 64_080], 1);
+        inputs.observe(&vec![0.0; 64_080], 1);
         output.observe(&vec![0; 2 * 64_080]);
         assert_eq!(inputs.read(1), vec![1], "one step short of 1.5 s");
         assert_eq!(output.read(), [1, 1]);
 
-        inputs.observe(&vec![0; 720], 1);
+        inputs.observe(&vec![0.0; 720], 1);
         output.observe(&vec![0; 2 * 720]);
         assert_eq!(inputs.read(1), vec![0], "1.5 s after the peak");
         assert_eq!(output.read(), [0, 0]);
@@ -2615,15 +2648,15 @@ mod tests {
     fn a_new_peak_above_the_fallen_level_shows_at_once() {
         let inputs = LevelMeter::new();
         let output = OutputMeter::default();
-        inputs.observe(&[32_767, 32_767], 2);
+        inputs.observe(&pcm(&[32_767, 32_767]), 2);
         output.observe(&[32_767, 32_767]);
-        inputs.observe(&vec![0; 2 * 36_000], 2);
+        inputs.observe(&vec![0.0; 2 * 36_000], 2);
         output.observe(&vec![0; 2 * 36_000]);
         assert_eq!(inputs.read(2), vec![50, 50], "half way down after 0.75 s");
         assert_eq!(output.read(), [50, 50]);
 
         // One frame: 80 on the first side, 30 on the second.
-        inputs.observe(&[26_214, 9_830], 2);
+        inputs.observe(&pcm(&[26_214, 9_830]), 2);
         output.observe(&[26_214, 9_830]);
 
         assert_eq!(inputs.read(2), vec![80, 50]);
@@ -2660,7 +2693,7 @@ mod tests {
             .expect("registry should build");
         registry.read()[0].output_meter.observe(&[32_767, 16_384]);
         let inputs = LevelMeter::new();
-        inputs.observe(&[32_767, 16_384], 2);
+        inputs.observe(&pcm(&[32_767, 16_384]), 2);
 
         clear_meters(&inputs, &registry.read());
 
@@ -2684,7 +2717,7 @@ mod tests {
             .expect("registry should build");
         registry.read()[0].output_meter.observe(&[32_767, -16_384]);
         let inputs = LevelMeter::new();
-        inputs.observe(&[16_384, 0, -32_767, 0], 2);
+        inputs.observe(&pcm(&[16_384, 0, -32_767, 0]), 2);
 
         let meters = read_meters(&inputs, 2, &registry.read());
 
@@ -2745,7 +2778,7 @@ mod tests {
     fn observe_ignores_incomplete_frames_and_zero_channels() {
         let meter = LevelMeter::new();
 
-        meter.observe(&[1, 2, 3], 2);
+        meter.observe(&pcm(&[1, 2, 3]), 2);
         meter.observe(&[], 0);
 
         assert_eq!(meter.read(2), vec![0, 0]);

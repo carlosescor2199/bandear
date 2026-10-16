@@ -933,6 +933,15 @@ slice. Push and PRs are the user's decision.
 - Review `review-a8a8d8e4b1bf18da` over 71b9aff..d379367 (T5c) approved and acknowledged; next
   review base d379367. Its WARNING (R3-read-choice-latched-on-failure) is fixed by T5c-fix.
 
+- Review `review-04bcc805c7f78bcf` over d379367..39f4b32 (T5c-fix and T5b-fix) approved and
+  acknowledged; next review base 39f4b32. Folded into T6:
+  - WARNING R3-persistent-unreadable-choice-blocks-start: if `audio_settings` fails on every read,
+    Start, Try again and the automatic start all refuse with "could not be read" and nothing tells
+    the engineer that choosing an input in Network and system gets past it. Say so in the message,
+    offer the way out, and test a read that never succeeds.
+  - SUGGESTION R3-running-engine-read-failure-untested: test that a failed read with an engine
+    already running leaves it running and shows the command error as intended.
+
 ## Next step
 
 T6 (presets, copy and mirror).

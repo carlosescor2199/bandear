@@ -502,6 +502,22 @@ test("adding, removing and renaming musicians answer with the result, and the li
   app.dispose();
 });
 
+test("a musician's label stays on screen when their phone comes back from a new IP", async () => {
+  const { fake, app } = await connected();
+  const phone = sampleStatus().musicians.find((musician) => !musician.clientName);
+
+  assert.deepEqual(await app.rename(phone.address, "Drum kit"), { ok: true });
+  fake.movePhone(phone.address, "192.168.1.77:50000");
+
+  const { musicians } = app.store.getState();
+  assert.equal(musicians.some((musician) => musician.address === phone.address), false);
+  const moved = musicians.find((musician) => musician.address === "192.168.1.77:50000");
+  assert.equal(moved.clientId, phone.clientId);
+  assert.equal(moved.name, "Drum kit");
+  assert.equal(moved.nameIsLocal, true);
+  app.dispose();
+});
+
 test("the window is titled after the input device, and plainly when no engine runs", async () => {
   const { fake, app } = await connected();
   await app.stop();

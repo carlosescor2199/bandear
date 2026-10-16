@@ -34,10 +34,12 @@ function count(value) {
 }
 
 /**
- * One row per musician: `{ address, name, editable, nameIsLocal, connected, link, mix, sent,
- * discarded, loss, lossHigh }`. A name the phone announced is the phone's, so it is not editable;
- * a local label is only offered while the phone announced none. `loss` is the share of packets
- * this server discarded for that phone.
+ * One row per musician: `{ address, clientId, name, editable, nameIsLocal, labelFollows,
+ * connected, link, mix, sent, discarded, loss, lossHigh }`. A name the phone announced is the
+ * phone's, so it is not editable; a local label is only offered while the phone announced none.
+ * The desk keeps a local label for the phone when it has a client id, so the label follows it to
+ * any IP (`labelFollows: "phone"`), and for the address otherwise (`"address"`). `loss` is the
+ * share of packets this server discarded for that phone.
  */
 export function musicianRows(state) {
   return state.musicians.map((musician) => {
@@ -45,11 +47,14 @@ export function musicianRows(state) {
     const discarded = musician.packetsDiscarded ?? 0;
     const total = sent + discarded;
     const loss = total === 0 ? 0 : (discarded / total) * 100;
+    const clientId = musician.clientId ?? null;
     return {
       address: musician.address,
+      clientId,
       name: musician.name ?? "",
       editable: !musician.clientName,
       nameIsLocal: Boolean(musician.nameIsLocal),
+      labelFollows: clientId ? "phone" : "address",
       connected: Boolean(musician.controlConnected),
       link: linkState(musician),
       mix: `${formatPercent(musician.mix.volumePercent)} · ${musician.mix.muted ? "muted" : "live"}`,

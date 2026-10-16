@@ -11,14 +11,12 @@ use std::time::Duration;
 
 use mixlink_desktop::commands::{self, DesktopState};
 use mixlink_desktop::dto::StartRequest;
-use mixlink_desktop::names::MusicianNames;
+use mixlink_desktop::session::SessionStore;
 
 fn main() {
-    // A scratch config directory: the probe must not disturb the real app's labels.
-    let names_path = std::env::temp_dir()
-        .join("mixlink-desktop-probe")
-        .join("musicians.json");
-    let state = DesktopState::new(MusicianNames::load(names_path));
+    // A scratch config directory: the probe must not disturb the real app's session.
+    let directory = std::env::temp_dir().join("mixlink-desktop-probe");
+    let state = DesktopState::new(SessionStore::open(&directory));
 
     let summary =
         commands::start_engine(&state, StartRequest::default()).expect("the engine should start");

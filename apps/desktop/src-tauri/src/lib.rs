@@ -7,12 +7,12 @@
 pub mod commands;
 pub mod dto;
 pub mod events;
-pub mod names;
+pub mod session;
 
 use commands::DesktopState;
 use dto::{EngineStateDto, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest, StartSummary};
 use events::EventPump;
-use names::MusicianNames;
+use session::SessionStore;
 use tauri::{Manager, State};
 
 /// Fails to compile rather than at runtime if the shared state ever gains a non-`Send` field,
@@ -87,17 +87,19 @@ async fn set_musician_name(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // The label store is a desktop-app concern and lives in the app's config directory, so
-            // it survives a restart without touching the engine or any client protocol.
+            // The session (musician labels today) is a desktop-app concern and lives in the app's
+            // config directory, so it survives a restart without touching the engine or any client
+            // protocol. Opening it never fails: a damaged file is set aside and logged.
             let directory = app.path().app_config_dir()?;
             // Every engine the window starts streams its meters, status and mix changes as events
             // (see [events]); the app handle is both where the pump reads and where it emits.
             let handle = app.handle().clone();
             app.manage(
-                DesktopState::new(MusicianNames::load(directory.join(names::NAMES_FILE)))
-                    .with_event_pump(move |events, run| {
+                DesktopState::new(SessionStore::open(&directory)).with_event_pump(
+                    move |events, run| {
                         EventPump::start(events, run, handle.clone(), handle.clone())
-                    }),
+                    },
+                ),
             );
             Ok(())
         })

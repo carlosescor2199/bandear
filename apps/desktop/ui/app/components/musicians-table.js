@@ -9,7 +9,9 @@
 //   { address } when the form is sent.
 //
 // A name commits on Enter or when the field loses focus; Escape puts the saved name back. A name
-// the phone announced is the phone's, so its field is read-only; a local label is marked as such.
+// the phone announced is the phone's, so its field is read-only; a local label is marked as such,
+// and its field's title says whether the desk keeps it for the phone (it follows the phone to a new
+// IP) or for the address.
 // A field being typed in is never overwritten by new data. Remove asks first: the row shows
 // "Keep" where Remove was, and the confirming Remove only works after a short pause, so a double
 // click or a stray click cannot remove anyone.
@@ -20,9 +22,14 @@ import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./suppo
 
 const CLIENT_NAME_TITLE =
   "Announced by the musician in their own app; the name is set on their phone, not on this desk";
-const LOCAL_LABEL_TITLE =
-  "Local label for this desk, shown only while the musician has not announced a name. " +
-  "Enter saves, Escape reverts";
+const LOCAL_LABEL_TITLES = Object.freeze({
+  phone:
+    "Local label for this desk, kept for this phone even when its address changes, and shown " +
+    "only while the musician has not announced a name. Enter saves, Escape reverts",
+  address:
+    "Local label for this desk, kept for this address, and shown only while the musician has " +
+    "not announced a name. Enter saves, Escape reverts",
+});
 const ARMED_FOR_MS = 10000;
 
 const styles = sheet(`
@@ -367,7 +374,9 @@ class MlMusiciansTable extends HTMLElement {
       view.name.value = row.name;
     }
     view.name.disabled = !row.editable;
-    view.name.title = row.editable ? LOCAL_LABEL_TITLE : CLIENT_NAME_TITLE;
+    view.name.title = row.editable
+      ? (LOCAL_LABEL_TITLES[row.labelFollows] ?? LOCAL_LABEL_TITLES.address)
+      : CLIENT_NAME_TITLE;
     reflect(view.name, "aria-label", `Name of ${row.name || row.address}`);
     view.badge.hidden = !row.nameIsLocal;
     setText(view.addressText, row.address);

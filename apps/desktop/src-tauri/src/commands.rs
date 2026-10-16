@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use personal_monitoring::{
     start, AudioHost, EngineConfig, EngineEvent, EngineHandle, GroupDefinition, MixValues,
+    MusicianStatus,
 };
 
 use crate::dto::{
@@ -18,16 +19,16 @@ use crate::dto::{
     MixDto, MixUpdateRequest, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
-use crate::names::MusicianNames;
+use crate::session::SessionStore;
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
 
 /// The state the desktop commands share: the running engine, its event pump, and the desktop-only
-/// name store.
+/// session (see [crate::session]).
 ///
 /// The engine handle is behind a [Mutex] because the engine is already internally concurrent: the
-/// commands only need exclusive access to start, stop and take a snapshot. The name store has its
+/// commands only need exclusive access to start, stop and take a snapshot. The session has its
 /// own lock, and the two are never held in the opposite order, so they cannot deadlock.
 ///
 /// The pump's lock is taken first by start and stop and held throughout, so two quick starts can
@@ -41,18 +42,18 @@ pub struct DesktopState {
     run: AtomicU64,
     pump: Mutex<Option<EventPump>>,
     start_pump: Option<PumpStarter>,
-    names: MusicianNames,
+    session: SessionStore,
 }
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
-    pub fn new(names: MusicianNames) -> Self {
+    pub fn new(session: SessionStore) -> Self {
         Self {
             engine: Mutex::new(None),
             run: AtomicU64::new(0),
             pump: Mutex::new(None),
             start_pump: None,
-            names,
+            session,
         }
     }
 
@@ -200,7 +201,7 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
 fn status_of(state: &DesktopState, handle: &EngineHandle) -> EngineStatusDto {
     let mut status = EngineStatusDto::from(&handle.status());
     status.run = state.run();
-    apply_names(&mut status, &state.names);
+    apply_names(&mut status, &state.session);
     status
 }
 
@@ -227,7 +228,8 @@ pub fn musician_mix(state: &DesktopState, address: SocketAddr) -> Option<(Socket
     state.engine.lock().ok()?.as_ref()?.musician_mix(address)
 }
 
-/// Fills each musician row's displayed name, joining the local label store on the address string.
+/// Fills each musician row's displayed name from the session's local labels: the label kept for
+/// the row's phone (its client id) first, then the one kept for its address.
 ///
 /// The client's announced name wins: each musician sets their own name in their own app, and a
 /// stored label must not shadow it. The engineer's local label is the fallback for a client that
@@ -238,12 +240,21 @@ pub fn musician_mix(state: &DesktopState, address: SocketAddr) -> Option<(Socket
 /// the desktop-only concern is applied in one place. The client's own name stays in `clientName`,
 /// so the window can still show what the phone calls itself. Public so the headless probe can
 /// drive exactly the name resolution the window gets, without a webview.
-pub fn apply_names(status: &mut EngineStatusDto, names: &MusicianNames) {
+pub fn apply_names(status: &mut EngineStatusDto, session: &SessionStore) {
     for musician in &mut status.musicians {
-        let local = names.get(&musician.address);
+        let local = session.label_for(musician.client_id.as_deref(), &musician.address);
         musician.name_is_local = musician.client_name.is_none() && local.is_some();
         musician.name = musician.client_name.clone().or(local);
     }
+}
+
+/// The client id of the musician the status lists at `address` (the address string as the status
+/// reports it), or `None` when that row has none or no row is there.
+fn client_id_at(musicians: &[MusicianStatus], address: &str) -> Option<String> {
+    musicians
+        .iter()
+        .find(|musician| musician.address.to_string() == address)
+        .and_then(|musician| musician.client_id.clone())
 }
 
 /// Adds a musician by address while the engine runs, returning the resolved address.
@@ -313,13 +324,42 @@ pub fn set_mix(
 
 /// Sets or clears a musician's label. The label never reaches the engine or any client, and it is
 /// only shown for a client that has not announced a name of its own: a client's own name wins.
+///
+/// `address` is the row's address as the status reports it. When the running engine lists a phone
+/// with a client id there, the label is kept for that phone, so it stays with the musician when
+/// their IP changes; otherwise it is kept for the address.
 pub fn set_musician_name(
     state: &DesktopState,
     address: String,
     name: String,
 ) -> Result<(), String> {
-    state.names.set(&address, &name)?;
-    println!("[mixlink-desktop] set_musician_name: {address} -> \"{name}\"");
+    // The engine lock is released before the session's is taken, as everywhere else.
+    let musicians = {
+        let guard = state
+            .engine
+            .lock()
+            .map_err(|_| "engine state lock was poisoned".to_owned())?;
+        guard
+            .as_ref()
+            .map(|handle| handle.status().musicians)
+            .unwrap_or_default()
+    };
+    label_musician(&state.session, &musicians, &address, &name)
+}
+
+/// Saves `name` as the label of the musician at `address`, keyed on the client id of the row
+/// `musicians` lists there (the running engine's rows, none without an engine), or on the
+/// address when that row has none or no row is there.
+fn label_musician(
+    session: &SessionStore,
+    musicians: &[MusicianStatus],
+    address: &str,
+    name: &str,
+) -> Result<(), String> {
+    let client_id = client_id_at(musicians, address);
+    session.set_label(client_id.as_deref(), address, name)?;
+    let kept_for = client_id.map_or_else(|| "address".to_owned(), |id| format!("phone {id}"));
+    println!("[mixlink-desktop] set_musician_name: {address} ({kept_for}) -> \"{name}\"");
     Ok(())
 }
 
@@ -405,6 +445,7 @@ mod tests {
                 .map(|address| MusicianDto {
                     address: (*address).to_owned(),
                     client_name: None,
+                    client_id: None,
                     name: None,
                     name_is_local: false,
                     control_connected: false,
@@ -421,23 +462,39 @@ mod tests {
         }
     }
 
-    fn names_path(test: &str) -> std::path::PathBuf {
+    /// An empty scratch config directory for one test's session.
+    fn session_directory(test: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir()
             .join("mixlink-command-tests")
             .join(test);
         let _ = std::fs::remove_dir_all(&directory);
-        directory.join("musicians.json")
+        directory
+    }
+
+    const PHONE: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
+
+    /// The engine's row for the phone `client_id` at `address`, every other value neutral.
+    fn engine_row(address: &str, client_id: Option<&str>) -> personal_monitoring::MusicianStatus {
+        personal_monitoring::MusicianStatus {
+            address: address.parse().expect("test address"),
+            name: None,
+            client_id: client_id.map(str::to_owned),
+            control_connected: true,
+            mix: Default::default(),
+            counters: Default::default(),
+            link: Default::default(),
+        }
     }
 
     #[test]
-    fn status_rows_take_their_labels_from_the_name_store() {
-        let names = MusicianNames::load(names_path("labels"));
-        names
-            .set("192.168.1.30:50000", "Ana")
-            .expect("setting a name should persist");
+    fn status_rows_take_their_labels_from_the_session() {
+        let session = SessionStore::open(&session_directory("labels"));
+        session
+            .set_label(None, "192.168.1.30:50000", "Ana")
+            .expect("setting a label should persist");
         let mut status = status_with_musicians(&["192.168.1.30:50000", "192.168.1.31:50000"]);
 
-        apply_names(&mut status, &names);
+        apply_names(&mut status, &session);
 
         assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
         assert!(status.musicians[0].name_is_local);
@@ -447,14 +504,15 @@ mod tests {
 
     #[test]
     fn the_clients_own_name_beats_the_local_label() {
-        let names = MusicianNames::load(names_path("client-wins"));
-        names
-            .set("192.168.1.30:50000", "Lead vocal")
-            .expect("setting a name should persist");
+        let session = SessionStore::open(&session_directory("client-wins"));
+        session
+            .set_label(Some(PHONE), "192.168.1.30:50000", "Lead vocal")
+            .expect("setting a label should persist");
         let mut status = status_with_musicians(&["192.168.1.30:50000"]);
         status.musicians[0].client_name = Some("Ana".to_owned());
+        status.musicians[0].client_id = Some(PHONE.to_owned());
 
-        apply_names(&mut status, &names);
+        apply_names(&mut status, &session);
 
         // The phone is the authority on its own name: the desk's stored label must not shadow it,
         // and the row must not report the label as if it were the name on screen.
@@ -465,13 +523,13 @@ mod tests {
 
     #[test]
     fn a_local_label_applies_when_the_client_announced_nothing() {
-        let names = MusicianNames::load(names_path("silent-client"));
-        names
-            .set("192.168.1.30:50000", "Rack A")
-            .expect("setting a name should persist");
+        let session = SessionStore::open(&session_directory("silent-client"));
+        session
+            .set_label(None, "192.168.1.30:50000", "Rack A")
+            .expect("setting a label should persist");
         let mut status = status_with_musicians(&["192.168.1.30:50000"]);
 
-        apply_names(&mut status, &names);
+        apply_names(&mut status, &session);
 
         assert_eq!(status.musicians[0].name.as_deref(), Some("Rack A"));
         assert_eq!(status.musicians[0].client_name, None);
@@ -480,18 +538,94 @@ mod tests {
 
     #[test]
     fn a_row_with_no_client_name_and_no_label_stays_unnamed() {
-        let names = MusicianNames::load(names_path("unnamed"));
+        let session = SessionStore::open(&session_directory("unnamed"));
         let mut status = status_with_musicians(&["192.168.1.30:50000"]);
 
-        apply_names(&mut status, &names);
+        apply_names(&mut status, &session);
 
         assert_eq!(status.musicians[0].name, None);
         assert!(!status.musicians[0].name_is_local);
     }
 
     #[test]
+    fn a_rename_is_kept_for_the_rows_phone_when_it_has_a_client_id() {
+        let rows = [
+            engine_row("192.168.1.10:50000", Some(PHONE)),
+            engine_row("192.168.1.40:50000", None),
+        ];
+
+        assert_eq!(
+            client_id_at(&rows, "192.168.1.10:50000").as_deref(),
+            Some(PHONE)
+        );
+        assert_eq!(client_id_at(&rows, "192.168.1.40:50000"), None, "no id");
+        assert_eq!(client_id_at(&rows, "192.168.1.99:50000"), None, "no row");
+    }
+
+    #[test]
+    fn a_musician_keeps_their_label_after_their_phones_ip_changes() {
+        let session = SessionStore::open(&session_directory("ip-change"));
+        // The engineer labels the phone while it is at its first address, as the window does.
+        let before = [engine_row("192.168.1.10:50000", Some(PHONE))];
+        label_musician(&session, &before, "192.168.1.10:50000", "Ana")
+            .expect("setting a label should persist");
+        // DHCP gives the phone another IP; the engine moves its row and keeps its client id.
+        let mut status = status_with_musicians(&["192.168.1.22:50000"]);
+        status.musicians[0].client_id = Some(PHONE.to_owned());
+
+        apply_names(&mut status, &session);
+
+        assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
+        assert!(status.musicians[0].name_is_local);
+    }
+
+    /// The saved session's `musicians` section in `test`'s scratch directory.
+    fn saved_musicians(test: &str) -> serde_json::Value {
+        let path = std::env::temp_dir()
+            .join("mixlink-command-tests")
+            .join(test)
+            .join(crate::session::SESSION_FILE);
+        let text = std::fs::read_to_string(path).expect("the session should be saved");
+        serde_json::from_str::<serde_json::Value>(&text).expect("the session is JSON")["musicians"]
+            .clone()
+    }
+
+    #[test]
+    fn naming_a_musician_without_an_engine_keeps_the_label_for_the_address() {
+        let state = DesktopState::new(SessionStore::open(&session_directory("name-idle")));
+
+        set_musician_name(&state, "192.168.1.40:50000".to_owned(), "Rack A".to_owned())
+            .expect("the label is saved without an engine");
+
+        assert_eq!(
+            saved_musicians("name-idle"),
+            serde_json::json!({ "address:192.168.1.40:50000": { "label": "Rack A" } })
+        );
+    }
+
+    #[test]
+    fn naming_a_listed_phone_keeps_the_label_for_its_client_id() {
+        let session = SessionStore::open(&session_directory("name-phone"));
+        let rows = [
+            engine_row("192.168.1.10:50000", Some(PHONE)),
+            engine_row("192.168.1.40:50000", None),
+        ];
+
+        label_musician(&session, &rows, "192.168.1.10:50000", "Ana").expect("saved");
+        label_musician(&session, &rows, "192.168.1.40:50000", "Rack A").expect("saved");
+
+        assert_eq!(
+            saved_musicians("name-phone"),
+            serde_json::json!({
+                format!("client:{PHONE}"): { "label": "Ana" },
+                "address:192.168.1.40:50000": { "label": "Rack A" }
+            })
+        );
+    }
+
+    #[test]
     fn setting_a_mix_without_a_running_engine_says_so() {
-        let state = DesktopState::new(MusicianNames::load(names_path("set-mix-idle")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("set-mix-idle")));
 
         let error = set_mix(
             &state,
@@ -556,7 +690,7 @@ mod tests {
 
     #[test]
     fn stopping_the_engine_stops_its_event_pump() {
-        let state = DesktopState::new(MusicianNames::load(names_path("stop-pump")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("stop-pump")));
         let (alive, _bus) = install_pump(&state);
 
         stop_engine(&state).expect("stopping is fine without an engine");
@@ -571,7 +705,7 @@ mod tests {
 
     #[test]
     fn a_restart_stops_the_previous_event_pump_even_when_the_new_engine_fails() {
-        let state = DesktopState::new(MusicianNames::load(names_path("restart-pump")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("restart-pump")));
         let (alive, _bus) = install_pump(&state);
 
         // An invalid target fails the start before any audio device is touched.
@@ -595,7 +729,7 @@ mod tests {
 
     #[test]
     fn with_no_engine_the_state_says_so_instead_of_failing() {
-        let state = DesktopState::new(MusicianNames::load(names_path("state-idle")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("state-idle")));
 
         let idle = engine_state(&state).expect("the state is always readable");
         let json = serde_json::to_value(&idle).expect("the state serializes");
@@ -605,7 +739,7 @@ mod tests {
 
     #[test]
     fn after_a_failed_start_the_state_names_the_run_that_ended() {
-        let state = DesktopState::new(MusicianNames::load(names_path("state-failed")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("state-failed")));
         start_engine(
             &state,
             StartRequest {
@@ -623,7 +757,7 @@ mod tests {
 
     #[test]
     fn every_start_takes_the_next_engine_run_even_when_it_fails() {
-        let state = DesktopState::new(MusicianNames::load(names_path("runs")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("runs")));
         assert_eq!(state.run(), 0, "no engine has run yet");
         let failing = || StartRequest {
             targets: vec!["not a target".to_owned()],
@@ -642,7 +776,7 @@ mod tests {
 
     #[test]
     fn reading_meters_or_a_mix_without_a_running_engine_finds_nothing() {
-        let state = DesktopState::new(MusicianNames::load(names_path("meters-idle")));
+        let state = DesktopState::new(SessionStore::open(&session_directory("meters-idle")));
 
         assert_eq!(
             engine_meters(&state).expect_err("there is no engine to read"),

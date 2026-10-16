@@ -257,10 +257,21 @@ pub(crate) struct TargetEntry {
 /// follower's mix takes their leader's channels and groups, and their phone is held off them,
 /// whenever they register. The mirrors' lock follows the same rules as the controls' and is never
 /// held together with it.
+///
+/// A follower takes its leader's mix under the propagation lock, from the read of the leader's mix
+/// to the follower's store, so two changes of one leader carried on at the same moment can never
+/// land in the wrong order: each copy reads the leader's mix as it is when it runs, and the last one
+/// to run reads the newest. It is taken after the table's lock and before the mirrors' lock and any
+/// mix's writer lock.
 pub(crate) struct TargetRegistry {
     entries: RwLock<Vec<TargetEntry>>,
     controls: Mutex<HashMap<BookKey, EngineerControls>>,
     mirrors: Mutex<HashMap<BookKey, Mirror>>,
+    propagation: Mutex<()>,
+    /// Runs once, in the next propagation, between its read of a leader's mix and the followers
+    /// taking it: lets a test hold a propagation there while another one runs.
+    #[cfg(test)]
+    after_leader_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TargetRegistry {
@@ -292,11 +303,19 @@ impl TargetRegistry {
             entries: RwLock::new(entries),
             controls: Mutex::new(HashMap::new()),
             mirrors: Mutex::new(HashMap::new()),
+            propagation: Mutex::new(()),
+            #[cfg(test)]
+            after_leader_read: Mutex::new(None),
         })
     }
 
     fn mirror_book(&self) -> std::sync::MutexGuard<'_, HashMap<BookKey, Mirror>> {
         self.mirrors.lock().expect("mirrors lock poisoned")
+    }
+
+    /// Held from the read of a leader's mix to the store of every follower's copy of it.
+    fn propagation(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.propagation.lock().expect("propagation lock poisoned")
     }
 
     /// Puts the mirror kept for `entry`'s musician in force on its mix, or none when none is kept:
@@ -320,6 +339,7 @@ impl TargetRegistry {
                 .find(|other| !std::ptr::eq(*other, entry) && names(&mirror.leader, other))
         });
         let followed = leader.is_some_and(|leader| {
+            let _order = self.propagation();
             entry
                 .mix_state
                 .follow(&leader.mix_state.current())
@@ -348,8 +368,10 @@ impl TargetRegistry {
 
     /// Makes every musician who follows `entries[start]`'s mix, and those who follow them in turn,
     /// take it now. Returns those whose stored mix changed, in the order they took it. Each mix is
-    /// visited once, so even a book that went round in a circle could not loop.
+    /// visited once, so even a book that went round in a circle could not loop. It runs under the
+    /// propagation lock, so it never stores a leader's mix older than one already carried on.
     fn propagate_from(&self, entries: &[TargetEntry], start: usize) -> Vec<SocketAddr> {
+        let _order = self.propagation();
         let mut changed = Vec::new();
         let mut visited = vec![start];
         let mut leaders = VecDeque::from([start]);
@@ -359,6 +381,18 @@ impl TargetRegistry {
                 continue;
             }
             let values = entries[leader].mix_state.current();
+            #[cfg(test)]
+            {
+                // Taken first, so the hook's own lock is not held while it runs.
+                let hold = self
+                    .after_leader_read
+                    .lock()
+                    .expect("test hook lock poisoned")
+                    .take();
+                if let Some(hold) = hold {
+                    hold();
+                }
+            }
             for index in followers {
                 if visited.contains(&index) {
                     continue;
@@ -1983,6 +2017,120 @@ mod tests {
         desk_gains(&registry, "192.168.1.21:50000", &[70, 80]);
         assert_eq!(registry.propagate(ip("192.168.1.21")), vec![address(A)]);
         assert_eq!(gains_at(&registry, A, 2), [70, 80]);
+    }
+
+    /// Two changes of a leader's mix at nearly the same moment, each carried on to the follower:
+    /// the first propagation is held right after it read the leader's mix while the second change
+    /// and its propagation run. The follower must end with the leader's newest mix, never with the
+    /// older one landing after it.
+    #[test]
+    fn two_leader_changes_at_once_leave_the_follower_with_the_newest_mix() {
+        let registry = Arc::new(racks());
+        registry.set_mirror(A, Some((B, "B"))).expect("A follows B");
+        let (parked, held) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        *registry.after_leader_read.lock().expect("test hook lock") = Some(Box::new(move || {
+            parked.send(()).expect("the test waits for the hold");
+            // Held until the second propagation is done, or for as long as it could take.
+            let _ = finished.recv_timeout(Duration::from_millis(300));
+        }));
+        desk_gains(&registry, B, &[11, 11]);
+
+        let first = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || registry.propagate(ip("192.168.1.4")))
+        };
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the first propagation read the leader's mix");
+        let second = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                desk_gains(&registry, B, &[22, 22]);
+                let moved = registry.propagate(ip("192.168.1.4"));
+                let _ = done.send(());
+                moved
+            })
+        };
+        first.join().expect("the first propagation ends");
+        second.join().expect("the second propagation ends");
+
+        assert_eq!(
+            gains_at(&registry, A, 2),
+            [22, 22],
+            "the leader's newest mix, never the older one after it"
+        );
+    }
+
+    #[test]
+    fn another_musician_taking_a_followers_row_is_never_held_by_its_mirror() {
+        let registry = racks();
+        desk_gains(&registry, B, &[30, 40]);
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry
+            .set_mirror("192.168.1.10:50000", Some((B, "B")))
+            .expect("Ana follows B");
+
+        let taken = register_phone(&registry, "192.168.1.10", 50000, "Eva", Some(PHONE_B));
+
+        assert!(
+            taken.controls_changed,
+            "Eva's phone is told it follows nobody"
+        );
+        assert!(!taken.followed);
+        let mix = mix_at(&registry, "192.168.1.10:50000");
+        assert_eq!(mix.following(), None);
+        let free = mix
+            .apply_from_phone(&crate::mix::MixUpdate {
+                channel_gains: Some(vec![12]),
+                ..crate::mix::MixUpdate::default()
+            })
+            .expect("a valid mix applies");
+        assert_eq!(free.channel_gains[0], 12, "Eva's phone moves her channels");
+        assert!(registry.mirror_statuses(&registry.read()).is_empty());
+        let back = register_phone(&registry, "192.168.1.11", 50000, "Ana", Some(PHONE_A));
+        assert!(back.followed, "Ana's mirror is still kept for her phone");
+        assert_eq!(gains_at(&registry, "192.168.1.11:50000", 2), [30, 40]);
+    }
+
+    #[test]
+    fn a_target_added_where_a_mirror_is_kept_follows_its_leader_at_once() {
+        let registry = racks();
+        desk_gains(&registry, B, &[33, 44]);
+        registry
+            .keep_mirror(
+                &MusicianKey::Address(address("192.168.1.7:50000")),
+                &MusicianKey::Address(address(B)),
+                "Bass",
+            )
+            .expect("kept for a rack not added yet");
+
+        registry
+            .add("192.168.1.7:50000", &GroupLayout::default())
+            .expect("a fresh address");
+
+        let mix = mix_at(&registry, "192.168.1.7:50000");
+        assert_eq!(mix.following().as_deref(), Some("Bass"));
+        assert_eq!(gains_at(&registry, "192.168.1.7:50000", 2), [33, 44]);
+        desk_gains(&registry, B, &[55, 66]);
+        assert_eq!(
+            registry.propagate(ip("192.168.1.4")),
+            vec![address("192.168.1.7:50000")]
+        );
+    }
+
+    #[test]
+    fn kept_mirrors_refuse_two_addresses_on_one_ip_as_one_musician() {
+        let registry = racks();
+
+        let refused = registry
+            .keep_mirror(
+                &MusicianKey::Address(address("192.168.1.9:50000")),
+                &MusicianKey::Address(address("192.168.1.9:50001")),
+                "Rack",
+            )
+            .expect_err("the engine keeps an address by its IP");
+
+        assert!(refused.contains("own mix"), "{refused}");
     }
 
     #[test]

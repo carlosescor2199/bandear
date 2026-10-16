@@ -799,15 +799,15 @@ async fn handle_control_connection(
                         None => mix_error(NO_TARGET_ERROR.to_owned(), seq)?,
                         Some(mix_state) => {
                             match parse_mix_update(&text)
-                                .and_then(|update| mix_state.apply_from_phone(&update))
+                                .and_then(|update| mix_state.apply_from_phone_report(&update))
                             {
-                                Ok(values) => {
+                                Ok((values, following)) => {
                                     events.emit(EngineEvent::MixChanged {
                                         address: peer,
                                         origin: MixOrigin::Client { peer },
                                     });
                                     announce_engine_changes(&events, targets.propagate(peer.ip()));
-                                    mix_ack(values, mix_state.following().as_deref(), seq)?
+                                    mix_ack(values, following.as_deref(), seq)?
                                 }
                                 Err(error) => mix_error(error, seq)?,
                             }

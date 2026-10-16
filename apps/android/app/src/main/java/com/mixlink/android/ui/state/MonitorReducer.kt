@@ -192,6 +192,11 @@ internal fun reduce(state: MonitorUiState, event: MonitorEvent): MonitorUiState 
  * step numbers it as the phone's newest mix ([MixSyncState.changed]): the change and its number land
  * in one state, so a send still queued already counts, and no answer from the server can be matched
  * to a mix older than the one on screen.
+ *
+ * A change that is sent also cancels a lift restore still waiting ([MonitorUiState.ownLevelsToRestore]):
+ * the phone's mix holds the musician's own unlifted levels, this one included, so that send already
+ * puts them on the server, and the report that follows settles through the `seq` rules. Restoring
+ * the levels kept at the `config` would undo the change.
  */
 internal fun reduceChange(
     state: MonitorUiState,
@@ -199,7 +204,7 @@ internal fun reduceChange(
     sends: (before: MonitorUiState, after: MonitorUiState) -> Boolean,
 ): MonitorUiState {
     val next = reduce(state, event)
-    return if (sends(state, next)) next.copy(mixSync = next.mixSync.changed()) else next
+    return if (sends(state, next)) next.copy(mixSync = next.mixSync.changed(), ownLevelsToRestore = null) else next
 }
 
 /** The connection showing a control channel in [controlState], with the mix held where [mixAcknowledged] says. */

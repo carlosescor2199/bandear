@@ -505,6 +505,45 @@ class MonitorReducerTest {
     }
 
     @Test
+    fun anEditMadeBeforeTheLinksMixArrivesStandsAndNoOlderLevelsAreRestored() {
+        val paired = running().after(
+            ConfigReceived(5, emptyList()),
+            ChannelLevelChanged(0, 80),
+            ChannelLevelChanged(1, 60),
+            ChannelLevelChanged(2, 40),
+            ChannelLevelChanged(3, 70),
+            ChannelLevelChanged(4, 90),
+            MusicianChannelChosen(2),
+            MoreOfMeToggled(true),
+            ConfigReceived(5, emptyList(), band),
+        )
+
+        // The musician moves a fader before the link's `mix_state` arrives: that send carries their
+        // own levels (More of me is off), so nothing waits to be put back any more.
+        val edited = paired.sent(ChannelLevelChanged(0, 55))
+        assertNull(edited.ownLevelsToRestore)
+
+        val linked = MixSnapshot(
+            channelGains = intArrayOf(40, 30, 30, 35, 45),
+            channelPans = intArrayOf(0, 0, 100, 100, 0),
+            channelMutes = BooleanArray(5),
+            channelSolos = BooleanArray(5),
+        )
+        // The server took that whole mix (the pair's sides made equal, the first winning).
+        val answer = MixSnapshot(
+            channelGains = intArrayOf(55, 60, 60, 70, 90),
+            channelPans = intArrayOf(0, 100, 0, 100, 0),
+            channelMutes = BooleanArray(5),
+            channelSolos = BooleanArray(5),
+        )
+        val answered = edited.after(MixPushed(linked), MixAnswered(edited.mixSync.latest, answer))
+
+        assertEquals(listOf(55, 60, 60, 70, 90), answered.mix.levels)
+        assertEquals(edited.mixSync.latest, answered.mixSync.latest)
+        assertTrue(answered.mixSync.settled)
+    }
+
+    @Test
     fun aHiddenMusicianChannelIsForgottenAndMoreOfMeSaysWhy() {
         val on = withChannels(5).after(MusicianChannelChosen(3), MoreOfMeToggled(true))
         val remembered = withChannels(5).after(MusicianChannelChosen(3))

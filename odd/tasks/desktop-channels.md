@@ -1330,7 +1330,20 @@ slice. Push and PRs are the user's decision.
   - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 455 tests, 0 failures, 0 errors
     (454 before: 1 new; the T7b ViewModel test, which used neutral levels, now checks the restored
     levels, the moved pans and a single lift afterwards); no compiler warnings.
-  - Commit: this commit (`fix(android): drop the More of me lift when a link turns it off`).
+  - Commit: c91d0d2 `fix(android): drop the More of me lift when a link turns it off`.
+- [x] T7b-fix2 (review fix for T7b-fix, review `review-4c6fd738e50cbb30`). Route: inline writer of
+  the delegated T7b worker (the reducer and its tests).
+  - R3-own-levels-stale-after-meanwhile-edit: a change the musician makes while a lift restore
+    waits is sent with their own unlifted levels (More of me is off), so every sent change now
+    clears `ownLevelsToRestore` in the same step that numbers it (`reduceChange`), and the report
+    that follows settles through the `seq` rules; before, the levels kept at the `config` were
+    written over the newer change and sent.
+  - RED: 1 of 456 failed against the T7b-fix code (`anEditMadeBeforeTheLinksMixArrivesStandsAndNoOlderLevelsAreRestored`:
+    the restore was still waiting after the edit; with that check set aside, the answer to the edit
+    came back as `[80, 60, 60, 70, 90]`, the edit to 55 undone, and was numbered to be sent).
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 456 tests, 0 failures, 0 errors
+    (455 before: 1 new); no compiler warnings.
+  - Commit: this commit (`fix(android): let a new edit cancel a pending lift restore`).
 
 ## Progress
 
@@ -1525,6 +1538,8 @@ slice. Push and PRs are the user's decision.
 - Review `review-c9bf544c067c5dbb` over 2b4ba22..05f3a6a (T7a-fix2 and T7b) approved and
   acknowledged; next review base 05f3a6a. Its WARNING (R3-paired-moreofme-off-keeps-server-lift)
   is fixed by T7b-fix; its two desktop SUGGESTIONs go to a desktop follow-up commit.
+- Review `review-4c6fd738e50cbb30` over 05f3a6a..44b5572 approved and acknowledged; next review
+  base 44b5572. Its WARNING (R3-own-levels-stale-after-meanwhile-edit) is fixed by T7b-fix2.
 
 ## Next step
 

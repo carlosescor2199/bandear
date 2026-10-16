@@ -143,6 +143,108 @@ fn pairs(linked: u32) -> impl Iterator<Item = usize> {
     (0..MAX_MIX_CHANNELS - 1).filter(move |&first| linked & (1 << first) != 0)
 }
 
+/// What the engineer sets for one musician beyond the mix itself: a cap on what they hear and the
+/// channels their phone cannot change.
+///
+/// It is engineer policy, never client input: only the engine's own path changes it
+/// ([crate::EngineHandle::set_engineer_controls]), a phone's `mix` has no field for it, and every
+/// report of the mix carries it so the phone can show it.
+///
+/// - `limit_percent` (0-100, 100 by default) caps the musician's output as the phone's own level
+///   cap (`max_level_percent`) does; the mixer applies the lower of the two.
+/// - `locked` holds one bit per source channel (bit `k` is channel `k`, 0-based): the phone cannot
+///   change a locked channel's level, pan, mute or solo, while the desk still can. Both sides of a
+///   stereo pair are locked or unlocked together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineerControls {
+    pub limit_percent: u8,
+    pub locked: u32,
+}
+
+impl Default for EngineerControls {
+    fn default() -> Self {
+        Self {
+            limit_percent: 100,
+            locked: 0,
+        }
+    }
+}
+
+impl EngineerControls {
+    /// Whether the phone is kept from changing `channel` (0-based).
+    pub fn is_locked(&self, channel: usize) -> bool {
+        channel < MAX_MIX_CHANNELS && self.locked & (1 << channel) != 0
+    }
+}
+
+/// A partial change to one musician's [EngineerControls]: an absent field keeps its value.
+///
+/// `locked` replaces the lock of each channel from the first on (entry 0 is CH 1) and leaves the
+/// rest alone, as the lists of a [MixUpdate] do, and a list longer than the mix is rejected. The
+/// limit is clamped to 0-100. Changing one side of a stereo pair changes both; when one change
+/// sets the two sides differently, the first channel's lock wins.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineerUpdate {
+    pub limit_percent: Option<i32>,
+    pub locked: Option<Vec<bool>>,
+}
+
+impl EngineerUpdate {
+    /// Merges this change into `current`, with both sides of each pair in `linked` kept alike, or
+    /// names the list that cannot be applied.
+    fn merge_into(
+        &self,
+        current: EngineerControls,
+        linked: u32,
+    ) -> Result<EngineerControls, String> {
+        let before = lock_flags(current.locked);
+        let mut merged = merge_flags("locked", self.locked.as_ref(), &before)?;
+        for first in pairs(linked) {
+            follow(&before, &mut merged, first);
+        }
+        Ok(EngineerControls {
+            limit_percent: self
+                .limit_percent
+                .map_or(current.limit_percent, clamp_percent),
+            locked: lock_mask(&merged),
+        })
+    }
+}
+
+/// One lock per channel, from a mask (bit `k` is channel `k`).
+fn lock_flags(mask: u32) -> [bool; MAX_MIX_CHANNELS] {
+    std::array::from_fn(|channel| mask & (1 << channel) != 0)
+}
+
+/// The mask of the channels whose lock is set.
+fn lock_mask(flags: &[bool; MAX_MIX_CHANNELS]) -> u32 {
+    flags
+        .iter()
+        .enumerate()
+        .filter(|(_, &locked)| locked)
+        .fold(0, |mask, (channel, _)| mask | 1 << channel)
+}
+
+/// `locked` with both sides of every pair in `linked` locked when either side is: a pair is one
+/// strip, so a lock that reaches it covers the whole strip.
+fn lock_pairs(locked: u32, linked: u32) -> u32 {
+    pairs(linked).fold(locked, |locked, first| {
+        let both = 0b11 << first;
+        if locked & both != 0 {
+            locked | both
+        } else {
+            locked
+        }
+    })
+}
+
+/// Who writes a mix: the desk may change any value, the musician's phone none the engineer locked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Writer {
+    Desk,
+    Phone,
+}
+
 pub(crate) struct MixState {
     channel_gains: [AtomicU8; MAX_MIX_CHANNELS],
     pans: [AtomicU8; MAX_MIX_CHANNELS],
@@ -157,6 +259,12 @@ pub(crate) struct MixState {
     hidden: AtomicU32,
     /// The stereo pairs ([ChannelFlags::linked]). Only writers read it, under the writer lock.
     linked: AtomicU32,
+    /// The engineer's limit ([EngineerControls::limit_percent]), loaded by the network thread with
+    /// the rest of the mix, so the output ceiling needs no lock on the audio path.
+    engineer_limit: AtomicU8,
+    /// The engineer's locked channels ([EngineerControls::locked]); writers read it under the
+    /// writer lock.
+    locked: AtomicU32,
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
@@ -214,10 +322,11 @@ impl MixUpdate {
                 self.group_levels.as_ref(),
                 &current.group_levels,
             )?,
-            // Membership and hidden channels are server configuration, never client input:
-            // preserve whatever the source snapshot carried.
+            // Membership, hidden channels and the engineer's controls are server configuration,
+            // never client input: preserve whatever the source snapshot carried.
             channel_group: current.channel_group,
             hidden_channels: current.hidden_channels,
+            engineer: current.engineer,
             // The store that keeps the merge gives it its revision.
             revision: current.revision,
             volume_percent: self
@@ -251,7 +360,12 @@ pub struct MixValues {
     /// channel is never heard and its solo counts for nothing. Server configuration, like
     /// `channel_group`: a change of it is not a change of the stored mix and takes no revision.
     pub hidden_channels: u32,
+    /// What the engineer set for this musician: their limit and their locked channels. Engineer
+    /// policy, which no `mix` can change; setting it is a change of the mix and takes a revision,
+    /// so the phone is told.
+    pub engineer: EngineerControls,
     pub volume_percent: u8,
+    /// The phone's own level cap. The mixer's ceiling is the lower of it and the engineer's limit.
     pub max_level_percent: u8,
     pub muted: bool,
     /// Which stored version of the mix this is: every change stores a higher revision, so of two
@@ -281,6 +395,8 @@ impl Default for MixState {
             channel_group: std::array::from_fn(|_| AtomicU8::new(NO_GROUP)),
             hidden: AtomicU32::new(0),
             linked: AtomicU32::new(0),
+            engineer_limit: AtomicU8::new(EngineerControls::default().limit_percent),
+            locked: AtomicU32::new(EngineerControls::default().locked),
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
@@ -300,6 +416,7 @@ impl Default for MixValues {
             group_levels: [NEUTRAL_GROUP_LEVEL; MAX_GROUPS],
             channel_group: [None; MAX_MIX_CHANNELS],
             hidden_channels: 0,
+            engineer: EngineerControls::default(),
             volume_percent: 100,
             max_level_percent: 100,
             muted: false,
@@ -352,6 +469,9 @@ impl MixState {
     /// change of the mix, made under the writer lock like [MixState::apply] and with a new
     /// revision, so the musician's phone is sent it: the pair is panned apart (first channel 0,
     /// second 100) and its second side takes the first side's level, mute and solo.
+    ///
+    /// A new pair with either side locked by the engineer is locked whole (see
+    /// [EngineerControls::locked]), so the phone cannot move the side that was free.
     pub(crate) fn set_channel_flags(&self, flags: ChannelFlags) -> Option<MixValues> {
         let mut revision = self.writer.lock().expect("mix writer lock poisoned");
         let newly_linked = flags.linked & !self.linked.load(Ordering::Relaxed);
@@ -360,6 +480,10 @@ impl MixState {
         if newly_linked == 0 {
             return None;
         }
+        self.locked.store(
+            lock_pairs(self.locked.load(Ordering::Relaxed), newly_linked),
+            Ordering::Relaxed,
+        );
         let mut pans = self.snapshot().pans;
         for first in pairs(newly_linked) {
             pans[first] = 0;
@@ -372,7 +496,7 @@ impl MixState {
             ..MixUpdate::default()
         };
         Some(
-            self.apply_locked(&update, &mut revision)
+            self.apply_locked(&update, &mut revision, Writer::Desk)
                 .expect("a whole table of pans always fits the mix"),
         )
     }
@@ -420,12 +544,20 @@ impl MixState {
         self.max_level_percent
             .store(values.max_level_percent, Ordering::Relaxed);
         self.muted.store(values.muted, Ordering::Relaxed);
+        self.publish_revision(revision)
+    }
+
+    /// Gives what was just stored a new revision, which it returns. The caller holds the writer
+    /// lock and passes its revision.
+    fn publish_revision(&self, revision: &mut u64) -> u64 {
         *revision = next_revision();
         self.published.store(*revision, Ordering::Release);
         *revision
     }
 
-    /// Applies a partial update and returns the mix that is now stored, with its new revision.
+    /// Applies a partial update from the desk and returns the mix that is now stored, with its new
+    /// revision. The desk may change every value, locked channels included; a phone's `mix` goes
+    /// through [MixState::apply_from_phone].
     ///
     /// The read, merge and store happen under the writer lock, so the phone and the desktop can
     /// both change different parts of the same mix without one undoing the other: the last writer
@@ -433,19 +565,92 @@ impl MixState {
     /// the mix exactly as it was, revision included.
     pub(crate) fn apply(&self, update: &MixUpdate) -> Result<MixValues, String> {
         let mut revision = self.writer.lock().expect("mix writer lock poisoned");
-        self.apply_locked(update, &mut revision)
+        self.apply_locked(update, &mut revision, Writer::Desk)
+    }
+
+    /// Applies a `mix` from the musician's phone as [MixState::apply] does, except that the level,
+    /// pan, mute and solo of every channel the engineer locked keep their stored values: the phone
+    /// sends its whole mix, and everything else in it applies. The mix returned, which the phone is
+    /// acknowledged with, carries the kept values.
+    pub(crate) fn apply_from_phone(&self, update: &MixUpdate) -> Result<MixValues, String> {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        self.apply_locked(update, &mut revision, Writer::Phone)
     }
 
     /// [MixState::apply] for a caller that holds the writer lock and passes its revision.
     ///
-    /// Every linked pair leaves it with both sides equal (see [keep_pairs_equal]); the pairs are
-    /// read under the lock, so a writer never merges against pairs an edit is replacing.
-    fn apply_locked(&self, update: &MixUpdate, revision: &mut u64) -> Result<MixValues, String> {
+    /// A phone's change to a locked channel is undone first (see [keep_locked]); then every linked
+    /// pair is left with both sides equal (see [keep_pairs_equal]). A pair is always locked whole,
+    /// so the two rules never pull a pair apart. The pairs and the locks are read under the lock,
+    /// so a writer never merges against pairs or locks an edit is replacing.
+    fn apply_locked(
+        &self,
+        update: &MixUpdate,
+        revision: &mut u64,
+        writer: Writer,
+    ) -> Result<MixValues, String> {
         let current = self.snapshot();
         let mut merged = update.merge_into(current)?;
+        if writer == Writer::Phone {
+            keep_locked(&current, &mut merged);
+        }
         keep_pairs_equal(&current, &mut merged, self.linked.load(Ordering::Relaxed));
         merged.revision = self.store(merged, revision);
         Ok(merged)
+    }
+
+    /// The engineer's controls in force.
+    fn engineer(&self) -> EngineerControls {
+        EngineerControls {
+            limit_percent: self.engineer_limit.load(Ordering::Relaxed),
+            locked: self.locked.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stores the engineer's controls; the caller holds the writer lock and then publishes a
+    /// revision.
+    fn store_engineer(&self, controls: EngineerControls) {
+        self.engineer_limit
+            .store(controls.limit_percent, Ordering::Relaxed);
+        self.locked.store(controls.locked, Ordering::Relaxed);
+    }
+
+    /// Changes the engineer's controls for this musician, as the desk does, and returns the mix now
+    /// stored. It is a change of the mix under the writer lock with a new revision, like
+    /// [MixState::apply], so the phone is sent the new limit and locks; no value of the mix moves.
+    ///
+    /// Both sides of a pair are locked or unlocked together (see [EngineerUpdate]). A list longer
+    /// than the mix is an error naming it, and nothing changes.
+    pub(crate) fn apply_engineer(&self, update: &EngineerUpdate) -> Result<MixValues, String> {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        let controls = update.merge_into(self.engineer(), self.linked.load(Ordering::Relaxed))?;
+        self.store_engineer(controls);
+        self.publish_revision(&mut revision);
+        Ok(MixValues {
+            revision: *revision,
+            ..self.snapshot()
+        })
+    }
+
+    /// Puts the engineer's controls kept for this musician in force, as a registration or the
+    /// desk's saved session does: a pair with either side locked is locked whole, and a limit above
+    /// 100 reads as 100. Returns the mix now stored when they changed, under a new revision like
+    /// [MixState::apply_engineer]; `None` when they were in force already.
+    pub(crate) fn restore_engineer(&self, controls: EngineerControls) -> Option<MixValues> {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        let controls = EngineerControls {
+            limit_percent: controls.limit_percent.min(100),
+            locked: lock_pairs(controls.locked, self.linked.load(Ordering::Relaxed)),
+        };
+        if controls == self.engineer() {
+            return None;
+        }
+        self.store_engineer(controls);
+        self.publish_revision(&mut revision);
+        Some(MixValues {
+            revision: *revision,
+            ..self.snapshot()
+        })
     }
 
     /// Moves this mix onto an edited set of groups: switches the membership the mixer reads to
@@ -499,6 +704,7 @@ impl MixState {
                 }
             }),
             hidden_channels: self.hidden.load(Ordering::Relaxed),
+            engineer: self.engineer(),
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
@@ -575,6 +781,18 @@ pub(crate) fn keep_pairs_equal(before: &MixValues, merged: &mut MixValues, linke
     }
 }
 
+/// Puts back the stored level, pan, mute and solo of every channel `before` has locked
+/// ([EngineerControls::locked]) after a phone's merge from `before` to `merged`: the phone's change
+/// to them is ignored, and everything else it sent stands.
+pub(crate) fn keep_locked(before: &MixValues, merged: &mut MixValues) {
+    for channel in (0..MAX_MIX_CHANNELS).filter(|&channel| before.engineer.is_locked(channel)) {
+        merged.channel_gains[channel] = before.channel_gains[channel];
+        merged.pans[channel] = before.pans[channel];
+        merged.channel_muted[channel] = before.channel_muted[channel];
+        merged.channel_solo[channel] = before.channel_solo[channel];
+    }
+}
+
 /// Makes the pair at `first` equal in one table: the second side's new value when only the second
 /// side changed, the first side's otherwise.
 fn follow<T: Copy + PartialEq>(before: &[T], merged: &mut [T], first: usize) {
@@ -606,7 +824,9 @@ fn clamp_sample(value: f32, ceiling: f32) -> i16 {
 /// is no longer bound to output slot `k`. The default pan table keeps the captured layout (even
 /// sources hard left, odd sources hard right), which with neutral gains on a two-channel source
 /// reproduces the pre-pan output exactly, apart from the full-scale ceiling clamp that also
-/// applied before. Master volume, mute and the ceiling are applied after the sum.
+/// applied before. Master volume, mute and the ceiling are applied after the sum. The ceiling is
+/// the lower of the phone's level cap (`max_level_percent`) and the engineer's limit
+/// ([EngineerControls::limit_percent]), both read from `values`.
 ///
 /// A channel contributes only when it is not hidden, not muted and either nothing is soloed or it
 /// is one of the soloed channels. Solo is applied here rather than by zeroing gains, so coming out
@@ -622,7 +842,8 @@ pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -
     let active = channels.min(MAX_MIX_CHANNELS);
     let audible = |channel: usize| values.hidden_channels & (1 << channel) == 0;
     let any_solo = (0..active).any(|channel| values.channel_solo[channel] && audible(channel));
-    let ceiling = (i32::from(i16::MAX) * i32::from(values.max_level_percent) / 100) as f32;
+    let ceiling_percent = values.max_level_percent.min(values.engineer.limit_percent);
+    let ceiling = (i32::from(i16::MAX) * i32::from(ceiling_percent) / 100) as f32;
     let master = f32::from(values.volume_percent) / 100.0;
     let mut output = vec![0i16; frames * usize::from(OUTPUT_CHANNELS)];
 
@@ -1651,5 +1872,303 @@ mod tests {
 
         assert_eq!(&mix.pans[..4], &[0, 0, 100, 100]);
         assert_eq!(mix.hidden_channels, 0b1_0000);
+    }
+
+    fn locks(channels: &[bool]) -> EngineerUpdate {
+        EngineerUpdate {
+            locked: Some(channels.to_vec()),
+            ..EngineerUpdate::default()
+        }
+    }
+
+    /// A phone's whole mix: every table and the master values, as a phone sends it.
+    fn whole_phone_mix(gains: &[i32], pans: &[i32], mutes: &[bool], solos: &[bool]) -> MixUpdate {
+        MixUpdate {
+            channel_gains: Some(gains.to_vec()),
+            pans: Some(pans.to_vec()),
+            channel_muted: Some(mutes.to_vec()),
+            channel_solo: Some(solos.to_vec()),
+            group_levels: Some(vec![100; 2]),
+            volume_percent: Some(70),
+            max_level_percent: Some(90),
+            muted: Some(false),
+        }
+    }
+
+    #[test]
+    fn the_engineers_controls_start_open_and_change_under_a_new_revision() {
+        let state = MixState::new(&GroupLayout::default());
+        state
+            .apply(&gains(&[40, 50]))
+            .expect("a valid update applies");
+        let before = state.current();
+        assert_eq!(before.engineer, EngineerControls::default());
+        assert_eq!(before.engineer.limit_percent, 100);
+
+        let set = state
+            .apply_engineer(&EngineerUpdate {
+                limit_percent: Some(60),
+                locked: Some(vec![true]),
+            })
+            .expect("valid controls apply");
+
+        assert_eq!(set, state.current(), "what it answers is what is stored");
+        assert!(
+            set.revision > before.revision,
+            "the phone is sent the change"
+        );
+        assert_eq!(
+            set.engineer,
+            EngineerControls {
+                limit_percent: 60,
+                locked: 0b1,
+            }
+        );
+        assert_eq!(
+            MixValues {
+                engineer: before.engineer,
+                revision: before.revision,
+                ..set
+            },
+            before,
+            "no value of the mix moves"
+        );
+
+        let clamped = state
+            .apply_engineer(&EngineerUpdate {
+                limit_percent: Some(150),
+                ..EngineerUpdate::default()
+            })
+            .expect("valid controls apply");
+        assert_eq!(clamped.engineer.limit_percent, 100);
+        assert_eq!(
+            clamped.engineer.locked, 0b1,
+            "an absent list keeps the locks"
+        );
+        let clamped = state
+            .apply_engineer(&EngineerUpdate {
+                limit_percent: Some(-5),
+                ..EngineerUpdate::default()
+            })
+            .expect("valid controls apply");
+        assert_eq!(clamped.engineer.limit_percent, 0);
+    }
+
+    #[test]
+    fn an_oversized_lock_list_changes_nothing() {
+        let state = MixState::new(&GroupLayout::default());
+        let before = state.current();
+
+        let error = state
+            .apply_engineer(&EngineerUpdate {
+                limit_percent: Some(10),
+                locked: Some(vec![true; MAX_MIX_CHANNELS + 1]),
+            })
+            .expect_err("a list longer than the mix is refused");
+
+        assert!(
+            error.contains("locked"),
+            "the error names the list: {error}"
+        );
+        assert_eq!(state.current(), before);
+    }
+
+    #[test]
+    fn a_phone_cannot_change_a_locked_channel_and_the_rest_of_its_mix_applies() {
+        let state = MixState::new(&GroupLayout::default());
+        state
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![40, 50]),
+                pans: Some(vec![30, 60]),
+                channel_muted: Some(vec![true, false]),
+                channel_solo: Some(vec![false, false]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        state
+            .apply_engineer(&locks(&[true]))
+            .expect("valid controls apply");
+        let before = state.current();
+
+        let applied = state
+            .apply_from_phone(&whole_phone_mix(
+                &[90, 80],
+                &[50, 50],
+                &[false, true],
+                &[true, false],
+            ))
+            .expect("a valid mix applies");
+
+        assert_eq!(applied, state.current(), "the ack carries what is stored");
+        assert!(applied.revision > before.revision);
+        assert_eq!(applied.channel_gains[0], 40, "CH 1's level is kept");
+        assert_eq!(applied.pans[0], 30, "CH 1's pan is kept");
+        assert!(applied.channel_muted[0], "CH 1's mute is kept");
+        assert!(!applied.channel_solo[0], "CH 1's solo is kept");
+        assert_eq!(applied.channel_gains[1], 80, "CH 2 is the phone's");
+        assert_eq!(applied.pans[1], 50);
+        assert!(applied.channel_muted[1]);
+        assert_eq!(
+            applied.volume_percent, 70,
+            "the master values are the phone's"
+        );
+        assert_eq!(applied.max_level_percent, 90);
+        assert_eq!(applied.engineer, before.engineer);
+    }
+
+    #[test]
+    fn the_desk_can_still_change_a_locked_channel() {
+        let state = MixState::new(&GroupLayout::default());
+        state
+            .apply_engineer(&locks(&[true]))
+            .expect("valid controls apply");
+
+        let applied = state
+            .apply(&MixUpdate {
+                channel_gains: Some(vec![25]),
+                channel_muted: Some(vec![true]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        assert_eq!(applied.channel_gains[0], 25);
+        assert!(applied.channel_muted[0]);
+        assert!(applied.engineer.is_locked(0), "and the lock stays");
+    }
+
+    #[test]
+    fn locking_either_side_of_a_pair_locks_both_and_unlocking_either_unlocks_both() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[1], &[]));
+
+        let second = state
+            .apply_engineer(&locks(&[false, false, true]))
+            .expect("valid controls apply");
+        assert_eq!(second.engineer.locked, 0b110, "CH 2 and CH 3 are one strip");
+
+        let first = state
+            .apply_engineer(&locks(&[false, false]))
+            .expect("valid controls apply");
+        assert_eq!(first.engineer.locked, 0, "unlocking CH 2 unlocks CH 3");
+
+        let disagreeing = state
+            .apply_engineer(&locks(&[false, true, false]))
+            .expect("valid controls apply");
+        assert_eq!(
+            disagreeing.engineer.locked, 0b110,
+            "when both sides are set apart the first channel wins"
+        );
+    }
+
+    #[test]
+    fn a_phone_cannot_move_either_side_of_a_locked_pair() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[0], &[]));
+        state.apply(&gains(&[60])).expect("a valid update applies");
+        state
+            .apply_engineer(&locks(&[true]))
+            .expect("valid controls apply");
+
+        // An older phone shows the sides apart and moves the second one only.
+        let applied = state
+            .apply_from_phone(&gains(&[60, 20]))
+            .expect("a valid mix applies");
+
+        assert_eq!(&applied.channel_gains[..2], &[60, 60]);
+    }
+
+    #[test]
+    fn a_pair_linked_after_one_side_was_locked_is_locked_whole() {
+        let state = MixState::new(&GroupLayout::default());
+        state
+            .apply_engineer(&locks(&[false, true]))
+            .expect("valid controls apply");
+
+        let linked = state
+            .set_channel_flags(flags(&[0], &[]))
+            .expect("linking moves the pair");
+
+        assert_eq!(linked.engineer.locked, 0b11);
+        let applied = state
+            .apply_from_phone(&gains(&[10, 10]))
+            .expect("a valid mix applies");
+        assert_eq!(
+            &applied.channel_gains[..2],
+            &[100, 100],
+            "neither side moves"
+        );
+    }
+
+    #[test]
+    fn the_output_ceiling_is_the_lower_of_the_phones_cap_and_the_engineers_limit() {
+        let source = [i16::MIN, -16_000, 16_000, i16::MAX];
+        let limited = |max_level_percent: u8, limit_percent: u8| MixValues {
+            max_level_percent,
+            engineer: EngineerControls {
+                limit_percent,
+                ..EngineerControls::default()
+            },
+            ..MixValues::default()
+        };
+
+        assert_eq!(
+            mix_channels(&source, 2, limited(90, 25)),
+            [-8191, -8191, 8191, 8191],
+            "the engineer's limit is lower"
+        );
+        assert_eq!(
+            mix_channels(&source, 2, limited(25, 90)),
+            [-8191, -8191, 8191, 8191],
+            "the phone's cap is lower"
+        );
+        let quiet = [-16_000, -8_000, 8_000, 16_000];
+        assert_eq!(mix_channels(&quiet, 2, limited(100, 100)), quiet);
+    }
+
+    #[test]
+    fn the_mixer_reads_the_engineers_limit_from_the_stored_mix() {
+        let state = MixState::new(&GroupLayout::default());
+        state
+            .apply_engineer(&EngineerUpdate {
+                limit_percent: Some(25),
+                ..EngineerUpdate::default()
+            })
+            .expect("valid controls apply");
+
+        assert_eq!(
+            mix_channels(&[20_000, -20_000], 2, state.snapshot()),
+            [8191, -8191]
+        );
+    }
+
+    #[test]
+    fn kept_controls_apply_once_with_their_pairs_locked_whole() {
+        let state = MixState::configured(&GroupLayout::default(), flags(&[2], &[]));
+        let before = state.current();
+        let kept = EngineerControls {
+            limit_percent: 60,
+            locked: 0b1000,
+        };
+
+        let restored = state
+            .restore_engineer(kept)
+            .expect("the controls were not in force");
+
+        assert_eq!(restored, state.current());
+        assert!(restored.revision > before.revision);
+        assert_eq!(
+            restored.engineer,
+            EngineerControls {
+                limit_percent: 60,
+                locked: 0b1100,
+            },
+            "CH 3 and CH 4 are one strip"
+        );
+        assert_eq!(state.restore_engineer(kept), None, "already in force");
+        let capped = state
+            .restore_engineer(EngineerControls {
+                limit_percent: 250,
+                locked: 0,
+            })
+            .expect("other controls");
+        assert_eq!(capped.engineer.limit_percent, 100);
     }
 }

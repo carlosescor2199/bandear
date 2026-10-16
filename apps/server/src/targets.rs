@@ -1,12 +1,40 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use crate::engine::OutputMeter;
 use crate::health::LatestLinkReport;
-use crate::mix::{GroupLayout, Membership, MixState};
+use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixState, MixValues};
 use crate::network::TargetCounters;
+
+/// Whom the engineer's controls for a musician are kept for: the stable client id their phone
+/// announced, or, for a configured target and a phone that announced none, their address (joined
+/// by IP, like everything else about a musician).
+///
+/// The desk keeps what it knows about a musician under the same two keys, so the controls it saved
+/// follow a phone to a new IP and stay with a fixed rack's address.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MusicianKey {
+    Client(String),
+    Address(SocketAddr),
+}
+
+/// [MusicianKey] as the registry looks controls up: an address by its IP.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BookKey {
+    Client(String),
+    Ip(IpAddr),
+}
+
+impl From<&MusicianKey> for BookKey {
+    fn from(key: &MusicianKey) -> Self {
+        match key {
+            MusicianKey::Client(id) => BookKey::Client(id.clone()),
+            MusicianKey::Address(address) => BookKey::Ip(address.ip()),
+        }
+    }
+}
 
 /// How long a registered target survives after its last control channel closes.
 ///
@@ -83,8 +111,15 @@ pub(crate) struct TargetEntry {
 /// adds and removes entries under a short write lock. Adding or removing one entry therefore cannot
 /// disturb any other entry, and no thread has to be restarted: the same capture stream, control
 /// server and discovery beacon keep running, exactly as a device switch leaves them running.
+///
+/// It also keeps the engineer's controls per musician ([EngineerControls], by [MusicianKey]), so a
+/// musician whose mix is created again (back after the grace period, or from a new IP) gets them
+/// back the moment they register, before their phone's first `mix` is handled. The table's lock is
+/// always taken before the controls' lock, and the controls' lock is never held while a mix's
+/// writer lock is taken.
 pub(crate) struct TargetRegistry {
     entries: RwLock<Vec<TargetEntry>>,
+    controls: Mutex<HashMap<BookKey, EngineerControls>>,
 }
 
 impl TargetRegistry {
@@ -114,7 +149,87 @@ impl TargetRegistry {
         }
         Ok(Self {
             entries: RwLock::new(entries),
+            controls: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The controls kept for a musician: those kept for their phone's client id first, then those
+    /// kept for their IP, as the desk resolves a musician's label.
+    fn kept_controls(&self, client_id: Option<&str>, ip: IpAddr) -> Option<EngineerControls> {
+        let book = self
+            .controls
+            .lock()
+            .expect("engineer controls lock poisoned");
+        client_id
+            .and_then(|id| book.get(&BookKey::Client(id.to_owned())).copied())
+            .or_else(|| book.get(&BookKey::Ip(ip)).copied())
+    }
+
+    /// Puts the controls kept for `entry`'s musician in force on its mix, if any are kept. Returns
+    /// whether its stored mix changed.
+    fn restore_kept_controls(&self, entry: &TargetEntry) -> bool {
+        self.kept_controls(entry.origin.client_id(), entry.address.ip())
+            .and_then(|controls| entry.mix_state.restore_engineer(controls))
+            .is_some()
+    }
+
+    /// Changes the engineer's controls for the musician whose IP `value` names (see
+    /// [crate::EngineHandle::set_engineer_controls]) and keeps them for that musician: under their
+    /// phone's client id when it announced one, which also drops any kept for their IP, else under
+    /// their address. Returns the key they were kept under, the musician's address and the mix now
+    /// stored.
+    ///
+    /// The table is held for reading from the change through the keeping, so a registration cannot
+    /// come between them and leave the kept controls behind the mix.
+    pub(crate) fn set_controls(
+        &self,
+        value: &str,
+        update: &EngineerUpdate,
+    ) -> Result<(MusicianKey, SocketAddr, MixValues), String> {
+        let requested = value
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid target `{value}`: {error}"))?;
+        let entries = self.read();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.address.ip() == requested.ip())
+            .ok_or_else(|| format!("target `{value}` is not configured"))?;
+        let applied = entry.mix_state.apply_engineer(update)?;
+        let key = match entry.origin.client_id() {
+            Some(id) => MusicianKey::Client(id.to_owned()),
+            None => MusicianKey::Address(entry.address),
+        };
+        let mut book = self
+            .controls
+            .lock()
+            .expect("engineer controls lock poisoned");
+        if matches!(key, MusicianKey::Client(_)) {
+            book.remove(&BookKey::Ip(entry.address.ip()));
+        }
+        book.insert(BookKey::from(&key), applied.engineer);
+        Ok((key, entry.address, applied))
+    }
+
+    /// Keeps `controls` for the musician `key` names, as the desk's saved session does at start,
+    /// and puts them in force for that musician if they are here. Returns the addresses of the
+    /// musicians whose stored mix changed.
+    pub(crate) fn keep_controls(
+        &self,
+        key: &MusicianKey,
+        controls: EngineerControls,
+    ) -> Vec<SocketAddr> {
+        let entries = self.read();
+        self.controls
+            .lock()
+            .expect("engineer controls lock poisoned")
+            .insert(BookKey::from(key), controls);
+        // Every musician is resolved again, client id first, so controls kept for an IP never
+        // override those kept for the phone that is there.
+        entries
+            .iter()
+            .filter(|entry| self.restore_kept_controls(entry))
+            .map(|entry| entry.address)
+            .collect()
     }
 
     /// Adds or updates the target a client announced over the control channel.
@@ -134,6 +249,10 @@ impl TargetRegistry {
     /// records the id it announced (or none), so a row belongs to whoever registered from its IP
     /// last. Ids are random and only ever travel on the LAN, so this adds no trust beyond the IP
     /// rule above.
+    ///
+    /// The engineer's controls kept for the musician (by client id, else by IP) are put in force on
+    /// the mix under the same write lock, so the phone's first `mix` after it registers already
+    /// meets its locks and limit.
     pub(crate) fn register(
         &self,
         peer: IpAddr,
@@ -165,6 +284,7 @@ impl TargetRegistry {
             let entry = &mut entries[index];
             entry.address = address;
             entry.origin = origin;
+            self.restore_kept_controls(entry);
             return Registration {
                 address,
                 moved_from: Some(moved_from),
@@ -173,12 +293,13 @@ impl TargetRegistry {
         if let Some(existing) = entries.iter_mut().find(|entry| entry.address.ip() == peer) {
             existing.address = address;
             existing.origin = origin;
+            self.restore_kept_controls(existing);
             return Registration {
                 address,
                 moved_from: None,
             };
         }
-        entries.push(TargetEntry {
+        let entry = TargetEntry {
             address,
             // Created under the write lock, so it takes the membership in force now (see
             // [Membership]).
@@ -187,7 +308,9 @@ impl TargetRegistry {
             link_report: LatestLinkReport::default(),
             output_meter: OutputMeter::default(),
             origin,
-        });
+        };
+        self.restore_kept_controls(&entry);
+        entries.push(entry);
         Registration {
             address,
             moved_from: None,
@@ -245,8 +368,9 @@ impl TargetRegistry {
     /// Resolves and validates `value`, then adds it as a new target.
     ///
     /// The new entry starts with a neutral mix carrying the group membership in force (see
-    /// [Membership]) and zero counters. A value that cannot be resolved, or whose IP is already
-    /// configured, is rejected with an error naming the value; the table is left exactly as it was.
+    /// [Membership]) and the engineer's controls kept for its IP, and zero counters. A value that
+    /// cannot be resolved, or whose IP is already configured, is rejected with an error naming the
+    /// value; the table is left exactly as it was.
     pub(crate) fn add(
         &self,
         value: &str,
@@ -264,14 +388,16 @@ impl TargetRegistry {
                 existing.address
             ));
         }
-        entries.push(TargetEntry {
+        let entry = TargetEntry {
             address,
             mix_state: Arc::new(membership.new_mix()),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
             output_meter: OutputMeter::default(),
             origin: TargetOrigin::Configured,
-        });
+        };
+        self.restore_kept_controls(&entry);
+        entries.push(entry);
         Ok(address)
     }
 
@@ -527,6 +653,117 @@ mod tests {
             .iter()
             .find(|entry| entry.address.ip() == address)
             .and_then(|entry| entry.origin.name().map(str::to_owned))
+    }
+
+    const PHONE: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
+
+    fn controls_at(registry: &TargetRegistry, at: &str) -> EngineerControls {
+        registry
+            .mix_state(ip(at))
+            .expect("a musician at that IP")
+            .current()
+            .engineer
+    }
+
+    fn limit(limit_percent: u8) -> EngineerControls {
+        EngineerControls {
+            limit_percent,
+            ..EngineerControls::default()
+        }
+    }
+
+    #[test]
+    fn controls_kept_for_a_phone_win_over_those_kept_for_its_ip() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.keep_controls(
+            &MusicianKey::Address(address("192.168.1.4:50000")),
+            limit(30),
+        );
+        registry.keep_controls(&MusicianKey::Client(PHONE.to_owned()), limit(80));
+
+        registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            Some(PHONE),
+            &GroupLayout::default(),
+        );
+        registry.register(
+            ip("192.168.1.5"),
+            50000,
+            None,
+            None,
+            &GroupLayout::default(),
+        );
+
+        assert_eq!(controls_at(&registry, "192.168.1.4"), limit(80));
+        assert_eq!(
+            controls_at(&registry, "192.168.1.5"),
+            EngineerControls::default(),
+            "nothing is kept for this one"
+        );
+    }
+
+    #[test]
+    fn setting_a_phones_controls_keeps_them_for_its_client_id_and_drops_those_for_its_ip() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.keep_controls(
+            &MusicianKey::Address(address("192.168.1.4:50000")),
+            limit(30),
+        );
+        registry.register(
+            ip("192.168.1.4"),
+            50000,
+            None,
+            Some(PHONE),
+            &GroupLayout::default(),
+        );
+        assert_eq!(
+            controls_at(&registry, "192.168.1.4"),
+            limit(30),
+            "with nothing kept for the phone, those kept for its IP apply"
+        );
+
+        let (key, at, applied) = registry
+            .set_controls(
+                "192.168.1.4:50000",
+                &EngineerUpdate {
+                    limit_percent: Some(80),
+                    ..EngineerUpdate::default()
+                },
+            )
+            .expect("the phone's controls are set");
+
+        assert_eq!(key, MusicianKey::Client(PHONE.to_owned()));
+        assert_eq!(at, address("192.168.1.4:50000"));
+        assert_eq!(applied.engineer, limit(80));
+        // The phone leaves and a rack is added at its old IP: nothing is kept for that IP now.
+        registry
+            .remove("192.168.1.4:50000")
+            .expect("the phone's row is removed");
+        registry
+            .add("192.168.1.4:50000", &GroupLayout::default())
+            .expect("a fresh address is accepted");
+        assert_eq!(
+            controls_at(&registry, "192.168.1.4"),
+            EngineerControls::default()
+        );
+    }
+
+    #[test]
+    fn a_target_added_where_controls_were_kept_starts_with_them() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        let changed = registry.keep_controls(
+            &MusicianKey::Address(address("192.168.1.9:50000")),
+            limit(45),
+        );
+        assert!(changed.is_empty(), "nobody is there yet");
+
+        registry
+            .add("192.168.1.9:50000", &GroupLayout::default())
+            .expect("a fresh address is accepted");
+
+        assert_eq!(controls_at(&registry, "192.168.1.9"), limit(45));
     }
 
     #[test]

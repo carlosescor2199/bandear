@@ -17,4 +17,5 @@ pub use engine::{
     MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
 };
 pub use health::{LinkHealth, LinkStatus};
-pub use mix::{MixUpdate, MixValues};
+pub use mix::{EngineerControls, EngineerUpdate, MixUpdate, MixValues};
+pub use targets::MusicianKey;

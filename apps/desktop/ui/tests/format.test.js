@@ -32,6 +32,18 @@ test("a group edit says whether the phones have it now, later, or have it but it
     formatGroupsSet({ groups, applied: true, saved: false, saveError: "the disk is full" }),
     "Groups applied to every phone, but not saved: the disk is full.",
   );
+  assert.equal(
+    formatGroupsSet({ groups, applied: true, saved: false, saveError: "the disk is full.." }),
+    "Groups applied to every phone, but not saved: the disk is full.",
+    "one full stop, whatever the reason ends with",
+  );
+  for (const saveError of [null, undefined, "", "  "]) {
+    assert.equal(
+      formatGroupsSet({ groups, applied: true, saved: false, saveError }),
+      "Groups applied to every phone, but not saved.",
+      `no reason to give: ${saveError}`,
+    );
+  }
 });
 
 test("a channel edit says whether the phones have it now, later, or have it but it was not kept", () => {

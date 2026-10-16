@@ -1172,12 +1172,40 @@ mod tests {
     }
 
     /// Stands in for a running engine in a group edit: it records what it took, can be stopping,
-    /// and takes a moment to apply, as the real engine's regroup does.
+    /// and takes a moment to apply, as the real engine's regroup does. With a [Park] it holds the
+    /// next edit that reaches it right after taking its groups, before that edit is saved.
     #[derive(Default)]
     struct StandInEngine {
         applied: Option<Vec<GroupDefinition>>,
         applied_channels: Option<Vec<ChannelMeta>>,
         stopping: bool,
+        park: Option<Park>,
+    }
+
+    /// Holds one group edit between its apply and its save while another edit runs: the edit
+    /// says it is parked, then waits until the session's groups change (another edit saved while
+    /// this one was half done) or `wait` passes, and notes which.
+    struct Park {
+        session: std::sync::Arc<SessionStore>,
+        parked: std::sync::mpsc::Sender<()>,
+        wait: std::time::Duration,
+        saved_meanwhile: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Park {
+        fn hold(self) {
+            let before = self.session.groups();
+            self.parked.send(()).expect("the test waits for the park");
+            let deadline = std::time::Instant::now() + self.wait;
+            while std::time::Instant::now() < deadline {
+                if self.session.groups() != before {
+                    self.saved_meanwhile
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     impl GroupEngine for StandInEngine {
@@ -1187,6 +1215,9 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
             self.applied = Some(definitions);
+            if let Some(park) = self.park.take() {
+                park.hold();
+            }
             Ok(())
         }
     }
@@ -1278,33 +1309,69 @@ mod tests {
         assert_eq!(applied_names(&engine), Some(vec!["Drums".to_owned()]));
     }
 
-    /// Two windows (or two quick clicks) edit the groups at the same moment while the engine is busy
-    /// (a status read holds it), round after round: whichever edit wins, the session and the running
-    /// engine always end with the same one.
+    /// Two windows (or two quick clicks) edit the groups at the same moment. Every round forces the
+    /// overlap: the first edit is parked right after the engine took its groups, and the second
+    /// edit runs meanwhile. Under a save-then-apply order the second edit's groups reach the
+    /// session while the first edit is half done (the order that leaves the session and the engine
+    /// apart when the applies then land the other way round), and the park reports it. Since each
+    /// edit is one step under the engine lock, the second edit waits until the first is saved, and
+    /// the session and the engine end with the second edit's groups.
     #[test]
     fn two_group_edits_at_once_leave_the_session_and_the_engine_with_the_same_groups() {
-        let session = SessionStore::open(&session_directory("groups-concurrent"));
+        let session =
+            std::sync::Arc::new(SessionStore::open(&session_directory("groups-concurrent")));
         let engine = running(StandInEngine::default());
-        for round in 0..30 {
-            std::thread::scope(|scope| {
-                let busy = engine.lock().expect("engine lock");
-                for name in ["First", "Second"] {
-                    let (engine, session) = (&engine, &session);
-                    scope.spawn(move || {
-                        edit_groups(engine, session, vec![request(Some(name), name, &[1])])
-                            .expect("a valid edit");
-                    });
-                }
-                // Both edits arrive while the engine is busy.
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                drop(busy);
+        for round in 0..6 {
+            let (first, second) = if round % 2 == 0 {
+                ("First", "Second")
+            } else {
+                ("Second", "First")
+            };
+            let (parked, parked_signal) = std::sync::mpsc::channel();
+            let saved_meanwhile = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_mut()
+                .expect("a running stand-in")
+                .park = Some(Park {
+                session: std::sync::Arc::clone(&session),
+                parked,
+                wait: std::time::Duration::from_millis(100),
+                saved_meanwhile: std::sync::Arc::clone(&saved_meanwhile),
             });
 
+            std::thread::scope(|scope| {
+                let (engine, session) = (&engine, &session);
+                scope.spawn(move || {
+                    edit_groups(engine, session, vec![request(Some(first), first, &[1])])
+                        .expect("a valid edit");
+                });
+                parked_signal
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the first edit reached the engine");
+                // The second edit runs while the first sits between its apply and its save.
+                scope.spawn(move || {
+                    edit_groups(engine, session, vec![request(Some(second), second, &[1])])
+                        .expect("a valid edit");
+                });
+            });
+
+            assert!(
+                !saved_meanwhile.load(std::sync::atomic::Ordering::SeqCst),
+                "round {round}: the second edit was saved while the first was between its apply \
+                 and its save"
+            );
             let saved: Vec<String> = session
                 .groups()
                 .iter()
                 .map(|group| group.name.clone())
                 .collect();
+            assert_eq!(
+                saved,
+                vec![second.to_owned()],
+                "round {round}: the later edit wins"
+            );
             assert_eq!(applied_names(&engine), Some(saved), "round {round}");
         }
     }

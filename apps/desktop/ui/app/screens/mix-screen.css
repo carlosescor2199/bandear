@@ -1,0 +1,125 @@
+/*
+ * The Mix screen's layout: the top bar, the musician tabs, then the channel strips beside the
+ * group strips and the master, filling the window's height. The channel strips scroll sideways
+ * when a device has more inputs than the window is wide.
+ */
+
+.main:has(.mix-screen) {
+  height: 100vh;
+}
+
+.mix-screen {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--ml-space-3);
+  min-height: 0;
+}
+
+.mix-tabs {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--ml-border-subtle);
+}
+
+.mix-message {
+  padding: var(--ml-space-2) var(--ml-space-3);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-surface);
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-md);
+}
+
+.mix-message--error {
+  border-color: var(--ml-danger-border);
+  background: var(--ml-danger-bg);
+  color: var(--ml-danger-text);
+}
+
+.mix-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--ml-space-2);
+  max-width: 60ch;
+  margin-top: var(--ml-space-6);
+  padding: var(--ml-space-5);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-xl);
+  background: var(--ml-surface);
+}
+
+.mix-notice p {
+  color: var(--ml-text-secondary);
+}
+
+.mix-notice-action {
+  min-height: var(--ml-target-primary);
+  margin-top: var(--ml-space-2);
+  padding: 0 var(--ml-space-4);
+  border: 1px solid var(--ml-accent);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-accent);
+  color: var(--ml-text-on-bright);
+  font-weight: var(--ml-weight-bold);
+}
+
+.mix-body {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 10px;
+  align-items: stretch;
+  min-height: 320px;
+}
+
+.mix-body[hidden],
+.mix-notice[hidden],
+.mix-message[hidden] {
+  display: none;
+}
+
+.mix-channels {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 6px;
+  overflow-x: auto;
+}
+
+.mix-side {
+  display: flex;
+  flex: none;
+  gap: 6px;
+  padding-left: 10px;
+  border-left: 1px solid var(--ml-border-subtle);
+}
+
+.mix-groups {
+  display: flex;
+  gap: 6px;
+}
+
+/* A narrow window puts the groups and the master under the channels. */
+@media (max-width: 860px) {
+  .main:has(.mix-screen) {
+    height: auto;
+  }
+
+  .mix-body {
+    flex-direction: column;
+  }
+
+  .mix-channels,
+  .mix-side {
+    min-height: 320px;
+  }
+
+  .mix-side {
+    padding-top: 10px;
+    padding-left: 0;
+    border-top: 1px solid var(--ml-border-subtle);
+    border-left: 0;
+    overflow-x: auto;
+  }
+}

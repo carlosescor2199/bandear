@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { EVENTS, createEngineApi, createTauriBridge } from "../app/lib/bridge.js";
+import {
+  ENGINE_NOT_RUNNING,
+  EVENTS,
+  createEngineApi,
+  createTauriBridge,
+  isEngineNotRunning,
+} from "../app/lib/bridge.js";
 import { createFakeBridge, sampleStatus, syntheticMeters } from "../app/lib/fake-bridge.js";
 import { applyEdits, buildMixRequest, mixFromDto } from "../app/lib/mix.js";
 
@@ -110,6 +116,26 @@ test("the engine API listens for the three engine events", async () => {
   assert.deepEqual(EVENTS, { meters: "meters", status: "status", mixChanged: "mix-changed" });
 });
 
+test("only the desktop's own words mean that no engine runs", () => {
+  assert.equal(ENGINE_NOT_RUNNING, "the engine is not running");
+  assert.equal(isEngineNotRunning("the engine is not running"), true);
+  assert.equal(isEngineNotRunning(new Error("the engine is not running")), true);
+  assert.equal(isEngineNotRunning("engine state lock was poisoned"), false);
+  assert.equal(isEngineNotRunning(undefined), false);
+});
+
+test("the fake engine can fail a command once, before or after it takes effect", async () => {
+  const fake = createFakeBridge({ running: true });
+
+  fake.failNext("stop_engine", "could not stop the capture");
+  await assert.rejects(fake.invoke("stop_engine"), /could not stop the capture/);
+  assert.equal((await fake.invoke("engine_status")).run, 1, "the engine still runs");
+
+  fake.failNext("stop_engine", "stopped, but late", { afterEffect: true });
+  await assert.rejects(fake.invoke("stop_engine"), /stopped, but late/);
+  await assert.rejects(fake.invoke("engine_status"), /not running/, "this time it did stop");
+});
+
 test("the fake engine answers engine_status only while it runs, as the real one does", async () => {
   const fake = createFakeBridge();
 
@@ -138,6 +164,42 @@ test("starting the fake engine announces a status and stopping it ends engine_st
   await assert.rejects(fake.invoke("engine_status"), /not running/);
 });
 
+test("the fake engine names its run on every payload, and each start begins the next", async () => {
+  const fake = createFakeBridge();
+  const seen = [];
+  for (const event of ["status", "meters", "mix-changed"]) {
+    await fake.listen(event, (payload) => seen.push([event, payload.run]));
+  }
+
+  const first = await fake.invoke("start_engine", { config: {} });
+  const status = await fake.invoke("engine_status");
+  fake.changeFromPhone(status.musicians[0].address, { muted: true });
+  fake.emitMeters();
+  const second = await fake.invoke("start_engine", { config: {} });
+
+  assert.equal(first.run, 1);
+  assert.equal(status.run, 1);
+  assert.equal(second.run, 2);
+  assert.equal((await fake.invoke("engine_status")).run, 2);
+  assert.deepEqual(seen, [
+    ["status", 1],
+    ["mix-changed", 1],
+    ["meters", 1],
+    ["status", 2],
+  ]);
+});
+
+test("a failed start of the fake engine still ends the run before it", async () => {
+  const fake = createFakeBridge({ running: true, failStart: "No input device is available." });
+
+  await assert.rejects(fake.invoke("start_engine", { config: {} }), /No input device/);
+  await assert.rejects(fake.invoke("engine_status"), /not running/);
+  fake.failStart(null);
+  const summary = await fake.invoke("start_engine", { config: {} });
+
+  assert.equal(summary.run, 3, "the sample engine was run 1 and the failed start took run 2");
+});
+
 test("the fake engine merges a desk's change from the first channel, answers the mix and announces it", async () => {
   const fake = createFakeBridge({ running: true });
   const changes = [];
@@ -150,9 +212,34 @@ test("the fake engine merges a desk's change from the first channel, answers the
   });
 
   assert.deepEqual(answer.channelGains, [10, 20, ...before.channelGains.slice(2)]);
-  assert.deepEqual(changes, [{ address: before.address, origin: "desktop", mix: answer }]);
+  assert.deepEqual(changes, [{ run: 1, address: before.address, origin: "desktop", mix: answer }]);
   const status = await fake.invoke("engine_status");
   assert.deepEqual(status.musicians[1].channelGains, answer.channelGains);
+});
+
+test("every change of a fake mix takes a higher revision, from the desk or the phone", async () => {
+  const fake = createFakeBridge({ running: true });
+  const { address, revision: start } = sampleStatus().musicians[0];
+
+  const answer = await fake.invoke("set_mix", { address, mix: { volumePercent: 50 } });
+  fake.changeFromPhone(address, { muted: true });
+  const row = (await fake.invoke("engine_status")).musicians[0];
+
+  assert.ok(answer.revision > start);
+  assert.ok(row.revision > answer.revision);
+});
+
+test("the fake engine can answer a desk's change before announcing it, as the desktop may", async () => {
+  const fake = createFakeBridge({ running: true, answersFirst: true });
+  const order = [];
+  await fake.listen("mix-changed", () => order.push("event"));
+  const { address } = sampleStatus().musicians[0];
+
+  await fake.invoke("set_mix", { address, mix: { volumePercent: 50 } });
+  order.push("answer");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(order, ["answer", "event"]);
 });
 
 test("the fake engine refuses what the real one refuses", async () => {
@@ -236,7 +323,8 @@ test("a request built from local edits leaves the fake engine with the mix the e
     mix: buildMixRequest(mix, edits),
   });
 
-  assert.deepEqual(answer, applyEdits(mix, edits));
+  assert.deepEqual({ ...answer, revision: 0 }, { ...applyEdits(mix, edits), revision: 0 });
+  assert.ok(answer.revision > mix.revision, "the change is a newer revision");
 });
 
 test("synthetic meters cover every channel and musician with whole 0-100 peaks", () => {
@@ -244,6 +332,7 @@ test("synthetic meters cover every channel and musician with whole 0-100 peaks",
 
   const payload = syntheticMeters(status, 1234);
 
+  assert.equal(payload.run, status.run);
   assert.equal(payload.channels.length, status.sourceChannels);
   assert.deepEqual(
     Object.keys(payload.musicians).sort(),

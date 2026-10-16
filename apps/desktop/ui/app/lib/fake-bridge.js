@@ -1,7 +1,8 @@
 // An in-memory engine behind the bridge interface (see bridge.js), for tests, the component
 // gallery and a browser preview of the console. It answers the desktop commands with the same
 // shapes, the same mix-merge rules and the same refusals as the real engine, and emits the same
-// events. Like a Tauri command, a refused call rejects with the error text, not an Error.
+// events. Like a Tauri command, a refused call rejects with the error text, not an Error. Every
+// start, even a failed one, begins a new engine run, and every payload names its run.
 
 import { defaultMix, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { clampLevel } from "./values.js";
@@ -32,7 +33,11 @@ const LOST = {
   lossPercent: null,
   receiveTimeoutsPerSecond: null,
 };
-const NOT_CONNECTED = { ...LOST, controlConnected: false, linkHealth: "unknown" };
+const NO_REPORTS = { ...LOST, linkHealth: "unknown" };
+const NOT_CONNECTED = { ...NO_REPORTS, controlConnected: false };
+
+const STATUS_INTERVAL_MS = 250;
+const METER_INTERVAL_MS = 33;
 
 function clone(value) {
   return structuredClone(value);
@@ -54,36 +59,46 @@ function musicianRow(address, names, link, mixChanges = {}) {
     nameIsLocal: false,
     ...names,
     ...mergeMixUpdate(defaultMix(), mixChanges),
+    revision: 1,
     packetsSent: 0,
     packetsDiscarded: 0,
     ...link,
   };
 }
 
-/** A running four-channel engine with three musicians: a good link, a warning and a lost one. */
+/**
+ * A running six-channel engine with two groups (Drums on CH 1-3, Vocals on CH 5-6) and four
+ * musicians whose links are good, a warning, unreported and lost.
+ */
 export function sampleStatus() {
   const groups = [
-    { name: "Drums", channels: [0, 1], invalid: false },
-    { name: "Vocals", channels: [3], invalid: false },
+    { name: "Drums", channels: [0, 1, 2], invalid: false },
+    { name: "Vocals", channels: [4, 5], invalid: false },
   ];
   return {
-    deviceName: "Volt 4",
-    captureFormat: { channels: 4, sampleRate: 48000, sampleFormat: "I24", bufferSize: "Fixed(256)" },
+    run: 1,
+    deviceName: "Demo interface",
+    captureFormat: { channels: 6, sampleRate: 48000, sampleFormat: "I24", bufferSize: "Fixed(256)" },
     controlPort: 50001,
     sampleRate: 48000,
-    sourceChannels: 4,
+    sourceChannels: 6,
     groups,
-    channels: channelRows(4, groups),
+    channels: channelRows(6, groups),
     stopped: false,
     samplesReceived: 0,
     packetsSent: 0,
     packetsDiscarded: 0,
     musicians: [
       musicianRow("192.168.1.3:50000", { clientName: "Lead vocal", name: "Lead vocal" }, GOOD, {
-        channelGains: [62, 55, 40, 88],
-        pans: [50, 50, 65, 40],
+        channelGains: [62, 55, 40, 58, 88, 52],
+        pans: [50, 50, 50, 50, 50, 40],
+        volumePercent: 85,
+        maxLevelPercent: 90,
       }),
       musicianRow("192.168.1.12:50000", { clientName: "Bass", name: "Bass" }, WARNING),
+      musicianRow("192.168.1.17:50000", { clientName: "Keys", name: "Keys" }, NO_REPORTS, {
+        pans: [50, 50, 50, 50, 30, 70],
+      }),
       musicianRow("192.168.1.20:50000", { name: "Drums", nameIsLocal: true }, LOST, {
         channelMuted: [false, false, false, true],
       }),
@@ -94,17 +109,18 @@ export function sampleStatus() {
 /** The input devices `list_input_devices` offers; a device with 0 channels is listed but unusable. */
 export function sampleDevices() {
   return [
-    { name: "Volt 4", channels: 4 },
+    { name: "Demo interface", channels: 6 },
     { name: "Microphone (USB audio)", channels: 2 },
     { name: "Digital input", channels: 0 },
   ];
 }
 
-// A slow swell with a faster flutter, different for every seed, so meters look alive.
+// A slow swell with a faster flutter, different for every seed, so meters look alive. Peaks stay
+// below 75 % of full scale, as a sensible gain structure would, and only now and then run hot.
 function wave(seconds, seed) {
   const swell = 0.5 + 0.5 * Math.sin(seconds * (0.6 + seed * 0.13) + seed);
   const flutter = 0.5 + 0.5 * Math.sin(seconds * (7 + seed * 1.7) + seed * 2.3);
-  return clampLevel(100 * swell * (0.35 + 0.65 * flutter));
+  return clampLevel(75 * swell * (0.35 + 0.65 * flutter));
 }
 
 /** A `meters` payload for `status` at `time` milliseconds; the same time gives the same levels. */
@@ -118,6 +134,7 @@ export function syntheticMeters(status, time) {
     };
   });
   return {
+    run: status.run,
     channels: Array.from({ length: status.sourceChannels }, (_, index) => wave(seconds, index)),
     musicians,
   };
@@ -141,20 +158,31 @@ function withPort(address) {
 }
 
 /**
- * The fake bridge. `running` starts the engine already running. Besides `invoke` and `listen` it
- * offers `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
- * `startMeters(intervalMs)` (synthetic meters until the returned stop function is called) and
- * `calls`, every `{ command, args }` invoked.
+ * The fake bridge. `running` starts the engine already running, as run `status.run`; `failStart`
+ * is the error every start fails with (none by default); `answersFirst` delivers a `set_mix`
+ * answer before its `mix-changed` event, an order the desktop's two channels allow (by default
+ * the event comes first). Every stored mix change takes a higher `revision`, as in the engine.
+ * Besides `invoke` and `listen` it offers
+ * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
+ * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
+ * (timers until the returned stop function is called), `holdAnswers(command)` and
+ * `releaseAnswers()` (answers that arrive late), `failNext(command, message)` (one failed call),
+ * `failStart(message)` and `calls`, every `{ command, args }` invoked.
  */
 export function createFakeBridge({
   status = sampleStatus(),
   devices = sampleDevices(),
   running = false,
+  failStart = null,
+  answersFirst = false,
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
   const calls = [];
   let isRunning = running;
+  let run = running ? engine.run : 0;
+  let startError = failStart;
+  let revision = Math.max(0, ...engine.musicians.map((musician) => musician.revision ?? 0));
 
   function emit(event, payload) {
     for (const handler of [...(listeners.get(event) ?? [])]) {
@@ -177,7 +205,17 @@ export function createFakeBridge({
   }
 
   function summary() {
-    return { deviceName: engine.deviceName, captureFormat: clone(engine.captureFormat) };
+    return { run, deviceName: engine.deviceName, captureFormat: clone(engine.captureFormat) };
+  }
+
+  function announceMix(address, origin, mix) {
+    emit("mix-changed", { run, address, origin, mix: clone(mix) });
+  }
+
+  function emitMeters() {
+    if (isRunning) {
+      emit("meters", syntheticMeters(engine, performance.now()));
+    }
   }
 
   function mergeInto(row, update) {
@@ -187,6 +225,8 @@ export function createFakeBridge({
     } catch (error) {
       throw error.message;
     }
+    revision += 1;
+    merged.revision = revision;
     Object.assign(row, merged);
     return merged;
   }
@@ -197,7 +237,14 @@ export function createFakeBridge({
       return clone(engine);
     },
     start_engine() {
+      // As in the desktop, a start ends the previous engine and takes a run even when it fails.
+      run += 1;
+      isRunning = false;
+      if (startError) {
+        throw startError;
+      }
       isRunning = true;
+      engine.run = run;
       engine.stopped = false;
       emit("status", clone(engine));
       return summary();
@@ -250,25 +297,60 @@ export function createFakeBridge({
     set_mix({ address, mix }) {
       requireRunning();
       const merged = mergeInto(musicianAt(address), mix);
-      emit("mix-changed", { address, origin: "desktop", mix: clone(merged) });
+      if (answersFirst) {
+        // The answer settles at once; the event follows in a later task.
+        setTimeout(() => announceMix(address, "desktop", merged), 0);
+      } else {
+        announceMix(address, "desktop", merged);
+      }
       return clone(merged);
     },
   };
+
+  // A change made on the musician's phone: merged as the engine would, announced as "phone".
+  function changeFromPhone(address, update) {
+    announceMix(address, "phone", mergeInto(musicianAt(address), update));
+  }
+
+  // Commands whose answers wait for `releaseAnswers`, and the answers waiting.
+  const held = new Set();
+  const waiting = [];
+  // Commands whose next call fails: { message, afterEffect }.
+  const failing = new Map();
 
   return {
     calls,
     invoke(command, args) {
       calls.push({ command, args });
-      return new Promise((resolve, reject) => {
-        const handler = commands[command];
-        if (!handler) {
-          reject(`unknown command: ${command}`);
-          return;
+      // The command takes effect at once, events included; only its answer may be held back.
+      const handler = commands[command];
+      const failure = failing.get(command);
+      failing.delete(command);
+      let outcome;
+      if (failure) {
+        if (failure.afterEffect) {
+          try {
+            handler?.(args ?? {});
+          } catch {
+            // The failure below is the answer either way.
+          }
         }
+        outcome = { ok: false, value: failure.message };
+      } else if (handler) {
         try {
-          resolve(handler(args ?? {}));
+          outcome = { ok: true, value: handler(args ?? {}) };
         } catch (error) {
-          reject(error);
+          outcome = { ok: false, value: error };
+        }
+      } else {
+        outcome = { ok: false, value: `unknown command: ${command}` };
+      }
+      return new Promise((resolve, reject) => {
+        const answer = () => (outcome.ok ? resolve(outcome.value) : reject(outcome.value));
+        if (held.has(command)) {
+          waiting.push(answer);
+        } else {
+          answer();
         }
       });
     },
@@ -282,19 +364,65 @@ export function createFakeBridge({
       });
     },
     emit,
-    /** A change made on the musician's phone: merged as the engine would, announced as "phone". */
-    changeFromPhone(address, update) {
-      const merged = mergeInto(musicianAt(address), update);
-      emit("mix-changed", { address, origin: "phone", mix: clone(merged) });
+    emitMeters,
+    changeFromPhone,
+    /** From now on the answers to `command` wait for `releaseAnswers`, as a slow link would. */
+    holdAnswers(command) {
+      held.add(command);
+    },
+    /**
+     * Makes the next call of `command` fail with `message`: before it does anything, or, with
+     * `afterEffect`, after it took effect, as a command whose answer is an error but whose work
+     * was done.
+     */
+    failNext(command, message, { afterEffect = false } = {}) {
+      failing.set(command, { message, afterEffect });
+    },
+    /** Delivers every answer waiting now, in the order the commands were invoked. */
+    releaseAnswers() {
+      for (const answer of waiting.splice(0)) {
+        answer();
+      }
     },
     /** Emits synthetic `meters` while the engine runs; returns the function that stops them. */
-    startMeters(intervalMs = 33) {
-      const timer = setInterval(() => {
-        if (isRunning) {
-          emit("meters", syntheticMeters(engine, performance.now()));
-        }
-      }, intervalMs);
+    startMeters(intervalMs = METER_INTERVAL_MS) {
+      const timer = setInterval(emitMeters, intervalMs);
       return () => clearInterval(timer);
+    },
+    /**
+     * Plays a live engine for a browser preview: meters about 30 times a second, a status 4 times
+     * a second, and now and then a fader moved on a phone that is reporting. Returns the function
+     * that stops it.
+     */
+    startDemo({ phoneChangeEveryMs = 4000 } = {}) {
+      let step = 0;
+      const timers = [
+        setInterval(emitMeters, METER_INTERVAL_MS),
+        setInterval(() => {
+          if (isRunning) {
+            emit("status", clone(engine));
+          }
+        }, STATUS_INTERVAL_MS),
+        setInterval(() => {
+          const phones = engine.musicians.filter(
+            (musician) => musician.controlConnected && typeof musician.lossPercent === "number",
+          );
+          if (!isRunning || phones.length === 0) {
+            return;
+          }
+          const row = phones[step % phones.length];
+          const channel = step % engine.sourceChannels;
+          step += 1;
+          const gains = row.channelGains.slice(0, channel + 1);
+          gains[channel] = (gains[channel] + 37) % 101;
+          changeFromPhone(row.address, { channelGains: gains });
+        }, phoneChangeEveryMs),
+      ];
+      return () => timers.forEach((timer) => clearInterval(timer));
+    },
+    /** Makes every later start fail with `message`, or succeed again with `null`. */
+    failStart(message) {
+      startError = message;
     },
   };
 }

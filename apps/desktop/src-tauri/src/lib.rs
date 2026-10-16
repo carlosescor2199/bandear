@@ -93,8 +93,8 @@ pub fn run() {
             let handle = app.handle().clone();
             app.manage(
                 DesktopState::new(MusicianNames::load(directory.join(names::NAMES_FILE)))
-                    .with_event_pump(move |events| {
-                        EventPump::start(events, handle.clone(), handle.clone())
+                    .with_event_pump(move |events, run| {
+                        EventPump::start(events, run, handle.clone(), handle.clone())
                     }),
             );
             Ok(())

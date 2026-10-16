@@ -6,19 +6,23 @@
 //! reads the engine through the command layer. The window receives these events (camelCase JSON,
 //! peaks 0-100):
 //!
-//! - `meters`, about 30 times a second:
-//!   `{ "channels": [peak, ...], "musicians": { "<address>": { "left": peak, "right": peak } } }`.
-//!   `channels` holds the input peaks, index-aligned with the status's `channels`; `musicians`
-//!   holds the peak of the stereo mix each musician is sent.
+//! - `meters`, about 30 times a second: `{ "run": n, "channels": [peak, ...], "musicians":
+//!   { "<address>": { "left": peak, "right": peak } } }`. `channels` holds the input peaks,
+//!   index-aligned with the status's `channels`; `musicians` holds the peak of the stereo mix each
+//!   musician is sent.
 //! - `status`, about 4 times a second: the `EngineStatusDto` that `engine_status` returns, with the
 //!   local names applied.
 //! - `mix-changed`, as soon as a mix changes:
-//!   `{ "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`, the whole
-//!   mix stored after the change. A musician removed in between is not announced.
+//!   `{ "run": n, "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`,
+//!   the whole mix stored after the change. A musician removed in between is not announced.
 //!
 //! `<address>` is always the musician's address as the status rows show it, even for a change from
 //! the phone, whose control connection has another port. The window still asks `engine_status`
 //! once for its first paint.
+//!
+//! Every event names the engine run it belongs to (`run`, the same number `start_engine` and
+//! `engine_status` report). An event can still be on its way to the window after its engine has
+//! stopped, so the window ignores events from a run that has ended.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,20 +48,22 @@ const METER_INTERVAL: Duration = Duration::from_millis(33);
 /// the musician list change slowly.
 const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The `mix-changed` payload for an engine event, or `None` for any other event.
+/// The `mix-changed` payload of engine run `run` for an engine event, or `None` for any other
+/// event.
 ///
 /// `lookup` is the engine's join on IP (`EngineHandle::musician_mix`): it gives the musician's
 /// address as the status shows it and the mix stored now, so a phone's change, which names its
 /// control peer, lands on the right row. A musician removed in between has nothing to announce.
 pub fn mix_changed(
     event: &EngineEvent,
+    run: u64,
     lookup: impl FnOnce(SocketAddr) -> Option<(SocketAddr, MixValues)>,
 ) -> Option<MixChangedDto> {
     let EngineEvent::MixChanged { address, origin } = event else {
         return None;
     };
     let (address, mix) = lookup(*address)?;
-    Some(MixChangedDto::new(address, *origin, &mix))
+    Some(MixChangedDto::new(address, *origin, &mix, run))
 }
 
 /// What one pass of the pump has to send.
@@ -140,19 +146,20 @@ pub struct EventPump {
 }
 
 impl EventPump {
-    /// Starts streaming from `source` to `sink`.
+    /// Starts streaming engine run `run` from `source` to `sink`; every event it emits names `run`.
     ///
     /// `events` is the engine's bus (`EngineHandle::subscribe`); the thread also ends on its own
     /// once the engine is gone and the bus closes.
     pub fn start(
         events: Receiver<EngineEvent>,
+        run: u64,
         source: impl PumpSource,
         sink: impl PumpSink,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let thread = {
             let running = Arc::clone(&running);
-            thread::spawn(move || pump(&events, &running, &source, &sink))
+            thread::spawn(move || pump(&events, run, &running, &source, &sink))
         };
         Self {
             running,
@@ -186,6 +193,7 @@ impl Drop for EventPump {
 /// announces it.
 fn pump(
     events: &Receiver<EngineEvent>,
+    run: u64,
     running: &AtomicBool,
     source: &impl PumpSource,
     sink: &impl PumpSink,
@@ -195,19 +203,20 @@ fn pump(
         let due = schedule.take_due(Instant::now());
         if due.meters {
             if let Some(meters) = source.meters() {
-                sink.emit(METERS_EVENT, meters);
+                sink.emit(METERS_EVENT, MetersDto { run, ..meters });
             }
         }
         if due.status {
             if let Some(status) = source.status() {
-                sink.emit(STATUS_EVENT, status);
+                sink.emit(STATUS_EVENT, EngineStatusDto { run, ..status });
             }
         }
         // Waiting on the bus is also the pump's sleep: a change goes out at once, and a stop is
         // noticed within one meter interval.
         match events.recv_timeout(schedule.wait(Instant::now())) {
             Ok(event) => {
-                if let Some(change) = mix_changed(&event, |address| source.musician_mix(address)) {
+                let lookup = |address| source.musician_mix(address);
+                if let Some(change) = mix_changed(&event, run, lookup) {
                     sink.emit(MIX_CHANGED_EVENT, change);
                 }
             }
@@ -281,7 +290,7 @@ mod tests {
             origin: MixOrigin::Client { peer },
         };
 
-        let change = mix_changed(&event, one_musician).expect("a change of a musician's mix");
+        let change = mix_changed(&event, 1, one_musician).expect("a change of a musician's mix");
 
         assert_eq!(
             change.address, MUSICIAN,
@@ -298,7 +307,7 @@ mod tests {
             origin: MixOrigin::Engine,
         };
 
-        let change = mix_changed(&event, one_musician).expect("a change of a musician's mix");
+        let change = mix_changed(&event, 1, one_musician).expect("a change of a musician's mix");
 
         assert_eq!(change.address, MUSICIAN);
         assert_eq!(change.origin, "desktop");
@@ -311,7 +320,7 @@ mod tests {
             origin: MixOrigin::Engine,
         };
 
-        assert!(mix_changed(&event, one_musician).is_none());
+        assert!(mix_changed(&event, 1, one_musician).is_none());
     }
 
     #[test]
@@ -328,7 +337,7 @@ mod tests {
                 address: address(PHONE),
             },
         ] {
-            assert!(mix_changed(&event, never).is_none());
+            assert!(mix_changed(&event, 1, never).is_none());
         }
     }
 
@@ -437,6 +446,7 @@ mod tests {
 
     fn idle_status() -> EngineStatusDto {
         EngineStatusDto {
+            run: 0,
             device_name: "Test device".to_owned(),
             capture_format: CaptureFormatDto {
                 channels: 2,
@@ -466,6 +476,7 @@ mod tests {
     impl PumpSource for FakeEngine {
         fn meters(&self) -> Option<MetersDto> {
             Some(MetersDto {
+                run: 0,
                 channels: vec![50, 0],
                 musicians: BTreeMap::new(),
             })
@@ -498,6 +509,7 @@ mod tests {
         let recorder = Recorder::default();
         let pump = EventPump::start(
             events,
+            7,
             FakeEngine {
                 _alive: Arc::new(()),
             },
@@ -509,14 +521,12 @@ mod tests {
         ));
         assert_eq!(
             recorder.last(METERS_EVENT),
-            Some(serde_json::json!({ "channels": [50, 0], "musicians": {} }))
+            Some(serde_json::json!({ "run": 7, "channels": [50, 0], "musicians": {} })),
+            "meters name the pump's run"
         );
-        assert_eq!(
-            recorder
-                .last(STATUS_EVENT)
-                .map(|status| status["deviceName"].clone()),
-            Some(serde_json::json!("Test device"))
-        );
+        let status = recorder.last(STATUS_EVENT).expect("a status went out");
+        assert_eq!(status["deviceName"], "Test device");
+        assert_eq!(status["run"], 7, "a status names the pump's run");
 
         let peer = address(PHONE);
         bus.send(EngineEvent::MixChanged {
@@ -529,6 +539,7 @@ mod tests {
         assert_eq!(change["address"], MUSICIAN);
         assert_eq!(change["origin"], "phone");
         assert_eq!(change["mix"]["volumePercent"], 42);
+        assert_eq!(change["run"], 7, "a mix change names the pump's run");
 
         pump.stop();
     }
@@ -540,6 +551,7 @@ mod tests {
         let alive = Arc::new(());
         let pump = EventPump::start(
             events,
+            1,
             FakeEngine {
                 _alive: Arc::clone(&alive),
             },
@@ -565,6 +577,7 @@ mod tests {
         let alive = Arc::new(());
         let pump = EventPump::start(
             events,
+            1,
             FakeEngine {
                 _alive: Arc::clone(&alive),
             },
@@ -583,6 +596,7 @@ mod tests {
         let alive = Arc::new(());
         let pump = EventPump::start(
             events,
+            1,
             FakeEngine {
                 _alive: Arc::clone(&alive),
             },

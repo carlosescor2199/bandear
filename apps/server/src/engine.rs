@@ -533,7 +533,8 @@ pub(crate) fn musician_mix(
         .read()
         .iter()
         .find(|entry| entry.address.ip() == address.ip())
-        .map(|entry| (entry.address, entry.mix_state.snapshot()))
+        // With its exact revision, so a window can order it against the other copies it gets.
+        .map(|entry| (entry.address, entry.mix_state.current()))
 }
 
 /// Snapshots the fixed group layout into the observation-friendly [GroupStatus] list.
@@ -736,7 +737,7 @@ impl EngineHandle {
             .collect();
         let mixes: HashMap<IpAddr, MixValues> = entries
             .iter()
-            .map(|entry| (entry.address.ip(), entry.mix_state.snapshot()))
+            .map(|entry| (entry.address.ip(), entry.mix_state.current()))
             .collect();
         let names: HashMap<IpAddr, String> = entries
             .iter()
@@ -1267,7 +1268,11 @@ mod tests {
         )
         .expect("a configured target's mix is set");
 
-        assert_eq!(applied, state.snapshot());
+        assert_eq!(applied, state.current());
+        assert!(
+            applied.revision > before.revision,
+            "the change takes a new revision"
+        );
         assert!(applied.channel_solo[1]);
         assert_eq!(applied.group_levels[0], 0, "clamped like a phone's value");
         assert_eq!(applied.max_level_percent, 75);

@@ -6,15 +6,30 @@
 // `listen` hands the handler the event's payload, not Tauri's event envelope. A command that fails
 // rejects with the command's error text.
 
-/** The engine events the desktop emits (apps/desktop/src-tauri/src/events.rs). */
+/**
+ * The engine events the desktop emits (apps/desktop/src-tauri/src/events.rs). Every payload names
+ * the engine run it belongs to; see `isLiveRun` in console-state.js.
+ */
 export const EVENTS = Object.freeze({
-  /** About 30 a second: `{ channels: [peak], musicians: { address: { left, right } } }`. */
+  /** About 30 a second: `{ run, channels: [peak], musicians: { address: { left, right } } }`. */
   meters: "meters",
-  /** About 4 a second: the `engine_status` snapshot. */
+  /** About 4 a second: the `engine_status` snapshot, with its `run`. */
   status: "status",
-  /** At once: `{ address, origin: "phone" | "desktop", mix }`. */
+  /** At once: `{ run, address, origin: "phone" | "desktop", mix }`. */
   mixChanged: "mix-changed",
 });
+
+/**
+ * The error text every engine command answers with while no engine runs (commands.rs). Only this
+ * answer means "not running"; any other failure of `engine_status` is a real problem.
+ */
+export const ENGINE_NOT_RUNNING = "the engine is not running";
+
+/** True when a command failed only because no engine runs. */
+export function isEngineNotRunning(error) {
+  const text = error instanceof Error ? error.message : error;
+  return text === ENGINE_NOT_RUNNING;
+}
 
 /** The bridge over `window.__TAURI__`, which `withGlobalTauri` provides. */
 export function createTauriBridge(tauri = globalThis.__TAURI__) {
@@ -35,9 +50,12 @@ export function createTauriBridge(tauri = globalThis.__TAURI__) {
  */
 export function createEngineApi(bridge) {
   return Object.freeze({
-    /** The `EngineStatusDto`; rejects while no engine runs. */
+    /** The `EngineStatusDto`, with its `run`; rejects while no engine runs. */
     status: () => bridge.invoke("engine_status"),
-    /** `config` is the `StartRequest`: deviceFilter, targets, controlPort, groups, host, bufferFrames. */
+    /**
+     * `config` is the `StartRequest`: deviceFilter, targets, controlPort, groups, host,
+     * bufferFrames. Resolves to `{ run, deviceName, captureFormat }`.
+     */
     start: (config = {}) => bridge.invoke("start_engine", { config }),
     stop: () => bridge.invoke("stop_engine"),
     /** `host` is "auto", "asio" or "wasapi"; none means auto. */

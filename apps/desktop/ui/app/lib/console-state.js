@@ -3,48 +3,102 @@
 // to the meter elements.
 //
 // State:
-//   engine     { phase, error, status }: phase is "idle", "starting", "running", "stopping",
-//              "stopped" or "error"; status is the last `EngineStatusDto` without its musicians.
+//   engine     { phase, error, status, run, endedRun }: phase is "idle", "starting", "running",
+//              "stopping", "stopped" or "error"; status is the last `EngineStatusDto` without its
+//              musicians; run is the engine run that status came from (null when none runs), and
+//              endedRun the newest run known to have ended.
 //   musicians  [musician] in the status's order: the status row with its mix nested as `mix`.
 //   selected   the address whose mix is open. It survives a stop, so a restart reopens it.
+//   departed   { address, label } of the open musician when a status no longer listed them and
+//              the first musician opened instead; cleared by a pick, their return or a run's end.
 //   pending    { address: { editKey: value } }: local edits still waiting for the engine.
 //   mixError   { address, message } of the last refused change, cleared by the next answer.
+//   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
+//   connection { status, error }: "connecting", "ready" (the engine answered, or a status came)
+//              or "failed" with the reason the console cannot hear the engine.
+//   commandError { action, message }: a stop (or start) the engine refused while its run went
+//              on; cleared by the next start or stop.
 //
 // The mix a screen shows is the engine's mix with the pending edits on top (`viewMix`), so a fader
-// never jumps back to an older value while its change is on the way.
+// never jumps back to an older value while its change is on the way. Each copy of a musician's mix
+// carries the engine's revision, and a status row, a `mix-changed` event and a `set_mix` answer
+// can arrive in any order: the store keeps the copy with the highest revision from any of them and
+// never goes back to a lower one. An answer also settles the edits it carried.
+//
+// Every engine payload names its run. Starting, a failed start and a confirmed stop end the
+// current run, and a payload of an ended or older run is ignored, so a late event can never bring
+// back an engine that has stopped. A stop the engine refused ends nothing: the engine may still
+// run, so its run stays live and the refusal is shown (`commandFailed`).
 
-import { needsAttention } from "./format.js";
+import { DEFAULT_AUDIO, audioChoice } from "./engine-config.js";
+import { musicianLabel, needsAttention } from "./format.js";
 import { MIX_FIELDS, applyEdits, mixFromDto, parseEditKey, settleEdits } from "./mix.js";
 
 export const PHASES = Object.freeze(["idle", "starting", "running", "stopping", "stopped", "error"]);
+
+/** The phases in which the engine of the current run is gone or being replaced. */
+const RUN_ENDING_PHASES = new Set(["idle", "starting", "error"]);
 
 const NO_EDITS = Object.freeze({});
 const MIX_FIELD_SET = new Set(MIX_FIELDS);
 
 export const initialState = Object.freeze({
-  engine: Object.freeze({ phase: "idle", error: null, status: null }),
+  engine: Object.freeze({ phase: "idle", error: null, status: null, run: null, endedRun: 0 }),
   musicians: Object.freeze([]),
   selected: null,
+  departed: null,
   pending: NO_EDITS,
   mixError: null,
+  audio: DEFAULT_AUDIO,
+  connection: Object.freeze({ status: "connecting", error: null }),
+  commandError: null,
 });
+
+const READY = Object.freeze({ status: "ready", error: null });
 
 /** Action creators, so a screen never spells an action by hand. */
 export const actions = Object.freeze({
   /** An `EngineStatusDto` from `engine_status` or the `status` event. */
   status: (status) => ({ type: "status", status }),
-  /** The engine's phase as a screen learns it from its own start and stop calls. */
+  /**
+   * The engine's phase as a screen learns it from its own start and stop calls. "starting",
+   * "idle" and "error" end the current run.
+   */
   engine: (phase, error = null) => ({ type: "engine", phase, error }),
   select: (address) => ({ type: "select", address }),
-  /** A `mix-changed` payload: `{ address, origin, mix }`. */
-  mixChanged: ({ address, origin, mix }) => ({ type: "mix-changed", address, origin, mix }),
+  /** A `mix-changed` payload: `{ run, address, origin, mix }`. */
+  mixChanged: ({ run, address, origin, mix }) => ({ type: "mix-changed", run, address, origin, mix }),
   /** Local edits to one musician's mix, keyed as `editKey` makes them. */
   mixEdit: (address, edits) => ({ type: "mix-edit", address, edits }),
-  /** The engine's answer to a `set_mix` that carried the edits `sent`. */
-  mixApplied: (address, sent, mix) => ({ type: "mix-applied", address, sent, mix }),
+  /** The engine answered a `set_mix` that carried the edits `sent` with the mix it stored. */
+  mixApplied: (address, sent, mix = null) => ({ type: "mix-applied", address, sent, mix }),
   /** A `set_mix` that carried the edits `sent` was refused. */
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
+  /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
+  audio: (change) => ({ type: "audio", change }),
+  /**
+   * The engine refused `action` ("stop" or "start") but its run goes on: the phase goes back to
+   * what the last status said, and the refusal is kept to be shown.
+   */
+  commandFailed: (action, message) => ({ type: "command-failed", action, message }),
+  /** The console is (re)connecting to the engine's events and status. */
+  connecting: () => ({ type: "connection", connection: { status: "connecting", error: null } }),
+  connected: () => ({ type: "connection", connection: READY }),
+  /** The console cannot hear the engine, for `message`. */
+  connectionFailed: (message) => ({
+    type: "connection",
+    connection: { status: "failed", error: message },
+  }),
 });
+
+/**
+ * True when a payload of engine run `run` belongs to the engine the console shows, or to a newer
+ * one whose first status has not arrived yet; false for an ended or older run, or no run at all.
+ */
+export function isLiveRun(state, run) {
+  const { run: current, endedRun } = state.engine;
+  return Number.isInteger(run) && run > endedRun && (current === null || run >= current);
+}
 
 /** A status row as the console keeps it: every field but the mix, and the mix nested. */
 export function musicianFromDto(row) {
@@ -67,24 +121,49 @@ function onlyListed(pending, addresses) {
   return kept.length === Object.keys(pending).length ? pending : Object.fromEntries(kept);
 }
 
+// True when `incoming` is a newer copy of a musician's mix than `current`.
+function isNewer(incoming, current) {
+  return incoming.revision > current.revision;
+}
+
 function receiveStatus(state, status) {
-  const musicians = status.musicians.map(musicianFromDto);
+  if (!isLiveRun(state, status.run)) {
+    return state;
+  }
+  // A status may have been read before a change the console already has: keep the newer mix.
+  const musicians = status.musicians.map((row) => {
+    const musician = musicianFromDto(row);
+    const known = musicianByAddress(state, musician.address);
+    return known && !isNewer(musician.mix, known.mix) ? { ...musician, mix: known.mix } : musician;
+  });
   const addresses = new Set(musicians.map((musician) => musician.address));
   let phase = status.stopped ? "stopped" : "running";
   if (state.engine.phase === "stopping") {
     phase = "stopping";
   }
+  const stays = addresses.has(state.selected);
+  // The open musician was on screen and is gone now: the first one opens, and the console says so.
+  const leaving = stays ? null : musicianByAddress(state, state.selected);
+  let departed = leaving ? { address: leaving.address, label: musicianLabel(leaving) } : state.departed;
+  if (departed && addresses.has(departed.address)) {
+    departed = null;
+  }
   return {
     ...state,
     engine: {
+      ...state.engine,
       phase,
       error: phase === "running" ? null : state.engine.error,
       status: withoutMusicians(status),
+      run: status.run,
     },
     musicians,
-    selected: addresses.has(state.selected) ? state.selected : (musicians[0]?.address ?? null),
+    selected: stays ? state.selected : (musicians[0]?.address ?? null),
+    departed,
     pending: onlyListed(state.pending, addresses),
     mixError: state.mixError && addresses.has(state.mixError.address) ? state.mixError : null,
+    // A status proves the console hears the engine.
+    connection: READY,
   };
 }
 
@@ -92,30 +171,52 @@ function setPhase(state, { phase, error }) {
   if (!PHASES.includes(phase)) {
     throw new Error(`unknown engine phase: ${phase}`);
   }
-  if (phase === "idle") {
+  if (RUN_ENDING_PHASES.has(phase)) {
+    // The engine of the current run is gone, or a start is replacing it: forget its snapshot and
+    // never take its late payloads again.
+    const { run, endedRun } = state.engine;
     return {
       ...state,
-      engine: { phase, error, status: null },
+      engine: { phase, error, status: null, run: null, endedRun: Math.max(endedRun, run ?? 0) },
       musicians: [],
+      departed: null,
       pending: NO_EDITS,
       mixError: null,
+      commandError: null,
     };
   }
-  return { ...state, engine: { ...state.engine, phase, error } };
+  return { ...state, engine: { ...state.engine, phase, error }, commandError: null };
+}
+
+// The engine refused a command but its run goes on: back to the phase the last status showed.
+function commandFailed(state, { action, message }) {
+  const { status } = state.engine;
+  let phase = "idle";
+  if (status) {
+    phase = status.stopped ? "stopped" : "running";
+  }
+  return {
+    ...state,
+    engine: { ...state.engine, phase },
+    commandError: { action, message },
+  };
 }
 
 function isListed(state, address) {
   return state.musicians.some((musician) => musician.address === address);
 }
 
-function replaceMix(state, address, mix) {
-  if (!isListed(state, address)) {
+// Takes `mix` for `address` when it is newer than the copy the console has; never goes back.
+function offerMix(state, address, mix) {
+  const known = musicianByAddress(state, address);
+  const incoming = mixFromDto(mix);
+  if (!known || !isNewer(incoming, known.mix)) {
     return state;
   }
   return {
     ...state,
     musicians: state.musicians.map((musician) =>
-      musician.address === address ? { ...musician, mix: mixFromDto(mix) } : musician,
+      musician.address === address ? { ...musician, mix: incoming } : musician,
     ),
   };
 }
@@ -143,12 +244,14 @@ function edit(state, address, edits) {
 }
 
 // Only a listed musician can have pending edits (a status drops the others), so an answer for
-// anyone else has nothing to settle.
+// anyone else has nothing to settle. The answer's mix is offered like any other copy: taken when
+// it is the newest yet (its event has not arrived), ignored when an event already brought a newer
+// one. Either way the edits it carried never leave the fader on an older value.
 function answered(state, { address, sent, mix }) {
   if (!isListed(state, address)) {
     return state;
   }
-  const next = mix ? replaceMix(state, address, mix) : state;
+  const next = mix ? offerMix(state, address, mix) : state;
   return {
     ...next,
     pending: withPending(next, address, settleEdits(next.pending[address], sent)),
@@ -175,17 +278,26 @@ export function consoleReducer(state, action) {
     case "engine":
       return setPhase(state, action);
     case "select":
-      return state.selected === action.address || !isListed(state, action.address)
+      if (!isListed(state, action.address)) {
+        return state;
+      }
+      return state.selected === action.address && state.departed === null
         ? state
-        : { ...state, selected: action.address };
+        : { ...state, selected: action.address, departed: null };
     case "mix-changed":
-      return replaceMix(state, action.address, action.mix);
+      return isLiveRun(state, action.run) ? offerMix(state, action.address, action.mix) : state;
     case "mix-edit":
       return edit(state, action.address, action.edits);
     case "mix-applied":
       return answered(state, action);
     case "mix-failed":
       return refused(state, action);
+    case "audio":
+      return { ...state, audio: audioChoice(state.audio, action.change) };
+    case "command-failed":
+      return commandFailed(state, action);
+    case "connection":
+      return { ...state, connection: action.connection };
     default:
       return state;
   }

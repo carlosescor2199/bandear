@@ -296,8 +296,89 @@ user's decision.
   T5 bundles tokens, state, mapping, bridge and fake, seven atoms, the shell, the gallery and the
   dev server; the two commits split at the tested foundation and the visual layer. Commits:
   13217be (tokens, store and bridge); this commit (atoms, shell and gallery).
-- [ ] T6 (Mix screen): top bar, musician tabs, channel strips, group strips and master strip
-  wired to `set_mix` and the events. Route: delegated writer.
+- [x] T6 (Mix screen): top bar, musician tabs, channel strips, group strips and master strip
+  wired to `set_mix` and the events, with the T5 review's R3-001, R3-002 and R3-003. Route:
+  delegated writer. Three commits:
+  - R3-001 and R3-002 (0c6da0f). Every start, even a failed one, begins a new engine run:
+    `DesktopState` counts runs under the engine lock, `start_engine`'s summary, `engine_status`,
+    `switch_device` and every pump event (meters, status, mix-changed) name the run, and the
+    pump is started with it. The store keeps the run it shows and the newest run that ended
+    (start, failed start, stop) and ignores any payload of an ended or older run (`isLiveRun`);
+    a newer run's status is taken even before the start's answer. A `set_mix` answer only
+    settles the edits it carried; the stored mix follows `status` and `mix-changed`, which come
+    in the engine's order. The fake engine counts runs the same way and can fail its starts.
+  - R3-003 (ffec1e5). The slider gestures live in `lib/slider-gesture.js` (`SliderGesture`), and
+    the element only maps DOM events onto it. It now shows a value held during a drag before the
+    drag's `change` goes out, not after, so the listener that answers has the last word.
+  - The Mix screen (this commit). `lib/console-app.js` is the window's controller: it listens
+    to the events, loads the status, starts a stopped engine with the old window's request
+    (`lib/engine-config.js`: auto driver, 256 frames, no targets, port 50001, no groups; ASIO
+    only when chosen; the choice is the store's `audio`, for T7), drives start and stop, and
+    sends edits through the coalescer (one `set_mix` in flight per musician, latest edits
+    sent). `lib/mix-view.js` works out the top bar, tabs, strips, master, empty-state notice and
+    messages. The store also records who was removed while open (`departed`). Organisms are
+    in `app/components/`: `ml-top-bar` (engine pill, device and format, "N phones need
+    attention" link to `#/network`, Start or Stop), `ml-musician-tabs` (tablist, roving focus,
+    arrows, Home/End, the link as a word and a shaped mark), `ml-channel-strip` ("CH n", group
+    chip, pan, input meter, fader, readout that says "muted", Mute, Solo), `ml-group-strip`
+    (no group mute: the engine has none) and `ml-master-strip` (output L/R meters, level, level
+    cap as a compact fader, Mute). Each takes `data` and emits `mix-edit`. The screen
+    (`app/screens/mix-screen.js`) renders at most once per animation frame, routes meters to the
+    strips, and shows notices for a stopped engine (with Start), starting, stopping, an error
+    (with Try again), no phones (with a link to Network and system), a removed musician and a
+    refused change. `console.html?fake` runs on the fake engine (six channels, two groups, four
+    musicians with good, warning, unreported and lost links, moving meters, a phone change every
+    4 s); without Tauri and without `?fake` it says so. Phase 2-5 controls are left out.
+  RED observed: Rust 37 compile errors (`run` on `EngineStatusDto`, `MetersDto`, `StartSummary`,
+  `MixChangedDto::new` and `EventPump::start` arity, `DesktopState::run`); against the old
+  reducer 6 of 24 store tests failed (late status after idle and after a failed start, old vs
+  new run, late mix change, live meters, the answer replacing a later phone change); 3 fake
+  tests failed; then `slider-gesture.js`, `engine-config.js`, `mix-view.js` and
+  `console-app.js` missing, and 3 store tests failed (who left, audio choices). GREEN:
+  `fnm exec --using=default node --test apps/desktop/ui/tests` 135 passed, 0 failed (96 after
+  the first commit, 105 after the second); `cargo test -p mixlink-desktop` 44 passed (3 new);
+  `cargo fmt -p mixlink-desktop -- --check` clean, no new clippy warnings;
+  `cargo build -p mixlink-desktop` ok after `cargo clean -p mixlink-desktop`. Browser check of
+  `console.html?fake`: no console errors; keys on a fader, Mute, tab clicks and arrows, Stop
+  (stopped notice, Start), Start (the open musician kept), routing to `#/network` and back
+  with focus on the heading; 1280, 900 and 480 px without page scroll (channels scroll
+  sideways at 900 px). The gallery still works. Not covered: the custom elements have no
+  Node tests (their logic is in the tested modules); the real app does not load
+  `console.html` until T7. About 507 + 311 + 2,035 authored changed lines (about 450 of them
+  tests in the last), over the 400-line heuristic: the screen needs its controller, view
+  model, five organisms, the screen and the demo engine together to show anything; the
+  review fixes came first as their own commits.
+  Commit: this commit.
+- [x] T6b (review R3-001 to R3-003 of T6). Route: delegated writer. Two commits:
+  - Mix revisions (08fe631, R3-001). Every stored mix has a revision: a process-wide counter
+    hands one out under the mix's writer lock on every change (phone or desk), so each change
+    is higher than the one before, none is shared, and a mix created later (a musician added
+    again) starts above every earlier one. `MixState::current` reads the mix and its revision
+    together (status and the mix join use it); the audio path keeps the lock-free `snapshot`.
+    The phone protocol is unchanged. `MixDto.revision` reaches status rows, `mix-changed` and
+    the `set_mix` answer. The store keeps, per musician, the copy with the highest revision
+    from any source and never goes back; an answer settles its edits and offers its mix. The
+    fake engine numbers its changes and can answer before it announces (`answersFirst`).
+  - Engine lifecycle (this commit, R3-002 and R3-003). Only a confirmed stop ends the run: a
+    refused stop keeps it, shows "The engine could not be stopped: ..." and reads the status
+    again ("not running" then means it did stop). A start whose status read fails keeps the new
+    run and asks again up to 3 times while the status events have not filled the view. Only
+    `engine_status`'s "the engine is not running" (`ENGINE_NOT_RUNNING`) triggers the
+    auto-start; any other failure, and a failed or partial event registration (taken down
+    again), becomes the console's connection error, shown as "The console cannot reach the
+    engine" with Try again (`reconnect`). The store has `connection` and `commandError`; the
+    fake engine can fail one call (`failNext`, before or after it takes effect).
+  RED observed: server 16 compile errors (`MixState::read`, `MixValues::revision`), desktop 1;
+  node 6 failures, then with the fake answering first the end-to-end test showed the fader at
+  40, 55, 40 (the jump back); for the lifecycle, 9 failures with `failNext` in place (a refused
+  stop ending the run, a failed status read ending a new run, a poisoned lock auto-starting,
+  a failed registration rejecting `ready`, the new notices and messages). GREEN:
+  `cargo fmt` clean; `cargo test -p personal-monitoring` 208 passed (4 new);
+  `cargo test -p mixlink-desktop` 45 passed (1 new); `cargo build -p mixlink-desktop` ok after
+  `cargo clean -p mixlink-desktop`; `fnm exec --using=default node --test apps/desktop/ui/tests`
+  152 passed (143 after the first commit); `console.html?fake` with no console errors. No new
+  clippy warnings. About 426 + 421 authored changed lines.
+  Commit: this commit.
 - [ ] T7 (Network and system, switch): musicians table and audio setup moved from the old UI;
   switch `index.html` to the new shell; delete the old `main.js` and styles; docs. Route:
   delegated writer.
@@ -356,9 +437,18 @@ user's decision.
     should only settle pending edits; `mix-changed` events (server order) carry the truth.
   - SUGGESTION R3-003: the shared slider logic (drag hold, one `change` at drag end, grab
     offset, double-click reset) has no automated tests; move it into a pure module and test it.
+- T6 0c6da0f + ffec1e5 + a31d96c: lineage `review-4f22c9c9e2296c71` over 43304a7..a31d96c
+  approved and acknowledged. Next review base: a31d96c. Its notes, all fixed by T6b:
+  - WARNING R3-001: a `set_mix` answer arriving before its `mix-changed` event left the fader
+    on the older stored mix until the event. Fixed by numbering every mix change (revisions).
+  - WARNING R3-002: a refused stop, or a failed status read after a good start, ended a run
+    that may still be live, so its events were dropped. Fixed: only a confirmed stop ends it.
+  - SUGGESTION R3-003: any `engine_status` failure auto-started, and a failed event
+    registration rejected `ready` unseen. Fixed: only "not running" starts; failures show with
+    Try again.
 - Local preview: `.claude/launch.json` (excluded through `.git/info/exclude`) runs
   `fnm exec --using=default node apps/desktop/ui/dev/serve.mjs 5199`.
 
 ## Next step
 
-T6.
+T7.

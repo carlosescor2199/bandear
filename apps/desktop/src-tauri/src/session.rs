@@ -45,6 +45,15 @@
 //!     "device": "INPUT 1/2 (Volt 4)",
 //!     "bufferFrames": 256,
 //!     "asioDriver": null
+//!   },
+//!   "local": {
+//!     "mix": {
+//!       "channels": [{ "gain": 80, "pan": 50, "muted": false, "solo": false }],
+//!       "groups": { "g3f9a0c1d2e4b5a6": 70 },
+//!       "volumePercent": 85,
+//!       "muted": false
+//!     },
+//!     "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 0 }
 //!   }
 //! }
 //! ```
@@ -99,6 +108,18 @@
 //!   choice that names ASIO without a driver is read as written, and the window treats it as no ASIO
 //!   (ASIO only ever starts on a driver the engineer picked). The section was added within version
 //!   1: an earlier build reads the file and drops it when it saves.
+//! - `local` is the engineer's local mix, the engine's own mix for this computer, and the output
+//!   it plays on (see [crate::commands::local]). `mix` holds what a saved session keeps of a
+//!   musician's mix ([SessionMix]): the level, pan, mute and solo of each input in channel order,
+//!   the group levels by group id, the master volume and the master mute, never a level cap. It is
+//!   absent until the engineer changed the local mix, and every change replaces it. `output` is the
+//!   output device by its exact name and the first output of the stereo pair, 0-based (outputs 1/2
+//!   are `0`); null for no local output, the default. Both are applied to every engine the desk
+//!   starts: the mix through the desk's path, then the output, which opens only when the running
+//!   driver offers that device (under ASIO only the capture driver's own outputs) and is otherwise
+//!   left off with a notice, never replaced by another device. Like `audio`, the section was added
+//!   within version 1 and is absent until something was kept: an earlier build reads the file and
+//!   drops it when it saves.
 //!
 //! Every save writes a temporary file next to the session, flushes it to disk and renames it over
 //! the session, so a crash or a full disk leaves the old file or the new one, never a torn one, and
@@ -158,6 +179,9 @@ pub struct Session {
     /// The audio input the desk last ran with; absent until an engine ran with a choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<SessionAudio>,
+    /// The engineer's local mix and the output it plays on; absent until either was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<SessionLocal>,
 }
 
 impl Default for Session {
@@ -169,6 +193,7 @@ impl Default for Session {
             groups: Vec::new(),
             presets: Vec::new(),
             audio: None,
+            local: None,
         }
     }
 }
@@ -239,6 +264,46 @@ pub struct SessionAudio {
 
 fn auto_host() -> String {
     "auto".to_owned()
+}
+
+/// A whole mix as the desk keeps it: a musician's in a saved session (see [crate::sessions]) and
+/// the engineer's local mix ([SessionLocal]). Each input's level, pan, mute and solo in channel
+/// order (the inputs the device had; a field left out defaults to 100, 50, false, false), the
+/// group levels by group id (so they land on the right groups whatever their order), and the
+/// master volume and master mute. Never a phone's own level cap or the engineer's controls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMix {
+    #[serde(default)]
+    pub channels: Vec<SessionPresetChannel>,
+    #[serde(default)]
+    pub groups: BTreeMap<String, u8>,
+    #[serde(default = "full_level")]
+    pub volume_percent: u8,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+/// The engineer's local mix and the output it plays on, as the desk keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLocal {
+    /// The local mix; `None` until the engineer changed it, and then the engine's default mix
+    /// plays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<SessionMix>,
+    /// The output the local mix plays on; `None` for no local output, the default.
+    #[serde(default)]
+    pub output: Option<SessionOutput>,
+}
+
+/// An output the local mix plays on: the device by its exact name, and the first output of the
+/// stereo pair, 0-based (outputs 1/2 are `0`, outputs 3/4 are `2`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOutput {
+    pub device: String,
+    #[serde(default)]
+    pub first_channel: u16,
 }
 
 /// What the desk keeps about one musician.
@@ -738,6 +803,41 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The engineer's local mix and its output as the desk keeps them, or `None` before either was
+    /// kept.
+    pub fn local(&self) -> Option<SessionLocal> {
+        self.lock().session.local.clone()
+    }
+
+    /// Keeps the engineer's local mix; the output it plays on stays as kept. The file is written
+    /// before success is reported; a save that fails, or is refused over a session this build must
+    /// not replace, changes nothing.
+    pub fn set_local_mix(&self, mix: SessionMix) -> Result<(), String> {
+        self.update_local(|local| local.mix = Some(mix))
+    }
+
+    /// Keeps the output the local mix plays on, or none; the local mix stays as kept. Saved as
+    /// [Self::set_local_mix] is.
+    pub fn set_local_output(&self, output: Option<SessionOutput>) -> Result<(), String> {
+        self.update_local(|local| local.output = output)
+    }
+
+    fn update_local(&self, change: impl FnOnce(&mut SessionLocal)) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let mut local = loaded.session.local.clone().unwrap_or_default();
+        change(&mut local);
+        let session = Session {
+            local: Some(local),
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     // The session is only replaced after a successful write, so even a poisoned lock guards a
     // session that matches the file; the desk keeps working rather than panicking.
     fn lock(&self) -> MutexGuard<'_, Loaded> {
@@ -843,12 +943,14 @@ pub(crate) fn read_session(
     let channels = take_section(&mut fields, "channels", damaged);
     let presets = take_section(&mut fields, "presets", damaged);
     let audio = take_section(&mut fields, "audio", damaged);
+    let local = take_section(&mut fields, "local", damaged);
     serde_json::from_value::<Session>(Value::Object(fields))
         .map(|session| Session {
             groups,
             channels,
             presets,
             audio,
+            local,
             ..session
         })
         .map_err(|error| format!("is not a session ({error})"))
@@ -2132,6 +2234,213 @@ mod tests {
             .set_audio(other)
             .expect_err("the write cannot happen");
         assert_eq!(session.audio(), Some(volt_on_wasapi()));
+    }
+
+    fn local_mix() -> SessionMix {
+        SessionMix {
+            channels: vec![SessionPresetChannel {
+                gain: 80,
+                pan: 50,
+                muted: false,
+                solo: true,
+            }],
+            groups: BTreeMap::from([("kit".to_owned(), 70)]),
+            volume_percent: 85,
+            muted: false,
+        }
+    }
+
+    fn volt_out(first_channel: u16) -> SessionOutput {
+        SessionOutput {
+            device: "OUTPUT 1/2 (Volt 4)".to_owned(),
+            first_channel,
+        }
+    }
+
+    #[test]
+    fn the_local_mix_and_its_output_survive_a_reload_beside_the_other_sections() {
+        let directory = test_directory("local");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("saved");
+        assert_eq!(
+            session.local(),
+            None,
+            "nothing is kept until the engineer chose"
+        );
+
+        session.set_local_mix(local_mix()).expect("saved");
+        session.set_local_output(Some(volt_out(0))).expect("saved");
+
+        let kept = SessionLocal {
+            mix: Some(local_mix()),
+            output: Some(volt_out(0)),
+        };
+        assert_eq!(session.local(), Some(kept.clone()));
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(reloaded.local(), Some(kept));
+        assert_eq!(reloaded.notice(), None);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)),
+            serde_json::json!({
+                "version": 1,
+                "musicians": { "address:192.168.1.30:50000": { "label": "Ana" } },
+                "channels": [],
+                "groups": [],
+                "presets": [],
+                "local": {
+                    "mix": {
+                        "channels": [{ "gain": 80, "pan": 50, "muted": false, "solo": true }],
+                        "groups": { "kit": 70 },
+                        "volumePercent": 85,
+                        "muted": false
+                    },
+                    "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 0 }
+                }
+            }),
+            "the same version 1 file, never a level cap: an earlier build reads it and drops the \
+             section it does not know"
+        );
+    }
+
+    #[test]
+    fn the_local_mix_and_its_output_are_kept_apart_and_no_output_is_written_as_null() {
+        let directory = test_directory("local-apart");
+        let session = SessionStore::open(&directory);
+
+        session.set_local_output(Some(volt_out(2))).expect("saved");
+        assert_eq!(
+            session.local(),
+            Some(SessionLocal {
+                mix: None,
+                output: Some(volt_out(2)),
+            }),
+            "an output kept before any mix change keeps the engine's default mix"
+        );
+        session.set_local_mix(local_mix()).expect("saved");
+        assert_eq!(
+            session.local().and_then(|local| local.output),
+            Some(volt_out(2)),
+            "a mix change keeps the output"
+        );
+
+        session.set_local_output(None).expect("saved");
+
+        assert_eq!(
+            session.local(),
+            Some(SessionLocal {
+                mix: Some(local_mix()),
+                output: None,
+            }),
+            "turning the output off keeps the mix"
+        );
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["local"]["output"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn a_damaged_local_section_is_set_aside_on_its_own_and_the_rest_is_kept() {
+        let directory = test_directory("local-damaged");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "groups":[{"id":"kit","name":"Drums","channels":[1]}],
+                "local":{"mix":{"volumePercent":"loud"},"output":null}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(session.local(), None, "the local section starts empty");
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(session.groups().len(), 1, "the readable sections are kept");
+        let aside = files_in(&directory)
+            .into_iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.local-damaged-")))
+            .expect("the damaged section is kept for recovery");
+        assert_eq!(
+            read_json(&directory.join(aside)),
+            serde_json::json!({ "mix": { "volumePercent": "loud" }, "output": null })
+        );
+        assert!(session.notice().expect("reported").contains("local"));
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)).get("local"),
+            None,
+            "the session is saved without it"
+        );
+    }
+
+    #[test]
+    fn a_local_section_may_leave_out_what_it_does_not_keep() {
+        let directory = test_directory("local-short");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"local":{"mix":{"channels":[{"gain":20}]},"output":{"device":"Speakers"}}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.local(),
+            Some(SessionLocal {
+                mix: Some(SessionMix {
+                    channels: vec![SessionPresetChannel {
+                        gain: 20,
+                        pan: 50,
+                        muted: false,
+                        solo: false,
+                    }],
+                    groups: BTreeMap::new(),
+                    volume_percent: 100,
+                    muted: false,
+                }),
+                output: Some(SessionOutput {
+                    device: "Speakers".to_owned(),
+                    first_channel: 0,
+                }),
+            })
+        );
+        assert_eq!(session.notice(), None);
+    }
+
+    #[test]
+    fn saving_the_local_mix_or_output_is_refused_over_a_newer_session_and_a_failed_save_changes_nothing(
+    ) {
+        let newer_directory = test_directory("local-newer");
+        fs::write(newer_directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let newer = SessionStore::open(&newer_directory);
+        for error in [
+            newer.set_local_mix(local_mix()).expect_err("refused"),
+            newer
+                .set_local_output(Some(volt_out(0)))
+                .expect_err("refused"),
+        ] {
+            assert!(error.contains("newer"), "{error}");
+        }
+        assert_eq!(newer.local(), None);
+
+        let directory = test_directory("local-failed-save");
+        let session = SessionStore::open(&directory);
+        session.set_local_mix(local_mix()).expect("saved");
+        fs::create_dir(directory.join(format!("{SESSION_FILE}.tmp"))).expect("blocker");
+        session
+            .set_local_output(Some(volt_out(0)))
+            .expect_err("the write cannot happen");
+        session
+            .set_local_mix(SessionMix {
+                volume_percent: 10,
+                ..local_mix()
+            })
+            .expect_err("the write cannot happen");
+        assert_eq!(
+            session.local(),
+            Some(SessionLocal {
+                mix: Some(local_mix()),
+                output: None,
+            })
+        );
     }
 
     #[test]

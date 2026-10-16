@@ -1489,7 +1489,9 @@ fn edit_groups<E: GroupEngine>(
 ///
 /// A refused list is an error and changes nothing. Each edit is one step under the engine lock,
 /// with the session's inside it, so two edits at once never leave the session and the engine with
-/// different details.
+/// different details. A kind this build does not know, which the session keeps for an input (a
+/// newer build wrote it), is kept as written while the edit leaves that input's kind as it applies,
+/// `other` (see [keep_unknown_kinds]).
 pub fn set_channels(
     state: &DesktopState,
     channels: Vec<ChannelRequest>,
@@ -1594,18 +1596,35 @@ fn channel_details(
     Ok((details, kept))
 }
 
+/// Keeps, in the details about to be saved, each kind this build does not know that `stored` (the
+/// session's details) has for that input, unless the edit gave the input another kind.
+///
+/// Such a kind (written by a newer build) applies as `other`, so the table the window edits reads it
+/// as `other` and sends it back so with any edit; saving that would rewrite every such kind on the
+/// first edit of anything. An input whose kind still reads as the stored one applies keeps the
+/// stored name; one given another kind takes it.
+fn keep_unknown_kinds(kept: &mut [SessionChannel], stored: &[SessionChannel]) {
+    for (entry, previous) in kept.iter_mut().zip(stored) {
+        let applies_as = ChannelKind::from_name(&previous.kind).unwrap_or_default();
+        if ChannelKind::from_name(&previous.kind).is_none() && entry.kind == applies_as.name() {
+            entry.kind.clone_from(&previous.kind);
+        }
+    }
+}
+
 /// [set_channels] over any engine slot and session.
 fn edit_channels<E: ChannelEngine>(
     engine: &Mutex<Option<E>>,
     session: &SessionStore,
     channels: Vec<ChannelRequest>,
 ) -> Result<ChannelsSetDto, String> {
-    let (details, kept) = channel_details(channels)?;
+    let (details, mut kept) = channel_details(channels)?;
     // One step per edit, in the lock order every command that holds both follows (see
     // [edit_groups]).
     let mut guard = engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    keep_unknown_kinds(&mut kept, &session.channels());
     let applied = match guard.as_mut() {
         // A refusal (an engine that is stopping) returns here, before anything is saved.
         Some(engine) => {
@@ -3515,6 +3534,76 @@ mod tests {
                 kept("Keys R", "keys", false, false),
                 kept("Spare", "other", true, false),
             ]
+        );
+    }
+
+    /// A kind a newer build wrote reads back as `other`, as it applies; sent back with an edit of
+    /// another entry, or of that entry's name, it is kept as written, with or without an engine.
+    /// Only choosing another kind for that entry replaces it.
+    #[test]
+    fn an_edit_keeps_a_kind_this_build_does_not_know_until_that_entry_gets_another_kind() {
+        let session = SessionStore::open(&session_directory("channel-table-unknown-kind"));
+        session
+            .set_channels(vec![
+                kept("Kick", "drums", false, false),
+                kept("Theremin", "theremin", true, false),
+            ])
+            .expect("kept");
+        let idle: Mutex<Option<StandInEngine>> = Mutex::new(None);
+        let round_trip = |engine: &Mutex<Option<StandInEngine>>,
+                          change: &dyn Fn(&mut Vec<ChannelRequest>)| {
+            let read =
+                serde_json::to_string(&read_channel_table(engine, &session).expect("readable"))
+                    .expect("serializes");
+            let mut requests: Vec<ChannelRequest> =
+                serde_json::from_str(&read).expect("the window can send back what it reads");
+            change(&mut requests);
+            edit_channels(engine, &session, requests).expect("the details are taken");
+        };
+
+        round_trip(&idle, &|requests| requests[0].name = "Kick in".to_owned());
+        assert_eq!(
+            session.channels(),
+            vec![
+                kept("Kick in", "drums", false, false),
+                kept("Theremin", "theremin", true, false),
+            ],
+            "an idle edit of another entry keeps the kind as written"
+        );
+
+        round_trip(&idle, &|requests| {
+            requests[1].name = "Theremin (spare)".to_owned()
+        });
+        assert_eq!(
+            session.channels()[1],
+            kept("Theremin (spare)", "theremin", true, false),
+            "a new name for that entry keeps its kind too"
+        );
+
+        // A running engine took the details as they apply: the unknown kind is `other` there.
+        let engine = running(StandInEngine::default());
+        edit_channels(
+            &engine,
+            &session,
+            vec![
+                detail("Kick in", "drums", false, false),
+                detail("Theremin (spare)", "other", true, false),
+            ],
+        )
+        .expect("the details are taken");
+        assert_eq!(session.channels()[1].kind, "theremin");
+        round_trip(&engine, &|requests| requests[0].hidden = true);
+        assert_eq!(
+            session.channels()[1].kind,
+            "theremin",
+            "an edit read from the running engine keeps it as well"
+        );
+
+        round_trip(&idle, &|requests| requests[1].kind = "keys".to_owned());
+        assert_eq!(
+            session.channels()[1],
+            kept("Theremin (spare)", "keys", true, false),
+            "choosing another kind for that entry replaces it"
         );
     }
 

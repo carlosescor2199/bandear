@@ -188,7 +188,7 @@ test("a mirror set with no engine is kept for the phone and in force at the next
     { applied: false, saved: true, keptFor: "phone", mix: null },
   );
   assert.deepEqual(fake.mirrors(), [
-    [`client:${BASS_PHONE}`, { leader: `address:${LEAD}`, name: "Lead vocal" }],
+    [`client:${BASS_PHONE}`, { leader: `address:${LEAD}`, name: "Lead vocal", followerAddress: BASS }],
   ]);
   assert.match(
     await refusal(fake.invoke("set_mirror", { address: "lead.local:50000", leader: null })),
@@ -196,6 +196,42 @@ test("a mirror set with no engine is kept for the phone and in force at the next
   );
   await fake.invoke("start_engine", { config: {} });
   assert.equal((await rowAt(fake, BASS)).channelGains[0], 44, "it took the leader's mix at start");
+});
+
+test("with no engine the fake checks mirrors as the desktop does: addresses by IP, phones by every key", async () => {
+  const fake = createFakeBridge();
+  const ANA_AT = "10.0.0.10:50000";
+  const RACK = "10.0.0.40:50000";
+  const PAD = "10.0.0.41:50000";
+  await fake.invoke("set_mirror", { address: RACK, leader: { address: ANA_AT, name: "Ana" } });
+
+  assert.match(
+    await refusal(fake.invoke("set_mirror", { address: "10.0.0.10:50001", leader: { address: RACK } })),
+    /circle/,
+    "another port of Ana's host is Ana, as the engine keeps one musician per IP",
+  );
+  assert.match(
+    await refusal(fake.invoke("set_mirror", { address: "10.0.0.40:50001", leader: { address: RACK } })),
+    /own mix/,
+  );
+  // Ana's phone follows Pad: kept by her phone's key, with her address beside it.
+  await fake.invoke("set_mirror", {
+    address: ANA_AT,
+    clientId: "ana-phone",
+    leader: { address: PAD, name: "Pad" },
+  });
+  assert.deepEqual(fake.mirrors().at(-1), [
+    "client:ana-phone",
+    { leader: `address:${PAD}`, name: "Pad", followerAddress: ANA_AT },
+  ]);
+
+  assert.match(
+    await refusal(fake.invoke("set_mirror", { address: PAD, leader: { address: ANA_AT } })),
+    /circle/,
+    "Pad following Ana, known here by her address only, would close the circle through her phone",
+  );
+  const kept = await fake.invoke("set_mirror", { address: "10.0.0.50:50000", leader: { address: PAD } });
+  assert.equal(kept.saved, true, "a chain that does not close is kept");
 });
 
 test("a musician address reads as the desktop reads it: an IP and a port, never a host name", () => {

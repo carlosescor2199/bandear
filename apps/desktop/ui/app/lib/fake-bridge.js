@@ -222,6 +222,38 @@ function keysOf(row) {
   return row.clientId ? [`client:${row.clientId}`, `address:${row.address}`] : [`address:${row.address}`];
 }
 
+// Whether the desk keys `one` and `other` name one musician as the desktop compares them with no
+// engine: two phones by client id, two addresses by host (the engine keeps one musician per IP);
+// a phone and an address are told apart.
+function sameMusician(one, other) {
+  const kind = (key) => key.slice(0, key.indexOf(":"));
+  const value = (key) => key.slice(key.indexOf(":") + 1);
+  if (kind(one) !== kind(other)) {
+    return false;
+  }
+  return kind(one) === "client"
+    ? value(one) === value(other)
+    : hostOf(value(one)) === hostOf(value(other));
+}
+
+// Adds to `known` every key of each of `groups` (keys naming one musician) that shares a musician
+// with it (sameMusician), until no group adds more.
+function widenKeys(known, groups) {
+  let before;
+  do {
+    before = known.length;
+    for (const group of groups) {
+      if (group.some((key) => known.some((own) => sameMusician(key, own)))) {
+        for (const key of group) {
+          if (!known.includes(key)) {
+            known.push(key);
+          }
+        }
+      }
+    }
+  } while (known.length !== before);
+}
+
 /**
  * True when `text` reads as the desktop reads a musician address (Rust's `SocketAddr`): an IPv4
  * address and a port, or a bracketed IPv6 address and a port. A host name and port is not one.
@@ -541,6 +573,37 @@ export function createFakeBridge({
     } else {
       mirrorBook.delete(key);
     }
+  }
+
+  // Whether, with no engine running, the musician known by the keys `follower` following the one
+  // known by the keys `leader` would close a circle with the kept mirrors, as the desktop decides it:
+  // at every step a musician is known by all the keys the desk has for them (the window's, and each
+  // kept mirror's key with the address kept beside a phone's key), joined when two keys name one
+  // musician (sameMusician), and the mirror kept for them is looked up by each of those keys,
+  // phones first. A chain longer than the mirrors can only go round already.
+  function closesCircleOffline(follower, leader) {
+    const kept = [...mirrorBook.entries()].map(([key, mirror]) => [
+      mirror.followerAddress ? [key, `address:${mirror.followerAddress}`] : [key],
+      mirror.leaderAddress ? [mirror.leader, `address:${mirror.leaderAddress}`] : [mirror.leader],
+    ]);
+    const groups = [follower, leader, ...kept.flat()];
+    const named = (keys) => keys.some((key) => follower.some((own) => sameMusician(key, own)));
+    let known = [...leader];
+    for (let step = 0; step <= kept.length; step += 1) {
+      widenKeys(known, groups);
+      if (named(known)) {
+        return true;
+      }
+      known.sort((one, other) => Number(one.startsWith("address:")) - Number(other.startsWith("address:")));
+      const next = known
+        .map((key) => kept.find(([follows]) => sameMusician(follows[0], key)))
+        .find(Boolean);
+      if (!next) {
+        return false;
+      }
+      known = [...next[1]];
+    }
+    return true;
   }
 
   // Whether following the kept mirrors from `leaderKey` reaches the follower (known by `keys`, and
@@ -1286,14 +1349,24 @@ export function createFakeBridge({
             throw `invalid musician address \`${leader.address}\``;
           }
           const leaderPhone = phoneOf(leader.clientId);
-          const leaderKey = leaderPhone ? `client:${leaderPhone}` : `address:${leader.address}`;
-          if (hostOf(leader.address) === hostOf(address) || keys.includes(leaderKey)) {
+          const leading = leaderPhone
+            ? [`client:${leaderPhone}`, `address:${leader.address}`]
+            : [`address:${leader.address}`];
+          // Keys are compared as the desktop compares them: phones by client id, addresses by IP.
+          if (leading.some((key) => keys.some((own) => sameMusician(key, own)))) {
             throw `${address} cannot follow their own mix`;
           }
-          if (closesCircleFrom(leaderKey, keys)) {
+          if (closesCircleOffline(keys, leading)) {
             throw circle();
           }
-          kept = { leader: leaderKey, name: named(hostOf(leader.address)) };
+          // As the desktop keeps it: a phone's key with its address beside it, so a later check
+          // with no engine knows both keys of that musician.
+          kept = {
+            leader: leading[0],
+            name: named(hostOf(leader.address)),
+            ...(leaderPhone ? { leaderAddress: leader.address } : {}),
+            ...(phone ? { followerAddress: address } : {}),
+          };
         }
         if (phone) {
           mirrorBook.delete(`address:${address}`);
@@ -1314,6 +1387,8 @@ export function createFakeBridge({
         kept = {
           leader: labelKey(leading),
           name: named(leading.clientName ?? hostOf(leading.address)),
+          ...(leading.clientId ? { leaderAddress: leading.address } : {}),
+          ...(row.clientId ? { followerAddress: row.address } : {}),
         };
       }
       // As the desktop keeps it: for the phone, dropping what was kept for its address.

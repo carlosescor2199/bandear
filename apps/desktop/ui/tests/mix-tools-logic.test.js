@@ -3,7 +3,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ARMED_FOR_MS, createMixTools, followingState } from "../app/lib/mix-tools.js";
+import {
+  ARMED_FOR_MS,
+  createMixTools,
+  followingState,
+  mixToolCommands,
+} from "../app/lib/mix-tools.js";
 import { CONFIRM_DELAY_MS } from "../app/lib/network-view.js";
 
 const LEAD = "192.168.1.3:50000";
@@ -100,6 +105,82 @@ test("the Mirror control shows a choice on its way, then the desk's mirror after
   controller.chooseMirror(KEYS);
   controller.chooseMirror("away");
   assert.equal(sent.length, 2, "the mirror it has, or a leader away, sends nothing");
+});
+
+test("a desk mirror that changes by any route replaces a choice still on its way", () => {
+  const { controller } = tools();
+  controller.setData(toolsData());
+  controller.chooseMirror(BASS);
+
+  controller.setData(toolsData());
+  assert.equal(controller.mirrorValue(), BASS, "a status that leaves the desk's mirror keeps it");
+  controller.setData(toolsData({ mirror: KEYS }));
+  assert.equal(controller.mirrorValue(), KEYS, "the desk's new mirror shows, not the old choice");
+  controller.setData(toolsData({ mirror: KEYS }));
+  assert.equal(controller.mirrorValue(), KEYS);
+});
+
+// The screen's wiring with the real tools and a stand-in console whose mirror command answers when
+// the test says so.
+function wired() {
+  const said = [];
+  const handled = [];
+  const asked = [];
+  const app = {
+    selected: LEAD,
+    store: { getState: () => ({ selected: app.selected }) },
+    setMirror: (address, leader) =>
+      new Promise((resolve, reject) => asked.push({ address, leader, resolve, reject })),
+  };
+  let commands = null;
+  const controller = createMixTools({
+    emit: (type, detail) => handled.push(commands.handle(type, detail)),
+  });
+  commands = mixToolCommands({ app, tools: controller, said: (outcome) => said.push(outcome) });
+  controller.setData(toolsData());
+  return { app, controller, commands, said, handled, asked };
+}
+
+test("the screen hands the mirror command's answer to the tools, done or refused", async () => {
+  const { controller, commands, said, handled, asked } = wired();
+  assert.ok(commands.types.includes("mirror-change"));
+
+  controller.chooseMirror(BASS);
+  assert.deepEqual(
+    asked.map(({ address, leader }) => [address, leader]),
+    [[LEAD, BASS]],
+    "the open musician's mirror is asked for",
+  );
+  assert.equal(controller.mirrorValue(), BASS);
+  asked[0].resolve({ ok: false, message: "The mirror was not changed: a circle." });
+  await handled[0];
+  assert.equal(controller.mirrorValue(), "", "the refusal reached the tools");
+
+  controller.chooseMirror(KEYS);
+  asked[1].resolve({ ok: true, message: "Lead vocal follows Keys's mix now." });
+  await handled[1];
+  assert.equal(controller.mirrorValue(), "", "the desk's mirror until its status shows Keys");
+  assert.deepEqual(
+    said.map((outcome) => outcome.ok),
+    [false, true],
+    "both answers are said above the strips",
+  );
+});
+
+test("a mirror command that fails, or finds no musician open, still frees the Mirror control", async () => {
+  const { app, controller, said, handled, asked } = wired();
+
+  controller.chooseMirror(BASS);
+  asked[0].reject(new Error("the bridge went away"));
+  await assert.rejects(handled[0], /bridge went away/);
+  assert.equal(controller.mirrorValue(), "", "no choice stays on show unanswered");
+
+  app.selected = null;
+  controller.chooseMirror(KEYS);
+  assert.equal(await handled[1], null);
+  assert.equal(asked.length, 1, "nothing is asked for without a musician open");
+  assert.equal(controller.mirrorValue(), "");
+  assert.deepEqual(said, [], "nothing to say");
 });
 
 test("ticks go with the open musician, and a musician who starts following loses theirs", () => {

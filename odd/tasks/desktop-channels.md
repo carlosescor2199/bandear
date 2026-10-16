@@ -973,6 +973,39 @@ slice. Push and PRs are the user's decision.
   - Commits: 8531b9d `fix(engine): keep mirrors in order and report the hold the ack used` (about
     190 changed lines); d5e87ac `fix(desktop): check mirror circles and addresses like the engine`
     (about 420); this commit (`fix(desktop-ui): show the mirror the desk has and test the mix tools`).
+- [x] T6a-fix2 (review fixes for T6a-fix, review `review-af815f7391283cf6`). Route: delegated
+  writer (bounded fixes in the desktop commands and session, and in the UI, one commit each).
+  - R3-offline-circle-later-steps-single-key: with no engine every step of the circle walk knows
+    the musician by all the keys the desk has for them (the window's keys for the follower and the
+    leader, and each kept mirror's pairs), joined as the engine's book compares keys (phones by
+    client id, addresses by IP), and looks the mirror up by each of them, phones first. A mirror
+    kept with a phone's key now keeps the address beside it (`leaderAddress`, `followerAddress` in
+    the session, both optional, written with and without an engine): with no engine that is the
+    only way the desk knows a phone and an address are one musician. Mirrors kept by earlier builds
+    carry no addresses and are joined only through the keys the window gives.
+  - R3-pending-mirror-cleared-only-by-unseen-answer: the screen did call `answered('mirror')` (its
+    `tool("mirror", …)` handed every answer to `<ml-mix-tools>`), but a command that failed or
+    found no musician open left the choice on show, a desk mirror changed by another route did not
+    replace it, and between the answer and the next frame the control showed the old mirror (seen
+    in the preview). The wiring moved to `mixToolCommands` (`lib/mix-tools.js`, DOM-free): every
+    command answers the tools (in a `finally`), the screen hears the outcome first and gives the
+    tools the store's data at once, and `setData` drops a choice on its way when the desk's mirror
+    changes.
+  - RED: desktop 1 of 143 failed (the keys player's mirror on Ana was saved over a three-musician
+    circle with mixed keys); the non-circle guard passed at once. UI 2 of 323 failed against the
+    screen's wiring moved unchanged into `mixToolCommands` (a desk change kept the old choice; a
+    failed command never answered the tools), the done and refused wiring tests passing at once;
+    then the console-level check of what the control shows when the answer lands, 1 of 323 failed
+    (`''`, the old mirror, instead of Keys).
+  - GREEN: `cargo test -p mixlink-desktop` 143 passed (2 new; the session's round-trip test pins
+    the two addresses); UI 323 passed (4 new); `cargo fmt` clean; clippy: no new warnings. Preview
+    (`index.html?fake#/mix`): choosing Bass, Keys and Off goes from the choice straight to the
+    desk's mirror and says it at once; save and copy still answer; no console errors.
+  - Follow-up: the fake bridge's idle circle check still compares keys as strings (not by IP, and
+    without the kept addresses).
+  - Commits: 56b82ed `fix(desktop): follow every key of each musician when checking mirror
+    circles` (about 320 changed lines); this commit (`fix(desktop-ui): clear a pending mirror
+    choice when the desk answers or changes`, about 240 plus this document).
 - [ ] T6b (presets, copy and mirror, Android): read `following` from `mix_ack` and `mix_state`
   (lenient: absent on older servers is null); while it is set say "Following <name>'s mix", show
   every channel strip's level, pan or balance, mute and solo and every group fader disabled (as
@@ -1126,6 +1159,9 @@ slice. Push and PRs are the user's decision.
   38317f1..62d8ddb (`review-bad720d5ff930d4c`) and the UI 62d8ddb..d0dcdfd
   (`review-c8654069e3cf6af8`), all approved and acknowledged; next review base d0dcdfd. Their
   findings are fixed by T6a-fix.
+- Review `review-af815f7391283cf6` over d0dcdfd..97dcc8e (T6a-fix) approved and acknowledged; next
+  review base 97dcc8e. Both WARNINGs (R3-offline-circle-later-steps-single-key,
+  R3-pending-mirror-cleared-only-by-unseen-answer) are fixed by T6a-fix2.
 
 ## Next step
 

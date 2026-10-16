@@ -5,6 +5,8 @@ import { createConsoleApp } from "../app/lib/console-app.js";
 import { musicianByAddress } from "../app/lib/console-state.js";
 import { createFakeBridge, isSocketAddress, sampleStatus } from "../app/lib/fake-bridge.js";
 import { channelStrips, groupStrips } from "../app/lib/mix-view.js";
+import { createMixTools, mixToolCommands } from "../app/lib/mix-tools.js";
+import { mixToolsView } from "../app/lib/mixes.js";
 
 const [LEAD, BASS, KEYS, DRUMS] = sampleStatus().musicians.map((musician) => musician.address);
 const BASS_PHONE = sampleStatus().musicians[1].clientId;
@@ -244,6 +246,56 @@ test("the Mix tools answer in words, and a follower's strips say whose mix they 
     message: 'Deleted the preset "Chorus".',
   });
   assert.deepEqual(app.store.getState().presets, []);
+  app.dispose();
+});
+
+test("the Mix screen's wiring hands the console's mirror answers to the tools, done or refused", async () => {
+  const fake = createFakeBridge({ running: true });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  app.select(LEAD);
+  const said = [];
+  const handled = [];
+  let commands = null;
+  const tools = createMixTools({
+    emit: (type, detail) => handled.push(commands.handle(type, detail)),
+  });
+  const show = () => tools.setData({ ...mixToolsView(app.store.getState(), LEAD), address: LEAD });
+  // What the Mirror control shows the moment each answer reaches the tools.
+  const shownOnAnswer = [];
+  const answered = tools.answered;
+  tools.answered = (kind, ok) => {
+    const cleared = answered(kind, ok);
+    shownOnAnswer.push(tools.mirrorValue());
+    return cleared;
+  };
+  // As the screen does: the outcome is said, and the tools take the store's data at once.
+  commands = mixToolCommands({
+    app,
+    tools,
+    said(outcome) {
+      said.push(outcome);
+      show();
+    },
+  });
+
+  show();
+  tools.chooseMirror(KEYS);
+  assert.equal((await handled[0]).ok, true);
+  assert.deepEqual(shownOnAnswer, [KEYS], "the new mirror at once, never the old one in between");
+
+  // Bass starts following Lead by another route while the tools still offer Bass to Lead.
+  await fake.invoke("set_mirror", { address: BASS, leader: { address: LEAD, name: "Lead" } });
+  tools.chooseMirror(BASS);
+  assert.equal(tools.mirrorValue(), BASS, "on its way");
+  const refused = await handled[1];
+  assert.equal(refused.ok, false);
+  assert.match(refused.message, /circle/);
+  assert.equal(tools.mirrorValue(), KEYS, "the refusal reached the tools: the desk's mirror shows");
+  assert.deepEqual(
+    said.map((outcome) => outcome.ok),
+    [true, false],
+  );
   app.dispose();
 });
 

@@ -2,6 +2,7 @@
 // browser: which panel is open and where the focus goes when it closes, which musicians are ticked,
 // what the Mirror control shows, when a request may go out, and the guarded delete with its timers.
 // The element only renders what this answers and forwards the engineer's actions to it. No DOM.
+// The Mix screen runs the tools' commands and hands every answer back through mixToolCommands.
 //
 // It also words a strip's mirror (followingState), which <ml-channel-strip> and <ml-group-strip>
 // show.
@@ -40,7 +41,8 @@ export function createMixTools({
   let open = null;
   const copyTicks = new Set();
   let applyTicks = null;
-  // The Mirror choice sent and not answered yet; the desk's own value shows once it is.
+  // The Mirror choice sent and not answered yet; the desk's own value shows once it is answered or
+  // the desk's mirror changes.
   let pendingMirror = null;
   let armed = null;
   let timers = [];
@@ -77,6 +79,9 @@ export function createMixTools({
         applyTicks = null;
         pendingMirror = null;
         disarm();
+      } else if (data.mirror?.value !== next.mirror?.value) {
+        // The desk's mirror changed (the answer's status, or any other route): it shows now.
+        pendingMirror = null;
       }
       data = next;
       for (const target of [...data.copyTargets, ...data.presetTargets]) {
@@ -98,7 +103,10 @@ export function createMixTools({
       }
     },
 
-    /** The value the Mirror control shows: a choice on its way, else the desk's own. */
+    /**
+     * The value the Mirror control shows: a choice on its way while it is still offered and the
+     * desk's mirror has not changed since, else the desk's own.
+     */
     mirrorValue() {
       const offered = data?.mirror.options.some((option) => option.value === pendingMirror);
       return pendingMirror !== null && offered ? pendingMirror : (data?.mirror.value ?? "");
@@ -238,5 +246,45 @@ export function createMixTools({
 
     /** Stops the timers, when the element leaves the page. */
     dispose: disarm,
+  };
+}
+
+/**
+ * The Mix screen's side of the tools: `handle(type, detail)` runs the console `app`'s command for
+ * one of <ml-mix-tools>' events (`types`) on the open musician's mix, then hands its answer `{ ok,
+ * message }` to `said(outcome)`, which says it above the strips and gives the tools the store's
+ * data at once, and then to `tools.answered(kind, ok)`, so the Mirror control goes from the choice
+ * on its way straight to the desk's mirror the answer brought. The tools are answered every time:
+ * a command that fails (its error goes on to the caller) or finds no musician open is answered as
+ * not done.
+ */
+export function mixToolCommands({ app, tools, said }) {
+  const commands = {
+    "mirror-change": ["mirror", (address, detail) => app.setMirror(address, detail.leader)],
+    "mix-copy": ["copy", (address, detail) => app.copyMix(address, detail.to)],
+    "preset-save": ["save", (address, detail) => app.savePreset(address, detail.name)],
+    "preset-apply": ["apply", (_, detail) => app.applyPreset(detail.id, detail.to)],
+    "preset-rename": ["rename", (_, detail) => app.renamePreset(detail.id, detail.name)],
+    "preset-delete": ["delete", (_, detail) => app.deletePreset(detail.id)],
+  };
+  return {
+    types: Object.keys(commands),
+    async handle(type, detail) {
+      const [kind, run] = commands[type];
+      const address = app.store.getState().selected;
+      let outcome = null;
+      try {
+        // The tools act on the open musician's mix: with none open nothing is run.
+        outcome = address ? await run(address, detail) : null;
+      } finally {
+        // The screen first, so the tools already hold the status the answer brought, then the
+        // tools whatever happened, so a Mirror choice never stays on show unanswered.
+        if (outcome) {
+          said(outcome);
+        }
+        tools.answered(kind, outcome?.ok === true);
+      }
+      return outcome;
+    },
   };
 }

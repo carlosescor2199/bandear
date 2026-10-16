@@ -6,9 +6,10 @@
 //   { address, name, mirror: { value, options, note }, copyTargets, presetTargets, presets,
 //   canUse }.
 // Method: `answered(kind, ok)` after the screen's command for `kind` ("mirror", "save", "rename",
-//   "copy", "apply", "delete") was answered: a done save or rename empties its field, a done copy
-//   unticks its musicians, and the Mirror control shows the desk's mirror again whatever the
-//   answer (a refused choice never stays on show).
+//   "copy", "apply", "delete") was answered (the screen answers every command, see
+//   mixToolCommands): a done save or rename empties its field, a done copy unticks its musicians,
+//   and the Mirror control shows the desk's mirror again whatever the answer (a refused choice
+//   never stays on show), as it does as soon as new data changes the desk's mirror.
 // Events (bubbling, composed): `mirror-change` { leader } (an address, or null for none),
 //   `mix-copy` { to }, `preset-save` { name }, `preset-apply` { id, to }, `preset-rename` { id,
 //   name }, `preset-delete` { id } once a deletion is confirmed, `presets-load` {} to read the

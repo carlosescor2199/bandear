@@ -345,12 +345,14 @@ private fun chooseMusicianChannel(state: MonitorUiState, channel: Int?): Monitor
  * The mix with a saved [snapshot] applied, as if every control had been moved by hand. What the
  * server announced (the channel count and the groups) is kept; the strips take the saved mix's size
  * until the server announces again, as the old screen did. A channel the engineer locked keeps the
- * level, pan, mute and solo it has, as a moved control on it would.
+ * level, pan, mute and solo it has, as a moved control on it would; a pair is locked as one strip
+ * ([MixUiState.lockedSides]), so neither side takes the saved values when either is locked.
  */
 private fun MixUiState.recalled(snapshot: MixSnapshot): MixUiState {
     val count = snapshot.channelGains.size
+    val locked = lockedSides
     fun <T> kept(index: Int, current: List<T>, saved: () -> T): T =
-        if (engineer.isLocked(index) && index in current.indices) current[index] else saved()
+        if (index in locked && index in current.indices) current[index] else saved()
     return copy(
         levels = List(count) { kept(it, levels) { snapshot.channelGains[it] } },
         pans = List(count) { kept(it, pans) { snapshot.channelPans.getOrElse(it) { defaultPan(it) } } },
@@ -431,12 +433,13 @@ private fun IntArray.percentAt(index: Int): Int? = getOrNull(index)?.coerceIn(PE
 
 /**
  * The mix as the phone sends it: with More of me on, its channel lifted (both sides of a stereo
- * pair) and the others lowered, except the channels the engineer locked, which stay as they are.
+ * pair) and the others lowered, except the channels the engineer locked, which stay as they are (a
+ * pair whole when either side is locked, as the channel sends it).
  */
 private fun MixUiState.asPlayed(moreOfMe: MoreOfMeUiState): MixUiState {
     if (!moreOfMe.enabled) return this
     val channel = moreOfMe.musicianChannel ?: return this
-    val lifted = toSnapshot().moreOfMeFor(stripSides(channel), engineer.lockedChannels) ?: return this
+    val lifted = toSnapshot().moreOfMeFor(stripSides(channel), lockedSides) ?: return this
     return copy(levels = lifted.channelGains.toList())
 }
 

@@ -855,6 +855,41 @@ class MonitorReducerTest {
         assertEquals(listOf(true, false, true), recalled.solos)
     }
 
+    /** A keys pair on channels 0 and 1 and a voice on channel 2. */
+    private val keysPair = listOf(ChannelInfo("Keys", ChannelKind.KEYS, link = true), ChannelInfo(), ChannelInfo("Vox"))
+
+    @Test
+    fun recallKeepsAPairWholeWhenOnlyOneSideIsLocked() {
+        val state = lockedBy(engineer(locked = setOf(1)), keysPair)
+        val saved = MixSnapshot(
+            channelGains = intArrayOf(10, 20, 30),
+            channelPans = intArrayOf(50, 50, 50),
+            channelMutes = booleanArrayOf(true, true, true),
+            channelSolos = booleanArrayOf(true, true, true),
+        )
+
+        val recalled = state.after(MixRecalled("Verse", saved)).mix
+
+        // The pair is locked as one strip: neither side takes the saved values, so they stay equal.
+        assertEquals(listOf(100, 100, 30), recalled.levels)
+        assertEquals(listOf(0, 100, 50), recalled.pans)
+        assertEquals(listOf(false, false, true), recalled.mutes)
+        assertEquals(listOf(false, false, true), recalled.solos)
+        assertEquals(setOf(0, 1), recalled.lockedSides)
+    }
+
+    @Test
+    fun moreOfMeLeavesAPairWholeWhenOnlyOneSideIsLocked() {
+        val on = lockedBy(engineer(locked = setOf(1)), keysPair).after(MusicianChannelChosen(2), MoreOfMeToggled(true))
+        val played = on.mix.toSnapshot().moreOfMeFor(on.moreOfMeChannels, on.mix.lockedSides)!!
+
+        assertTrue(on.moreOfMe.enabled)
+        // Neither side of the locked pair is lowered; the voice is lifted.
+        assertEquals(listOf(100, 100, 100), played.channelGains.toList())
+        // The server keeps the pair as it was; hearing that back keeps More of me on.
+        assertEquals(on, on.after(MixPushed(played, on.mix.engineer)))
+    }
+
     @Test
     fun moreOfMeNeitherLiftsNorLowersALockedChannel() {
         val on = lockedBy(engineer(locked = setOf(2))).after(ChannelLevelChanged(0, 80), MusicianChannelChosen(1), MoreOfMeToggled(true))

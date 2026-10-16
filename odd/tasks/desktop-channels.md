@@ -706,6 +706,25 @@ slice. Push and PRs are the user's decision.
     the second plus this document.
   - Commits: 2c01a83 `feat(android): read the engineer's limit and locks`; this commit
     (`feat(android): show locked channels and the engineer's limit`).
+- [x] T5b-fix (review fixes for T5b, review `review-34d9af3b149c510c`). Route: inline writer of the
+  delegated T5b worker (bounded fixes in three UI-state files and their tests).
+  - R3-recall-and-lift-split-half-locked-pair: `MixUiState.lockedSides` applies the strip rule
+    (each locked channel, and both sides of a pair when either side is locked), and recall, the More
+    of me lift and lower (the channel's `lockedChannels` now reads it) and the reducer's echo check
+    all use it, as edits already did through `stripLocked`, so a half-locked pair is never split.
+  - R3-limit-only-push-playback-unproved: the report path already republished the receive thread's
+    ceiling because the engineer's controls are part of `mix`, which `serverMixReported` compares;
+    the rule is now documented there and tested: a `mix_state` that only sets the limit to 60, then a
+    `mix_ack` that only lowers it to 45, move `maxLevelPercent` with no master edit.
+  - RED: 3 of 430 failed against the per-channel rule (`recallKeepsAPairWholeWhenOnlyOneSideIsLocked`:
+    the open side took the saved values; `moreOfMeLeavesAPairWholeWhenOnlyOneSideIsLocked`: the open
+    side was lowered and the echo turned More of me off; the ViewModel's half-locked send was
+    `[50, 100, 100]`). The limit-only test passed against the T5b code (characterisation); a mutant
+    that ignores the engineer's controls when deciding to republish fails it.
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 430 tests, 0 failures, 0 errors
+    (426 before: 4 new); no compiler warnings.
+  - Commit: this commit (`fix(android): treat a half-locked pair as locked and follow a new limit
+    at once`).
 - [x] T5c (the audio input the engineer chose is reopened and remembered; bug from the live test
   on 2026-10-15): the engineer switched the input live under WASAPI to "INPUT 1/2 (Volt 4)" and a
   later Start reopened the Windows default ("Varios micrófonos (Realtek)"). The live switch
@@ -906,6 +925,9 @@ slice. Push and PRs are the user's decision.
   the locked fader, the registration `mix_state`, the Locked tag and the limit line on the 390 dp
   Master card); with the musician's channel locked More of me stays off and the levels it lowered
   stay as the server plays them until the musician moves them back (as after a desktop change).
+- Review `review-34d9af3b149c510c` over c248e3b..71b9aff (T5b) approved and acknowledged; both
+  WARNINGs (R3-recall-and-lift-split-half-locked-pair, R3-limit-only-push-playback-unproved) are
+  fixed by T5b-fix.
 
 - T5c done (the audio input reopened and remembered); see its entry for evidence and follow-ups.
 - Review `review-a8a8d8e4b1bf18da` over 71b9aff..d379367 (T5c) approved and acknowledged; next

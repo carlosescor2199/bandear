@@ -523,6 +523,41 @@ class MonitorViewModelTest {
     }
 
     @Test
+    fun aLimitOnlyReportMovesThePhonesOwnCeilingWithNoMasterEdit() {
+        connected(channels = 3)
+        answerMixes()
+        assertEquals(100, receiver.mixState.maxLevelPercent)
+
+        socket().receive(engineerState(60))
+
+        assertEquals(60, receiver.mixState.maxLevelPercent)
+
+        // An answer that only lowers the limit moves it too; the change it answers kept the cap.
+        viewModel.setChannelLevel(0, 40)
+        val answer = socket().sentOfType("mix").last()
+            .put("type", "mix_ack")
+            .put("engineer_limit_percent", 45)
+            .put("locked", JSONArray(List(32) { false }))
+        socket().receive(answer.toString())
+
+        assertEquals(45, receiver.mixState.maxLevelPercent)
+        assertEquals(100, state.mix.levelCap)
+    }
+
+    @Test
+    fun moreOfMeLeavesBothSidesOfAHalfLockedPairInWhatItSends() {
+        connected(channels = 3)
+        announcePair()
+        answerMixes()
+        socket().receive(engineerState(100, 1))
+
+        viewModel.setMusicianChannel(2)
+        viewModel.setMoreOfMe(true)
+
+        assertEquals(listOf(100, 100, 100), lastMix().ints("channels"))
+    }
+
+    @Test
     fun masterChangesReachTheAudioThreadAndTheServer() {
         connected()
 

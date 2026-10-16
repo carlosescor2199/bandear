@@ -149,6 +149,14 @@ data class MixUiState(
     /** True when the engineer locked [channel]'s strip: a pair is locked when either side is. */
     fun stripLocked(channel: Int): Boolean = stripSides(channel).any(engineer::isLocked)
 
+    /**
+     * Every channel the phone must leave as it is, by the strip rule: each channel the engineer
+     * locked, and both sides of a pair when either side is, so a pair is never split by an edit, a
+     * recalled mix or More of me. The server keeps a pair's sides equal and locks them together.
+     */
+    val lockedSides: Set<Int>
+        get() = engineer.lockedChannels + layout.filter { strip -> strip.sides.any(engineer::isLocked) }.flatMap { it.sides }
+
     /** Which channels each strip controls, left to right. */
     val layout: List<StripChannels>
         get() = stripLayout(levels.size, channelDetails)

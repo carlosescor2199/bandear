@@ -14,6 +14,7 @@ import {
 } from "./channels.js";
 import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
+import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
 import { clampLevel } from "./values.js";
 
 const DEFAULT_PORT = 50000;
@@ -183,6 +184,7 @@ function musicianRow(address, identity, link, mixChanges = {}) {
     packetsSent: 0,
     packetsDiscarded: 0,
     ...link,
+    mirror: null,
   };
 }
 
@@ -190,6 +192,29 @@ function musicianRow(address, identity, link, mixChanges = {}) {
 // phone's client id when it has one, so the label follows it to any IP, else the address.
 function labelKey(row) {
   return row.clientId ? `client:${row.clientId}` : `address:${row.address}`;
+}
+
+// The keys a musician is known by, the strongest first: their phone's, then their address's.
+function keysOf(row) {
+  return row.clientId ? [`client:${row.clientId}`, `address:${row.address}`] : [`address:${row.address}`];
+}
+
+/**
+ * True when `text` reads as the desktop reads a musician address (Rust's `SocketAddr`): an IPv4
+ * address and a port, or a bracketed IPv6 address and a port. A host name and port is not one.
+ */
+export function isSocketAddress(text) {
+  const value = String(text ?? "");
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}):(\d{1,5})$/.exec(value);
+  if (v4) {
+    const octets = v4.slice(1, 5);
+    return (
+      octets.every((octet) => Number(octet) <= 255 && !/^0\d/.test(octet)) &&
+      Number(v4[5]) <= 65535
+    );
+  }
+  const v6 = /^\[([0-9a-fA-F:.]+)(%[^\]]+)?\]:(\d{1,5})$/.exec(value);
+  return Boolean(v6) && v6[1].includes(":") && Number(v6[3]) <= 65535;
 }
 
 /**
@@ -371,14 +396,24 @@ function withPort(address) {
  * interface left unplugged. The audio input is kept as the desktop's session keeps it:
  * `audio_settings` reads it (null before any; `savedAudio` seeds it, as a session kept before) and
  * `set_audio_settings` keeps it only while an engine runs, refusing an unknown driver and ASIO
- * without a picked driver. Besides `invoke` and `listen` it offers
+ * without a picked driver. Presets, copies and mirrors too, with the engine's rules (see mixes.js):
+ * `save_preset` keeps a running musician's mix as a new preset (each input and the group levels by
+ * id), `rename_preset` and `delete_preset` work with or without an engine, `apply_preset` and
+ * `copy_mix` change the named mixes (never a master, cap or the engineer's controls) and refuse a
+ * musician whose mix follows another's; `set_mirror` makes a follower take their leader's mix at
+ * once and on every later change (from the desk, a phone, a preset or a copy, and on to whoever
+ * follows them), holds the follower's phone off its channels and groups, refuses a circle, keeps it
+ * like the engineer's controls (by phone, else address; idle edits for the next start) and every
+ * start puts the kept mirrors in force; every status row says whom it follows (`mirror`). Besides
+ * `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
  * (timers until the returned stop function is called), `holdAnswers(command)` and
  * `releaseAnswers()` (answers that arrive late), `failNext(command, message)` (one failed call),
  * `failStart(message)`, `engineerKeys()` (the keys the engineer's controls are kept under),
- * `savedAudio()` (the audio input kept) and `calls`, every `{ command, args }` invoked.
+ * `mirrors()` (the mirrors kept), `savedAudio()` (the audio input kept) and `calls`, every `{
+ * command, args }` invoked. `presets` seeds the presets the session keeps.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -388,6 +423,7 @@ export function createFakeBridge({
   answersFirst = false,
   statusOnStart = true,
   savedAudio = null,
+  presets = [],
 } = {}) {
   const engine = clone(status);
   const listeners = new Map();
@@ -421,6 +457,169 @@ export function createFakeBridge({
   // The audio input as the desk's session keeps it, `{ host, device, bufferFrames, asioDriver }`,
   // or null before any was kept.
   let keptAudio = savedAudio ? clone(savedAudio) : null;
+  // The engineer's mix presets as the desk's session keeps them, in the order they were saved.
+  let keptPresets = clone(presets);
+  let lastPresetId = 0;
+  // The mirrors as the desk's session keeps them, `{ leader, name }` by the follower's labelKey
+  // (the leader by theirs): every start and `set_mirror` put them in force.
+  const mirrorBook = new Map();
+
+  // A rule of mixes.js or mix.js broken, as the desk refuses it: the error text, not an Error.
+  function checked(rule) {
+    try {
+      return rule();
+    } catch (error) {
+      throw error.message;
+    }
+  }
+
+  // The row a desk key names: a phone by its client id, an address by its host.
+  function rowForKey(key) {
+    if (key.startsWith("client:")) {
+      const id = key.slice("client:".length);
+      return engine.musicians.find((row) => row.clientId === id) ?? null;
+    }
+    const host = hostOf(key.slice("address:".length));
+    return engine.musicians.find((row) => hostOf(row.address) === host) ?? null;
+  }
+
+  // The mirror kept for `row`'s musician: for their phone first, then for their address.
+  function keptMirror(row) {
+    for (const key of keysOf(row)) {
+      if (mirrorBook.has(key)) {
+        return mirrorBook.get(key);
+      }
+    }
+    return null;
+  }
+
+  // Keeps `mirror` under `key`, or drops what is kept there with null.
+  function keepMirror(key, mirror) {
+    if (mirror) {
+      mirrorBook.set(key, mirror);
+    } else {
+      mirrorBook.delete(key);
+    }
+  }
+
+  // Whether following the kept mirrors from `leaderKey` reaches the follower (known by `keys`, and
+  // by `row` when they are here): then following that leader would close a circle.
+  function closesCircleFrom(leaderKey, keys, row = null) {
+    let key = leaderKey;
+    for (let step = 0; step <= mirrorBook.size; step += 1) {
+      const here = rowForKey(key);
+      if (keys.includes(key) || (row && here === row)) {
+        return true;
+      }
+      const kept = here ? keptMirror(here) : (mirrorBook.get(key) ?? null);
+      if (!kept) {
+        return false;
+      }
+      key = kept.leader;
+    }
+    return true;
+  }
+
+  // Every row's `mirror` as the status shows it: whom it follows, and where the leader is now.
+  function showMirrors() {
+    for (const row of engine.musicians) {
+      const kept = keptMirror(row);
+      const leader = kept ? rowForKey(kept.leader) : null;
+      row.mirror = kept
+        ? {
+            leader: kept.leader,
+            leaderAddress: leader && leader !== row ? leader.address : null,
+            name: kept.name,
+          }
+        : null;
+    }
+  }
+
+  // The status as the desktop answers it, every row saying whom it follows.
+  function statusNow() {
+    showMirrors();
+    return clone(engine);
+  }
+
+  // As the engine does: `row`'s mix takes `leader`'s channels and group levels under a new
+  // revision when they differ; its master, cap and the engineer's controls stay. Returns whether
+  // it changed.
+  function takeMix(row, leader) {
+    const mix = mixFromDto(row);
+    const led = mixFromDto(leader);
+    if (sameShared(mix, led)) {
+      return false;
+    }
+    revision += 1;
+    Object.assign(row, withShared(mix, led), { revision });
+    return true;
+  }
+
+  // As the engine does after any change of `leader`'s mix: every musician who follows it takes it,
+  // and those who follow them in turn, each mix that moved announced.
+  function propagate(leader) {
+    const queue = [leader];
+    const seen = new Set(queue);
+    while (queue.length > 0) {
+      const current = queue.shift();
+      for (const row of engine.musicians) {
+        const kept = keptMirror(row);
+        if (seen.has(row) || !kept || rowForKey(kept.leader) !== current) {
+          continue;
+        }
+        seen.add(row);
+        if (takeMix(row, current)) {
+          announceMix(row.address, "desktop", mixFromDto(row));
+        }
+        queue.push(row);
+      }
+    }
+  }
+
+  // As every start does: each musician on a kept mirror takes their leader's mix when the leader is
+  // here, a follower of a follower after the one they follow.
+  function giveKeptMirrors() {
+    showMirrors();
+    for (let pass = 0; pass < engine.musicians.length; pass += 1) {
+      let moved = false;
+      for (const row of engine.musicians) {
+        const leader = row.mirror?.leaderAddress ? musicianAt(row.mirror.leaderAddress) : null;
+        moved = (leader !== null && takeMix(row, leader)) || moved;
+      }
+      if (!moved) {
+        return;
+      }
+    }
+  }
+
+  // The rows a desk change names, each once, as the engine finds them: an unknown musician, or one
+  // whose mix follows another's, refuses the whole change.
+  function deskTargets(addresses) {
+    const rows = [];
+    for (const address of addresses ?? []) {
+      const row = musicianAt(address);
+      const kept = keptMirror(row);
+      if (kept) {
+        throw `${address} follows ${kept.name}'s mix: stop that mirror before changing their mix`;
+      }
+      if (!rows.includes(row)) {
+        rows.push(row);
+      }
+    }
+    return rows;
+  }
+
+  function presetAt(id) {
+    const preset = keptPresets.find((kept) => kept.id === id);
+    if (!preset) {
+      throw `there is no preset with the id \`${id}\``;
+    }
+    return preset;
+  }
+
+  function presetsAnswer(preset) {
+    return { preset: preset ? clone(preset) : null, presets: clone(keptPresets) };
+  }
 
   // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
   // and names are trimmed.
@@ -556,13 +755,16 @@ export function createFakeBridge({
   }
 
   // Merges `update` into `row`'s mix as the engine does; a phone's change leaves every channel the
-  // engineer locked as it was.
+  // engineer locked as it was, and while the mix follows another's every channel and group level.
   function mergeInto(row, update, { fromPhone = false } = {}) {
     let merged;
     try {
       const before = mixFromDto(row);
       const applied = mergeMixUpdate(before, update ?? {});
-      const allowed = fromPhone ? keepLocked(before, applied) : applied;
+      let allowed = fromPhone ? keepLocked(before, applied) : applied;
+      if (fromPhone && keptMirror(row)) {
+        allowed = withShared(allowed, before);
+      }
       merged = keepPairsEqual(before, allowed, runningChannels);
     } catch (error) {
       throw error.message;
@@ -576,7 +778,7 @@ export function createFakeBridge({
   const commands = {
     engine_status() {
       // As the desktop answers: no engine running is an answer, not an error.
-      return isRunning ? { state: "running", ...clone(engine) } : { state: "notRunning", run };
+      return isRunning ? { state: "running", ...statusNow() } : { state: "notRunning", run };
     },
     start_engine({ config } = {}) {
       // As in the desktop, a start ends the previous engine and takes a run even when it fails.
@@ -613,11 +815,12 @@ export function createFakeBridge({
       showGroups(runningGroups);
       linkMixes([]);
       giveKeptControls();
+      giveKeptMirrors();
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
       if (statusOnStart) {
-        emit("status", clone(engine));
+        emit("status", statusNow());
       }
       return summary();
     },
@@ -671,9 +874,11 @@ export function createFakeBridge({
         throw `a musician at ${host} is already listed`;
       }
       const row = musicianRow(resolved, {}, NOT_CONNECTED);
-      // A label the desk kept for this address before shows again, as in the desktop.
+      // A label the desk kept for this address before shows again, as in the desktop, and a mirror
+      // kept for it is in force at once.
       showLabel(row);
       engine.musicians.push(row);
+      giveKeptMirrors();
       return resolved;
     },
     remove_target({ address }) {
@@ -698,13 +903,16 @@ export function createFakeBridge({
     },
     set_mix({ address, mix }) {
       requireRunning();
-      const merged = mergeInto(musicianAt(address), mix);
+      const row = musicianAt(address);
+      const merged = mergeInto(row, mix);
       if (answersFirst) {
         // The answer settles at once; the event follows in a later task.
         setTimeout(() => announceMix(address, "desktop", merged), 0);
       } else {
         announceMix(address, "desktop", merged);
       }
+      // As the engine does: everyone who follows this mix takes it at once.
+      propagate(row);
       return clone(merged);
     },
     set_groups({ groups } = {}) {
@@ -723,7 +931,7 @@ export function createFakeBridge({
         }
         const after = engine.groups.map((group) => group.id);
         // As the desktop does: the new groups go out first, then every mix whose levels moved.
-        emit("status", clone(engine));
+        emit("status", statusNow());
         const moved =
           before.length !== after.length || before.some((id, index) => id !== after[index]);
         if (moved) {
@@ -754,7 +962,7 @@ export function createFakeBridge({
         // As the desktop does: the new details go out first, then every mix a new pair moved. The
         // same details, or a change only to inputs the device lacks, announce no status.
         if (JSON.stringify(engine.channels) !== shown) {
-          emit("status", clone(engine));
+          emit("status", statusNow());
         }
         for (const row of linkMixes(previous)) {
           announceMix(row.address, "desktop", mixFromDto(row));
@@ -785,13 +993,15 @@ export function createFakeBridge({
         }
       };
       if (!isRunning) {
-        // As the desktop does with no engine: the address must be a musician's, and the controls
-        // are merged into those kept for the musician and kept under the strongest key the window
-        // gave, the phone's (dropping the address's) else the address, for the next start.
-        if (!/:\d+$/.test(String(address ?? ""))) {
+        // As the desktop does with no engine: the address must read as a musician's (an IP and a
+        // port, never a host name), an empty client id names no phone, and the controls are merged
+        // into those kept for the musician and kept under the strongest key the window gave, the
+        // phone's (dropping the address's) else the address, for the next start.
+        if (!isSocketAddress(address)) {
           throw `invalid musician address \`${address}\``;
         }
-        const phoneKey = clientId ? `client:${clientId}` : null;
+        const phone = typeof clientId === "string" && clientId.trim() ? clientId : null;
+        const phoneKey = phone ? `client:${phone}` : null;
         const addressKey = `address:${address}`;
         const kept = merge(
           (phoneKey && engineerBook.get(phoneKey)) ?? engineerBook.get(addressKey) ?? defaultMix(),
@@ -824,12 +1034,156 @@ export function createFakeBridge({
       announceMix(address, "desktop", mix);
       return outcome(kept, row.clientId ? "phone" : "address", true, clone(mix));
     },
+    presets() {
+      return clone(keptPresets);
+    },
+    save_preset({ address, name } = {}) {
+      // As the desktop does: from a mix the engine plays, under a new name and a new id.
+      if (!isRunning) {
+        throw "the engine is not running: a preset is saved from a mix the engine plays";
+      }
+      const kept = checked(() => checkPresetName(name, keptPresets));
+      const row = musicianAt(address);
+      lastPresetId += 1;
+      const preset = { id: `p${lastPresetId}`, name: kept, mix: presetOf(mixFromDto(row), engine) };
+      keptPresets = [...keptPresets, preset];
+      return presetsAnswer(preset);
+    },
+    rename_preset({ id, name } = {}) {
+      const preset = presetAt(id);
+      const kept = checked(() => checkPresetName(name, keptPresets, id));
+      keptPresets = keptPresets.map((other) => (other === preset ? { ...other, name: kept } : other));
+      return presetsAnswer(keptPresets.find((other) => other.id === id));
+    },
+    delete_preset({ id } = {}) {
+      const preset = presetAt(id);
+      keptPresets = keptPresets.filter((other) => other !== preset);
+      return presetsAnswer(null);
+    },
+    apply_preset({ id, musicians = [] } = {}) {
+      if (!isRunning) {
+        throw "the engine is not running: a preset is put on mixes the engine plays";
+      }
+      const preset = presetAt(id);
+      const rows = deskTargets(musicians);
+      const mixes = rows.map((row) => {
+        revision += 1;
+        Object.assign(row, withPreset(mixFromDto(row), preset.mix, engine.groups, runningChannels), {
+          revision,
+        });
+        announceMix(row.address, "desktop", mixFromDto(row));
+        propagate(row);
+        return { address: row.address, mix: clone(mixFromDto(row)) };
+      });
+      return { mixes };
+    },
+    copy_mix({ from, to = [] } = {}) {
+      if (!isRunning) {
+        throw "the engine is not running: a mix is copied between mixes the engine plays";
+      }
+      const source = musicianAt(from);
+      const rows = deskTargets(to);
+      if (rows.includes(source)) {
+        throw `${from}'s mix cannot be copied onto itself`;
+      }
+      const mixes = rows.map((row) => {
+        if (takeMix(row, source)) {
+          announceMix(row.address, "desktop", mixFromDto(row));
+          propagate(row);
+        }
+        return { address: row.address, mix: clone(mixFromDto(row)) };
+      });
+      return { mixes };
+    },
+    set_mirror({ address, clientId = null, leader = null } = {}) {
+      const phoneOf = (id) => (typeof id === "string" && id.trim() ? id : null);
+      const answer = (kept, keptFor, applied, mix) => ({
+        address,
+        leader: leader?.address ?? null,
+        name: kept?.name ?? null,
+        keptFor,
+        applied,
+        saved: true,
+        saveError: null,
+        mix,
+      });
+      const named = (fallback) => String(leader?.name ?? "").trim() || fallback;
+      const circle = () =>
+        `${leader.address} already follows ${address}'s mix, directly or through another ` +
+        "musician: a mirror cannot go round in a circle";
+      if (!isRunning) {
+        // As the desktop does with no engine: kept under the strongest keys the window gave, for
+        // the next start, never on oneself or in a circle with those kept.
+        if (!isSocketAddress(address)) {
+          throw `invalid musician address \`${address}\``;
+        }
+        const phone = phoneOf(clientId);
+        const keys = phone ? [`client:${phone}`, `address:${address}`] : [`address:${address}`];
+        let kept = null;
+        if (leader) {
+          if (!isSocketAddress(leader.address)) {
+            throw `invalid musician address \`${leader.address}\``;
+          }
+          const leaderPhone = phoneOf(leader.clientId);
+          const leaderKey = leaderPhone ? `client:${leaderPhone}` : `address:${leader.address}`;
+          if (hostOf(leader.address) === hostOf(address) || keys.includes(leaderKey)) {
+            throw `${address} cannot follow their own mix`;
+          }
+          if (closesCircleFrom(leaderKey, keys)) {
+            throw circle();
+          }
+          kept = { leader: leaderKey, name: named(hostOf(leader.address)) };
+        }
+        if (phone) {
+          mirrorBook.delete(`address:${address}`);
+        }
+        keepMirror(keys[0], kept);
+        return answer(kept, phone ? "phone" : "address", false, null);
+      }
+      const row = musicianAt(address);
+      let kept = null;
+      if (leader) {
+        const leading = musicianAt(leader.address);
+        if (leading === row) {
+          throw `${address} cannot follow their own mix`;
+        }
+        if (closesCircleFrom(labelKey(leading), keysOf(row), row)) {
+          throw circle();
+        }
+        kept = {
+          leader: labelKey(leading),
+          name: named(leading.clientName ?? hostOf(leading.address)),
+        };
+      }
+      // As the desktop keeps it: for the phone, dropping what was kept for its address.
+      if (row.clientId) {
+        mirrorBook.delete(`address:${row.address}`);
+      }
+      keepMirror(labelKey(row), kept);
+      showMirrors();
+      // As the engine does: the phone is told (a new revision), and a new leader's mix is taken
+      // at once and carried on to whoever follows this musician.
+      revision += 1;
+      row.revision = revision;
+      const leading = kept ? rowForKey(kept.leader) : null;
+      if (leading) {
+        takeMix(row, leading);
+      }
+      announceMix(address, "desktop", mixFromDto(row));
+      if (leading) {
+        propagate(row);
+      }
+      return answer(kept, row.clientId ? "phone" : "address", true, clone(mixFromDto(row)));
+    },
   };
 
   // A change made on the musician's phone: merged as the engine would (a locked channel kept as it
-  // was), announced as "phone".
+  // was, and every channel and group of a mix that follows another's), announced as "phone", and
+  // taken at once by everyone who follows this mix.
   function changeFromPhone(address, update) {
-    announceMix(address, "phone", mergeInto(musicianAt(address), update, { fromPhone: true }));
+    const row = musicianAt(address);
+    announceMix(address, "phone", mergeInto(row, update, { fromPhone: true }));
+    propagate(row);
   }
 
   // The phone at `from` comes back from another IP with its client id, as after a DHCP change: as
@@ -846,7 +1200,7 @@ export function createFakeBridge({
     row.address = to;
     showLabel(row);
     if (isRunning) {
-      emit("status", clone(engine));
+      emit("status", statusNow());
     }
   }
 
@@ -922,6 +1276,10 @@ export function createFakeBridge({
     engineerKeys() {
       return [...engineerBook.keys()];
     },
+    /** The mirrors kept, `[followerKey, { leader, name }]`, as the desktop's session keys them. */
+    mirrors() {
+      return clone([...mirrorBook.entries()]);
+    },
     /** The audio input the session keeps, as `audio_settings` reads it: null before any. */
     savedAudio() {
       return keptAudio ? clone(keptAudio) : null;
@@ -960,7 +1318,7 @@ export function createFakeBridge({
         setInterval(emitMeters, METER_INTERVAL_MS),
         setInterval(() => {
           if (isRunning) {
-            emit("status", clone(engine));
+            emit("status", statusNow());
           }
         }, STATUS_INTERVAL_MS),
         setInterval(() => {

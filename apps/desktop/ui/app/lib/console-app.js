@@ -34,6 +34,9 @@
 //   leaves out); a group edit on the list the last answer gave, or on the status's (a status lists
 //   every group). Without either the desk does not know the groups, and replacing them blindly
 //   would lose what is kept, so the edit is refused. Each answers `{ ok, message }`.
+// - The Mix screen's tools: presets (read once connected, `loadPresets` again), save, rename,
+//   delete and apply them, copy a mix onto others, and start or stop a mirror. Each answers `{ ok,
+//   message }`, the desk's answer in words, and reads the status after it.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -55,8 +58,9 @@ import {
   restoredAudio,
   startRequest,
 } from "./engine-config.js";
-import { formatChannelsSet, formatGroupsSet, sentenceWithReason } from "./format.js";
+import { formatChannelsSet, formatGroupsSet, musicianLabel, sentenceWithReason } from "./format.js";
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
+import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { createStore } from "./store.js";
 
@@ -193,12 +197,14 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
   }
 
-  // Why nothing started while the kept choices could not be read, as a sentence.
+  // Why nothing started while the kept choices could not be read, and the way past it: an input
+  // the engineer chooses in Network and system starts without them (and is kept from then on).
   function choiceUnread(error) {
-    return sentenceWithReason(
+    const why = sentenceWithReason(
       "The saved audio input could not be read, so nothing was started",
       message(error),
     );
+    return `${why} Choose an input in Network and system to start without it.`;
   }
 
   // Keeps the applied choices, which an engine now runs with, in the session for every later
@@ -397,6 +403,11 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       return;
     }
     store.dispatch(actions.connected());
+    // The presets live in the desk's session, engine or not; a failed read leaves them unknown
+    // until the Mix tools read them again.
+    if (store.getState().presets === null) {
+      await loadPresets();
+    }
     if (answer.state === "notRunning" && autoStart) {
       if (unread) {
         // Never the defaults in place of a kept input that could not be read: Try again reads it
@@ -540,6 +551,40 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     unknown: "no engine is running, so this desk does not know them yet; start the engine first",
   });
 
+  // What the console calls the musician at `address`: their name, else their IP.
+  function labelAt(address) {
+    const musician = musicianByAddress(store.getState(), address);
+    return musician ? musicianLabel(musician) : address;
+  }
+
+  // Reads the desk's presets into the store. Resolves to null, or to the error of a failed read
+  // (the presets stay as they were known, or unknown).
+  async function loadPresets() {
+    try {
+      store.dispatch(actions.presets(await api.presets()));
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Runs one of the Mix tools' commands: `run` resolves to the outcome in words, and the status is
+  // read after it. A refusal is said after `refused`. Answers `{ ok, message }`.
+  async function mixCommand(run, refused) {
+    try {
+      const said = await run();
+      await readStatus();
+      return { ok: true, message: said };
+    } catch (error) {
+      return { ok: false, message: sentenceWithReason(refused, message(error)) };
+    }
+  }
+
+  // The name of the preset `id` as the console knows it, or a plain word for one it does not.
+  function presetName(id) {
+    return store.getState().presets?.find((preset) => preset.id === id)?.name ?? "the preset";
+  }
+
   // The window's title follows the input device, as the old window's did.
   let title = windowTitle(initialState);
   store.subscribe((state) => {
@@ -596,6 +641,68 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     editChannels: (change) => editList(CHANNEL_LIST, change),
     /** Replaces the groups with `change(groups)`, as editChannels does (see formatGroupsSet). */
     editGroups: (change) => editList(GROUP_LIST, change),
+    /** Reads the desk's presets again; resolves to null, or to the error of a failed read. */
+    loadPresets,
+    /** Saves `address`'s mix as a new preset called `name`; answers `{ ok, message }`. */
+    savePreset: (address, name) =>
+      mixCommand(async () => {
+        const outcome = await api.savePreset(address, name);
+        store.dispatch(actions.presets(outcome.presets));
+        return `Saved ${labelAt(address)}'s mix as "${outcome.preset.name}".`;
+      }, "The preset was not saved"),
+    /** Renames the preset `id` to `name`; answers `{ ok, message }`. */
+    renamePreset: (id, name) =>
+      mixCommand(async () => {
+        const before = presetName(id);
+        const outcome = await api.renamePreset(id, name);
+        store.dispatch(actions.presets(outcome.presets));
+        return `Renamed "${before}" to "${outcome.preset.name}".`;
+      }, "The preset was not renamed"),
+    /** Deletes the preset `id`; answers `{ ok, message }`. */
+    deletePreset: (id) =>
+      mixCommand(async () => {
+        const name = presetName(id);
+        const outcome = await api.deletePreset(id);
+        store.dispatch(actions.presets(outcome.presets));
+        return `Deleted the preset "${name}".`;
+      }, "The preset was not deleted"),
+    /** Puts the preset `id` on the mixes of `addresses`; answers `{ ok, message }`. */
+    applyPreset: (id, addresses) =>
+      mixCommand(async () => {
+        const outcome = await api.applyPreset(id, addresses);
+        return formatPresetApplied(
+          presetName(id),
+          outcome.mixes.map(({ address }) => labelAt(address)),
+        );
+      }, "The preset was not applied"),
+    /** Copies `from`'s mix onto the mixes of `to`; answers `{ ok, message }`. */
+    copyMix: (from, to) =>
+      mixCommand(async () => {
+        const outcome = await api.copyMix(from, to);
+        return formatCopied(
+          labelAt(from),
+          outcome.mixes.map(({ address }) => labelAt(address)),
+        );
+      }, "The mix was not copied"),
+    /**
+     * Makes `address`'s mix follow the mix of the musician at `leaderAddress`, or stops it with
+     * null; the leader's phone's client id and the name this console shows for them go with it, so
+     * the follower's phone says "Following <name>'s mix". Answers `{ ok, message }`.
+     */
+    setMirror: (address, leaderAddress) =>
+      mixCommand(async () => {
+        const state = store.getState();
+        const follower = musicianByAddress(state, address);
+        const leader = leaderAddress ? musicianByAddress(state, leaderAddress) : null;
+        if (leaderAddress && !leader) {
+          throw new Error(`no musician is listed at ${leaderAddress}`);
+        }
+        const request = leader
+          ? { address: leader.address, clientId: leader.clientId ?? null, name: musicianLabel(leader) }
+          : null;
+        const outcome = await api.setMirror(address, request, follower?.clientId ?? null);
+        return formatMirrorSet(outcome, labelAt(address), leader ? musicianLabel(leader) : null);
+      }, "The mirror was not changed"),
     select(address) {
       store.dispatch(actions.select(address));
     },

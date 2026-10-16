@@ -109,6 +109,45 @@ export function createEngineApi(bridge) {
      * kept.
      */
     setAudioSettings: (settings) => bridge.invoke("set_audio_settings", { settings }),
+    /**
+     * The engineer's mix presets in the order they were saved, `[{ id, name, mix: { channels:
+     * [{ gain, pan, muted, solo }], groups: { <groupId>: level } } }]` (see mixes.js).
+     */
+    presets: () => bridge.invoke("presets"),
+    /**
+     * Saves the mix of the musician at `address` as a new preset called `name` (each input's level,
+     * pan, mute and solo and the group levels by id; never the master, the cap or the engineer's
+     * controls). Resolves to `{ preset, presets }`. It rejects with no engine running and for a
+     * name that is empty, too long or taken (see checkPresetName), and nothing is kept.
+     */
+    savePreset: (address, name) => bridge.invoke("save_preset", { address, name }),
+    /** Renames the preset `id`, as savePreset checks names; resolves to `{ preset, presets }`. */
+    renamePreset: (id, name) => bridge.invoke("rename_preset", { id, name }),
+    /** Deletes the preset `id`; resolves to `{ preset: null, presets }`. */
+    deletePreset: (id) => bridge.invoke("delete_preset", { id }),
+    /**
+     * Puts the preset `id` on the mix of every musician `musicians` names (addresses), through the
+     * running engine; resolves to `{ mixes: [{ address, mix }] }`. It rejects with no engine, for a
+     * preset that is not kept and for a musician whose mix follows another's, and then nobody's mix
+     * changed.
+     */
+    applyPreset: (id, musicians) => bridge.invoke("apply_preset", { id, musicians }),
+    /**
+     * Copies the mix of the musician at `from` onto every musician `to` names: channels, pans,
+     * mutes, solos and group levels, never the master, the cap or the engineer's controls. Resolves
+     * to `{ mixes }` and rejects as applyPreset does.
+     */
+    copyMix: (from, to) => bridge.invoke("copy_mix", { from, to }),
+    /**
+     * Makes the mix of the musician at `address` follow `leader`, `{ address, clientId, name }` (the
+     * leader's row, and the name the follower's phone is told), or stops it with null; `clientId` is
+     * the follower's row's. Resolves to `{ address, leader, name, keptFor, applied, saved,
+     * saveError, mix }`: with an engine running the follower's mix takes the leader's at once and
+     * follows it, and their phone is held off its channels and groups; with none it is kept for the
+     * next start. A mirror on oneself or in a circle rejects, and nothing changed.
+     */
+    setMirror: (address, leader, clientId = null) =>
+      bridge.invoke("set_mirror", { address, clientId, leader }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

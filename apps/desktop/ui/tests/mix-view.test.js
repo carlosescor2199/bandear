@@ -85,6 +85,7 @@ test("a channel strip per input, named as the engineer named it, with its kind, 
     readout: "62%",
     locked: false,
     lockText: "Unlocked",
+    following: null,
   });
   assert.deepEqual(
     strips.map((strip) => strip.label),
@@ -204,8 +205,26 @@ test("a group strip per configured group, in its chip's tone, with the musician'
   const edited = reduce([actions.mixEdit(LEAD, { "groupLevels.1": 70 })], running);
 
   assert.deepEqual(groupStrips(edited, LEAD), [
-    { index: 0, id: "drums", name: "Drums", tone: "teal", invalid: false, level: 100, readout: "100%" },
-    { index: 1, id: "vocals", name: "Vocals", tone: "blue", invalid: false, level: 70, readout: "70%" },
+    {
+      index: 0,
+      id: "drums",
+      name: "Drums",
+      tone: "teal",
+      invalid: false,
+      level: 100,
+      readout: "100%",
+      following: null,
+    },
+    {
+      index: 1,
+      id: "vocals",
+      name: "Vocals",
+      tone: "blue",
+      invalid: false,
+      level: 70,
+      readout: "70%",
+      following: null,
+    },
   ]);
 });
 

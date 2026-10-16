@@ -540,8 +540,8 @@ pub fn set_mix(
 /// channels their phone cannot change. Returns what was done ([EngineerControlsSetDto]).
 ///
 /// `address` is the row's address as the status reports it, `client_id` the client id the row
-/// carries when the window knows one, and `controls` is partial (see [EngineerControlsRequest]).
-/// Then, as for the groups ([set_groups]):
+/// carries when the window knows one (an empty one is none), and `controls` is partial (see
+/// [EngineerControlsRequest]). Then, as for the groups ([set_groups]):
 ///
 /// - With an engine running, the engine takes them first (the limit caps the musician's output at
 ///   once, the phone is told, and from its next mix on it cannot change a locked channel, see
@@ -648,6 +648,8 @@ fn edit_engineer_controls<E: ControlsEngine>(
     client_id: Option<&str>,
     request: EngineerControlsRequest,
 ) -> Result<EngineerControlsSetDto, String> {
+    // An empty client id names no phone: what the window gives for a row without one.
+    let client_id = phone_id(client_id);
     let update = EngineerUpdate::from(request);
     // One step per change, in the lock order every command that holds both follows (see
     // [edit_groups]).
@@ -3012,6 +3014,36 @@ mod tests {
             )],
             "the next engine gets exactly the edit, and nothing kept for the address"
         );
+    }
+
+    #[test]
+    fn an_empty_client_id_names_no_phone_and_idle_controls_stay_with_the_address() {
+        let engine: Mutex<Option<StandInEngine>> = Mutex::new(None);
+
+        for (test, client_id) in [("controls-idle-empty", ""), ("controls-idle-blank", "   ")] {
+            let session = SessionStore::open(&session_directory(test));
+            let outcome = edit_engineer_controls(
+                &engine,
+                &session,
+                "192.168.1.10:50000",
+                Some(client_id),
+                controls_request(Some(55), None),
+            )
+            .expect("kept for the next start");
+
+            assert_eq!(outcome.kept_for, "address", "{client_id:?}");
+            assert_eq!(
+                session_engineer_controls(&session),
+                vec![(
+                    MusicianKey::Address("192.168.1.10:50000".parse().expect("an address")),
+                    EngineerControls {
+                        limit_percent: 55,
+                        locked: 0,
+                    }
+                )],
+                "{client_id:?} is kept under no phone"
+            );
+        }
     }
 
     #[test]

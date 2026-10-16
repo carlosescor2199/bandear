@@ -17,8 +17,21 @@
 }
 
 .mix-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--ml-border-subtle);
+}
+
+.mix-tabs ml-musician-tabs {
+  flex: 1 1 320px;
+}
+
+.mix-tabs ml-mix-tools {
+  flex: 0 1 auto;
+  margin-left: auto;
 }
 
 .mix-message {

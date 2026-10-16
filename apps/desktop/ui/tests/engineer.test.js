@@ -478,6 +478,27 @@ test("an idle edit for a known phone is kept for the phone, and that is what the
   );
 });
 
+test("with the fake engine stopped, an edit is checked as the desktop checks it", async () => {
+  const fake = createFakeBridge();
+
+  for (const address of ["studio.local:50000", "192.168.1.300:50000", "192.168.1.5"]) {
+    await assert.rejects(
+      fake.invoke("set_engineer_controls", { address, controls: { limitPercent: 50 } }),
+      new RegExp(`invalid musician address \`${address.replace(/\./g, "\\.")}\``),
+      `${address} is no IP and port`,
+    );
+  }
+  for (const clientId of ["", "   "]) {
+    const kept = await fake.invoke("set_engineer_controls", {
+      address: BASS,
+      controls: { limitPercent: 50 },
+      clientId,
+    });
+    assert.equal(kept.keptFor, "address", `an empty client id (${JSON.stringify(clientId)}) names no phone`);
+  }
+  assert.deepEqual(fake.engineerKeys(), [`address:${BASS}`]);
+});
+
 test("a phone back from a new IP keeps the controls the desk kept for it", async () => {
   const fake = createFakeBridge({ running: true });
   await fake.invoke("set_engineer_controls", { address: LEAD, controls: { limitPercent: 30 } });

@@ -1,7 +1,8 @@
-// <ml-group-strip>: one configured group's level in a musician's mix.
+// <ml-group-strip>: one configured group's level in a musician's mix. While the mix follows
+// another musician's, the strip says so in words and its fader takes no move.
 //
 // Property: `data`, one entry of groupStrips (mix-view.js):
-//   { index, name, tone, invalid, level, readout }.
+//   { index, name, tone, invalid, level, readout, following }.
 // Event: `mix-edit` { field: "groupLevels", index, value } (bubbling, composed) while its fader
 //   moves. Groups have no mute of their own in the engine, so the strip offers none.
 
@@ -17,6 +18,15 @@ const styles = sheet(`
   .strip {
     background: var(--ml-surface-sunken);
   }
+  .follows {
+    max-width: 100%;
+    overflow: hidden;
+    color: var(--ml-accent);
+    font-size: var(--ml-text-2xs);
+    font-weight: var(--ml-weight-bold);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 `);
 
 class MlGroupStrip extends HTMLElement {
@@ -31,6 +41,7 @@ class MlGroupStrip extends HTMLElement {
       `<div class="strip" role="group">
         <div class="caption" aria-hidden="true">GROUP</div>
         <ml-group-chip></ml-group-chip>
+        <div class="follows" hidden></div>
         <div class="levels"><ml-fader></ml-fader></div>
         <output class="readout"></output>
       </div>`,
@@ -38,6 +49,7 @@ class MlGroupStrip extends HTMLElement {
     this.#parts = {
       strip: root.querySelector(".strip"),
       chip: root.querySelector("ml-group-chip"),
+      follows: root.querySelector(".follows"),
       fader: root.querySelector("ml-fader"),
       readout: root.querySelector(".readout"),
     };
@@ -59,7 +71,15 @@ class MlGroupStrip extends HTMLElement {
   set data(data) {
     this.#data = data;
     const parts = this.#parts;
-    reflect(parts.strip, "aria-label", `${data.name} group`);
+    const following = data.following ?? null;
+    reflect(
+      parts.strip,
+      "aria-label",
+      following ? `${data.name} group, follows ${following}'s mix` : `${data.name} group`,
+    );
+    parts.follows.hidden = !following;
+    setText(parts.follows, following ? `Follows ${following}` : "");
+    reflect(parts.fader, "disabled", Boolean(following));
     reflect(parts.chip, "name", data.name);
     reflect(parts.chip, "tone", data.tone);
     reflect(parts.chip, "invalid", data.invalid);

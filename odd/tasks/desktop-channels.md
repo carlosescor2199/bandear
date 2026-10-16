@@ -803,8 +803,130 @@ slice. Push and PRs are the user's decision.
   - GREEN: UI 290 passed (3 new); preview (`index.html?fake`): the automatic start still runs.
   - Commit: this commit (`fix(desktop-ui): retry reading the kept input instead of starting the
     default`).
-- [ ] T6 (presets, copy and mirror): presets in the session; apply to a musician; copy; one-way
-  mirror with the follower locked; the Mix screen's controls. Route: delegated writer.
+- [x] T6a (presets, copy and mirror: engine, protocol, desktop): presets in the session; apply to
+  musicians; copy; one-way mirror with the follower's phone held off its channels and groups; the
+  Mix screen's controls; the items folded into T6. Route: delegated writer (trigger: 2+
+  non-trivial files across the engine, the desktop and the UI).
+  - Engine (`mix.rs`): `MixPreset { channels: Vec<PresetChannel { gain, pan, muted, solo }>,
+    groups: Vec<(id, level)> }` (public). `MixPreset::of(values, layout, count)` takes the device's
+    inputs and every group level by the live layout's ids; `MixState::apply_preset` (desk writer)
+    puts each listed input (up to 32) and the level of every live group the preset names by id, a
+    live group it does not name and an input past it keeping their own, a pair's second side taking
+    the first side's level, mute and solo (the first wins), locked channels included.
+    `MixState::follow(&leader)` (desk writer) copies every channel value and group level in place
+    (both mixes are placed for the same groups) and returns `None` (no revision) when they already
+    match. Neither ever touches the master volume, the phone's cap, the master mute or the
+    engineer's controls. `MixState::set_following(name)` (new revision, no value moves) and a
+    `following` name per mix (a mutex beside the writer lock, never on the audio path);
+    `apply_from_phone` runs `keep_followed` (every channel value and group level kept) before
+    `keep_locked` while it follows, so only the phone's master, cap and mute apply.
+  - Book and identity (`targets.rs`): `Mirror { leader: MusicianKey, name }` kept per follower key
+    (client id, else IP; a phone's key drops the IP's) beside the controls, with the same lock rules
+    (taken after the table's, never with the controls' or a mix writer lock). `set_mirror(follower,
+    Some((leader, name)) | None)`: refuses an unknown musician, following oneself, and a circle
+    (`reaches` walks the leaders from the new leader, resolving a present musician client id first
+    then IP, and counts a chain longer than the book as a circle); starting puts the name on the mix
+    and copies the leader's mix at once; stopping leaves the mix as it is. `propagate(ip)` makes every
+    follower take its leader's mix after any change (breadth first, each mix once, down chains).
+    `register` and `add` put the kept mirror in force like the controls (`restore_mirror`: kept or
+    none, and the present leader's mix copied at once; `Registration.followed` tells the connection
+    to carry it on); a leader who registers changes nobody's mix (a fresh neutral mix is never
+    copied: their next change is). `keep_mirror` (the desk's saved mirrors at start) refuses
+    oneself and circles. `mirror_statuses` gives `MirrorStatus { leader, name, leader_address }`
+    (`leader_address` null while the leader is away; the follower keeps the last mix and stays held).
+  - API (`engine.rs`): `EngineHandle::mix_preset(address)`, `apply_preset(&preset, musicians)`,
+    `copy_mix(from, to)` (refuses copying onto itself), `set_mirror(follower, Some(MirrorSource {
+    address, name }) | None) -> MirrorOutcome { follower, leader, name, mix }` and
+    `keep_mirror(follower, leader, name)`; a preset or copy onto a follower is refused ("… follows
+    Ana's mix: stop that mirror before changing their mix") and nothing changes. Every desk path
+    (`set_mix`, presets, copies, mirror starts) and the phone's `mix` announce the followers moved
+    (`MixChanged{Engine}`, each after its leader's), so their phones get `mix_state` at once. The desk's
+    `set_mix` may still change a follower's mix (the UI does not offer it); the leader's next change
+    replaces it. `MusicianStatus.mirror`.
+  - Protocol: `mix_ack` and `mix_state` gain `"following": "<name>"` or `null` (always present),
+    documented on `MixReport`; old phones ignore it.
+  - Session: `presets` takes its shape (version stays 1: earlier builds wrote it empty and keep what
+    they read): `[{ id, name, mix: { channels: [{ gain, pan, muted, solo }] in channel order (inputs
+    past the device kept; a field left out defaults to 100, 50, false, false), groups: { <groupId>:
+    level } } }]`; a misshapen section is set aside on its own. A musician entry gains `"mirror": {
+    "leader": "client:<id>" | "address:<ip:port>", "name": "Ana" }` (lenient: unreadable is none).
+  - Desktop: Tauri `presets`, `save_preset(address, name)` (a running engine gives the mix; id `p` +
+    16 hex digits; names trimmed, 1-40 characters, unique in any case; answer `{ preset, presets }`),
+    `rename_preset(id, name)`, `delete_preset(id)` (no engine needed), `apply_preset(id, musicians)`
+    and `copy_mix(from, to)` (engine required; answer `{ mixes: [{ address, mix }] }`) and
+    `set_mirror(address, clientId?, leader: { address, clientId?, name } | null)`: one step under the
+    engine lock with the session's inside; a running engine takes it first, then it is saved under
+    the follower key the engine returned with the leader's key; no engine keeps it under the
+    strongest key the window gave (an empty client id is none; the address must parse), refusing
+    oneself and a circle over the session's keys; answer `{ address, leader, name, keptFor, applied,
+    saved, saveError, mix }`. Every start hands the engine the session's mirrors after the controls
+    (`session_mirrors`; unreadable keys skipped and logged). `MusicianDto.mirror: { leader,
+    leaderAddress, name } | null`.
+  - UI: `lib/mixes.js` (`checkPresetName`, `presetOf`, `withPreset`, `withShared`, `sameShared`,
+    `closesCircle`, `mirrorChoice`, `mixTargets`, `mixToolsView`, `joinNames`, `formatMirrorSet`,
+    `formatCopied`, `formatPresetApplied`); the engine API (`presets`, `savePreset`, `renamePreset`,
+    `deletePreset`, `applyPreset`, `copyMix`, `setMirror`); the console keeps `presets` (read once
+    connected, `loadPresets` again) and answers each tool `{ ok, message }` in words, reading the
+    status after. `<ml-mix-tools>` beside the tabs (the design's row): Mirror select (Off and every
+    other musician except one that would close a circle; an absent leader shows as "Ana (not here)"
+    with a note that the mix stays as Ana left it), Copy mix to… (one or more musicians; a follower
+    offered disabled with "follows Bass") and Presets (save this mix as…, a preset select, Apply to
+    with this mix ticked first, Rename, Delete behind the delayed confirm with Keep in its place);
+    both panels are disclosures closed by Escape. The outcome is said above the strips (status or
+    alert). A follower's channel and group strips say "Follows Lead vocal" (and in their accessible
+    names) and their level, pan, mute and solo or group fader are disabled; the lock stays. The fake
+    bridge implements all of it with the engine's rules (`isSocketAddress` reads addresses as Rust's
+    `SocketAddr`).
+  - Folded: (a) the desktop treats an empty or blank `clientId` as none in `set_engineer_controls`
+    (`phone_id`), and the fake checks idle edits as the desktop does (`isSocketAddress`: a host name
+    and port is refused; a blank client id is none) (R3-fake-idle-validation-diverges); (b) a kept
+    input that can never be read says "… so nothing was started: <reason>. Choose an input in Network
+    and system to start without it." and choosing one starts the engine and keeps it
+    (R3-persistent-unreadable-choice-blocks-start); (c) a failed read while an engine runs leaves it
+    running and Start says why through the command error (R3-running-engine-read-failure-untested).
+  - RED: (a) server against stubs (`MixPreset::of` empty, no-op `apply_preset`/`follow`/
+    `set_following`/`keep_followed`, registry mirror methods refusing or doing nothing, reports
+    without `following`) 19 of 291 failed: 5 mix, 7 targets, 4 engine, 2 real-socket control, 1
+    protocol. (b) desktop tests failed to compile (no `MixesEngine`, `save_preset_with`,
+    `rename_kept_preset`, `delete_kept_preset`, `apply_preset_with`, `copy_mix_with`, `edit_mirror`,
+    `session_mirrors`, `SessionMirror`, `MirrorRequest`, store `set_presets`/`set_mirror`). (c) UI:
+    `mixes.test.js` against a stub module 9 of 9 failed; against the committed console, fake and
+    view code (with `mixes.js` present and a stub `isSocketAddress`) 11 of 308 failed (the 9 new
+    fake and console tests, and the 2 strip expectations that gained `following`). (d) folded: UI 4
+    of 311 failed (the wording in three console tests, the fake accepting a host name), desktop 1
+    of 134 failed (an empty client id kept for "phone").
+  - GREEN: `cargo test -p personal-monitoring` 291 passed (19 new), control tests 39 passed in three
+    runs; real-socket proofs `a_followers_phone_is_told_whom_it_follows_and_cannot_move_its_channels`
+    (mirror start pushes `following` with the rack's channels, a desk change of the rack reaches the
+    phone, its whole mix keeps the channels and applies its master and cap, stopping frees it) and
+    `a_leaders_phone_change_reaches_its_follower_at_once` (the rack's mix equals the phone's before
+    the ack, announced as an engine change after the phone's). `cargo test -p mixlink-desktop` 134
+    passed (13 new, 1 session test reshaped for typed presets); UI 311 passed (21 new; 3 expectations
+    updated); `cargo build -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok; `cargo fmt`
+    clean; clippy: no new warnings. Preview (`index.html?fake#/mix`): Bass follows Lead vocal (the
+    outcome line, the note, every Bass strip "Follows Lead vocal" and disabled, Lead's demo moves
+    followed live), a preset saved, applied to Lead vocal and Keys, deleted after Keep/Delete, a copy
+    to Drums; no console errors.
+  - Follow-ups: the name a follower's phone is told is the leader's name when the mirror was set (a
+    later rename shows after the mirror is set again); a mirror kept with no engine is checked for
+    circles over the session's keys only (one musician known by phone in one mirror and by address
+    in another is not joined; the engine refuses such a circle at start and logs it); the Mix tools'
+    row wraps the tabs at narrow widths; live check with the desktop app and phones (T6b).
+  - Size: about 2,000 authored changed lines in the engine commit, 1,560 in the desktop commit,
+    1,300 and 710 in the two UI commits and 260 in the folded fixes with this document; above the
+    400-line heuristic mostly in tests (about 2,100 lines), split by work unit.
+  - Commits: 38317f1 `feat(engine): copy, mirror and apply mixes from the desk`; 62d8ddb
+    `feat(desktop): keep presets and mirrors in the session`; 49e8a8f `feat(desktop-ui): handle
+    presets, copies and mirrors in the console`; 413ab3c `feat(desktop-ui): add presets, copy and
+    mirror to the mix`; this commit (`fix(desktop): say how to get past an unreadable input and
+    check idle edits as the desktop does`).
+- [ ] T6b (presets, copy and mirror, Android): read `following` from `mix_ack` and `mix_state`
+  (lenient: absent on older servers is null); while it is set say "Following <name>'s mix", show
+  every channel strip's level, pan or balance, mute and solo and every group fader disabled (as
+  locks do, groups included), keep the master volume, level cap and master mute; keep sending whole
+  mixes (the server keeps the channels and groups and the ack carries them); decide what recall of
+  a saved mix and More of me do while following (likely: refused with the notice, as for a locked
+  channel). Route: delegated writer.
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
   connected phones; the deferred Android follow-up (adopt the server's answer after `config`);
   docs. Route: delegated writer.
@@ -942,6 +1064,11 @@ slice. Push and PRs are the user's decision.
   - SUGGESTION R3-running-engine-read-failure-untested: test that a failed read with an engine
     already running leaves it running and shows the command error as intended.
 
+- T6a done (presets, copy and mirror in the engine, the protocol, the desktop and the UI, and the
+  three items folded into T6); see its entry for evidence and follow-ups. Review base 39f4b32 (the
+  last reviewed boundary; 67c3e7e is this document only). The slice is about 5,900 authored changed
+  lines in five commits, so it is reviewed commit by commit (each under about 2,000 lines).
+
 ## Next step
 
-T6 (presets, copy and mirror).
+T6b (presets, copy and mirror on Android: the `following` field).

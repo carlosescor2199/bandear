@@ -26,6 +26,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -147,11 +148,13 @@ private fun ChannelStrip(
         top = ChannelStripTopPadding,
     ) {
         StripLabelButton(channel = channel, onOpen = onOpen)
-        // A locked strip says so where its group shows (the sheet still names the group), and its
-        // controls fade and take no input.
+        // A held strip says so where its group shows (the sheet still names the group), and its
+        // controls fade and take no input. The lock outlasts a mirror, so a locked follower says
+        // "Locked" here, and both in its spoken names and its sheet.
         val group = channel.group
         when {
-            channel.locked -> LockedTag()
+            channel.locked -> HeldTag(LineIcons.Lock, LOCKED_TAG)
+            channel.following != null -> HeldTag(LineIcons.Follow, FOLLOWING_TAG)
             group != null -> GroupChip(group.name, groupToneFor(group.index))
             else -> Text(
                 text = "No group",
@@ -160,12 +163,13 @@ private fun ChannelStrip(
                 color = colors.textSecondary,
             )
         }
+        val open = !channel.locked && channel.following == null
         VerticalFader(
             value = channel.level,
             onValueChange = onLevel,
             accent = stripColor(stripFillFor(channel.muted, mine, moreOfMeOn)),
-            contentDescription = stripFaderDescription(channel.label, mine, channel.muted, channel.locked),
-            enabled = !channel.locked,
+            contentDescription = stripFaderDescription(channel.label, mine, channel.muted, channel.locked, channel.following),
+            enabled = open,
             height = ChannelFaderHeight,
         )
         Text(
@@ -178,15 +182,18 @@ private fun ChannelStrip(
             soloed = channel.soloed,
             onMute = onMuted,
             onSolo = onSoloed,
-            channelLabel = lockedLabel(channel.label, channel.locked),
-            enabled = !channel.locked,
+            channelLabel = lockedLabel(channel.label, channel.locked, channel.following),
+            enabled = open,
         )
     }
 }
 
-/** The lock and "Locked" in words: a strip the engineer locked, never told by its fade alone. */
+/**
+ * Why a strip takes no input, as an [icon] and [text] in words ("Locked", "Following"), so it is
+ * never told by its fade alone.
+ */
 @Composable
-private fun LockedTag() {
+private fun HeldTag(icon: ImageVector, text: String) {
     val colors = MixLinkTheme.colors
     Row(
         modifier = Modifier
@@ -195,8 +202,8 @@ private fun LockedTag() {
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(LineIcons.Lock, contentDescription = null, tint = colors.text, modifier = Modifier.size(12.dp))
-        Text(LOCKED_TAG, style = MaterialTheme.typography.labelSmall, color = colors.text)
+        Icon(icon, contentDescription = null, tint = colors.text, modifier = Modifier.size(12.dp))
+        Text(text, style = MaterialTheme.typography.labelSmall, color = colors.text)
     }
 }
 
@@ -205,11 +212,15 @@ private fun GroupStrip(group: GroupUiState, onLevel: (Int) -> Unit) {
     val colors = MixLinkTheme.colors
     StripPanel(background = colors.surface, border = colors.border) {
         GroupChip(group.name, groupToneFor(group.index))
+        // While the mix follows another's every group level is the leader's: said in words, faded.
+        val following = group.following
+        if (following != null) HeldTag(LineIcons.Follow, FOLLOWING_TAG)
         VerticalFader(
             value = group.level,
             onValueChange = onLevel,
             accent = colors.faderIdle,
-            contentDescription = "${group.name} group level",
+            contentDescription = groupFaderDescription(group.name, following),
+            enabled = following == null,
         )
         Text(stripValueText(group.level, muted = false), style = MixLinkType.Number, color = colors.text)
         Text(

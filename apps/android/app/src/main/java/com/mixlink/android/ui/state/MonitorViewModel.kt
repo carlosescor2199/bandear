@@ -417,14 +417,17 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         return true
     }
 
-    /** Applies a saved mix and sends it, exactly as if the musician had moved every control. */
+    /**
+     * Applies a saved mix and sends it, exactly as if the musician had moved every control. While
+     * the mix follows another musician's the recall is refused with a notice and nothing is sent.
+     */
     override fun recallMix(name: String) {
         val bank = store.loadBanks().firstOrNull { it.name == name }
         if (bank == null) {
             dispatch(MixMissing(name, savedNames()))
             return
         }
-        change(MixRecalled(name, bank.snapshot)) { _, _ -> true }
+        change(MixRecalled(name, bank.snapshot)) { before, _ -> before.mix.following == null }
     }
 
     /** Renames a saved mix. A name another mix already has is refused, so no mix is overwritten. */

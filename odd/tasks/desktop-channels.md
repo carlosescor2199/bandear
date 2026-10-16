@@ -1006,13 +1006,49 @@ slice. Push and PRs are the user's decision.
   - Commits: 56b82ed `fix(desktop): follow every key of each musician when checking mirror
     circles` (about 320 changed lines); this commit (`fix(desktop-ui): clear a pending mirror
     choice when the desk answers or changes`, about 240 plus this document).
-- [ ] T6b (presets, copy and mirror, Android): read `following` from `mix_ack` and `mix_state`
+- [x] T6b (presets, copy and mirror, Android): read `following` from `mix_ack` and `mix_state`
   (lenient: absent on older servers is null); while it is set say "Following <name>'s mix", show
   every channel strip's level, pan or balance, mute and solo and every group fader disabled (as
   locks do, groups included), keep the master volume, level cap and master mute; keep sending whole
   mixes (the server keeps the channels and groups and the ack carries them); decide what recall of
   a saved mix and More of me do while following (likely: refused with the notice, as for a locked
-  channel). Route: delegated writer.
+  channel). Route: delegated writer (trigger: 2+ non-trivial files across the control channel, the
+  UI state and the screens).
+  - Reading: `EngineerControls.following: String?` (one more of the engineer's controls);
+    `parseEngineerControls` reads it leniently (absent, null or not a string follows nobody; an
+    empty name is still followed and shown as "another musician"). It therefore holds at once, even
+    from a push a pending change overtakes, while the leader's values settle through the existing
+    `seq` rules; a refusal keeps it; `SessionStarted` resets it; the `mix` never carries it.
+    `MixUiState.following`, `ChannelUiState.following`, `GroupUiState.following`, `leaderName`.
+  - Rules (reducer): while following, every channel edit (`withStrip`) and group edit
+    (`setGroupLevel`) changes nothing, so nothing is sent; the master volume, level cap and master
+    mute still apply and are sent in the whole mix. Decided: a saved mix is not recalled at all
+    while following (not even its master), with the notice "\"Verse\" was not recalled: your mix
+    follows Ana's", and the ViewModel sends nothing; More of me goes off with "More of me is off
+    while your mix follows another musician's" (`FOLLOWING`) when following starts (reports,
+    `config` and a chosen channel go through `offIfHeld`, which also covers a locked channel), and
+    turning it on is refused with that notice while it lasts. When `following` turns null every
+    control is the musician's again, the mix stays as it was, and a `FOLLOWING` notice is cleared
+    (More of me stays off until turned on).
+  - UI: the Mix screen shows a blue banner (a polite live region) "Following Ana's mix" with "Your
+    channels and groups follow that mix. Your master, level cap and mute are still yours."; channel
+    strips show a "Following" tag (`LineIcons.Follow`) where the group was, or "Locked" when the
+    channel is locked too, and their fader and keys fade and take no input; group strips show the
+    tag under their chip and a disabled fader; TalkBack hears ", following Ana's mix" (after ",
+    locked by the engineer" when both) on faders, keys, the label button and the pan control; the
+    channel sheet shows "Following Ana's mix" and, when locked, "Locked by the engineer" over its
+    disabled controls. Previews: following Lead vocal with the kick locked (channels and groups).
+  - RED: (a) against stubs (`following` never read, `MixUiState.following` null), 6 of 436 failed
+    (2 parsing, 3 reducer, 1 ViewModel); the never-sent guard (one more assertion) passed. (b)
+    against stubs (no blocking, recall and More of me unaware, strips not told, empty wording), 11
+    of 448 failed: 6 of 7 reducer tests (the master-still-works guard passed), 2 ViewModel and 3
+    text tests; the follow icon's test came with the icon.
+  - GREEN: `:app:testDebugUnitTest assembleDebug --rerun-tasks` ok, 449 tests, 0 failures, 0 errors
+    (430 before: 19 new); no compiler warnings.
+  - Size: about 125 authored changed lines in the first commit and 410 in the second plus this
+    document.
+  - Commits: ef67872 `feat(android): read whose mix the phone is following`; this commit
+    (`feat(android): show and respect a followed mix`).
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
   connected phones; the deferred Android follow-up (adopt the server's answer after `config`);
   docs. Route: delegated writer.
@@ -1172,6 +1208,12 @@ slice. Push and PRs are the user's decision.
   saved, and with the engine running the engine's own check decides. Revisit if offline mirror
   editing becomes common; the fake's offline circle check also still compares keys as strings.
 
+- T6b done (a followed mix on Android); see its entry for evidence. Follow-ups: live check on the
+  Galaxy S23 with the desktop setting and stopping a mirror (the banner and tags appearing and
+  going at once, the leader's changes following live, master, cap and mute still moving the
+  phone's output); the leader's name is the one the desk had when the mirror was set (T6a); a
+  recalled master volume is refused with the rest of a saved mix while following.
+
 ## Next step
 
-T6b (presets, copy and mirror on Android: the `following` field).
+T7 (session save and load).

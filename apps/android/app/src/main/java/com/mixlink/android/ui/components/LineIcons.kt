@@ -41,6 +41,9 @@ object LineIcons {
     /** A tick: the chosen item of a list. */
     val Check: ImageVector by lazy { lineIcon("Check", "M5 12l5 5L20 7") }
 
+    /** An arrow running up to a bar: this mix follows another musician's. */
+    val Follow: ImageVector by lazy { lineIcon("Following", "M3 12h13", "M12 8l4 4l-4 4", "M20 5v14") }
+
     /** A closed padlock: locked by the engineer. */
     val Lock: ImageVector by lazy { lineIcon("Locked", "M6 11h12v9H6z", "M8.5 11V8a3.5 3.5 0 0 1 7 0v3") }
 

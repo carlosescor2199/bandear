@@ -3,6 +3,7 @@ package com.mixlink.android.ui.screens
 import com.mixlink.android.ui.components.PillKind
 import com.mixlink.android.ui.state.ConnectionUiState
 import com.mixlink.android.ui.state.ServerEndpoint
+import com.mixlink.android.ui.state.leaderName
 import com.mixlink.android.ui.theme.ColorToken
 
 /** What the row of strips on the Mix screen shows: one strip per channel, or one per group. */
@@ -34,18 +35,45 @@ fun stripFillFor(muted: Boolean, mine: Boolean, moreOfMeOn: Boolean): StripFill 
  * What a screen reader says for a strip's fader: the channel, whether it is yours, whether muted,
  * and whether the engineer locked it.
  */
-fun stripFaderDescription(label: String, mine: Boolean, muted: Boolean, locked: Boolean = false): String = buildString {
+fun stripFaderDescription(
+    label: String,
+    mine: Boolean,
+    muted: Boolean,
+    locked: Boolean = false,
+    following: String? = null,
+): String = buildString {
     append("$label level")
     if (mine) append(", your channel")
     if (muted) append(", muted")
-    if (locked) append(", locked by the engineer")
+    append(heldWords(locked, following))
 }
 
 /** The words a locked strip shows in place of its group, with the lock, so it is not told by a fade. */
 const val LOCKED_TAG = "Locked"
 
-/** A control's channel [label] for a screen reader, saying the engineer locked it when [locked]. */
-fun lockedLabel(label: String, locked: Boolean): String = if (locked) "$label, locked by the engineer" else label
+/**
+ * A control's channel [label] for a screen reader, saying the engineer locked it when [locked] and
+ * whose mix it follows while [following] is set.
+ */
+fun lockedLabel(label: String, locked: Boolean, following: String? = null): String = label + heldWords(locked, following)
+
+/** The title over the Mix screen, and the channel sheet's note, while the mix follows [following]'s. */
+fun followingTitle(following: String): String = "Following ${leaderName(following)}'s mix"
+
+/** What the following banner says under its title: what follows and what stays the musician's. */
+const val FOLLOWING_DETAIL = "Your channels and groups follow that mix. Your master, level cap and mute are still yours."
+
+/** The words a follower's strips show in place of their group, so it is not told by a fade. */
+const val FOLLOWING_TAG = "Following"
+
+/** What a screen reader says for a group's fader, and whose mix it follows while [following] is set. */
+fun groupFaderDescription(name: String, following: String?): String = "$name group level" + heldWords(false, following)
+
+/** ", locked by the engineer" and ", following Ana's mix", as they apply, for a screen reader. */
+private fun heldWords(locked: Boolean, following: String?): String = buildString {
+    if (locked) append(", locked by the engineer")
+    if (following != null) append(", ${followingTitle(following).replaceFirstChar { it.lowercase() }}")
+}
 
 /**
  * The engineer's limit under the Master card's level cap, with what the musician hears at most (the

@@ -99,6 +99,11 @@ internal object PreviewSamples {
         mix = mix.copy(levelCap = 80, engineer = EngineerControls(limitPercent = 60, lockedChannels = setOf(0, 1))),
     )
 
+    /** The engineer has this mix follow Lead vocal's; the kick stays locked as well. */
+    val following = moreOfMeOff.copy(
+        mix = mix.copy(engineer = EngineerControls(lockedChannels = setOf(0), following = "Lead vocal")),
+    )
+
     /** More of me asked for before a channel was chosen. */
     val noChannelChosen = connected.copy(
         moreOfMe = MoreOfMeUiState(enabled = false, musicianChannel = null, notice = MoreOfMeNotice.NEEDS_CHANNEL),

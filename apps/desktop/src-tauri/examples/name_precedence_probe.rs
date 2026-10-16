@@ -63,6 +63,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            mirror: None,
         }],
     }
 }

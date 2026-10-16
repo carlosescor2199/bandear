@@ -18,12 +18,12 @@ use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlP
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
 use crate::mix::{
-    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, MixUpdate,
-    MixValues, MAX_MIX_CHANNELS,
+    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, MixPreset,
+    MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
 };
 use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
-use crate::targets::{MusicianKey, TargetEntry, TargetRegistry};
+use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
 const CHANNEL_CAPACITY: usize = 8;
 
@@ -125,6 +125,9 @@ pub struct MusicianStatus {
     /// [LinkHealth::Bad] with no rates when its reports stopped while the control channel is still
     /// connected: the phone is there but its link is lost.
     pub link: LinkStatus,
+    /// Whose mix this musician's follows, when the engineer made it follow one (see
+    /// [EngineHandle::set_mirror]); `None` when it follows nobody.
+    pub mirror: Option<MirrorStatus>,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -402,29 +405,197 @@ impl EventBus {
 ///
 /// `value` is the address string the engine reports, so a UI can hand back what it displayed; the
 /// musician is found by IP, the same join a phone's `mix` uses. The update is validated and merged
-/// exactly as a phone's is. An invalid address, an unknown musician or an update that cannot be
-/// applied is an error naming the problem, and then nothing changes and nothing is announced.
+/// exactly as a phone's is. Every musician who follows this one's mix takes it at once, each
+/// announced after it. An invalid address, an unknown musician or an update that cannot be applied
+/// is an error naming the problem, and then nothing changes and nothing is announced.
 pub(crate) fn set_target_mix(
     targets: &TargetRegistry,
     events: &EventBus,
     value: &str,
     update: &MixUpdate,
 ) -> Result<MixValues, String> {
+    let (address, mix_state) = musician_at(targets, value)?;
+    let applied = mix_state.apply(update)?;
+    announce_engine_change(events, address);
+    announce_followers(targets, events, address);
+    Ok(applied)
+}
+
+/// The musician at `value`'s IP, at the address the status reports, and their mix.
+fn musician_at(
+    targets: &TargetRegistry,
+    value: &str,
+) -> Result<(SocketAddr, Arc<MixState>), String> {
     let requested = value
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid target `{value}`: {error}"))?;
-    let (address, mix_state) = targets
+    targets
         .read()
         .iter()
         .find(|entry| entry.address.ip() == requested.ip())
         .map(|entry| (entry.address, Arc::clone(&entry.mix_state)))
-        .ok_or_else(|| format!("target `{value}` is not configured"))?;
-    let applied = mix_state.apply(update)?;
+        .ok_or_else(|| format!("target `{value}` is not configured"))
+}
+
+/// Announces a change of `address`'s mix made through the engine.
+fn announce_engine_change(events: &EventBus, address: SocketAddr) {
     events.emit(EngineEvent::MixChanged {
         address,
         origin: MixOrigin::Engine,
     });
-    Ok(applied)
+}
+
+/// Makes everyone who follows the mix of the musician at `leader`'s IP take it now (see
+/// [TargetRegistry::propagate]) and announces each of them.
+fn announce_followers(targets: &TargetRegistry, events: &EventBus, leader: SocketAddr) {
+    for address in targets.propagate(leader.ip()) {
+        announce_engine_change(events, address);
+    }
+}
+
+/// The musicians `values` name, for a change of their mixes from the desk: each found by IP, once,
+/// in the order named. A value that does not parse or is no musician is an error naming it, and so
+/// is a musician whose mix follows another's (a change would only last until the leader's next
+/// change): the engineer stops that mirror first.
+fn desk_targets(
+    targets: &TargetRegistry,
+    values: &[String],
+) -> Result<Vec<(SocketAddr, Arc<MixState>)>, String> {
+    let mut found: Vec<(SocketAddr, Arc<MixState>)> = Vec::with_capacity(values.len());
+    for value in values {
+        let (address, mix_state) = musician_at(targets, value)?;
+        if let Some(leader) = mix_state.following() {
+            return Err(format!(
+                "{value} follows {leader}'s mix: stop that mirror before changing their mix"
+            ));
+        }
+        if !found.iter().any(|(known, _)| known.ip() == address.ip()) {
+            found.push((address, mix_state));
+        }
+    }
+    Ok(found)
+}
+
+/// The mix of the musician at `value`'s IP as a preset (see [EngineHandle::mix_preset]).
+pub(crate) fn target_preset(
+    targets: &TargetRegistry,
+    config: &ConfigState,
+    value: &str,
+) -> Result<MixPreset, String> {
+    let (_, mix_state) = musician_at(targets, value)?;
+    let live = config.snapshot();
+    Ok(MixPreset::of(
+        &mix_state.current(),
+        &live.layout,
+        usize::from(live.source_channels),
+    ))
+}
+
+/// Puts `preset` on the mix of every musician `musicians` names, as [EngineHandle::apply_preset]
+/// does, and announces each change, each followed by those of the musicians who follow them.
+pub(crate) fn apply_target_preset(
+    targets: &TargetRegistry,
+    config: &ConfigState,
+    events: &EventBus,
+    preset: &MixPreset,
+    musicians: &[String],
+) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+    let found = desk_targets(targets, musicians)?;
+    let layout = config.snapshot().layout.clone();
+    Ok(found
+        .into_iter()
+        .map(|(address, mix_state)| {
+            let applied = mix_state.apply_preset(preset, &layout);
+            announce_engine_change(events, address);
+            announce_followers(targets, events, address);
+            (address, applied)
+        })
+        .collect())
+}
+
+/// Copies the mix of the musician at `from`'s IP onto every musician `to` names, as
+/// [EngineHandle::copy_mix] does, and announces each change, each followed by those of the
+/// musicians who follow them.
+pub(crate) fn copy_target_mix(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    from: &str,
+    to: &[String],
+) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+    let (source, source_mix) = musician_at(targets, from)?;
+    let found = desk_targets(targets, to)?;
+    if found.iter().any(|(address, _)| address.ip() == source.ip()) {
+        return Err(format!("{from}'s mix cannot be copied onto itself"));
+    }
+    let values = source_mix.current();
+    Ok(found
+        .into_iter()
+        .map(|(address, mix_state)| {
+            let copied = mix_state.follow(&values);
+            if copied.is_some() {
+                announce_engine_change(events, address);
+                announce_followers(targets, events, address);
+            }
+            (address, copied.unwrap_or_else(|| mix_state.current()))
+        })
+        .collect())
+}
+
+/// The musician a mirror follows, as [EngineHandle::set_mirror] takes it: their address as the
+/// status reports it, and the name the follower's phone is told it follows ("Following Bass's
+/// mix"); an empty name is the name the leader's phone announced, else their IP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MirrorSource<'a> {
+    pub address: &'a str,
+    pub name: &'a str,
+}
+
+/// What [EngineHandle::set_mirror] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorOutcome {
+    /// The key the mirror is kept under: the follower's phone's client id, else their address.
+    pub follower: MusicianKey,
+    /// The leader by the key the mirror keeps, or `None` when the mirror stopped.
+    pub leader: Option<MusicianKey>,
+    /// The name the follower's phone is told it follows, or `None` when the mirror stopped.
+    pub name: Option<String>,
+    /// The follower's mix now stored.
+    pub mix: MixValues,
+}
+
+/// Starts, changes or stops a mirror, as [EngineHandle::set_mirror] does, and announces every mix
+/// it moved: the follower's first, then those of the musicians who follow them.
+pub(crate) fn set_target_mirror(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    follower: &str,
+    leader: Option<MirrorSource<'_>>,
+) -> Result<MirrorOutcome, String> {
+    let set = targets.set_mirror(follower, leader.map(|source| (source.address, source.name)))?;
+    for address in set.changed {
+        announce_engine_change(events, address);
+    }
+    Ok(MirrorOutcome {
+        follower: set.follower,
+        leader: set.leader,
+        name: set.name.map(|name| name.to_string()),
+        mix: set.mix,
+    })
+}
+
+/// Keeps a mirror and puts it in force, as [EngineHandle::keep_mirror] does, announcing every mix
+/// it moved.
+pub(crate) fn keep_target_mirror(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    follower: &MusicianKey,
+    leader: &MusicianKey,
+    name: &str,
+) -> Result<(), String> {
+    for address in targets.keep_mirror(follower, leader, name)? {
+        announce_engine_change(events, address);
+    }
+    Ok(())
 }
 
 /// Changes the engineer's controls for the musician whose IP `value` names, keeps them for that
@@ -500,6 +671,7 @@ pub(crate) fn join_musicians(
     mixes: &HashMap<IpAddr, MixValues>,
     announced: &HashMap<IpAddr, Announced>,
     links: &HashMap<IpAddr, LinkStatus>,
+    mirrors: &HashMap<IpAddr, MirrorStatus>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -514,6 +686,7 @@ pub(crate) fn join_musicians(
                 mix: mixes.get(&ip).copied().unwrap_or_default(),
                 counters: counters.get(&ip).copied().unwrap_or_default(),
                 link: links.get(&ip).copied().unwrap_or_default(),
+                mirror: mirrors.get(&ip).cloned(),
             }
         })
         .collect()
@@ -1158,6 +1331,7 @@ impl EngineHandle {
             .collect();
         let announced = announced_identities(&entries);
         let links = link_statuses(&entries, &connected, Instant::now());
+        let mirrors = self.targets.mirror_statuses(&entries);
         let config = self.config_state.snapshot();
         EngineStatus {
             device_name: self.device_name.clone(),
@@ -1172,7 +1346,9 @@ impl EngineHandle {
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
-            musicians: join_musicians(&targets, &connected, &counters, &mixes, &announced, &links),
+            musicians: join_musicians(
+                &targets, &connected, &counters, &mixes, &announced, &links, &mirrors,
+            ),
         }
     }
 
@@ -1395,7 +1571,13 @@ impl EngineHandle {
     /// The update is partial: every absent field keeps its value, lists replace from the first
     /// channel on, and levels are clamped, exactly as for a phone's `mix`. The change is applied to
     /// the audio at once, emitted as [EngineEvent::MixChanged] with [MixOrigin::Engine], and pushed
-    /// to the musician's phone as `mix_state` so its screen follows. Returns the mix now stored.
+    /// to the musician's phone as `mix_state` so its screen follows. Every musician who follows
+    /// this one's mix ([Self::set_mirror]) takes it at once, announced the same way. Returns the mix
+    /// now stored.
+    ///
+    /// The desk may change any value of any musician, locked channels and the mix of a follower
+    /// included; a follower's channels and groups then stay so only until their leader's mix next
+    /// changes.
     ///
     /// An address that does not parse, a musician that is not configured, or a list longer than the
     /// mix holds is an error naming the problem, and the mix is left exactly as it was.
@@ -1404,6 +1586,122 @@ impl EngineHandle {
             return Err("the engine is stopping".into());
         }
         set_target_mix(&self.targets, &self.events, value, update)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// The mix of the musician at `value`'s IP as a preset ([MixPreset]): the level, pan, mute and
+    /// solo of each input of the current device, and every group level by the group's id. It holds
+    /// neither their master volume, their phone's level cap, their master mute nor the engineer's
+    /// controls. An address that does not parse or is no musician is an error naming it.
+    pub fn mix_preset(&self, value: &str) -> Result<MixPreset, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        target_preset(&self.targets, &self.config_state, value)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Puts `preset` on the mix of every musician `musicians` names (addresses as [Self::status]
+    /// reports them), from the desk: each listed channel's level, pan, mute and solo, locked
+    /// channels included, and the level of every live group the preset names by id, so a preset
+    /// saved before the groups were edited still lands on the right groups. Both sides of a stereo
+    /// pair stay equal (the first side wins where the preset holds them apart). The master volume,
+    /// the phone's level cap, the master mute and the engineer's controls are left alone.
+    ///
+    /// Each mix takes a new revision, is announced as [EngineEvent::MixChanged] from
+    /// [MixOrigin::Engine] and pushed to the phone, and every musician who follows one of them
+    /// takes it too. Returns each musician's address and mix now stored, in the order named (a
+    /// musician named twice once).
+    ///
+    /// An address that does not parse, a musician who is not here, or one whose mix follows
+    /// another's ([Self::set_mirror]) is an error naming them, and nobody's mix changes.
+    pub fn apply_preset(
+        &self,
+        preset: &MixPreset,
+        musicians: &[String],
+    ) -> Result<Vec<(SocketAddr, MixValues)>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        apply_target_preset(
+            &self.targets,
+            &self.config_state,
+            &self.events,
+            preset,
+            musicians,
+        )
+        .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Copies the mix of the musician at `from`'s IP onto every musician `to` names, from the
+    /// desk: every channel's level, pan, mute and solo and every group level, as [Self::apply_preset]
+    /// puts a preset on them, never the master volume, the phone's level cap, the master mute or the
+    /// engineer's controls. A musician whose mix already held those values is left alone. Returns
+    /// each musician's address and mix now stored, in the order named.
+    ///
+    /// `to` may not name `from`; otherwise the errors are those of [Self::apply_preset], and nobody's
+    /// mix changes.
+    pub fn copy_mix(
+        &self,
+        from: &str,
+        to: &[String],
+    ) -> Result<Vec<(SocketAddr, MixValues)>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        copy_target_mix(&self.targets, &self.events, from, to)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Makes the mix of the musician at `follower`'s IP follow the mix of `leader` (a mirror), or
+    /// stops it with `None`. A mirror is one-way:
+    ///
+    /// - Starting it copies the leader's mix at once (as [Self::copy_mix] does), and from then on
+    ///   every change of the leader's channels and group levels, from their phone, the desk, a
+    ///   preset or a copy, is copied at once to the follower, and on to whoever follows the
+    ///   follower. Each copy is a change through the engine with a new revision, pushed to the
+    ///   follower's phone.
+    /// - While it runs, the follower's phone cannot change any channel or group level (the server
+    ///   keeps them, as it keeps a locked channel), while its master volume, level cap and mute stay
+    ///   its own; every report to it names the leader (`following`) so it can say so.
+    /// - Stopping it leaves the follower's mix as it is and frees their phone.
+    ///
+    /// The engine keeps the mirror for the follower (under their phone's client id when it announced
+    /// one, else their address, the key it returns), so it is put in force again whenever they
+    /// register, and they take the leader's mix then. A leader who is not here keeps the follower
+    /// held to the last mix they took; the status says the leader is away
+    /// ([MirrorStatus::leader_address]).
+    ///
+    /// A musician cannot follow their own mix, nor one that already follows theirs, directly or
+    /// through others: a mirror never goes round in a circle. That, an address that does not parse
+    /// or a musician who is not here is an error naming it, and nothing changes.
+    pub fn set_mirror(
+        &self,
+        follower: &str,
+        leader: Option<MirrorSource<'_>>,
+    ) -> Result<MirrorOutcome, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        set_target_mirror(&self.targets, &self.events, follower, leader)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Keeps a mirror the desk saved: the musician `follower` names follows the one `leader` names,
+    /// shown to the follower's phone as `name`, whether or not either is here, as
+    /// [Self::keep_engineer_controls] keeps controls. A follower who is here is put on it at once
+    /// (taking the leader's mix when the leader is here too), one who registers later when they do.
+    /// A mirror on oneself or one that would go round in a circle is an error, and nothing changes.
+    pub fn keep_mirror(
+        &self,
+        follower: &MusicianKey,
+        leader: &MusicianKey,
+        name: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        keep_target_mirror(&self.targets, &self.events, follower, leader, name)
             .map_err(|error| -> Box<dyn Error> { error.into() })
     }
 
@@ -1687,6 +1985,7 @@ mod tests {
             &HashMap::new(),
             &announced_identities(&entries),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(musicians.len(), 1, "the row moved instead of doubling");
@@ -1748,7 +2047,15 @@ mod tests {
         let mut links = HashMap::new();
         links.insert(ip("192.168.1.3"), reporting);
 
-        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &announced, &links);
+        let musicians = join_musicians(
+            &targets,
+            &connected,
+            &counters,
+            &mixes,
+            &announced,
+            &links,
+            &HashMap::new(),
+        );
 
         assert_eq!(musicians.len(), 3);
 
@@ -3149,6 +3456,258 @@ mod tests {
 
         assert!(error.contains("CH 1"), "{error}");
         assert_eq!(config.snapshot(), before);
+        assert!(observed.try_recv().is_err(), "nothing is announced");
+    }
+
+    fn engine_change(address: &str) -> EngineEvent {
+        EngineEvent::MixChanged {
+            address: address.parse().unwrap(),
+            origin: MixOrigin::Engine,
+        }
+    }
+
+    fn mix_of(registry: &TargetRegistry, musician: &str) -> MixValues {
+        registry
+            .mix_state(ip(musician))
+            .expect("a musician")
+            .current()
+    }
+
+    /// [trio_session] and a third musician at .5 with a master, cap and limit of their own, the
+    /// first musician's channels moved from the desk.
+    fn trio_of_three() -> (TargetRegistry, ConfigState) {
+        let (registry, config) = trio_session();
+        registry
+            .add("192.168.1.5:50000", &config)
+            .expect("a fresh address");
+        set_target_mix(
+            &registry,
+            &EventBus::default(),
+            "192.168.1.3:50000",
+            &MixUpdate {
+                channel_gains: Some(vec![40, 50, 60]),
+                pans: Some(vec![10, 90]),
+                channel_solo: Some(vec![false, true]),
+                volume_percent: Some(95),
+                ..MixUpdate::default()
+            },
+        )
+        .expect("a valid update applies");
+        set_target_mix(
+            &registry,
+            &EventBus::default(),
+            "192.168.1.5:50000",
+            &MixUpdate {
+                volume_percent: Some(60),
+                max_level_percent: Some(80),
+                ..MixUpdate::default()
+            },
+        )
+        .expect("a valid update applies");
+        set_target_controls(
+            &registry,
+            &EventBus::default(),
+            "192.168.1.5:50000",
+            &EngineerUpdate {
+                limit_percent: Some(50),
+                locked: Some(vec![true]),
+            },
+        )
+        .expect("valid controls apply");
+        (registry, config)
+    }
+
+    #[test]
+    fn copying_a_mix_carries_its_channels_and_groups_never_the_master_cap_or_controls() {
+        let (registry, _) = trio_of_three();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let source = mix_of(&registry, "192.168.1.3");
+
+        let copied = copy_target_mix(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &[
+                "192.168.1.4:50000".to_owned(),
+                "192.168.1.5:50000".to_owned(),
+            ],
+        )
+        .expect("the copy is valid");
+
+        assert_eq!(
+            copied
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            ["192.168.1.4:50000", "192.168.1.5:50000"].map(|a| a.parse::<SocketAddr>().unwrap())
+        );
+        for (address, mix) in &copied {
+            assert_eq!(*mix, mix_of(&registry, &address.ip().to_string()));
+            assert_eq!(mix.channel_gains, source.channel_gains, "{address}");
+            assert_eq!(mix.pans, source.pans);
+            assert_eq!(mix.channel_solo, source.channel_solo);
+            assert_eq!(mix.group_levels, source.group_levels);
+        }
+        let third = &copied[1].1;
+        assert_eq!(
+            third.volume_percent, 60,
+            "the master volume stays the musician's"
+        );
+        assert_eq!(third.max_level_percent, 80, "so does the phone's cap");
+        assert_eq!(
+            third.engineer.limit_percent, 50,
+            "the engineer's controls stay"
+        );
+        assert_eq!(third.engineer.locked, 0b1);
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [
+                engine_change("192.168.1.4:50000"),
+                engine_change("192.168.1.5:50000")
+            ]
+        );
+        let onto_itself = copy_target_mix(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &["192.168.1.3:50000".to_owned()],
+        )
+        .expect_err("a mix is not copied onto itself");
+        assert!(onto_itself.contains("itself"), "{onto_itself}");
+    }
+
+    #[test]
+    fn a_preset_saved_from_one_musician_lands_on_another_by_group_id_after_an_edit() {
+        let (registry, config) = trio_of_three();
+        let events = EventBus::default();
+        let preset = target_preset(&registry, &config, "192.168.1.3:50000").expect("a musician");
+        assert_eq!(preset.channels.len(), 4, "one per input of the device");
+        assert_eq!(
+            preset.groups,
+            [("drums", 10), ("bass", 20), ("keys", 30)].map(|(id, level)| (id.to_owned(), level))
+        );
+        edit_groups(
+            &registry,
+            &config,
+            &events,
+            4,
+            &[
+                definition("keys", "Keys", &[3]),
+                definition("vocals", "Vocals", &[4]),
+                definition("drums", "Drums", &[1]),
+            ],
+        )
+        .expect("the edit is valid");
+        let observed = events.subscribe();
+
+        let applied = apply_target_preset(
+            &registry,
+            &config,
+            &events,
+            &preset,
+            &["192.168.1.5:50000".to_owned()],
+        )
+        .expect("the preset is valid");
+
+        let mix = &applied[0].1;
+        assert_eq!(
+            &mix.group_levels[..3],
+            &[30, 100, 10],
+            "Keys and Drums by id"
+        );
+        assert_eq!(&mix.channel_gains[..3], &[40, 50, 60]);
+        assert_eq!(mix.channel_gains[0], 40, "the desk sets a locked channel");
+        assert_eq!(mix.volume_percent, 60);
+        assert_eq!(mix.engineer.limit_percent, 50);
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [engine_change("192.168.1.5:50000")]
+        );
+    }
+
+    #[test]
+    fn a_desk_change_of_a_leader_reaches_its_follower_announced_after_it() {
+        let (registry, _) = trio_of_three();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+
+        let started = set_target_mirror(
+            &registry,
+            &events,
+            "192.168.1.4:50000",
+            Some(MirrorSource {
+                address: "192.168.1.3:50000",
+                name: "Ana",
+            }),
+        )
+        .expect("the mirror is valid");
+        assert_eq!(started.name.as_deref(), Some("Ana"));
+        assert_eq!(
+            started.mix.channel_gains,
+            mix_of(&registry, "192.168.1.3").channel_gains
+        );
+        set_target_mix(
+            &registry,
+            &events,
+            "192.168.1.3:50000",
+            &MixUpdate {
+                channel_gains: Some(vec![5]),
+                ..MixUpdate::default()
+            },
+        )
+        .expect("a valid update applies");
+
+        assert_eq!(mix_of(&registry, "192.168.1.4").channel_gains[0], 5);
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [
+                engine_change("192.168.1.4:50000"),
+                engine_change("192.168.1.3:50000"),
+                engine_change("192.168.1.4:50000"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_preset_or_a_copy_onto_a_follower_is_refused_and_changes_nobody() {
+        let (registry, config) = trio_of_three();
+        let events = EventBus::default();
+        set_target_mirror(
+            &registry,
+            &events,
+            "192.168.1.4:50000",
+            Some(MirrorSource {
+                address: "192.168.1.3:50000",
+                name: "Ana",
+            }),
+        )
+        .expect("the mirror is valid");
+        let before = [
+            mix_of(&registry, "192.168.1.4"),
+            mix_of(&registry, "192.168.1.5"),
+        ];
+        let observed = events.subscribe();
+        let both = [
+            "192.168.1.5:50000".to_owned(),
+            "192.168.1.4:50000".to_owned(),
+        ];
+
+        let copy = copy_target_mix(&registry, &events, "192.168.1.3:50000", &both)
+            .expect_err("a follower is not copied onto");
+        let preset = apply_target_preset(&registry, &config, &events, &MixPreset::default(), &both)
+            .expect_err("nor given a preset");
+
+        for refused in [copy, preset] {
+            assert!(refused.contains("follows Ana's mix"), "{refused}");
+        }
+        assert_eq!(
+            [
+                mix_of(&registry, "192.168.1.4"),
+                mix_of(&registry, "192.168.1.5")
+            ],
+            before
+        );
         assert!(observed.try_recv().is_err(), "nothing is announced");
     }
 }

@@ -696,6 +696,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            mirror: None,
         };
 
         let dto = MusicianDto::from(&musician);
@@ -715,6 +716,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            mirror: None,
         };
 
         let dto = MusicianDto::from(&musician);
@@ -754,6 +756,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link,
+            mirror: None,
         }
     }
 

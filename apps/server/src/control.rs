@@ -668,8 +668,9 @@ async fn handle_control_connection(
                 };
                 // Read under the mix's writer lock and before the configuration check in the send,
                 // so levels moved by an edit of the groups follow the new `config` (see
-                // [send_with_config]).
-                let message = mix_state_message(mix_state.current())?;
+                // [send_with_config]), with the name of the musician it follows, if any.
+                let (values, following) = mix_state.report();
+                let message = mix_state_message(values, following.as_deref())?;
                 // Bounded like the ping: a push that cannot be written in time means a dead peer.
                 match send_by(&writer, &config, Message::Text(message.into()), dead_at).await {
                     BoundedSend::Sent => continue,
@@ -722,15 +723,20 @@ async fn handle_control_connection(
                                 &*config_state,
                             );
                             let address = registration.address;
-                            // The registration put the engineer's limit and locks for this musician
-                            // in force (or took a previous occupant's away): announced as a change
-                            // through the engine, so this phone is sent its mix with them right
-                            // away, and the desktop follows.
+                            // The registration put the engineer's limit, locks and mirror for this
+                            // musician in force (or took a previous occupant's away): announced as a
+                            // change through the engine, so this phone is sent its mix with them
+                            // right away, and the desktop follows. A follower's mix took their
+                            // leader's, which those who follow them in turn take too, each
+                            // announced the same way.
                             if registration.controls_changed {
                                 events.emit(EngineEvent::MixChanged {
                                     address,
                                     origin: MixOrigin::Engine,
                                 });
+                            }
+                            if registration.followed {
+                                announce_engine_changes(&events, targets.propagate(peer.ip()));
                             }
                             // A new session starts with no link report: the one left by an earlier
                             // session describes a link that is gone, and kept it would turn stale
@@ -780,8 +786,10 @@ async fn handle_control_connection(
                     // A `mix` may carry the phone's number for it; the answer, ack or error, carries
                     // it back. Any other type that ends up here is never numbered.
                     //
-                    // The phone's mix never changes what the engineer locked, and the ack carries
-                    // the values kept (see [MixState::apply_from_phone]).
+                    // The phone's mix never changes what the engineer locked, nor the channels and
+                    // groups of a mix that follows another musician's, and the ack carries the
+                    // values kept (see [MixState::apply_from_phone]). Every musician who follows
+                    // this one's mix takes it at once, announced as a change through the engine.
                     let seq = if message_type == "mix" {
                         mix_sequence(&text)
                     } else {
@@ -798,7 +806,8 @@ async fn handle_control_connection(
                                         address: peer,
                                         origin: MixOrigin::Client { peer },
                                     });
-                                    mix_ack(values, seq)?
+                                    announce_engine_changes(&events, targets.propagate(peer.ip()));
+                                    mix_ack(values, mix_state.following().as_deref(), seq)?
                                 }
                                 Err(error) => mix_error(error, seq)?,
                             }
@@ -834,6 +843,17 @@ async fn handle_control_connection(
 
     watcher_task.abort();
     Ok(())
+}
+
+/// Announces each musician at `addresses` as having a mix changed through the engine, so their
+/// phone is sent it and the desktop follows: the followers a change of their leader's mix moved.
+fn announce_engine_changes(events: &EventBus, addresses: Vec<SocketAddr>) {
+    for address in addresses {
+        events.emit(EngineEvent::MixChanged {
+            address,
+            origin: MixOrigin::Engine,
+        });
+    }
 }
 
 /// The one line a connection closed by the heartbeat leaves in the log.
@@ -1734,6 +1754,177 @@ mod tests {
             .await
             .expect("the mix is acknowledged");
         assert_locked_ch1_held(&ack);
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// Reads `mix_state` pushes until one satisfies `wanted`, bounded like [read_message_of_type].
+    async fn read_mix_state_where(
+        client: &mut ClientStream,
+        wanted: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        loop {
+            let pushed = read_message_of_type(client, "mix_state")
+                .await
+                .expect("a mix_state should arrive");
+            if wanted(&pushed) {
+                return pushed;
+            }
+        }
+    }
+
+    /// The engineer makes the phone's musician follow a rack's mix ("Bass"): the phone is told
+    /// whom it follows with the rack's channels, every desk change of the rack reaches it at once,
+    /// and its own whole mix moves only its master. Stopping the mirror frees it again.
+    #[tokio::test]
+    async fn a_followers_phone_is_told_whom_it_follows_and_cannot_move_its_channels() {
+        let config = live_config(&[], 4);
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &[
+                    "127.0.0.1:50000".parse().expect("phone address"),
+                    "192.168.1.40:50000".parse().expect("rack address"),
+                ],
+                &config.snapshot().layout,
+            )
+            .expect("registry should build"),
+        );
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_on(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+            Arc::clone(&config),
+        );
+        let mut client = connect_client(address).await;
+        let rack_gains = |gains: Vec<i32>| crate::mix::MixUpdate {
+            channel_gains: Some(gains),
+            ..crate::mix::MixUpdate::default()
+        };
+        crate::engine::set_target_mix(
+            &targets,
+            &events,
+            "192.168.1.40:50000",
+            &rack_gains(vec![30, 40]),
+        )
+        .expect("a valid update");
+
+        crate::engine::set_target_mirror(
+            &targets,
+            &events,
+            "127.0.0.1:50000",
+            Some(crate::engine::MirrorSource {
+                address: "192.168.1.40:50000",
+                name: "Bass",
+            }),
+        )
+        .expect("the mirror is valid");
+        let told = read_mix_state_where(&mut client, |pushed| pushed["following"] == "Bass").await;
+        assert_eq!(told["channels"][1], 40, "the rack's mix, at once");
+
+        crate::engine::set_target_mix(
+            &targets,
+            &events,
+            "192.168.1.40:50000",
+            &rack_gains(vec![55]),
+        )
+        .expect("a valid update");
+        read_mix_state_where(&mut client, |pushed| pushed["channels"][0] == 55).await;
+
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+        assert_eq!(ack["seq"], 5);
+        assert_eq!(ack["following"], "Bass");
+        assert_eq!(ack["channels"][0], 55, "the channels follow the rack");
+        assert_eq!(ack["mutes"][0], false);
+        assert_eq!(ack["volume_percent"], 80, "the master is the phone's");
+        assert_eq!(ack["max_level_percent"], 90);
+
+        crate::engine::set_target_mirror(&targets, &events, "127.0.0.1:50000", None)
+            .expect("the mirror stops");
+        read_mix_state_where(&mut client, |pushed| pushed["following"].is_null()).await;
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let free = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+        assert_eq!(free["channels"][0], 20, "the phone is free again");
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The phone's musician leads a rack's mix: the phone's own change reaches the rack's mix
+    /// before the phone is answered, announced as a change through the engine after the phone's.
+    #[tokio::test]
+    async fn a_leaders_phone_change_reaches_its_follower_at_once() {
+        let config = live_config(&[], 4);
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &[
+                    "127.0.0.1:50000".parse().expect("phone address"),
+                    "192.168.1.41:50000".parse().expect("rack address"),
+                ],
+                &config.snapshot().layout,
+            )
+            .expect("registry should build"),
+        );
+        let events = EventBus::default();
+        crate::engine::set_target_mirror(
+            &targets,
+            &events,
+            "192.168.1.41:50000",
+            Some(crate::engine::MirrorSource {
+                address: "127.0.0.1:50000",
+                name: "Ana",
+            }),
+        )
+        .expect("the mirror is valid");
+        let observed = events.subscribe();
+        let (address, stopped, server) = start_server_on(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events,
+            Arc::clone(&config),
+        );
+        let mut client = connect_client(address).await;
+
+        send_text(&mut client, WHOLE_MIX_MOVING_CH1).await;
+        let ack = read_message_of_type(&mut client, "mix_ack")
+            .await
+            .expect("the mix is acknowledged");
+
+        assert!(ack["following"].is_null(), "the leader follows nobody");
+        let rack = targets
+            .mix_state("192.168.1.41".parse().expect("rack IP"))
+            .expect("the rack is there")
+            .current();
+        assert_eq!(&rack.channel_gains[..4], &[20, 40, 100, 100]);
+        assert_eq!(&rack.pans[..2], &[50, 50]);
+        assert!(rack.channel_muted[0]);
+        assert_eq!(rack.volume_percent, 100, "the rack keeps its own master");
+        let changes: Vec<EngineEvent> = observed
+            .try_iter()
+            .filter(|event| matches!(event, EngineEvent::MixChanged { .. }))
+            .collect();
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [
+                    EngineEvent::MixChanged {
+                        origin: MixOrigin::Client { .. },
+                        ..
+                    },
+                    EngineEvent::MixChanged {
+                        origin: MixOrigin::Engine,
+                        address,
+                    },
+                ] if address.ip() == "192.168.1.41".parse::<IpAddr>().unwrap()
+            ),
+            "{changes:?}"
+        );
 
         stop_server(address, &stopped, server).await;
     }

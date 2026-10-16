@@ -2,11 +2,12 @@
 // the store. It lives as long as the window; screens come and go and use it. No DOM.
 //
 // - On creation it listens to the engine's events, reads the audio choices the desk's session
-//   keeps (`audio_settings`, once), then asks for the engine's state. When the answer is that no
-//   engine runs (`state: "notRunning"`, an answer and not an error) it starts one with the start
-//   request the old window sent, built on those choices (see engine-config.js), unless `autoStart`
-//   is false. A failed read of the state, and a failed listen, is the console's connection error;
-//   `reconnect` tries again, one attempt at a time.
+//   keeps (`audio_settings`, until a read succeeds), then asks for the engine's state. When the
+//   answer is that no engine runs (`state: "notRunning"`, an answer and not an error) it starts one
+//   with the start request the old window sent, built on those choices (see engine-config.js),
+//   unless `autoStart` is false. A failed read of the state, and a failed listen, is the console's
+//   connection error, and so is a failed read of the choices when it would start: nothing starts
+//   on the defaults in place of a kept input. `reconnect` tries again, one attempt at a time.
 // - The audio choices (driver, input, buffer, picked ASIO driver) are applied only once an engine
 //   started or switched with them, and only then kept in the session (`set_audio_settings`), so
 //   every later start reopens them: Start, Try again, the automatic start, a start after a stop
@@ -165,30 +166,45 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     timer.unref?.();
   }
 
-  // The audio choices are read from the session once, when the window opens.
-  let choiceRead = false;
+  // The audio choices are known once read from the session, or once the engineer made one (which
+  // a later read must not replace).
+  let choiceKnown = false;
   // The applied choices differ from what the session keeps: kept for the next start while nothing
   // ran them, or not saved when they ran. The next start that runs them saves them.
   let choiceUnsaved = false;
 
-  // Reads the audio choices the desk's session keeps, once: every start builds on them. When they
-  // cannot be read the defaults stand (never ASIO), and nothing is saved over the session until
-  // the engineer makes a choice.
+  // Reads the audio choices the desk's session keeps, until a read succeeds: every start builds on
+  // them. Resolves to null once they are known, or to the error of a failed read, which the next
+  // connect or start tries again. While they are unknown nothing starts on the defaults, so a
+  // passing failure never opens the default input in place of the kept one.
   async function readChoice() {
-    if (choiceRead) {
-      return;
+    if (choiceKnown) {
+      return null;
     }
-    choiceRead = true;
     try {
-      store.dispatch(actions.audio(restoredAudio(await api.audioSettings())));
+      const saved = await api.audioSettings();
+      if (!choiceKnown) {
+        store.dispatch(actions.audio(restoredAudio(saved)));
+        choiceKnown = true;
+      }
+      return null;
     } catch (error) {
-      console.warn("the saved audio input could not be read; the defaults stand", error);
+      return error;
     }
+  }
+
+  // Why nothing started while the kept choices could not be read, as a sentence.
+  function choiceUnread(error) {
+    return sentenceWithReason(
+      "The saved audio input could not be read, so nothing was started",
+      message(error),
+    );
   }
 
   // Keeps the applied choices, which an engine now runs with, in the session for every later
   // start. A failure is said, and the next start that runs them tries again.
   async function keepChoice() {
+    choiceKnown = true;
     try {
       await api.setAudioSettings(store.getState().audio);
       choiceUnsaved = false;
@@ -286,7 +302,20 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
 
   // A start of the applied choices as they are (Start, Try again, the automatic start): a missing
   // input gives way to the default input, and choices not saved yet are saved once they run.
+  // Choices that could not be read yet are read first; while that fails nothing starts.
   async function startChoice() {
+    const unread = await readChoice();
+    if (unread) {
+      const reason = choiceUnread(unread);
+      // Nothing reaches the engine, so an engine that runs keeps running.
+      const running = store.getState().engine.status !== null;
+      store.dispatch(
+        running
+          ? actions.commandFailed("start", reason.replace(/\.$/, ""))
+          : actions.engine("error", reason),
+      );
+      return { ok: false, error: reason };
+    }
     const result = await start({ orDefault: true });
     const fellBack = store.getState().audioNotice?.kind === "fallback";
     if (result.ok && choiceUnsaved && !fellBack) {
@@ -359,7 +388,7 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       return;
     }
     // Before any start, so the automatic start reopens the input the engineer chose last.
-    await readChoice();
+    const unread = await readChoice();
     let answer;
     try {
       answer = await api.status();
@@ -369,6 +398,12 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
     store.dispatch(actions.connected());
     if (answer.state === "notRunning" && autoStart) {
+      if (unread) {
+        // Never the defaults in place of a kept input that could not be read: Try again reads it
+        // again and starts.
+        store.dispatch(actions.connectionFailed(choiceUnread(unread)));
+        return;
+      }
       await startChoice();
     } else {
       takeEngineState(answer);
@@ -546,6 +581,7 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
      */
     setAudio(change) {
       store.dispatch(actions.audio(change));
+      choiceKnown = true;
       choiceUnsaved = true;
     },
     switchDevice,

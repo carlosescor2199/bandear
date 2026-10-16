@@ -722,6 +722,66 @@ test("a choice kept while nothing ran is saved once a start runs it", async () =
   app.dispose();
 });
 
+test("a kept input that could not be read is read again on reconnect, and the start opens it", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session is busy");
+  fake.failNext("engine_status", "the engine is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  assert.equal(app.store.getState().connection.status, "failed");
+  assert.equal(commands(fake, "start_engine").length, 0);
+
+  await app.reconnect();
+
+  assert.deepEqual(startsOn(fake), [["wasapi", USB]], "never the default in its place");
+  assert.equal(app.store.getState().engine.status.deviceName, USB);
+  app.dispose();
+});
+
+test("while the kept input cannot be read nothing starts, and the console says why", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  assert.equal(commands(fake, "start_engine").length, 0);
+  assert.deepEqual(app.store.getState().connection, {
+    status: "failed",
+    error: "The saved audio input could not be read, so nothing was started: the session is busy.",
+  });
+
+  fake.failNext("audio_settings", "the session is still busy");
+  await app.start();
+  assert.equal(commands(fake, "start_engine").length, 0, "Start does not guess either");
+  assert.match(app.store.getState().engine.error, /could not be read.*still busy/);
+
+  await app.start();
+  assert.deepEqual(startsOn(fake), [["wasapi", USB]]);
+  app.dispose();
+});
+
+test("a choice the engineer makes while the kept one is unread is not replaced by a later read", async () => {
+  const fake = createFakeBridge({
+    savedAudio: { host: "wasapi", device: USB, bufferFrames: 256, asioDriver: null },
+  });
+  fake.failNext("audio_settings", "the session is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  await app.applyAudio({ host: "auto" });
+  const reads = commands(fake, "audio_settings").length;
+  await app.reconnect();
+
+  assert.equal(commands(fake, "audio_settings").length, reads, "nothing to read any more");
+  assert.equal(app.store.getState().audio.host, "auto");
+  assert.equal(fake.savedAudio().host, "auto");
+  app.dispose();
+});
+
 test("a choice the session could not keep is said, and the next start keeps it", async () => {
   const { fake, app } = await connected();
   fake.failNext("set_audio_settings", "could not save session.json");

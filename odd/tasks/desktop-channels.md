@@ -766,6 +766,24 @@ slice. Push and PRs are the user's decision.
     artificially.
   - Commits: 32b1eaf `feat(desktop): keep the audio input in the session for the next start`; this
     commit (`fix(desktop-ui): reopen the input the engineer chose, also after a restart`).
+- [x] T5c-fix (review fix for T5c, review `review-a8a8d8e4b1bf18da`,
+  R3-read-choice-latched-on-failure): the window marked the kept audio choices read before
+  `audio_settings` answered, so after a failed read a reconnect never read them again and the
+  automatic start opened the defaults. Now the choices are known only once a read succeeded (or
+  once the engineer made a choice, which a later read never replaces); a failed read is tried again
+  by the next connect, Try again or Start. While they are unknown nothing starts on its own: the
+  console shows the connection error "The saved audio input could not be read, so nothing was
+  started: ..." with Try again, and Start says the same without starting. Route: inline writer of
+  the delegated T5c worker (one file and its tests).
+  - RED: 2 of 290 UI tests failed (`a kept input that could not be read is read again on
+    reconnect, and the start opens it`: no start after the reconnect read nothing;
+    `while the kept input cannot be read nothing starts, and the console says why`: the default
+    input started). The third new test (`a choice the engineer makes while the kept one is unread is
+    not replaced by a later read`) passed against the old code as a guard, since nothing was read
+    again.
+  - GREEN: UI 290 passed (3 new); preview (`index.html?fake`): the automatic start still runs.
+  - Commit: this commit (`fix(desktop-ui): retry reading the kept input instead of starting the
+    default`).
 - [ ] T6 (presets, copy and mirror): presets in the session; apply to a musician; copy; one-way
   mirror with the follower locked; the Mix screen's controls. Route: delegated writer.
 - [ ] T7 (session save and load): save and load the whole session (RF7), pushing saved mixes to
@@ -888,6 +906,10 @@ slice. Push and PRs are the user's decision.
   the locked fader, the registration `mix_state`, the Locked tag and the limit line on the 390 dp
   Master card); with the musician's channel locked More of me stays off and the levels it lowered
   stay as the server plays them until the musician moves them back (as after a desktop change).
+
+- T5c done (the audio input reopened and remembered); see its entry for evidence and follow-ups.
+- Review `review-a8a8d8e4b1bf18da` over 71b9aff..d379367 (T5c) approved and acknowledged; next
+  review base d379367. Its WARNING (R3-read-choice-latched-on-failure) is fixed by T5c-fix.
 
 ## Next step
 

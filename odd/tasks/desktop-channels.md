@@ -774,6 +774,13 @@ slice. Push and PRs are the user's decision.
   R3-register-restore-not-announced, R3-idle-controls-shadowed-by-phone-key,
   R3-master-limit-change-wiring-untested) are fixed by T5a-fix.
 
+- Review `review-722972c3e330801a` over bd0d75b..c248e3b (T5a-fix) approved and acknowledged; next
+  review base c248e3b. One SUGGESTION folded into T6 (which extends the fake bridge):
+  R3-fake-idle-validation-diverges — with no engine the fake accepts addresses the desktop's
+  `SocketAddr` parse rejects (a host name and port) and keys an empty-string `clientId` under the
+  address while the desktop keys `Some("")` under the phone; make the desktop treat an empty
+  client id as none and make the fake validate exactly like the desktop.
+
 ## Next step
 
 T5b (engineer limit and locks on Android).

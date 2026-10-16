@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
-    LinkHealth, MixOrigin, MixUpdate, MixValues, MusicianStatus,
+    LinkHealth, MirrorStatus, MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus,
 };
 
-use crate::session::{SessionChannel, SessionGroup};
+use crate::session::{address_key, client_key, SessionChannel, SessionGroup, SessionPreset};
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
@@ -210,6 +210,122 @@ pub struct MusicianDto {
     /// Lost packets as a percentage of the packets the phone expected.
     pub loss_percent: Option<f64>,
     pub receive_timeouts_per_second: Option<f64>,
+    /// Whose mix this musician's follows (see [crate::commands::set_mirror]); null when it
+    /// follows nobody.
+    pub mirror: Option<MirrorDto>,
+}
+
+/// Whose mix a musician's follows, on their status row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorDto {
+    /// The leader as the desk keys them: `client:<id>` for a phone with a client id, else
+    /// `address:<ip:port>` (see [crate::session::client_key]).
+    pub leader: String,
+    /// The leader's address as the status rows show it; null while the leader is not here, and
+    /// then the follower keeps the last mix they took.
+    pub leader_address: Option<String>,
+    /// The name the follower's phone is told it follows.
+    pub name: String,
+}
+
+/// The key the desk keeps what it knows about `key`'s musician under.
+pub fn session_key(key: &MusicianKey) -> String {
+    match key {
+        MusicianKey::Client(id) => client_key(id),
+        MusicianKey::Address(address) => address_key(&address.to_string()),
+    }
+}
+
+impl From<&MirrorStatus> for MirrorDto {
+    fn from(mirror: &MirrorStatus) -> Self {
+        Self {
+            leader: session_key(&mirror.leader),
+            leader_address: mirror.leader_address.map(|address| address.to_string()),
+            name: mirror.name.clone(),
+        }
+    }
+}
+
+/// What a change to the engineer's presets did ([crate::commands::save_preset],
+/// [crate::commands::rename_preset], [crate::commands::delete_preset]): the preset saved or
+/// renamed (null after a delete) and every preset now kept, in order. A refused change or a save
+/// that fails is an error instead, and nothing changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetsDto {
+    pub preset: Option<SessionPreset>,
+    pub presets: Vec<SessionPreset>,
+}
+
+/// One musician's mix after a desk change of several ([crate::commands::apply_preset],
+/// [crate::commands::copy_mix]).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicianMixDto {
+    /// The musician's address as the status rows show it.
+    pub address: String,
+    pub mix: MixDto,
+}
+
+/// What a preset or a copy did: each musician's mix now stored, in the order named. The running
+/// engine took them all (each phone is sent its mix); a refusal is an error and changed nobody.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixesSetDto {
+    pub mixes: Vec<MusicianMixDto>,
+}
+
+impl MixesSetDto {
+    pub fn new(mixes: &[(std::net::SocketAddr, MixValues)]) -> Self {
+        Self {
+            mixes: mixes
+                .iter()
+                .map(|(address, mix)| MusicianMixDto {
+                    address: address.to_string(),
+                    mix: MixDto::from(mix),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The musician a mirror should follow, as the webview sends it to [crate::commands::set_mirror]:
+/// their address as the status rows show it, their phone's client id when the row has one, and the
+/// name the follower's phone is told ("Following Bass's mix"; the desk sends the name it shows).
+/// A field the desk does not know is rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MirrorRequest {
+    pub address: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// What [crate::commands::set_mirror] did, as [EngineerControlsSetDto] says it for the engineer's
+/// controls: `applied` whether the running engine took the mirror (the follower's mix follows the
+/// leader's now and their phone is held off its channels and groups), `saved` whether the session
+/// keeps it, and `saveError` why not. With no engine running it is saved and applies at the next
+/// start.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorSetDto {
+    /// The follower's address as the status rows show it.
+    pub address: String,
+    /// The leader's address as it was asked for; null once the mirror stopped.
+    pub leader: Option<String>,
+    /// The name the follower's phone is told it follows; null once the mirror stopped.
+    pub name: Option<String>,
+    /// "phone" when the mirror is kept for the follower's phone (it follows them to a new IP),
+    /// "address" when it is kept for their address.
+    pub kept_for: &'static str,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    /// The follower's whole mix now stored; null when no engine took the mirror.
+    pub mix: Option<MixDto>,
 }
 
 /// One musician's whole mix.
@@ -498,6 +614,7 @@ impl From<&MusicianStatus> for MusicianDto {
             underruns_per_second: musician.link.underruns_per_second,
             loss_percent: musician.link.loss_percent,
             receive_timeouts_per_second: musician.link.receive_timeouts_per_second,
+            mirror: musician.mirror.as_ref().map(MirrorDto::from),
         }
     }
 }
@@ -745,6 +862,52 @@ mod tests {
             rack_row["clientId"].is_null(),
             "a configured target or an older phone has no id: {rack_row}"
         );
+    }
+
+    #[test]
+    fn a_row_says_whose_mix_the_musician_follows_and_whether_the_leader_is_here() {
+        let follower = MusicianStatus {
+            mirror: Some(MirrorStatus {
+                leader: MusicianKey::Client("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
+                name: "Bass".to_owned(),
+                leader_address: Some("192.168.1.12:50000".parse().expect("test address")),
+            }),
+            ..musician_with_link(LinkStatus::default())
+        };
+        let away = MusicianStatus {
+            mirror: Some(MirrorStatus {
+                leader: MusicianKey::Address("192.168.1.40:50000".parse().expect("test address")),
+                name: "Rack".to_owned(),
+                leader_address: None,
+            }),
+            ..musician_with_link(LinkStatus::default())
+        };
+
+        let row = serde_json::to_value(MusicianDto::from(&follower)).expect("a row serializes");
+        let away_row = serde_json::to_value(MusicianDto::from(&away)).expect("a row serializes");
+        let free = serde_json::to_value(MusicianDto::from(&musician_with_link(
+            LinkStatus::default(),
+        )))
+        .expect("a row serializes");
+
+        assert_eq!(
+            row["mirror"],
+            serde_json::json!({
+                "leader": "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b",
+                "leaderAddress": "192.168.1.12:50000",
+                "name": "Bass"
+            })
+        );
+        assert_eq!(away_row["mirror"]["leader"], "address:192.168.1.40:50000");
+        assert!(
+            away_row["mirror"]["leaderAddress"].is_null(),
+            "the leader is away"
+        );
+        assert!(free["mirror"].is_null(), "{free}");
+        let misspelt = serde_json::from_value::<MirrorRequest>(
+            serde_json::json!({ "address": "192.168.1.12:50000", "leaderName": "Bass" }),
+        );
+        assert!(misspelt.is_err(), "an unknown field is refused");
     }
 
     fn musician_with_link(link: LinkStatus) -> MusicianStatus {

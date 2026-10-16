@@ -13,7 +13,10 @@
 //!       "label": "Ana",
 //!       "engineer": { "limitPercent": 60, "lockedChannels": [1, 2] }
 //!     },
-//!     "address:192.168.1.40:50000": { "label": "Rack A" }
+//!     "address:192.168.1.40:50000": {
+//!       "label": "Rack A",
+//!       "mirror": { "leader": "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b", "name": "Ana" }
+//!     }
 //!   },
 //!   "channels": [
 //!     { "name": "Kick", "kind": "drums", "hidden": false, "link": false },
@@ -23,7 +26,16 @@
 //!   "groups": [
 //!     { "id": "g3f9a0c1d2e4b5a6", "name": "Drums", "channels": [1, 2, 3] }
 //!   ],
-//!   "presets": [],
+//!   "presets": [
+//!     {
+//!       "id": "p0c4d2e6f8a1b3c5d",
+//!       "name": "Vocal heavy",
+//!       "mix": {
+//!         "channels": [{ "gain": 80, "pan": 50, "muted": false, "solo": false }],
+//!         "groups": { "g3f9a0c1d2e4b5a6": 70 }
+//!       }
+//!     }
+//!   ],
 //!   "audio": {
 //!     "host": "wasapi",
 //!     "device": "INPUT 1/2 (Volt 4)",
@@ -43,7 +55,11 @@
 //!   to every engine the desk starts (see [crate::commands::start_engine]), which puts them in
 //!   force when that musician registers. An entry's `engineer` was added within version 1: an
 //!   earlier build reads the entry and keeps its label, but drops the controls when it saves; an
-//!   `engineer` that cannot be read costs only itself (it reads as none).
+//!   `engineer` that cannot be read costs only itself (it reads as none). An entry's `mirror` (added
+//!   the same way) says whose mix this musician's follows: the leader's key (`client:` or
+//!   `address:`, as above) and the name the follower's phone is told ("Following Ana's mix"). It is
+//!   given to every engine the desk starts, which puts it in force whenever the follower registers;
+//!   one that cannot be read costs only itself.
 //! - `groups` holds the engineer's groups in their order: each with the stable id every musician's
 //!   group level follows, a name and 1-based channel numbers (as the engineer numbers them). They are
 //!   applied to every engine the desk starts (see [crate::commands::start_engine]) and replaced by
@@ -58,8 +74,14 @@
 //!   fewer inputs uses the details of the inputs it has, and the session keeps them all. Like
 //!   `groups`, the section was reserved in the first version and every earlier build wrote it empty
 //!   and kept whatever it read, so its shape does not change the version.
-//! - `presets` is reserved for the engineer's mix presets. Until the code that owns it lands it is
-//!   written back exactly as it was read.
+//! - `presets` holds the engineer's mix presets, in the order they were saved (see
+//!   [crate::commands::save_preset]): each with a stable id, a name and the mix it keeps, the
+//!   level, pan, mute and solo of each input in channel order (the first entry is CH 1; inputs the
+//!   current device lacks are kept) and the group levels by group id, so a preset still lands on
+//!   the right groups after they were edited. A preset never holds a musician's master volume,
+//!   level cap or the engineer's controls. A channel entry may leave out any field (level 100, pan
+//!   50, neither muted nor soloed). The section was reserved in the first version and every earlier
+//!   build wrote it empty and kept whatever it read, so its shape does not change the version.
 //! - `audio` is the audio input the desk last ran with: the driver (`auto`, `wasapi` or `asio`), the
 //!   input device picked under `auto` or `wasapi` (null for the system's default input), the buffer
 //!   in frames (null for the engine's default) and the ASIO driver the engineer picked. The window
@@ -117,9 +139,9 @@ pub struct Session {
     /// The engineer's groups, in their order.
     #[serde(default)]
     pub groups: Vec<SessionGroup>,
-    /// Reserved for the engineer's mix presets; kept as read.
+    /// The engineer's mix presets, in the order they were saved.
     #[serde(default)]
-    pub presets: Vec<Value>,
+    pub presets: Vec<SessionPreset>,
     /// The audio input the desk last ran with; absent until an engine ran with a choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<SessionAudio>,
@@ -174,6 +196,73 @@ pub struct MusicianEntry {
         deserialize_with = "lenient_engineer"
     )]
     pub engineer: Option<SessionEngineer>,
+    /// Whose mix this musician's follows; `None` when it follows nobody.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_mirror"
+    )]
+    pub mirror: Option<SessionMirror>,
+}
+
+/// A mirror as the desk keeps it for its follower (see [crate::commands::set_mirror]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMirror {
+    /// The leader's key: [client_key] for a phone that announced a client id, else [address_key].
+    pub leader: String,
+    /// The name the follower's phone is told it follows.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Reads an entry's `mirror` without ever failing the entry, as [lenient_engineer] does.
+fn lenient_mirror<'de, D>(deserializer: D) -> Result<Option<SessionMirror>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| SessionMirror::deserialize(value).ok()))
+}
+
+/// One of the engineer's mix presets as the desk keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPreset {
+    /// The preset's stable id, given by the desk when it was saved.
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mix: SessionPresetMix,
+}
+
+/// What a preset keeps of a mix: each input's values in channel order, and the group levels by
+/// group id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPresetMix {
+    #[serde(default)]
+    pub channels: Vec<SessionPresetChannel>,
+    #[serde(default)]
+    pub groups: BTreeMap<String, u8>,
+}
+
+/// One input of a preset: its level and pan (0-100), mute and solo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPresetChannel {
+    #[serde(default = "full_level")]
+    pub gain: u8,
+    #[serde(default = "centre")]
+    pub pan: u8,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub solo: bool,
+}
+
+fn full_level() -> u8 {
+    100
+}
+
+fn centre() -> u8 {
+    50
 }
 
 /// The engineer's controls for one musician as the desk keeps them (see
@@ -398,6 +487,81 @@ impl SessionStore {
                 entry.engineer = engineer
             }),
         }
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
+    /// The mirror kept for the musician with this client id at this address: the one kept for the
+    /// phone first, then the one kept for the address.
+    pub fn mirror_for(&self, client_id: Option<&str>, address: &str) -> Option<SessionMirror> {
+        let loaded = self.lock();
+        let musicians = &loaded.session.musicians;
+        let kept = |key: String| musicians.get(&key).and_then(|entry| entry.mirror.clone());
+        client_id
+            .and_then(|id| kept(client_key(id)))
+            .or_else(|| kept(address_key(address)))
+    }
+
+    /// Every mirror the session keeps, each with its follower's key ([client_key] or
+    /// [address_key]), in key order.
+    pub fn mirrors(&self) -> Vec<(String, SessionMirror)> {
+        self.lock()
+            .session
+            .musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.mirror.clone()?)))
+            .collect()
+    }
+
+    /// Keeps the mirror of the musician with this client id at this address, or drops it with
+    /// `None`, as [Self::set_engineer] keeps controls: under the phone's key, dropping any kept for
+    /// the address, or under the address for a musician without one. The file is written before
+    /// success is reported; a save that fails, or is refused over a session this build must not
+    /// replace, changes nothing.
+    pub fn set_mirror(
+        &self,
+        client_id: Option<&str>,
+        address: &str,
+        mirror: Option<SessionMirror>,
+    ) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let mut session = loaded.session.clone();
+        match client_id {
+            Some(id) => {
+                update_entry(&mut session, address_key(address), |entry| {
+                    entry.mirror = None
+                });
+                update_entry(&mut session, client_key(id), |entry| entry.mirror = mirror);
+            }
+            None => update_entry(&mut session, address_key(address), |entry| {
+                entry.mirror = mirror
+            }),
+        }
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
+    /// The engineer's mix presets, in the order they were saved.
+    pub fn presets(&self) -> Vec<SessionPreset> {
+        self.lock().session.presets.clone()
+    }
+
+    /// Replaces the engineer's mix presets. The file is written before success is reported; a save
+    /// that fails, or is refused over a session this build must not replace, changes nothing.
+    pub fn set_presets(&self, presets: Vec<SessionPreset>) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            presets,
+            ..loaded.session.clone()
+        };
         write_atomically(&self.path, &session)?;
         loaded.session = session;
         Ok(())
@@ -1115,11 +1279,11 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_section_and_the_others_are_written_back_as_they_were_read() {
+    fn the_other_sections_are_written_back_as_they_were_read() {
         let directory = test_directory("reserved");
         fs::write(
             directory.join(SESSION_FILE),
-            r#"{"version":1,"musicians":{},"channels":[{"name":"Kick","kind":"drums","hidden":false,"link":false}],"groups":[],"presets":[{"name":"Verse"}]}"#,
+            r#"{"version":1,"musicians":{},"channels":[{"name":"Kick","kind":"drums","hidden":false,"link":false}],"groups":[],"presets":[{"id":"p1","name":"Verse","mix":{"channels":[{"gain":80,"pan":20,"muted":true,"solo":false}],"groups":{"kit":70}}}]}"#,
         )
         .expect("write");
 
@@ -1132,7 +1296,17 @@ mod tests {
             saved["channels"],
             serde_json::json!([{ "name": "Kick", "kind": "drums", "hidden": false, "link": false }])
         );
-        assert_eq!(saved["presets"], serde_json::json!([{ "name": "Verse" }]));
+        assert_eq!(
+            saved["presets"],
+            serde_json::json!([{
+                "id": "p1",
+                "name": "Verse",
+                "mix": {
+                    "channels": [{ "gain": 80, "pan": 20, "muted": true, "solo": false }],
+                    "groups": { "kit": 70 }
+                }
+            }])
+        );
         assert_eq!(
             saved["musicians"],
             serde_json::json!({ "address:192.168.1.30:50000": { "label": "Ana" } })
@@ -1513,6 +1687,184 @@ mod tests {
 
         assert!(error.contains("newer"), "{error}");
         assert_eq!(session.engineer_for(None, ADDRESS), None);
+    }
+
+    fn preset(id: &str, name: &str, gains: &[u8], groups: &[(&str, u8)]) -> SessionPreset {
+        SessionPreset {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            mix: SessionPresetMix {
+                channels: gains
+                    .iter()
+                    .map(|&gain| SessionPresetChannel {
+                        gain,
+                        pan: 50,
+                        muted: false,
+                        solo: false,
+                    })
+                    .collect(),
+                groups: groups
+                    .iter()
+                    .map(|(id, level)| ((*id).to_owned(), *level))
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn presets_are_kept_in_order_and_survive_a_reload() {
+        let directory = test_directory("presets");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("saved");
+        let kept = vec![
+            preset("p1", "Verse", &[80, 60], &[("kit", 70)]),
+            preset("p2", "Chorus", &[100; 20], &[]),
+        ];
+
+        session.set_presets(kept.clone()).expect("saved");
+
+        assert_eq!(session.presets(), kept);
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(
+            reloaded.presets(),
+            kept,
+            "twenty inputs kept, whatever the device"
+        );
+        assert_eq!(reloaded.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["presets"][0]["mix"]["groups"],
+            serde_json::json!({ "kit": 70 }),
+            "group levels by group id"
+        );
+    }
+
+    #[test]
+    fn a_preset_channel_may_leave_out_what_it_does_not_change_and_a_misshapen_one_costs_the_section(
+    ) {
+        let directory = test_directory("presets-lenient");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{},"presets":[{"id":"p1","name":"Verse","mix":{"channels":[{"muted":true}]}}]}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            SessionStore::open(&directory).presets()[0].mix.channels,
+            [SessionPresetChannel {
+                gain: 100,
+                pan: 50,
+                muted: true,
+                solo: false,
+            }]
+        );
+
+        let damaged = test_directory("presets-damaged");
+        fs::write(
+            damaged.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},"presets":[{"name":"no id"}]}"#,
+        )
+        .expect("write");
+        let session = SessionStore::open(&damaged);
+        assert_eq!(session.presets(), Vec::new());
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert!(session.notice().expect("reported").contains("presets"));
+    }
+
+    fn follows(leader: &str, name: &str) -> SessionMirror {
+        SessionMirror {
+            leader: leader.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_mirror_is_kept_for_the_phone_beside_its_label_and_replaces_the_addresss() {
+        let directory = test_directory("mirror");
+        let session = SessionStore::open(&directory);
+        session
+            .set_mirror(
+                None,
+                ADDRESS,
+                Some(follows("address:192.168.1.40:50000", "Rack")),
+            )
+            .expect("saved");
+        session
+            .set_label(Some(PHONE), ADDRESS, "Ana")
+            .expect("saved");
+
+        session
+            .set_mirror(
+                Some(PHONE),
+                ADDRESS,
+                Some(follows(&client_key(OTHER_PHONE), "Bass")),
+            )
+            .expect("saved");
+
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["musicians"],
+            serde_json::json!({
+                format!("client:{PHONE}"): {
+                    "label": "Ana",
+                    "mirror": { "leader": format!("client:{OTHER_PHONE}"), "name": "Bass" }
+                }
+            }),
+            "the address's mirror gave way"
+        );
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(
+            reloaded.mirror_for(Some(PHONE), "192.168.1.99:50000"),
+            Some(follows(&client_key(OTHER_PHONE), "Bass"))
+        );
+        assert_eq!(
+            reloaded.mirrors(),
+            vec![(client_key(PHONE), follows(&client_key(OTHER_PHONE), "Bass"))]
+        );
+        reloaded
+            .set_mirror(Some(PHONE), ADDRESS, None)
+            .expect("saved");
+        assert_eq!(reloaded.mirrors(), Vec::new());
+        assert_eq!(
+            reloaded.label_for(Some(PHONE), ADDRESS),
+            Some("Ana".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_mirror_costs_only_itself_and_a_newer_session_refuses_the_new_sections() {
+        let directory = test_directory("mirror-unreadable");
+        fs::write(
+            directory.join(SESSION_FILE),
+            format!(
+                r#"{{"version":1,"musicians":{{"client:{PHONE}":{{"label":"Ana","mirror":{{"name":7}}}}}}}}"#
+            ),
+        )
+        .expect("write");
+        let session = SessionStore::open(&directory);
+        assert_eq!(session.notice(), None, "the file loads as it is");
+        assert_eq!(
+            session.label_for(Some(PHONE), ADDRESS),
+            Some("Ana".to_owned())
+        );
+        assert_eq!(session.mirrors(), Vec::new());
+
+        let newer = test_directory("presets-newer");
+        fs::write(newer.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let refused = SessionStore::open(&newer);
+        for error in [
+            refused
+                .set_presets(vec![preset("p1", "Verse", &[80], &[])])
+                .expect_err("refused"),
+            refused
+                .set_mirror(
+                    None,
+                    ADDRESS,
+                    Some(follows("address:192.168.1.40:50000", "Rack")),
+                )
+                .expect_err("refused"),
+        ] {
+            assert!(error.contains("newer"), "{error}");
+        }
+        assert_eq!(refused.presets(), Vec::new());
+        assert_eq!(refused.mirrors(), Vec::new());
     }
 
     fn volt_on_wasapi() -> SessionAudio {

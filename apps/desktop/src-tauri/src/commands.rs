@@ -13,17 +13,21 @@ use std::sync::Mutex;
 
 use personal_monitoring::{
     check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
-    EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition, MixValues,
-    MusicianKey, MusicianStatus,
+    EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition, MirrorOutcome,
+    MirrorSource, MixPreset, MixValues, MusicianKey, MusicianStatus, PresetChannel,
 };
 
 use crate::dto::{
-    locked_table, AudioSettingsRequest, CaptureFormatDto, ChannelRequest, ChannelsSetDto,
-    EngineStateDto, EngineStatusDto, EngineerControlsRequest, EngineerControlsSetDto, GroupRequest,
-    GroupsSetDto, InputDeviceDto, MetersDto, MixDto, MixUpdateRequest, StartRequest, StartSummary,
+    locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
+    ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
+    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MetersDto, MirrorRequest,
+    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, StartRequest, StartSummary,
 };
 use crate::events::EventPump;
-use crate::session::{SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionStore};
+use crate::session::{
+    address_key, client_key, SessionAudio, SessionChannel, SessionEngineer, SessionGroup,
+    SessionMirror, SessionPreset, SessionPresetChannel, SessionPresetMix, SessionStore,
+};
 
 /// Starts the event pump for a new engine, given that engine's event bus and run.
 pub type PumpStarter = Box<dyn Fn(Receiver<EngineEvent>, u64) -> EventPump + Send + Sync>;
@@ -133,10 +137,16 @@ fn group_definitions(groups: Vec<GroupRequest>) -> Vec<GroupDefinition> {
 /// never inherits a level kept for a deleted one. The randomness is the standard library's hash
 /// seed: an id needs to be unique, not secret.
 fn new_group_id(taken: &mut HashSet<String>) -> String {
+    new_id('g', taken)
+}
+
+/// A new id: `prefix` and 16 random hex digits, never one in `taken`, which it joins (see
+/// [new_group_id]).
+fn new_id(prefix: char, taken: &mut HashSet<String>) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     loop {
         let seed = NEXT.fetch_add(1, Ordering::Relaxed);
-        let id = format!("g{:016x}", RandomState::new().hash_one(seed));
+        let id = format!("{prefix}{:016x}", RandomState::new().hash_one(seed));
         if taken.insert(id.clone()) {
             return id;
         }
@@ -189,20 +199,47 @@ fn session_engineer_controls(session: &SessionStore) -> Vec<(MusicianKey, Engine
         .engineer_controls()
         .into_iter()
         .filter_map(|(key, kept)| {
-            let musician = if let Some(id) = key.strip_prefix("client:") {
-                MusicianKey::Client(id.to_owned())
-            } else if let Some(address) = key
-                .strip_prefix("address:")
-                .and_then(|address| address.parse().ok())
-            {
-                MusicianKey::Address(address)
-            } else {
+            let Some(musician) = musician_key_of(&key) else {
                 eprintln!(
                     "[mixlink-desktop] the engineer's controls kept for `{key}` are skipped: it names no phone or address"
                 );
                 return None;
             };
             Some((musician, engineer_controls(&kept)))
+        })
+        .collect()
+}
+
+/// The musician a session key names: a `client:` key as the phone's client id, an `address:` key
+/// as that address; `None` for a key this build cannot read.
+fn musician_key_of(key: &str) -> Option<MusicianKey> {
+    if let Some(id) = key.strip_prefix("client:") {
+        return Some(MusicianKey::Client(id.to_owned()));
+    }
+    key.strip_prefix("address:")
+        .and_then(|address| address.parse().ok())
+        .map(MusicianKey::Address)
+}
+
+/// The mirrors the session keeps, as the engine takes them at start (see
+/// [EngineHandle::keep_mirror]): the follower's key, the leader's key and the name the follower's
+/// phone is told. A mirror whose follower or leader key this build cannot read is skipped and
+/// logged.
+fn session_mirrors(session: &SessionStore) -> Vec<(MusicianKey, MusicianKey, String)> {
+    session
+        .mirrors()
+        .into_iter()
+        .filter_map(|(key, mirror)| {
+            match (musician_key_of(&key), musician_key_of(&mirror.leader)) {
+                (Some(follower), Some(leader)) => Some((follower, leader, mirror.name)),
+                _ => {
+                    eprintln!(
+                        "[mixlink-desktop] the mirror kept for `{key}` on `{}` is skipped: it names no phone or address",
+                        mirror.leader
+                    );
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -255,7 +292,9 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 /// runs without them: they are a convenience and must not stop the server. The engineer's controls
 /// the session keeps for each musician are given to the engine after them
 /// ([session_engineer_controls]): a configured target has them at once, and a phone gets them when
-/// it registers, from whatever IP, before its first mix is handled.
+/// it registers, from whatever IP, before its first mix is handled. The mirrors the session keeps
+/// follow the same way ([session_mirrors]); one the engine refuses (a circle in a hand-edited
+/// session) is logged and left out.
 pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let mut pump = state
         .pump
@@ -271,6 +310,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_groups = session_groups_for(&request, &state.session);
     let saved_channels = session_channels(&state.session);
     let saved_controls = session_engineer_controls(&state.session);
+    let saved_mirrors = session_mirrors(&state.session);
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
@@ -309,6 +349,13 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                 if let Err(error) = handle.keep_engineer_controls(&key, controls) {
                     eprintln!(
                         "[mixlink-desktop] start_engine: the saved controls for {key:?} were not applied: {error}"
+                    );
+                }
+            }
+            for (follower, leader, name) in saved_mirrors {
+                if let Err(error) = handle.keep_mirror(&follower, &leader, &name) {
+                    eprintln!(
+                        "[mixlink-desktop] start_engine: the saved mirror of {follower:?} on {leader:?} was not applied: {error}"
                     );
                 }
             }
@@ -656,6 +703,464 @@ fn edit_engineer_controls<E: ControlsEngine>(
         saved: save_error.is_none(),
         save_error,
         mix: Some(MixDto::from(&mix)),
+    })
+}
+
+/// The longest preset name the desk keeps, in characters.
+pub const MAX_PRESET_NAME_LENGTH: usize = 40;
+
+/// What a preset, a copy or a mirror needs from the running engine: the engine itself in the app, a
+/// stand-in in the tests, as [GroupEngine] is for a group edit.
+trait MixesEngine {
+    /// The mix of the musician at `address` as a preset ([EngineHandle::mix_preset]).
+    fn mix_preset(&self, address: &str) -> Result<MixPreset, String>;
+    /// Puts `preset` on every musician `musicians` names ([EngineHandle::apply_preset]).
+    fn apply_preset(
+        &mut self,
+        preset: &MixPreset,
+        musicians: &[String],
+    ) -> Result<Vec<(SocketAddr, MixValues)>, String>;
+    /// Copies `from`'s mix onto every musician `to` names ([EngineHandle::copy_mix]).
+    fn copy_mix(
+        &mut self,
+        from: &str,
+        to: &[String],
+    ) -> Result<Vec<(SocketAddr, MixValues)>, String>;
+    /// Starts, changes or stops `follower`'s mirror ([EngineHandle::set_mirror]).
+    fn set_mirror(
+        &mut self,
+        follower: &str,
+        leader: Option<MirrorSource<'_>>,
+    ) -> Result<MirrorOutcome, String>;
+}
+
+impl MixesEngine for EngineHandle {
+    fn mix_preset(&self, address: &str) -> Result<MixPreset, String> {
+        EngineHandle::mix_preset(self, address).map_err(|error| error.to_string())
+    }
+
+    fn apply_preset(
+        &mut self,
+        preset: &MixPreset,
+        musicians: &[String],
+    ) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+        EngineHandle::apply_preset(self, preset, musicians).map_err(|error| error.to_string())
+    }
+
+    fn copy_mix(
+        &mut self,
+        from: &str,
+        to: &[String],
+    ) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+        EngineHandle::copy_mix(self, from, to).map_err(|error| error.to_string())
+    }
+
+    fn set_mirror(
+        &mut self,
+        follower: &str,
+        leader: Option<MirrorSource<'_>>,
+    ) -> Result<MirrorOutcome, String> {
+        EngineHandle::set_mirror(self, follower, leader).map_err(|error| error.to_string())
+    }
+}
+
+/// The client id the window gave for a musician's phone, or `None` when it gave none or an empty
+/// one: an empty id names no phone.
+fn phone_id(client_id: Option<&str>) -> Option<&str> {
+    client_id.filter(|id| !id.trim().is_empty())
+}
+
+/// A musician's mix as a preset keeps it under `id` and `name` (see [crate::session]).
+fn kept_preset(id: String, name: String, preset: &MixPreset) -> SessionPreset {
+    SessionPreset {
+        id,
+        name,
+        mix: SessionPresetMix {
+            channels: preset
+                .channels
+                .iter()
+                .map(|channel| SessionPresetChannel {
+                    gain: channel.gain,
+                    pan: channel.pan,
+                    muted: channel.muted,
+                    solo: channel.solo,
+                })
+                .collect(),
+            groups: preset.groups.iter().cloned().collect(),
+        },
+    }
+}
+
+/// A kept preset's mix as the engine takes it.
+fn engine_preset(mix: &SessionPresetMix) -> MixPreset {
+    MixPreset {
+        channels: mix
+            .channels
+            .iter()
+            .map(|channel| PresetChannel {
+                gain: channel.gain,
+                pan: channel.pan,
+                muted: channel.muted,
+                solo: channel.solo,
+            })
+            .collect(),
+        groups: mix
+            .groups
+            .iter()
+            .map(|(id, level)| (id.clone(), *level))
+            .collect(),
+    }
+}
+
+/// `name` trimmed, when it can name a preset among `presets` (the one with the id `renaming`
+/// aside): not empty, at most [MAX_PRESET_NAME_LENGTH] characters, and no other preset's name in
+/// any case, so the engineer never has two presets to tell apart by id alone.
+fn preset_name(
+    name: &str,
+    presets: &[SessionPreset],
+    renaming: Option<&str>,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a preset needs a name".to_owned());
+    }
+    if name.chars().count() > MAX_PRESET_NAME_LENGTH {
+        return Err(format!(
+            "a preset name is at most {MAX_PRESET_NAME_LENGTH} characters"
+        ));
+    }
+    let taken = presets.iter().any(|preset| {
+        Some(preset.id.as_str()) != renaming && preset.name.to_lowercase() == name.to_lowercase()
+    });
+    if taken {
+        return Err(format!("a preset named \"{name}\" already exists"));
+    }
+    Ok(name.to_owned())
+}
+
+/// The position of the preset with the id `id` among `presets`, or the error naming it.
+fn preset_position(presets: &[SessionPreset], id: &str) -> Result<usize, String> {
+    presets
+        .iter()
+        .position(|preset| preset.id == id)
+        .ok_or_else(|| format!("there is no preset with the id `{id}`"))
+}
+
+/// The engineer's mix presets the session keeps, in the order they were saved.
+pub fn presets(state: &DesktopState) -> Vec<SessionPreset> {
+    state.session.presets()
+}
+
+/// Saves the mix of the musician at `address` as a new preset called `name`, and answers every
+/// preset now kept ([PresetsDto]).
+///
+/// The running engine gives the mix ([EngineHandle::mix_preset]): each input's level, pan, mute and
+/// solo and the group levels by group id, never the master volume, the phone's level cap or the
+/// engineer's controls. The preset gets a new id (`p` and 16 hex digits) and is kept after the
+/// others. The name is trimmed and must be new (see [preset_name]). With no engine running there is
+/// no mix to save, so it is refused; a refusal, or a save that fails, changes nothing.
+pub fn save_preset(
+    state: &DesktopState,
+    address: String,
+    name: String,
+) -> Result<PresetsDto, String> {
+    let outcome = save_preset_with(&state.engine, &state.session, &address, &name)?;
+    if let Some(preset) = &outcome.preset {
+        println!(
+            "[mixlink-desktop] save_preset: \"{}\" ({}) from {address}",
+            preset.name, preset.id
+        );
+    }
+    Ok(outcome)
+}
+
+/// [save_preset] over any engine slot and session.
+fn save_preset_with<E: MixesEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    address: &str,
+    name: &str,
+) -> Result<PresetsDto, String> {
+    // The lock order every command that holds both follows: the engine's, then the session's.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let engine = guard.as_ref().ok_or_else(|| {
+        "the engine is not running: a preset is saved from a mix the engine plays".to_owned()
+    })?;
+    let mut presets = session.presets();
+    let name = preset_name(name, &presets, None)?;
+    let mix = engine.mix_preset(address)?;
+    let mut taken: HashSet<String> = presets.iter().map(|preset| preset.id.clone()).collect();
+    let preset = kept_preset(new_id('p', &mut taken), name, &mix);
+    presets.push(preset.clone());
+    session.set_presets(presets.clone())?;
+    Ok(PresetsDto {
+        preset: Some(preset),
+        presets,
+    })
+}
+
+/// Renames the preset with the id `id` (the name is checked as [save_preset] checks it), with or
+/// without an engine, and answers every preset now kept. A refusal, or a save that fails, changes
+/// nothing.
+pub fn rename_preset(state: &DesktopState, id: String, name: String) -> Result<PresetsDto, String> {
+    let outcome = rename_kept_preset(&state.session, &id, &name)?;
+    println!(
+        "[mixlink-desktop] rename_preset: {id} -> \"{}\"",
+        name.trim()
+    );
+    Ok(outcome)
+}
+
+/// [rename_preset] over a session.
+fn rename_kept_preset(session: &SessionStore, id: &str, name: &str) -> Result<PresetsDto, String> {
+    let mut presets = session.presets();
+    let position = preset_position(&presets, id)?;
+    presets[position].name = preset_name(name, &presets, Some(id))?;
+    session.set_presets(presets.clone())?;
+    Ok(PresetsDto {
+        preset: Some(presets[position].clone()),
+        presets,
+    })
+}
+
+/// Deletes the preset with the id `id`, with or without an engine, and answers every preset now
+/// kept. The window asks the engineer to confirm first. A preset that is not there, or a save that
+/// fails, changes nothing.
+pub fn delete_preset(state: &DesktopState, id: String) -> Result<PresetsDto, String> {
+    let outcome = delete_kept_preset(&state.session, &id)?;
+    println!("[mixlink-desktop] delete_preset: {id}");
+    Ok(outcome)
+}
+
+/// [delete_preset] over a session.
+fn delete_kept_preset(session: &SessionStore, id: &str) -> Result<PresetsDto, String> {
+    let mut presets = session.presets();
+    presets.remove(preset_position(&presets, id)?);
+    session.set_presets(presets.clone())?;
+    Ok(PresetsDto {
+        preset: None,
+        presets,
+    })
+}
+
+/// Puts the preset with the id `id` on the mix of every musician `musicians` names (addresses as
+/// the status rows show them), through the running engine ([EngineHandle::apply_preset]): each
+/// kept input and every live group the preset names by id, locked channels included, pairs kept
+/// equal; never the master volume, the phone's level cap or the engineer's controls. Answers each
+/// musician's mix now stored ([MixesSetDto]). With no engine running, for a preset that is not
+/// there, or for a musician the engine refuses (one whose mix follows another's), it is an error
+/// and nobody's mix changed. Nothing is saved: the mixes live in the engine.
+pub fn apply_preset(
+    state: &DesktopState,
+    id: String,
+    musicians: Vec<String>,
+) -> Result<MixesSetDto, String> {
+    let outcome = apply_preset_with(&state.engine, &state.session, &id, &musicians)?;
+    println!("[mixlink-desktop] apply_preset: {id} on {musicians:?}");
+    Ok(outcome)
+}
+
+/// [apply_preset] over any engine slot and session.
+fn apply_preset_with<E: MixesEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    id: &str,
+    musicians: &[String],
+) -> Result<MixesSetDto, String> {
+    let mut guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        "the engine is not running: a preset is put on mixes the engine plays".to_owned()
+    })?;
+    let presets = session.presets();
+    let kept = &presets[preset_position(&presets, id)?];
+    let applied = engine.apply_preset(&engine_preset(&kept.mix), musicians)?;
+    Ok(MixesSetDto::new(&applied))
+}
+
+/// Copies the mix of the musician at `from` onto every musician `to` names, through the running
+/// engine ([EngineHandle::copy_mix]): every channel's level, pan, mute and solo and every group
+/// level, never the master volume, the phone's level cap or the engineer's controls. Answers each
+/// musician's mix now stored. With no engine running, or for a musician the engine refuses, it is
+/// an error and nobody's mix changed.
+pub fn copy_mix(
+    state: &DesktopState,
+    from: String,
+    to: Vec<String>,
+) -> Result<MixesSetDto, String> {
+    let outcome = copy_mix_with(&state.engine, &from, &to)?;
+    println!("[mixlink-desktop] copy_mix: {from} onto {to:?}");
+    Ok(outcome)
+}
+
+/// [copy_mix] over any engine slot.
+fn copy_mix_with<E: MixesEngine>(
+    engine: &Mutex<Option<E>>,
+    from: &str,
+    to: &[String],
+) -> Result<MixesSetDto, String> {
+    let mut guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        "the engine is not running: a mix is copied between mixes the engine plays".to_owned()
+    })?;
+    Ok(MixesSetDto::new(&engine.copy_mix(from, to)?))
+}
+
+/// Makes the mix of the musician at `address` follow the mix of `leader`, or stops it with `None`
+/// (see [EngineHandle::set_mirror]), and answers what was done ([MirrorSetDto]). `client_id` is the
+/// follower's phone's client id when the window knows one (an empty one is none).
+///
+/// - With an engine running, the engine takes the mirror first (the follower's mix takes the
+///   leader's at once and follows it, and their phone is held off its channels and groups and told
+///   whom it follows), and only then is it saved: under the follower's phone's client id when it
+///   announced one, else their address, with the leader's key as the engine keeps it. A save that
+///   fails then is reported in the answer, not as an error.
+/// - An engine that is stopping, a musician it does not list, a musician following their own mix or
+///   a mirror that would go round in a circle is refused: an error, and nothing changed.
+/// - With no engine, it is kept under the strongest key the desk knows for the follower (their
+///   phone's when the window gave its client id, else the address, which must be a musician
+///   address) and the leader's (likewise), refusing a mirror on oneself or one that would close a
+///   circle with those kept; it applies at the next start (`applied: false`).
+///
+/// Each change is one step under the engine lock, with the session's inside it.
+pub fn set_mirror(
+    state: &DesktopState,
+    address: String,
+    client_id: Option<String>,
+    leader: Option<MirrorRequest>,
+) -> Result<MirrorSetDto, String> {
+    let outcome = edit_mirror(
+        &state.engine,
+        &state.session,
+        &address,
+        client_id.as_deref(),
+        leader,
+    )?;
+    println!(
+        "[mixlink-desktop] set_mirror: {} follows {:?} kept_for={} applied={} saved={}",
+        outcome.address, outcome.leader, outcome.kept_for, outcome.applied, outcome.saved
+    );
+    Ok(outcome)
+}
+
+/// Whether following the session's `mirrors` from the leader key `leader` reaches one of
+/// `follower`'s keys: then the follower following the leader would close a circle.
+fn closes_circle(mirrors: &[(String, SessionMirror)], follower: &[String], leader: &str) -> bool {
+    let mut key = leader.to_owned();
+    for _ in 0..=mirrors.len() {
+        if follower.contains(&key) {
+            return true;
+        }
+        match mirrors.iter().find(|(kept_for, _)| *kept_for == key) {
+            Some((_, mirror)) => key = mirror.leader.clone(),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// [set_mirror] over any engine slot and session.
+fn edit_mirror<E: MixesEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    address: &str,
+    client_id: Option<&str>,
+    leader: Option<MirrorRequest>,
+) -> Result<MirrorSetDto, String> {
+    let client_id = phone_id(client_id);
+    // One step per change, in the lock order every command that holds both follows (see
+    // [edit_groups]).
+    let mut guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let Some(engine) = guard.as_mut() else {
+        let at = address
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid musician address `{address}`: {error}"))?;
+        let follower: Vec<String> = client_id
+            .map(client_key)
+            .into_iter()
+            .chain([address_key(&at.to_string())])
+            .collect();
+        let kept = match &leader {
+            None => None,
+            Some(request) => {
+                let leader_at = request.address.parse::<SocketAddr>().map_err(|error| {
+                    format!("invalid musician address `{}`: {error}", request.address)
+                })?;
+                let leader_key = phone_id(request.client_id.as_deref())
+                    .map(client_key)
+                    .unwrap_or_else(|| address_key(&leader_at.to_string()));
+                if leader_at.ip() == at.ip() || follower.contains(&leader_key) {
+                    return Err(format!("{address} cannot follow their own mix"));
+                }
+                if closes_circle(&session.mirrors(), &follower, &leader_key) {
+                    return Err(format!(
+                        "{} already follows {address}'s mix, directly or through another musician: a mirror cannot go round in a circle",
+                        request.address
+                    ));
+                }
+                let name = request.name.trim();
+                Some(SessionMirror {
+                    leader: leader_key,
+                    name: if name.is_empty() {
+                        leader_at.ip().to_string()
+                    } else {
+                        name.to_owned()
+                    },
+                })
+            }
+        };
+        // Nothing took it, so a save that fails changes nothing and is the answer.
+        session.set_mirror(client_id, &at.to_string(), kept.clone())?;
+        return Ok(MirrorSetDto {
+            address: address.to_owned(),
+            leader: leader.map(|request| request.address),
+            name: kept.map(|mirror| mirror.name),
+            kept_for: if client_id.is_some() {
+                "phone"
+            } else {
+                "address"
+            },
+            applied: false,
+            saved: true,
+            save_error: None,
+            mix: None,
+        });
+    };
+    // A refusal (an engine that is stopping, an unknown musician, a circle) returns here, before
+    // anything is saved.
+    let outcome = engine.set_mirror(
+        address,
+        leader.as_ref().map(|request| MirrorSource {
+            address: &request.address,
+            name: &request.name,
+        }),
+    )?;
+    let kept = outcome.leader.as_ref().map(|key| SessionMirror {
+        leader: session_key(key),
+        name: outcome.name.clone().unwrap_or_default(),
+    });
+    let (saved, kept_for) = match &outcome.follower {
+        MusicianKey::Client(id) => (session.set_mirror(Some(id), address, kept), "phone"),
+        MusicianKey::Address(at) => (session.set_mirror(None, &at.to_string(), kept), "address"),
+    };
+    // The phone already follows: say that it was not kept.
+    let save_error = saved.err();
+    Ok(MirrorSetDto {
+        address: address.to_owned(),
+        leader: leader.map(|request| request.address),
+        name: outcome.name,
+        kept_for,
+        applied: true,
+        saved: save_error.is_none(),
+        save_error,
+        mix: Some(MixDto::from(&outcome.mix)),
     })
 }
 
@@ -1116,6 +1621,7 @@ mod tests {
                     underruns_per_second: None,
                     loss_percent: None,
                     receive_timeouts_per_second: None,
+                    mirror: None,
                 })
                 .collect(),
         }
@@ -1536,6 +2042,92 @@ mod tests {
         rows: Vec<(String, Option<String>)>,
         /// The engineer's controls it took last.
         controls: Option<EngineerControls>,
+        /// What it answers for a musician's mix as a preset.
+        preset: MixPreset,
+        /// The preset it put on musicians last, and whom.
+        took_preset: Option<(MixPreset, Vec<String>)>,
+        /// The copy it made last: from whom, onto whom.
+        copied: Option<(String, Vec<String>)>,
+        /// The mirror it took last: the follower and the leader's address and name.
+        mirrored: Option<(String, Option<(String, String)>)>,
+    }
+
+    impl StandInEngine {
+        /// The key the stand-in keeps what it knows about the musician at `address` under.
+        fn key_at(&self, address: &str) -> Result<MusicianKey, String> {
+            let (at, client_id) = self
+                .rows
+                .iter()
+                .find(|(at, _)| at == address)
+                .cloned()
+                .ok_or_else(|| format!("target `{address}` is not configured"))?;
+            Ok(match client_id {
+                Some(id) => MusicianKey::Client(id),
+                None => MusicianKey::Address(at.parse().expect("a test address")),
+            })
+        }
+
+        fn mixes(&self, musicians: &[String]) -> Vec<(SocketAddr, MixValues)> {
+            musicians
+                .iter()
+                .map(|at| (at.parse().expect("a test address"), MixValues::default()))
+                .collect()
+        }
+    }
+
+    impl MixesEngine for StandInEngine {
+        fn mix_preset(&self, address: &str) -> Result<MixPreset, String> {
+            self.key_at(address).map(|_| self.preset.clone())
+        }
+
+        fn apply_preset(
+            &mut self,
+            preset: &MixPreset,
+            musicians: &[String],
+        ) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            self.took_preset = Some((preset.clone(), musicians.to_vec()));
+            Ok(self.mixes(musicians))
+        }
+
+        fn copy_mix(
+            &mut self,
+            from: &str,
+            to: &[String],
+        ) -> Result<Vec<(SocketAddr, MixValues)>, String> {
+            self.key_at(from)?;
+            self.copied = Some((from.to_owned(), to.to_vec()));
+            Ok(self.mixes(to))
+        }
+
+        fn set_mirror(
+            &mut self,
+            follower: &str,
+            leader: Option<MirrorSource<'_>>,
+        ) -> Result<MirrorOutcome, String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            let follower_key = self.key_at(follower)?;
+            let leader_key = leader
+                .map(|source| self.key_at(source.address))
+                .transpose()?;
+            self.mirrored = Some((
+                follower.to_owned(),
+                leader.map(|source| (source.address.to_owned(), source.name.to_owned())),
+            ));
+            Ok(MirrorOutcome {
+                follower: follower_key,
+                leader: leader_key,
+                name: leader.map(|source| source.name.to_owned()),
+                mix: MixValues {
+                    revision: 9,
+                    ..MixValues::default()
+                },
+            })
+        }
     }
 
     impl ControlsEngine for StandInEngine {
@@ -2590,6 +3182,322 @@ mod tests {
                 "bufferFrames": 128,
                 "asioDriver": "Volt ASIO"
             })
+        );
+    }
+
+    const RACK: &str = "192.168.1.40:50000";
+    const ANA: &str = "192.168.1.10:50000";
+
+    /// A running stand-in listing Ana's phone and a rack, whose mixes read as `preset`.
+    fn band(preset: MixPreset) -> Mutex<Option<StandInEngine>> {
+        running(StandInEngine {
+            rows: vec![
+                (ANA.to_owned(), Some(PHONE.to_owned())),
+                (RACK.to_owned(), None),
+            ],
+            preset,
+            ..StandInEngine::default()
+        })
+    }
+
+    fn two_inputs() -> MixPreset {
+        MixPreset {
+            channels: vec![
+                PresetChannel {
+                    gain: 80,
+                    pan: 20,
+                    muted: false,
+                    solo: true,
+                },
+                PresetChannel {
+                    gain: 60,
+                    pan: 70,
+                    muted: true,
+                    solo: false,
+                },
+            ],
+            groups: vec![("kit".to_owned(), 70), ("vox".to_owned(), 40)],
+        }
+    }
+
+    #[test]
+    fn a_preset_is_saved_from_a_musicians_mix_under_a_new_id_and_a_name_of_its_own() {
+        let session = SessionStore::open(&session_directory("preset-save"));
+        let engine = band(two_inputs());
+
+        let saved = save_preset_with(&engine, &session, ANA, "  Vocal heavy ")
+            .expect("a running engine has the mix");
+
+        let preset = saved.preset.expect("the new preset");
+        assert!(
+            preset.id.starts_with('p') && preset.id.len() > 1,
+            "{}",
+            preset.id
+        );
+        assert_eq!(preset.name, "Vocal heavy");
+        assert_eq!(
+            serde_json::to_value(&preset.mix).expect("serializes"),
+            serde_json::json!({
+                "channels": [
+                    { "gain": 80, "pan": 20, "muted": false, "solo": true },
+                    { "gain": 60, "pan": 70, "muted": true, "solo": false }
+                ],
+                "groups": { "kit": 70, "vox": 40 }
+            })
+        );
+        assert_eq!(session.presets(), saved.presets);
+        for (name, refusal) in [
+            ("vocal HEAVY", "already"),
+            ("   ", "name"),
+            (&"x".repeat(MAX_PRESET_NAME_LENGTH + 1), "characters"),
+        ] {
+            let error = save_preset_with(&engine, &session, ANA, name).expect_err("refused");
+            assert!(error.contains(refusal), "{name}: {error}");
+        }
+        let idle = save_preset_with(&Mutex::new(None::<StandInEngine>), &session, ANA, "Other")
+            .expect_err("a preset is saved from a mix that plays");
+        assert!(idle.contains("not running"), "{idle}");
+        assert_eq!(session.presets().len(), 1, "nothing else was kept");
+    }
+
+    #[test]
+    fn presets_are_renamed_and_deleted_by_id_without_an_engine() {
+        let session = SessionStore::open(&session_directory("preset-edit"));
+        let engine = band(two_inputs());
+        let verse = save_preset_with(&engine, &session, ANA, "Verse")
+            .expect("saved")
+            .preset
+            .expect("kept");
+        let chorus = save_preset_with(&engine, &session, ANA, "Chorus")
+            .expect("saved")
+            .preset
+            .expect("kept");
+        assert_ne!(verse.id, chorus.id);
+
+        let renamed = rename_kept_preset(&session, &verse.id, "Bridge").expect("renamed");
+
+        assert_eq!(
+            renamed.preset.as_ref().map(|preset| preset.name.as_str()),
+            Some("Bridge")
+        );
+        assert_eq!(renamed.presets[0].mix, verse.mix, "only the name changes");
+        assert!(rename_kept_preset(&session, &verse.id, "chorus")
+            .expect_err("taken")
+            .contains("already"));
+        assert!(rename_kept_preset(&session, "p-gone", "Intro")
+            .expect_err("unknown")
+            .contains("no preset"));
+        let deleted = delete_kept_preset(&session, &verse.id).expect("deleted");
+        assert_eq!(deleted.preset, None);
+        assert_eq!(
+            deleted
+                .presets
+                .iter()
+                .map(|preset| &preset.name)
+                .collect::<Vec<_>>(),
+            ["Chorus"]
+        );
+        assert_eq!(session.presets(), deleted.presets);
+        assert!(delete_kept_preset(&session, &verse.id).is_err());
+    }
+
+    #[test]
+    fn a_kept_preset_is_put_on_musicians_through_the_engine_as_it_was_saved() {
+        let session = SessionStore::open(&session_directory("preset-apply"));
+        let engine = band(two_inputs());
+        let kept = save_preset_with(&engine, &session, ANA, "Verse")
+            .expect("saved")
+            .preset
+            .expect("kept");
+        let both = vec![RACK.to_owned(), ANA.to_owned()];
+
+        let applied = apply_preset_with(&engine, &session, &kept.id, &both).expect("applied");
+
+        let took = engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .and_then(|engine| engine.took_preset.clone());
+        assert_eq!(took, Some((two_inputs(), both.clone())), "as it was saved");
+        assert_eq!(
+            applied
+                .mixes
+                .iter()
+                .map(|mixed| mixed.address.as_str())
+                .collect::<Vec<_>>(),
+            [RACK, ANA]
+        );
+        assert!(apply_preset_with(&engine, &session, "p-gone", &both)
+            .expect_err("unknown")
+            .contains("no preset"));
+        let idle = apply_preset_with(
+            &Mutex::new(None::<StandInEngine>),
+            &session,
+            &kept.id,
+            &both,
+        )
+        .expect_err("a preset is put on mixes that play");
+        assert!(idle.contains("not running"), "{idle}");
+    }
+
+    #[test]
+    fn a_copy_goes_to_the_running_engine() {
+        let engine = band(MixPreset::default());
+
+        let copied = copy_mix_with(&engine, ANA, &[RACK.to_owned()]).expect("copied");
+
+        assert_eq!(copied.mixes[0].address, RACK);
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .and_then(|engine| engine.copied.clone()),
+            Some((ANA.to_owned(), vec![RACK.to_owned()]))
+        );
+        assert!(
+            copy_mix_with(&Mutex::new(None::<StandInEngine>), ANA, &[RACK.to_owned()])
+                .expect_err("idle")
+                .contains("not running")
+        );
+    }
+
+    fn leader(address: &str, client_id: Option<&str>, name: &str) -> MirrorRequest {
+        MirrorRequest {
+            address: address.to_owned(),
+            client_id: client_id.map(str::to_owned),
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_mirror_the_engine_took_is_saved_for_the_followers_phone_and_stopping_drops_it() {
+        let session = SessionStore::open(&session_directory("mirror-running"));
+        let engine = band(MixPreset::default());
+
+        let started = edit_mirror(
+            &engine,
+            &session,
+            ANA,
+            Some(PHONE),
+            Some(leader(RACK, None, "Rack")),
+        )
+        .expect("the engine took it");
+
+        assert!(started.applied && started.saved, "{started:?}");
+        assert_eq!(started.kept_for, "phone");
+        assert_eq!(started.leader.as_deref(), Some(RACK));
+        assert_eq!(started.name.as_deref(), Some("Rack"));
+        assert_eq!(started.mix.as_ref().map(|mix| mix.revision), Some(9));
+        assert_eq!(
+            session.mirror_for(Some(PHONE), ANA),
+            Some(SessionMirror {
+                leader: format!("address:{RACK}"),
+                name: "Rack".to_owned(),
+            })
+        );
+        let stopped = edit_mirror(&engine, &session, ANA, Some(PHONE), None).expect("stopped");
+        assert!(stopped.applied && stopped.leader.is_none());
+        assert_eq!(session.mirrors(), Vec::new());
+
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_mut()
+            .expect("running")
+            .stopping = true;
+        let refused = edit_mirror(
+            &engine,
+            &session,
+            ANA,
+            Some(PHONE),
+            Some(leader(RACK, None, "Rack")),
+        )
+        .expect_err("a stopping engine refuses");
+        assert!(refused.contains("stopping"), "{refused}");
+        assert_eq!(session.mirrors(), Vec::new(), "nothing was saved");
+    }
+
+    #[test]
+    fn with_no_engine_a_mirror_is_kept_for_the_next_start_and_never_in_a_circle() {
+        let session = SessionStore::open(&session_directory("mirror-idle"));
+        let idle = Mutex::new(None::<StandInEngine>);
+
+        let kept = edit_mirror(
+            &idle,
+            &session,
+            ANA,
+            Some(PHONE),
+            Some(leader(RACK, None, "Rack")),
+        )
+        .expect("kept for the next start");
+
+        assert!(!kept.applied && kept.saved);
+        assert_eq!(kept.kept_for, "phone");
+        assert_eq!(
+            session.mirrors(),
+            vec![(
+                format!("client:{PHONE}"),
+                SessionMirror {
+                    leader: format!("address:{RACK}"),
+                    name: "Rack".to_owned(),
+                }
+            )]
+        );
+        let circle = edit_mirror(
+            &idle,
+            &session,
+            RACK,
+            None,
+            Some(leader(ANA, Some(PHONE), "Ana")),
+        )
+        .expect_err("the rack cannot follow Ana while Ana follows the rack");
+        assert!(circle.contains("circle"), "{circle}");
+        let own = edit_mirror(
+            &idle,
+            &session,
+            RACK,
+            None,
+            Some(leader(RACK, None, "Rack")),
+        )
+        .expect_err("nobody follows their own mix");
+        assert!(own.contains("own"), "{own}");
+        assert!(edit_mirror(&idle, &session, "rack.local:50000", None, None).is_err());
+        assert_eq!(session.mirrors().len(), 1, "the refusals kept nothing");
+    }
+
+    #[test]
+    fn every_start_is_handed_the_sessions_mirrors_by_key() {
+        let session = SessionStore::open(&session_directory("mirror-start"));
+        session
+            .set_mirror(
+                Some(PHONE),
+                ANA,
+                Some(SessionMirror {
+                    leader: format!("address:{RACK}"),
+                    name: "Rack".to_owned(),
+                }),
+            )
+            .expect("saved");
+        session
+            .set_mirror(
+                None,
+                RACK,
+                Some(SessionMirror {
+                    leader: "somewhere".to_owned(),
+                    name: "?".to_owned(),
+                }),
+            )
+            .expect("saved");
+
+        assert_eq!(
+            session_mirrors(&session),
+            vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                MusicianKey::Address(RACK.parse().expect("an address")),
+                "Rack".to_owned()
+            )],
+            "a leader key this build cannot read is skipped"
         );
     }
 }

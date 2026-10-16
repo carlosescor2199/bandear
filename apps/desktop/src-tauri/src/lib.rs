@@ -12,11 +12,11 @@ pub mod session;
 use commands::DesktopState;
 use dto::{
     AudioSettingsRequest, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
-    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MixDto, MixUpdateRequest,
-    StartRequest, StartSummary,
+    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MirrorRequest,
+    MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto, PresetsDto, StartRequest, StartSummary,
 };
 use events::EventPump;
-use session::{SessionAudio, SessionChannel, SessionStore};
+use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
 use tauri::{Manager, State};
 
 /// Fails to compile rather than at runtime if the shared state ever gains a non-`Send` field,
@@ -150,6 +150,75 @@ async fn set_audio_settings(
     commands::set_audio_settings(state.inner(), settings)
 }
 
+/// The engineer's mix presets (`[{ id, name, mix: { channels: [{ gain, pan, muted, solo }],
+/// groups: { <groupId>: level } } }]`, in the order they were saved; see [commands::presets]).
+#[tauri::command]
+async fn presets(state: State<'_, DesktopState>) -> Result<Vec<SessionPreset>, String> {
+    Ok(commands::presets(state.inner()))
+}
+
+/// Saves the mix of the musician at `address` as a new preset called `name` and answers `{ preset,
+/// presets }` (see [commands::save_preset]).
+#[tauri::command]
+async fn save_preset(
+    state: State<'_, DesktopState>,
+    address: String,
+    name: String,
+) -> Result<PresetsDto, String> {
+    commands::save_preset(state.inner(), address, name)
+}
+
+/// Renames the preset `id` and answers `{ preset, presets }` (see [commands::rename_preset]).
+#[tauri::command]
+async fn rename_preset(
+    state: State<'_, DesktopState>,
+    id: String,
+    name: String,
+) -> Result<PresetsDto, String> {
+    commands::rename_preset(state.inner(), id, name)
+}
+
+/// Deletes the preset `id` and answers `{ preset: null, presets }` (see [commands::delete_preset]).
+#[tauri::command]
+async fn delete_preset(state: State<'_, DesktopState>, id: String) -> Result<PresetsDto, String> {
+    commands::delete_preset(state.inner(), id)
+}
+
+/// Puts the preset `id` on the mix of every musician `musicians` names and answers `{ mixes: [{
+/// address, mix }] }` (see [commands::apply_preset]).
+#[tauri::command]
+async fn apply_preset(
+    state: State<'_, DesktopState>,
+    id: String,
+    musicians: Vec<String>,
+) -> Result<MixesSetDto, String> {
+    commands::apply_preset(state.inner(), id, musicians)
+}
+
+/// Copies the mix of the musician at `from` onto every musician `to` names and answers `{ mixes }`
+/// (see [commands::copy_mix]).
+#[tauri::command]
+async fn copy_mix(
+    state: State<'_, DesktopState>,
+    from: String,
+    to: Vec<String>,
+) -> Result<MixesSetDto, String> {
+    commands::copy_mix(state.inner(), from, to)
+}
+
+/// Makes the mix of the musician at `address` (`clientId`, the row's, when the window knows it)
+/// follow `leader` (`{ address, clientId?, name }`), or stops it with null, and answers `{ address,
+/// leader, name, keptFor, applied, saved, saveError, mix }` (see [commands::set_mirror]).
+#[tauri::command]
+async fn set_mirror(
+    state: State<'_, DesktopState>,
+    address: String,
+    client_id: Option<String>,
+    leader: Option<MirrorRequest>,
+) -> Result<MirrorSetDto, String> {
+    commands::set_mirror(state.inner(), address, client_id, leader)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -187,7 +256,14 @@ pub fn run() {
             channel_table,
             set_engineer_controls,
             audio_settings,
-            set_audio_settings
+            set_audio_settings,
+            presets,
+            save_preset,
+            rename_preset,
+            delete_preset,
+            apply_preset,
+            copy_mix,
+            set_mirror
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

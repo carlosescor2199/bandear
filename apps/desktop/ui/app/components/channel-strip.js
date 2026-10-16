@@ -1,14 +1,18 @@
 // <ml-channel-strip>: one input in a musician's mix, or a stereo pair of inputs as one strip:
 // instrument icon and name, group chip, pan (a balance for a pair, marked "Stereo"), input meter,
-// fader with its value, Mute and Solo.
+// fader with its value, Mute and Solo, and the engineer's lock for this musician's phone, its
+// state in words ("Locked" or "Unlocked"). A lock only binds the phone: the desk still moves the
+// strip, so its controls stay live here.
 //
 // Property: `data`, one entry of channelStrips (mix-view.js):
-//   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout }.
+//   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout, locked,
+//   lockText }.
 // Method: `setLevel(level)`, the input peak from the `meters` event (a pair's louder side).
 // Event: `mix-edit` { field, index, sides, stereo, value } (bubbling, composed) for a move of the
 //   fader ("channelGains") or the pan ("pans", a balance for a pair) and a press of Mute
-//   ("channelMuted") or Solo ("channelSolo"); the screen writes it to every input in `sides`
-//   (channelEdits). The strip does not change its data itself: the screen answers with new data.
+//   ("channelMuted"), Solo ("channelSolo") or the lock ("lockedChannels"); the screen writes it to
+//   every input in `sides` (channelEdits), so a pair locks as one. The strip does not change its
+//   data itself: the screen answers with new data.
 
 import "./fader.js";
 import "./group-chip.js";
@@ -62,6 +66,12 @@ const styles = sheet(`
   .readout[data-muted] {
     color: var(--ml-text-muted);
   }
+  /* "Unlocked" fits the strip in the small type. */
+  .lock::part(button) {
+    min-width: 64px;
+    padding: 0 4px;
+    font-size: var(--ml-text-2xs);
+  }
 `);
 
 class MlChannelStrip extends HTMLElement {
@@ -83,9 +93,10 @@ class MlChannelStrip extends HTMLElement {
         <div class="buttons">
           <ml-toggle kind="mute">M</ml-toggle><ml-toggle kind="solo">S</ml-toggle>
         </div>
+        <ml-toggle class="lock">Unlocked</ml-toggle>
       </div>`,
     );
-    const [mute, solo] = root.querySelectorAll("ml-toggle");
+    const [mute, solo, lock] = root.querySelectorAll("ml-toggle");
     this.#parts = {
       strip: root.querySelector(".strip"),
       name: root.querySelector(".label"),
@@ -98,11 +109,13 @@ class MlChannelStrip extends HTMLElement {
       readout: root.querySelector(".readout"),
       mute,
       solo,
+      lock,
     };
     this.#forward(this.#parts.fader, "input", "channelGains", (event) => event.detail.value);
     this.#forward(this.#parts.pan, "input", "pans", (event) => event.detail.value);
     this.#forward(mute, "change", "channelMuted", (event) => event.detail.pressed);
     this.#forward(solo, "change", "channelSolo", (event) => event.detail.pressed);
+    this.#forward(lock, "change", "lockedChannels", (event) => event.detail.pressed);
   }
 
   get data() {
@@ -137,6 +150,12 @@ class MlChannelStrip extends HTMLElement {
     parts.mute.pressed = data.muted;
     reflect(parts.solo, "label", `Solo ${label}`);
     parts.solo.pressed = data.solo;
+    reflect(parts.lock, "label", `Lock ${label} on the musician's phone`);
+    parts.lock.pressed = data.locked;
+    setText(parts.lock, data.lockText);
+    parts.lock.title = data.locked
+      ? "Locked: the musician's phone cannot change this channel; you still can"
+      : "Unlocked: the musician's phone can change this channel";
   }
 
   setLevel(level) {

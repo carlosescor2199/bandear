@@ -1,10 +1,15 @@
-// <ml-master-strip>: a musician's master: the stereo output meters, the level, the level cap
-// (the loudest the phone may play) and Mute.
+// <ml-master-strip>: a musician's master: the stereo output meters, the level, the phone's level
+// cap (the loudest the phone may play; the musician sets it too), the engineer's limit (the loudest
+// this desk lets the musician hear; their phone cannot change it), a line saying the lower of the
+// two wins, and Mute.
 //
-// Property: `data`, from masterStrip (mix-view.js): { volume, cap, muted, readout }.
+// Property: `data`, from masterStrip (mix-view.js):
+//   { volume, cap, limit, muted, readout, ceilingNote }.
 // Method: `setLevels(left, right)`, the output peaks from the `meters` event.
 // Event: `mix-edit` { field, index: null, value } (bubbling, composed) for the level
-//   ("volumePercent"), the cap ("maxLevelPercent") and Mute ("muted").
+//   ("volumePercent") and the cap ("maxLevelPercent") as they move, Mute ("muted"), and the limit
+//   ("engineerLimitPercent") when a gesture on it ends: each limit change is kept by the desk, so a
+//   drag sends its last value only.
 
 import "./fader.js";
 import "./meter.js";
@@ -14,7 +19,7 @@ import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./suppo
 
 const styles = sheet(`
   :host {
-    width: 148px;
+    width: 188px;
   }
   .strip {
     border-color: var(--ml-accent);
@@ -36,6 +41,18 @@ const styles = sheet(`
     color: var(--ml-text-muted);
     font-size: var(--ml-text-2xs);
   }
+  /* Level, cap and limit: the line wraps rather than run out of the strip. */
+  .readout {
+    white-space: normal;
+    text-align: center;
+  }
+  .note {
+    margin: 0;
+    color: var(--ml-text-secondary);
+    font-size: var(--ml-text-2xs);
+    line-height: 1.35;
+    text-align: center;
+  }
 `);
 
 class MlMasterStrip extends HTMLElement {
@@ -56,23 +73,31 @@ class MlMasterStrip extends HTMLElement {
             <ml-fader data-field="volumePercent" label="Master level"></ml-fader>
             <span class="sub" aria-hidden="true">LEVEL</span>
           </div>
-          <div class="column">
-            <ml-fader data-field="maxLevelPercent" compact label="Level cap"></ml-fader>
+          <div class="column" title="The musician's own level cap; they can change it on their phone too">
+            <ml-fader data-field="maxLevelPercent" compact label="Phone level cap" aria-describedby="ceiling"></ml-fader>
             <span class="sub" aria-hidden="true">CAP</span>
+          </div>
+          <div class="column" title="Your limit for this musician; their phone cannot change it">
+            <ml-fader data-field="engineerLimitPercent" compact label="Engineer limit" aria-describedby="ceiling"></ml-fader>
+            <span class="sub" aria-hidden="true">LIMIT</span>
           </div>
         </div>
         <output class="readout"></output>
+        <!-- Describes both caps: it says which one wins. -->
+        <p class="note" id="ceiling"></p>
         <ml-toggle kind="mute" wide label="Mute master">Mute</ml-toggle>
       </div>`,
     );
     const [left, right] = root.querySelectorAll("ml-meter");
-    const [level, cap] = root.querySelectorAll("ml-fader");
+    const [level, cap, limit] = root.querySelectorAll("ml-fader");
     this.#parts = {
       left,
       right,
       level,
       cap,
+      limit,
       readout: root.querySelector(".readout"),
+      note: root.querySelector(".note"),
       mute: root.querySelector("ml-toggle"),
     };
     for (const fader of [level, cap]) {
@@ -80,6 +105,10 @@ class MlMasterStrip extends HTMLElement {
         this.#edit(fader.dataset.field, event.detail.value);
       });
     }
+    // The desk keeps every limit it is given, so only a finished gesture (or a key press) goes out.
+    limit.addEventListener("change", (event) => {
+      this.#edit(limit.dataset.field, event.detail.value);
+    });
     this.#parts.mute.addEventListener("change", (event) => {
       this.#edit("muted", event.detail.pressed);
     });
@@ -95,7 +124,9 @@ class MlMasterStrip extends HTMLElement {
     reflect(parts.level, "tone", data.muted ? "muted" : "accent");
     parts.level.value = data.volume;
     parts.cap.value = data.cap;
+    parts.limit.value = data.limit;
     setText(parts.readout, data.readout);
+    setText(parts.note, data.ceilingNote);
     parts.mute.pressed = data.muted;
   }
 

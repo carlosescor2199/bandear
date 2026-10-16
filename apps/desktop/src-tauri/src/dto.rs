@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
-    CaptureFormat, EngineMeters, EngineStatus, InputDevice, LinkHealth, MixOrigin, MixUpdate,
-    MixValues, MusicianStatus,
+    CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
+    LinkHealth, MixOrigin, MixUpdate, MixValues, MusicianStatus,
 };
 
 use crate::session::{SessionChannel, SessionGroup};
@@ -209,6 +209,14 @@ pub struct MixDto {
     pub channel_muted: Vec<bool>,
     pub channel_solo: Vec<bool>,
     pub group_levels: Vec<u8>,
+    /// The engineer's limit on what the musician hears, 0-100 (100 is no limit), apart from the
+    /// phone's own `maxLevelPercent`: the engine plays at most the lower of the two. Only
+    /// [crate::commands::set_engineer_controls] changes it; `set_mix` cannot.
+    pub engineer_limit_percent: u8,
+    /// One entry per channel, index-aligned with `channelGains`: `true` for a channel the engineer
+    /// locked, whose level, pan, mute and solo the musician's phone cannot change (the desk still
+    /// can). Both sides of a stereo pair are locked together.
+    pub locked_channels: Vec<bool>,
 }
 
 impl From<&MixValues> for MixDto {
@@ -223,8 +231,65 @@ impl From<&MixValues> for MixDto {
             channel_muted: mix.channel_muted.to_vec(),
             channel_solo: mix.channel_solo.to_vec(),
             group_levels: mix.group_levels.to_vec(),
+            engineer_limit_percent: mix.engineer.limit_percent,
+            locked_channels: locked_table(&mix.engineer, mix.channel_gains.len()),
         }
     }
+}
+
+/// One lock per channel for `channels` channels, index-aligned with the mix's channel tables.
+pub fn locked_table(controls: &EngineerControls, channels: usize) -> Vec<bool> {
+    (0..channels)
+        .map(|channel| controls.is_locked(channel))
+        .collect()
+}
+
+/// A change to the engineer's controls for one musician that the webview sends to
+/// [crate::commands::set_engineer_controls].
+///
+/// Both fields are optional and an absent one keeps its value. `limitPercent` is 0-100 (clamped);
+/// `lockedChannels` replaces each channel's lock from CH 1 on (entry 0 is CH 1) and keeps the rest,
+/// as a `set_mix` table does, at most one entry per channel. A field the desk does not know is
+/// rejected.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EngineerControlsRequest {
+    #[serde(default)]
+    pub limit_percent: Option<i32>,
+    #[serde(default)]
+    pub locked_channels: Option<Vec<bool>>,
+}
+
+impl From<EngineerControlsRequest> for EngineerUpdate {
+    fn from(request: EngineerControlsRequest) -> Self {
+        Self {
+            limit_percent: request.limit_percent,
+            locked: request.locked_channels,
+        }
+    }
+}
+
+/// What [crate::commands::set_engineer_controls] did, as [GroupsSetDto] says it for groups:
+/// `applied` whether the running engine took the controls (the musician's phone has them now),
+/// `saved` whether the session keeps them, and `saveError` why not. With no engine running they are
+/// saved for the address and apply at the next start.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineerControlsSetDto {
+    /// The musician's address as the status rows show it.
+    pub address: String,
+    /// The controls now kept: the limit (0-100) and one lock per channel, index-aligned with the
+    /// mix's channel tables.
+    pub limit_percent: u8,
+    pub locked_channels: Vec<bool>,
+    /// "phone" when they are kept for the musician's phone (its client id), so they follow it to a
+    /// new IP; "address" when they are kept for the address.
+    pub kept_for: &'static str,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    /// The musician's whole mix now stored, with the new controls; null when no engine took them.
+    pub mix: Option<MixDto>,
 }
 
 /// The payload of the `mix-changed` event: a musician's whole mix right after a change.
@@ -825,6 +890,69 @@ mod tests {
         assert_eq!(row["revision"], 41, "flat on a status row");
         assert_eq!(change["mix"]["revision"], 41, "nested in a mix change");
         assert_eq!(answer["revision"], 41, "in the set_mix answer");
+    }
+
+    #[test]
+    fn the_engineers_limit_and_locks_reach_the_window_on_rows_changes_and_answers() {
+        let mix = MixValues {
+            max_level_percent: 90,
+            engineer: EngineerControls {
+                limit_percent: 60,
+                locked: 0b101,
+            },
+            ..MixValues::default()
+        };
+        let musician = MusicianStatus {
+            mix,
+            ..musician_with_link(LinkStatus::default())
+        };
+        let address = "192.168.1.3:50000".parse().expect("test address");
+
+        let row = serde_json::to_value(MusicianDto::from(&musician)).expect("a row serializes");
+        let change = serde_json::to_value(MixChangedDto::new(address, MixOrigin::Engine, &mix, 1))
+            .expect("a change serializes");
+        let answer = serde_json::to_value(MixDto::from(&mix)).expect("an answer serializes");
+
+        for (copy, json) in [
+            ("a status row", &row),
+            ("a mix change", &change["mix"]),
+            ("a set_mix answer", &answer),
+        ] {
+            assert_eq!(json["engineerLimitPercent"], 60, "{copy}");
+            assert_eq!(
+                json["maxLevelPercent"], 90,
+                "{copy}: the phone's cap is apart"
+            );
+            let locked: Vec<bool> =
+                serde_json::from_value(json["lockedChannels"].clone()).expect("a table of locks");
+            assert_eq!(locked.len(), 32, "{copy}: one per channel");
+            assert_eq!(&locked[..4], &[true, false, true, false], "{copy}");
+        }
+    }
+
+    #[test]
+    fn an_engineer_controls_request_reads_camel_case_and_refuses_unknown_fields() {
+        let request: EngineerControlsRequest =
+            serde_json::from_str(r#"{"limitPercent":60,"lockedChannels":[false,true]}"#)
+                .expect("a change parses");
+
+        assert_eq!(
+            EngineerUpdate::from(request),
+            EngineerUpdate {
+                limit_percent: Some(60),
+                locked: Some(vec![false, true]),
+            }
+        );
+        let partial: EngineerControlsRequest =
+            serde_json::from_str(r#"{"limitPercent":70}"#).expect("a partial change parses");
+        assert_eq!(partial.locked_channels, None, "absent means unchanged");
+        let error = serde_json::from_str::<EngineerControlsRequest>(r#"{"limit":60}"#)
+            .expect_err("a misspelt field must not be a silent no-op");
+        assert!(error.to_string().contains("limit"), "names it: {error}");
+        assert!(
+            serde_json::from_str::<MixUpdateRequest>(r#"{"engineerLimitPercent":100}"#).is_err(),
+            "set_mix cannot change the engineer's controls"
+        );
     }
 
     #[test]

@@ -11,8 +11,11 @@
 //   selected   the address whose mix is open. It survives a stop, so a restart reopens it.
 //   departed   { address, label } of the open musician when a status no longer listed them and
 //              the first musician opened instead; cleared by a pick, their return or a run's end.
-//   pending    { address: { editKey: value } }: local edits still waiting for the engine.
+//   pending    { address: { editKey: value } }: local edits still waiting for the engine, the
+//              engineer's limit and locks among them (keys of ENGINEER_FIELDS, see mix.js).
 //   mixError   { address, message } of the last refused change, cleared by the next answer.
+//   controlsNotice { address, outcome }: the last `set_engineer_controls` answer for `address`
+//              when it did not both apply and save; cleared by its next full success.
 //   audio      { host, bufferFrames }: the driver and buffer the next start asks for.
 //   connection { status, error }: "connecting", "ready" (the engine answered, or a status came)
 //              or "failed" with the reason the console cannot hear the engine.
@@ -53,6 +56,7 @@ export const initialState = Object.freeze({
   departed: null,
   pending: NO_EDITS,
   mixError: null,
+  controlsNotice: null,
   audio: DEFAULT_AUDIO,
   connection: Object.freeze({ status: "connecting", error: null }),
   commandError: null,
@@ -79,6 +83,17 @@ export const actions = Object.freeze({
   mixApplied: (address, sent, mix = null) => ({ type: "mix-applied", address, sent, mix }),
   /** A `set_mix` that carried the edits `sent` was refused. */
   mixFailed: (address, sent, error) => ({ type: "mix-failed", address, sent, error }),
+  /**
+   * The engine answered a `set_engineer_controls` that carried the engineer's edits `sent` with
+   * `outcome` (`{ applied, saved, saveError, mix }`): settled like a `set_mix` answer, and kept as
+   * the musician's controls notice when it did not both apply and save. A refusal is `mixFailed`.
+   */
+  engineerApplied: (address, sent, outcome) => ({
+    type: "engineer-applied",
+    address,
+    sent,
+    outcome,
+  }),
   /** A change of the driver (`host`) or the buffer (`bufferFrames`) for the next start. */
   audio: (change) => ({ type: "audio", change }),
   /** The input devices listed for `host`, or the reason they could not be listed. */
@@ -130,7 +145,13 @@ function onlyListed(pending, addresses) {
   return kept.length === Object.keys(pending).length ? pending : Object.fromEntries(kept);
 }
 
-const CHANNEL_TABLES = new Set(["channelGains", "pans", "channelMuted", "channelSolo"]);
+const CHANNEL_TABLES = new Set([
+  "channelGains",
+  "pans",
+  "channelMuted",
+  "channelSolo",
+  "lockedChannels",
+]);
 
 // What each input of a status is on the Mix: "hidden", "single", or the "first" or "second" side
 // of a stereo pair.
@@ -229,6 +250,10 @@ function receiveStatus(state, status) {
     departed,
     pending: settleLayout(onlyListed(state.pending, addresses), state.engine.status, status),
     mixError: state.mixError && addresses.has(state.mixError.address) ? state.mixError : null,
+    controlsNotice:
+      state.controlsNotice && addresses.has(state.controlsNotice.address)
+        ? state.controlsNotice
+        : null,
     // A status proves the console hears the engine.
     connection: READY,
   };
@@ -249,6 +274,7 @@ function setPhase(state, { phase, error }) {
       departed: null,
       pending: NO_EDITS,
       mixError: null,
+      controlsNotice: null,
       commandError: null,
     };
   }
@@ -326,6 +352,23 @@ function answered(state, { address, sent, mix }) {
   };
 }
 
+// An answer to the engineer's controls settles like a `set_mix` answer; one that did not both apply
+// and save stays to be said, and a full success clears what was said for that musician.
+function engineerAnswered(state, { address, sent, outcome }) {
+  if (!isListed(state, address)) {
+    return state;
+  }
+  const next = answered(state, { address, sent, mix: outcome?.mix ?? null });
+  const complete = Boolean(outcome?.applied && outcome?.saved);
+  let controlsNotice = next.controlsNotice;
+  if (!complete) {
+    controlsNotice = { address, outcome };
+  } else if (controlsNotice?.address === address) {
+    controlsNotice = null;
+  }
+  return { ...next, controlsNotice };
+}
+
 function refused(state, { address, sent, error }) {
   if (!isListed(state, address)) {
     return state;
@@ -359,6 +402,8 @@ export function consoleReducer(state, action) {
       return answered(state, action);
     case "mix-failed":
       return refused(state, action);
+    case "engineer-applied":
+      return engineerAnswered(state, action);
     case "audio":
       return { ...state, audio: audioChoice(state.audio, action.change) };
     case "command-failed":

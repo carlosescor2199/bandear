@@ -11,8 +11,9 @@ pub mod session;
 
 use commands::DesktopState;
 use dto::{
-    ChannelRequest, ChannelsSetDto, EngineStateDto, GroupRequest, GroupsSetDto, InputDeviceDto,
-    MixDto, MixUpdateRequest, StartRequest, StartSummary,
+    ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
+    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, MixDto, MixUpdateRequest,
+    StartRequest, StartSummary,
 };
 use events::EventPump;
 use session::{SessionChannel, SessionStore};
@@ -108,6 +109,19 @@ async fn set_channels(
     commands::set_channels(state.inner(), channels)
 }
 
+/// Sets the engineer's limit and locked channels for one musician (`{ limitPercent?,
+/// lockedChannels? }`, the locks from CH 1 on) and answers what was done: `{ address, limitPercent,
+/// lockedChannels, keptFor, applied, saved, saveError, mix }` (see [commands::set_engineer_controls]
+/// and [dto::EngineerControlsSetDto]).
+#[tauri::command]
+async fn set_engineer_controls(
+    state: State<'_, DesktopState>,
+    address: String,
+    controls: EngineerControlsRequest,
+) -> Result<EngineerControlsSetDto, String> {
+    commands::set_engineer_controls(state.inner(), address, controls)
+}
+
 /// The engineer's whole channel table (`[{ name, kind, hidden, link }]` in channel order, details of
 /// inputs the device lacks included): what the window edits and sends back with `set_channels`
 /// (see [commands::channel_table]).
@@ -150,7 +164,8 @@ pub fn run() {
             set_musician_name,
             set_groups,
             set_channels,
-            channel_table
+            channel_table,
+            set_engineer_controls
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

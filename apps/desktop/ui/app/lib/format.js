@@ -42,6 +42,21 @@ export function formatChannelsSet({ applied, saved, saveError }) {
     : sentenceWithReason("Channel details applied to every phone, but not saved", saveError);
 }
 
+/**
+ * What a change of the engineer's controls did, from the `set_engineer_controls` answer `{ applied,
+ * saved, saveError }`: in force on the phone and saved, saved for the next start (no engine was
+ * running), or in force but not kept. With `name`, the sentence names the musician.
+ */
+export function formatEngineerControlsSet({ applied, saved, saveError }, name = null) {
+  const subject = name ? `${name}'s limit and locks` : "Limit and locks";
+  if (!applied) {
+    return `${subject} saved; they apply at the next start.`;
+  }
+  return saved
+    ? `${subject} apply now and are saved.`
+    : sentenceWithReason(`${subject} apply now, but were not saved`, saveError);
+}
+
 /** "85%". */
 export function formatPercent(level) {
   return `${clampLevel(level)}%`;

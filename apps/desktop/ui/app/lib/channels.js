@@ -151,11 +151,12 @@ const PAIRED_TABLES = Object.freeze(["channelGains", "channelMuted", "channelSol
  * `merged` with both sides of every linked pair in `channels` at one level, mute and solo, as the
  * engine keeps them after any change from `before`: a side the change moved carries the other with
  * it, and when both sides changed to different values the first channel wins. Pans are left as
- * they are: a pair's balance writes both (see balanceToPans).
+ * they are: a pair's balance writes both (see balanceToPans). `fields` names the tables kept so,
+ * for the engineer's locks (`["lockedChannels"]`), which a pair takes the same way.
  */
-export function keepPairsEqual(before, merged, channels) {
+export function keepPairsEqual(before, merged, channels, fields = PAIRED_TABLES) {
   const kept = { ...merged };
-  for (const field of PAIRED_TABLES) {
+  for (const field of fields) {
     kept[field] = [...merged[field]];
   }
   channels.forEach((channel, first) => {
@@ -163,7 +164,7 @@ export function keepPairsEqual(before, merged, channels) {
     if (!channel.link || second >= MAX_CHANNELS) {
       return;
     }
-    for (const field of PAIRED_TABLES) {
+    for (const field of fields) {
       const table = kept[field];
       if (table[second] !== before[field][second] && table[first] === before[field][first]) {
         table[first] = table[second];
@@ -173,4 +174,37 @@ export function keepPairsEqual(before, merged, channels) {
     }
   });
   return kept;
+}
+
+const LOCKED_TABLES = Object.freeze(["channelGains", "pans", "channelMuted", "channelSolo"]);
+
+/**
+ * `merged`, a phone's change merged into `before`, with the level, pan, mute and solo of every
+ * channel `before` locks (`lockedChannels`) put back, as the engine keeps them: the phone cannot
+ * change a locked channel, and everything else it sent stands.
+ */
+export function keepLocked(before, merged) {
+  const kept = { ...merged };
+  for (const field of LOCKED_TABLES) {
+    kept[field] = merged[field].map((value, channel) =>
+      before.lockedChannels?.[channel] ? before[field][channel] : value,
+    );
+  }
+  return kept;
+}
+
+/**
+ * `locked` with both sides of every linked pair in `channels` locked when either side is, as the
+ * engine locks a pair linked after one of its sides was locked: a pair is one strip.
+ */
+export function lockPairs(locked, channels) {
+  const both = [...locked];
+  channels.forEach((channel, first) => {
+    const second = first + 1;
+    if (channel.link && second < MAX_CHANNELS && (both[first] || both[second])) {
+      both[first] = true;
+      both[second] = true;
+    }
+  });
+  return both;
 }

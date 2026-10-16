@@ -13,7 +13,9 @@
 //   again.
 // - `edit` records local mix edits and sends them with `set_mix` through a per-musician
 //   coalescer: one request in flight per musician, the latest edits always sent, each answer
-//   settling the edits it carried and offering its mix by revision.
+//   settling the edits it carried and offering its mix by revision. Edits of the engineer's limit
+//   and locks (ENGINEER_FIELDS) go the same way through their own coalescer to
+//   `set_engineer_controls`; an answer that did not both apply and save is kept to be said.
 // - Meters skip the store: `onMeters` listeners get each `meters` payload of the live run.
 // - The Network and system screen's commands: list devices, apply a driver or buffer (a
 //   restart; ASIO only on a picked driver), switch the device (live under WASAPI, a restart
@@ -38,7 +40,7 @@ import {
 import { groupDefinitions, groupDefinitionsOf } from "./channels-view.js";
 import { ASIO_NEEDS_DRIVER, audioChoice, startRequest } from "./engine-config.js";
 import { formatChannelsSet, formatGroupsSet, sentenceWithReason } from "./format.js";
-import { buildMixRequest } from "./mix.js";
+import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { createStore } from "./store.js";
 
@@ -61,12 +63,12 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   const unlisteners = [];
   let disposed = false;
 
-  // Sends `address`'s pending edits as they are when the send goes out. The coalescer calls it
+  // Sends `address`'s pending mix edits as they are when the send goes out. The coalescer calls it
   // at most once at a time per musician, and again after an answer when edits are still waiting.
   async function sendMix(address) {
     const state = store.getState();
     const musician = musicianByAddress(state, address);
-    const sent = { ...pendingEdits(state, address) };
+    const sent = splitEdits(pendingEdits(state, address)).mix;
     if (!musician || Object.keys(sent).length === 0) {
       return;
     }
@@ -78,7 +80,27 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     }
   }
 
+  // Sends `address`'s pending edits of the engineer's controls, as sendMix sends the mix's.
+  async function sendEngineer(address) {
+    const state = store.getState();
+    const musician = musicianByAddress(state, address);
+    const sent = splitEdits(pendingEdits(state, address)).engineer;
+    if (!musician || Object.keys(sent).length === 0) {
+      return;
+    }
+    try {
+      const outcome = await api.setEngineerControls(
+        address,
+        buildEngineerRequest(musician.mix, sent),
+      );
+      store.dispatch(actions.engineerApplied(address, sent, outcome));
+    } catch (error) {
+      store.dispatch(actions.mixFailed(address, sent, error));
+    }
+  }
+
   const sender = createCoalescer(sendMix);
+  const engineerSender = createCoalescer(sendEngineer);
 
   // Puts the engine's answer to `engine_status` in the store: its status when it runs, idle when
   // it says no engine runs.
@@ -398,11 +420,21 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     select(address) {
       store.dispatch(actions.select(address));
     },
-    /** Local edits to `address`'s mix, keyed as editKey (mix.js) makes them. */
+    /**
+     * Local edits to `address`'s mix, keyed as editKey (mix.js) makes them: mix edits go out with
+     * `set_mix`, edits of the engineer's limit and locks with `set_engineer_controls`.
+     */
     edit(address, edits) {
       const before = store.getState();
-      if (store.dispatch(actions.mixEdit(address, edits)) !== before) {
+      if (store.dispatch(actions.mixEdit(address, edits)) === before) {
+        return;
+      }
+      const { mix, engineer } = splitEdits(edits);
+      if (Object.keys(mix).length > 0) {
         sender.push(address, null);
+      }
+      if (Object.keys(engineer).length > 0) {
+        engineerSender.push(address, null);
       }
     },
     /** Calls `listener` with every `meters` payload of the live run; returns the unsubscribe. */

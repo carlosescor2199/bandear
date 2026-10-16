@@ -85,6 +85,16 @@ export function createEngineApi(bridge) {
      * is the engine's table, else the session's.
      */
     channelTable: () => bridge.invoke("channel_table"),
+    /**
+     * Sets what the engineer allows one musician beyond their mix: `controls` is `{ limitPercent?,
+     * lockedChannels? }` (see buildEngineerRequest), the limit 0-100 and the locks from CH 1 on.
+     * Resolves to `{ address, limitPercent, lockedChannels, keptFor, applied, saved, saveError, mix
+     * }`: the musician's phone has them now and is held to them (`applied`), they are kept for its
+     * phone or its address (`keptFor`), and `mix` is the mix now stored (null with no engine, when
+     * they apply at the next start). A refused change rejects, and nothing changed.
+     */
+    setEngineerControls: (address, controls) =>
+      bridge.invoke("set_engineer_controls", { address, controls }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

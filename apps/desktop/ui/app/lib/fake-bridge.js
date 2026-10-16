@@ -4,8 +4,15 @@
 // events. Like a Tauri command, a refused call rejects with the error text, not an Error. Every
 // start, even a failed one, begins a new engine run, and every payload names its run.
 
-import { checkChannels, defaultChannel, fitChannels, keepPairsEqual } from "./channels.js";
-import { MAX_GROUPS, defaultMix, mergeMixUpdate, mixFromDto } from "./mix.js";
+import {
+  checkChannels,
+  defaultChannel,
+  fitChannels,
+  keepLocked,
+  keepPairsEqual,
+  lockPairs,
+} from "./channels.js";
+import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { clampLevel } from "./values.js";
 
 const DEFAULT_PORT = 50000;
@@ -295,8 +302,9 @@ function heardLevels(musician, hidden, levels) {
       right = Math.max(right, level * gain * Math.sin(angle));
     });
   }
-  // The level cap is the ceiling of what the musician is sent.
-  const cap = musician.maxLevelPercent ?? 100;
+  // The ceiling of what the musician is sent: the lower of the phone's level cap and the
+  // engineer's limit.
+  const cap = Math.min(musician.maxLevelPercent ?? 100, musician.engineerLimitPercent ?? 100);
   return { left: clampLevel(Math.min(left, cap)), right: clampLevel(Math.min(right, cap)) };
 }
 
@@ -351,13 +359,20 @@ function withPort(address) {
  * inputs that come back again, as the engine does. A hidden input is heard in no musician's meter; a new
  * pair is panned apart (0 and 100) in every mix, announced in a status before the moved mixes; and
  * every change of a pair's level, mute or solo, from the desk or a phone, moves both sides (see
- * keepPairsEqual). Besides `invoke` and `listen` it offers
+ * keepPairsEqual). The engineer's controls too: `set_engineer_controls` merges a limit and locks as
+ * the engine does (a pair locks as one, also when it is linked after the lock), announces the mix,
+ * keeps them for the phone's client id (else the address) and answers `{ address, limitPercent,
+ * lockedChannels, keptFor, applied, saved, saveError, mix }`; a phone cannot change a locked
+ * channel, the desk can; the limit caps the musician's meter with the phone's cap, the lower
+ * winning; with the engine stopped they are kept for the address, and every start gives each
+ * musician the controls kept for them. Besides `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
  * (timers until the returned stop function is called), `holdAnswers(command)` and
  * `releaseAnswers()` (answers that arrive late), `failNext(command, message)` (one failed call),
- * `failStart(message)` and `calls`, every `{ command, args }` invoked.
+ * `failStart(message)`, `engineerKeys()` (the keys the engineer's controls are kept under) and
+ * `calls`, every `{ command, args }` invoked.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -393,6 +408,9 @@ export function createFakeBridge({
   // missing its second side stays linked in every mix.
   let savedChannels = channelDetails(engine.channels);
   let runningChannels = savedChannels;
+  // The engineer's controls as the desk's session keeps them, `{ engineerLimitPercent,
+  // lockedChannels }` by labelKey: for the phone's client id when it has one, else the address.
+  const engineerBook = new Map();
 
   // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
   // and names are trimmed.
@@ -424,9 +442,10 @@ export function createFakeBridge({
   }
 
   // As the engine does when pairs are linked: every musician's new pairs are panned apart (0 and
-  // 100) and take the first side's level, mute and solo, each mix under a new revision. Returns the
-  // rows that moved: every row when a pair was linked that `previous` did not have, else none. The
-  // pairs are the whole table's, as the engine's mixes take them, so a device switch moves none.
+  // 100) and take the first side's level, mute and solo, each mix under a new revision; a new pair
+  // with either side locked is locked whole. Returns the rows that moved: every row when a pair was
+  // linked that `previous` did not have, else none. The pairs are the whole table's, as the
+  // engine's mixes take them, so a device switch moves none.
   function linkMixes(previous) {
     const linked = runningChannels.map((channel, index) => channel.link && !previous[index]?.link);
     if (!linked.some(Boolean)) {
@@ -442,9 +461,32 @@ export function createFakeBridge({
         }
       });
       revision += 1;
-      Object.assign(row, keepPairsEqual(before, panned, runningChannels), { revision });
+      Object.assign(row, keepPairsEqual(before, panned, runningChannels), {
+        lockedChannels: lockPairs(panned.lockedChannels, runningChannels),
+        revision,
+      });
       return row;
     });
+  }
+
+  // As every start does: each musician's mix is new to the engine, so it takes the controls kept
+  // for its phone, else for its address, or none, a pair locked whole; a mix they change takes a
+  // new revision.
+  function giveKeptControls() {
+    for (const row of engine.musicians) {
+      const kept =
+        (row.clientId && engineerBook.get(`client:${row.clientId}`)) ??
+        engineerBook.get(`address:${row.address}`);
+      const limit = kept?.engineerLimitPercent ?? 100;
+      const locked = lockPairs(kept?.lockedChannels ?? defaultMix().lockedChannels, runningChannels);
+      if (
+        row.engineerLimitPercent !== limit ||
+        JSON.stringify(row.lockedChannels) !== JSON.stringify(locked)
+      ) {
+        revision += 1;
+        Object.assign(row, { engineerLimitPercent: limit, lockedChannels: locked, revision });
+      }
+    }
   }
 
   // Shows on `row` the label kept for its phone, else the one kept for its address. A name the
@@ -503,11 +545,15 @@ export function createFakeBridge({
     }
   }
 
-  function mergeInto(row, update) {
+  // Merges `update` into `row`'s mix as the engine does; a phone's change leaves every channel the
+  // engineer locked as it was.
+  function mergeInto(row, update, { fromPhone = false } = {}) {
     let merged;
     try {
       const before = mixFromDto(row);
-      merged = keepPairsEqual(before, mergeMixUpdate(before, update ?? {}), runningChannels);
+      const applied = mergeMixUpdate(before, update ?? {});
+      const allowed = fromPhone ? keepLocked(before, applied) : applied;
+      merged = keepPairsEqual(before, allowed, runningChannels);
     } catch (error) {
       throw error.message;
     }
@@ -545,6 +591,7 @@ export function createFakeBridge({
       runningChannels = savedChannels;
       showGroups(runningGroups);
       linkMixes([]);
+      giveKeptControls();
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
@@ -672,11 +719,60 @@ export function createFakeBridge({
       // As the desktop answers: the running engine's whole table, else the session's.
       return clone(isRunning ? runningChannels : savedChannels);
     },
+    set_engineer_controls({ address, controls } = {}) {
+      const outcome = (kept, keptFor, applied, mix) => ({
+        address,
+        limitPercent: kept.engineerLimitPercent,
+        lockedChannels: [...kept.lockedChannels],
+        keptFor,
+        applied,
+        saved: true,
+        saveError: null,
+        mix,
+      });
+      const merge = (mix) => {
+        try {
+          return mergeEngineerUpdate(mix, controls ?? {});
+        } catch (error) {
+          throw error.message;
+        }
+      };
+      if (!isRunning) {
+        // As the desktop does with no engine: merged into those kept for the address, for the next
+        // start.
+        const key = `address:${address}`;
+        const kept = merge(engineerBook.get(key) ?? defaultMix());
+        engineerBook.set(key, kept);
+        return outcome(kept, "address", false, null);
+      }
+      const row = musicianAt(address);
+      const before = mixFromDto(row);
+      const merged = merge(before);
+      const { lockedChannels } = keepPairsEqual(before, { ...before, ...merged }, runningChannels, [
+        "lockedChannels",
+      ]);
+      revision += 1;
+      Object.assign(row, {
+        engineerLimitPercent: merged.engineerLimitPercent,
+        lockedChannels,
+        revision,
+      });
+      // As the desktop keeps them: for the phone, dropping those kept for its address.
+      const kept = { engineerLimitPercent: row.engineerLimitPercent, lockedChannels: [...lockedChannels] };
+      if (row.clientId) {
+        engineerBook.delete(`address:${row.address}`);
+      }
+      engineerBook.set(labelKey(row), kept);
+      const mix = mixFromDto(row);
+      announceMix(address, "desktop", mix);
+      return outcome(kept, row.clientId ? "phone" : "address", true, clone(mix));
+    },
   };
 
-  // A change made on the musician's phone: merged as the engine would, announced as "phone".
+  // A change made on the musician's phone: merged as the engine would (a locked channel kept as it
+  // was), announced as "phone".
   function changeFromPhone(address, update) {
-    announceMix(address, "phone", mergeInto(musicianAt(address), update));
+    announceMix(address, "phone", mergeInto(musicianAt(address), update, { fromPhone: true }));
   }
 
   // The phone at `from` comes back from another IP with its client id, as after a DHCP change: as
@@ -765,6 +861,10 @@ export function createFakeBridge({
     emitMeters,
     changeFromPhone,
     movePhone,
+    /** The keys the engineer's controls are kept under, as the desktop's session keys them. */
+    engineerKeys() {
+      return [...engineerBook.keys()];
+    },
     /** From now on the answers to `command` wait for `releaseAnswers`, as a slow link would. */
     holdAnswers(command) {
       held.add(command);

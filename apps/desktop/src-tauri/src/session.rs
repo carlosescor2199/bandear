@@ -9,7 +9,10 @@
 //! {
 //!   "version": 1,
 //!   "musicians": {
-//!     "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b": { "label": "Ana" },
+//!     "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b": {
+//!       "label": "Ana",
+//!       "engineer": { "limitPercent": 60, "lockedChannels": [1, 2] }
+//!     },
 //!     "address:192.168.1.40:50000": { "label": "Rack A" }
 //!   },
 //!   "channels": [
@@ -24,11 +27,17 @@
 //! }
 //! ```
 //!
-//! - `musicians` holds what the desk keeps about each musician, today only the engineer's local
-//!   label. A phone that announced a stable client id is keyed `client:<client_id>`; a configured
+//! - `musicians` holds what the desk keeps about each musician: the engineer's local label and the
+//!   engineer's controls (`engineer`: the limit on what the musician hears, 0-100, and the channels
+//!   their phone cannot change, as 1-based channel numbers; absent when the engineer set neither).
+//!   A phone that announced a stable client id is keyed `client:<client_id>`; a configured
 //!   target, or a phone that sent no id, is keyed `address:<ip:port>`, the address exactly as the
-//!   status reports it. A label is looked up by the client key first and the address key second,
-//!   so a phone keeps its label when DHCP gives it another IP.
+//!   status reports it. Both are looked up by the client key first and the address key second, so
+//!   a phone keeps its label and its controls when DHCP gives it another IP. The controls are given
+//!   to every engine the desk starts (see [crate::commands::start_engine]), which puts them in
+//!   force when that musician registers. An entry's `engineer` was added within version 1: an
+//!   earlier build reads the entry and keeps its label, but drops the controls when it saves; an
+//!   `engineer` that cannot be read costs only itself (it reads as none).
 //! - `groups` holds the engineer's groups in their order: each with the stable id every musician's
 //!   group level follows, a name and 1-based channel numbers (as the engineer numbers them). They are
 //!   applied to every engine the desk starts (see [crate::commands::start_engine]) and replaced by
@@ -116,6 +125,50 @@ pub struct MusicianEntry {
     /// The engineer's local label, shown while the musician's phone announced no name of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The engineer's limit and locks for this musician; `None` when they are the defaults (no
+    /// limit, nothing locked).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_engineer"
+    )]
+    pub engineer: Option<SessionEngineer>,
+}
+
+/// The engineer's controls for one musician as the desk keeps them (see
+/// [personal_monitoring::EngineerControls]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEngineer {
+    /// The limit on what the musician hears, 0-100; 100 is no limit.
+    #[serde(default = "no_limit")]
+    pub limit_percent: u8,
+    /// The channels the musician's phone cannot change, as 1-based channel numbers in order.
+    #[serde(default)]
+    pub locked_channels: Vec<usize>,
+}
+
+impl Default for SessionEngineer {
+    fn default() -> Self {
+        Self {
+            limit_percent: no_limit(),
+            locked_channels: Vec::new(),
+        }
+    }
+}
+
+fn no_limit() -> u8 {
+    100
+}
+
+/// Reads an entry's `engineer` without ever failing the entry: one that cannot be read is none, so
+/// a damaged limit or lock list costs only itself and never the labels.
+fn lenient_engineer<'de, D>(deserializer: D) -> Result<Option<SessionEngineer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| SessionEngineer::deserialize(value).ok()))
 }
 
 /// One of the engineer's groups as the desk keeps it.
@@ -252,6 +305,63 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The engineer's controls for the musician with this client id at this address: those kept for
+    /// the phone first, then those kept for the address.
+    pub fn engineer_for(&self, client_id: Option<&str>, address: &str) -> Option<SessionEngineer> {
+        let loaded = self.lock();
+        let musicians = &loaded.session.musicians;
+        let kept = |key: String| musicians.get(&key).and_then(|entry| entry.engineer.clone());
+        client_id
+            .and_then(|id| kept(client_key(id)))
+            .or_else(|| kept(address_key(address)))
+    }
+
+    /// Every musician's controls the session keeps, each with its key ([client_key] or
+    /// [address_key]), in key order.
+    pub fn engineer_controls(&self) -> Vec<(String, SessionEngineer)> {
+        self.lock()
+            .session
+            .musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.engineer.clone()?)))
+            .collect()
+    }
+
+    /// Keeps the engineer's controls for the musician with this client id at this address, as
+    /// [Self::set_label] keeps a label: under the phone's key, dropping any kept for the address,
+    /// or under the address for a musician without one. Controls equal to the defaults are kept as
+    /// none. The file is written before success is reported; a save that fails, or is refused over
+    /// a session this build must not replace, changes nothing.
+    pub fn set_engineer(
+        &self,
+        client_id: Option<&str>,
+        address: &str,
+        engineer: SessionEngineer,
+    ) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let engineer = (engineer != SessionEngineer::default()).then_some(engineer);
+        let mut session = loaded.session.clone();
+        match client_id {
+            Some(id) => {
+                update_entry(&mut session, address_key(address), |entry| {
+                    entry.engineer = None
+                });
+                update_entry(&mut session, client_key(id), |entry| {
+                    entry.engineer = engineer
+                });
+            }
+            None => update_entry(&mut session, address_key(address), |entry| {
+                entry.engineer = engineer
+            }),
+        }
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     /// The engineer's groups, in their order.
     pub fn groups(&self) -> Vec<SessionGroup> {
         self.lock().session.groups.clone()
@@ -302,16 +412,16 @@ impl SessionStore {
 }
 
 fn set_entry_label(session: &mut Session, key: String, label: Option<String>) {
-    match label {
-        Some(label) => session.musicians.entry(key).or_default().label = Some(label),
-        None => {
-            if let Some(entry) = session.musicians.get_mut(&key) {
-                entry.label = None;
-                if *entry == MusicianEntry::default() {
-                    session.musicians.remove(&key);
-                }
-            }
-        }
+    update_entry(session, key, |entry| entry.label = label);
+}
+
+/// Changes the entry `key` with `change`, creating it when needed; an entry left with nothing in
+/// it is removed.
+fn update_entry(session: &mut Session, key: String, change: impl FnOnce(&mut MusicianEntry)) {
+    let entry = session.musicians.entry(key.clone()).or_default();
+    change(entry);
+    if *entry == MusicianEntry::default() {
+        session.musicians.remove(&key);
     }
 }
 
@@ -1215,6 +1325,130 @@ mod tests {
             .set_channels(Vec::new())
             .expect_err("the write cannot happen");
         assert_eq!(session.channels(), kept);
+    }
+
+    fn controls(limit_percent: u8, locked_channels: &[usize]) -> SessionEngineer {
+        SessionEngineer {
+            limit_percent,
+            locked_channels: locked_channels.to_vec(),
+        }
+    }
+
+    #[test]
+    fn engineer_controls_are_kept_for_the_phone_beside_its_label_and_survive_a_reload() {
+        let directory = test_directory("engineer-reload");
+        let session = SessionStore::open(&directory);
+        session
+            .set_label(Some(PHONE), ADDRESS, "Ana")
+            .expect("saved");
+
+        session
+            .set_engineer(Some(PHONE), ADDRESS, controls(60, &[1, 2]))
+            .expect("saved");
+
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["musicians"],
+            serde_json::json!({
+                format!("client:{PHONE}"): {
+                    "label": "Ana",
+                    "engineer": { "limitPercent": 60, "lockedChannels": [1, 2] }
+                }
+            })
+        );
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(
+            reloaded.engineer_for(Some(PHONE), "192.168.1.99:50000"),
+            Some(controls(60, &[1, 2])),
+            "they follow the phone to any address"
+        );
+        assert_eq!(
+            reloaded.engineer_controls(),
+            vec![(format!("client:{PHONE}"), controls(60, &[1, 2]))]
+        );
+    }
+
+    #[test]
+    fn controls_kept_for_a_phone_replace_those_kept_for_its_address() {
+        let directory = test_directory("engineer-address");
+        let session = SessionStore::open(&directory);
+        session
+            .set_engineer(None, ADDRESS, controls(40, &[3]))
+            .expect("saved");
+        session.set_label(None, ADDRESS, "Rack").expect("saved");
+        assert_eq!(
+            session.engineer_for(Some(PHONE), ADDRESS),
+            Some(controls(40, &[3])),
+            "the address is the fallback"
+        );
+
+        session
+            .set_engineer(Some(PHONE), ADDRESS, controls(80, &[]))
+            .expect("saved");
+
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["musicians"],
+            serde_json::json!({
+                format!("client:{PHONE}"): { "engineer": { "limitPercent": 80, "lockedChannels": [] } },
+                format!("address:{ADDRESS}"): { "label": "Rack" }
+            }),
+            "the address keeps its label but not the controls"
+        );
+    }
+
+    #[test]
+    fn controls_back_at_the_defaults_are_not_kept() {
+        let directory = test_directory("engineer-defaults");
+        let session = SessionStore::open(&directory);
+        session
+            .set_engineer(None, ADDRESS, controls(50, &[1]))
+            .expect("saved");
+
+        session
+            .set_engineer(None, ADDRESS, SessionEngineer::default())
+            .expect("saved");
+
+        assert_eq!(session.engineer_for(None, ADDRESS), None);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["musicians"],
+            serde_json::json!({}),
+            "an entry with nothing left in it goes"
+        );
+    }
+
+    #[test]
+    fn unreadable_engineer_controls_cost_only_themselves() {
+        let directory = test_directory("engineer-unreadable");
+        fs::write(
+            directory.join(SESSION_FILE),
+            format!(
+                r#"{{"version":1,"musicians":{{"client:{PHONE}":{{"label":"Ana","engineer":{{"limitPercent":900}}}},"address:{ADDRESS}":{{"engineer":"loud"}}}}}}"#
+            ),
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(session.notice(), None, "the file loads as it is");
+        assert_eq!(
+            session.label_for(Some(PHONE), ADDRESS),
+            Some("Ana".to_owned())
+        );
+        assert_eq!(session.engineer_for(Some(PHONE), ADDRESS), None);
+        assert_eq!(session.engineer_controls(), Vec::new());
+    }
+
+    #[test]
+    fn saving_engineer_controls_is_refused_over_a_newer_session() {
+        let directory = test_directory("engineer-newer");
+        fs::write(directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let session = SessionStore::open(&directory);
+
+        let error = session
+            .set_engineer(None, ADDRESS, controls(50, &[]))
+            .expect_err("refused");
+
+        assert!(error.contains("newer"), "{error}");
+        assert_eq!(session.engineer_for(None, ADDRESS), None);
     }
 
     #[test]

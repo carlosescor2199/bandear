@@ -65,6 +65,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
             link: Default::default(),
             mirror: None,
         }],
+        local_mix: Default::default(),
     }
 }
 

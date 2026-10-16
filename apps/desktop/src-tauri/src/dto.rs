@@ -813,6 +813,7 @@ mod tests {
             packets_sent: 0,
             packets_discarded: 0,
             musicians: Vec::new(),
+            local_mix: personal_monitoring::MixValues::default(),
         }
     }
 

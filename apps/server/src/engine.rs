@@ -18,8 +18,8 @@ use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlP
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
 use crate::mix::{
-    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, MixPreset,
-    MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
+    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
+    MixPreset, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
 };
 use crate::network::{NetworkSink, PacketStats};
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
@@ -60,6 +60,11 @@ pub enum EngineEvent {
     /// ([EngineHandle::set_channels]), or a device switch changed which inputs they are shown for.
     /// It comes before the [Self::MixChanged] of every mix a new stereo pair panned apart.
     ChannelsChanged,
+    /// The engine's local mix changed: through [EngineHandle::set_local_mix], or because a group
+    /// edit, a device switch or new channel details moved its levels or pans (then after
+    /// [Self::GroupsChanged] or [Self::ChannelsChanged]). Read it with [EngineHandle::local_mix].
+    /// It is no musician's mix, so it names no address and no phone is ever sent it.
+    LocalMixChanged,
 }
 
 /// Where a mix change came from.
@@ -339,6 +344,8 @@ pub struct EngineStatus {
     pub packets_sent: u64,
     pub packets_discarded: u64,
     pub musicians: Vec<MusicianStatus>,
+    /// The engine's local mix (see [EngineHandle::local_mix]), with its revision.
+    pub local_mix: MixValues,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -1264,6 +1271,34 @@ pub(crate) fn edit_groups(
     Ok(config.snapshot().groups.clone())
 }
 
+/// Moves the local mix from the configuration `previous` onto `live`, as [apply_groups] and
+/// [apply_channels] move every musician's mix, and returns whether its stored values moved (so it
+/// must be announced): group levels that followed their groups to new positions, or a pair that a
+/// new link panned apart. A configuration that did not change touches nothing.
+fn follow_configuration(
+    local: &MixState,
+    previous: &ConfigSnapshot,
+    live: &ConfigSnapshot,
+) -> bool {
+    if previous.generation == live.generation {
+        return false;
+    }
+    let mut moved = false;
+    if previous.layout.same_positions(&live.layout) {
+        local.set_group_layout(&live.layout);
+    } else {
+        local.regroup(&live.layout, &group_sources(&previous.layout, &live.layout));
+        moved = true;
+    }
+    if local
+        .set_channel_flags(channel_flags(&live.requested_channels))
+        .is_some()
+    {
+        moved = true;
+    }
+    moved
+}
+
 /// The live engine. Dropping it does not stop the engine; call [EngineHandle::stop].
 pub struct EngineHandle {
     device_name: String,
@@ -1292,6 +1327,10 @@ pub struct EngineHandle {
     /// what every phone is sent as `config`, and the membership a new musician's mix starts with.
     config_state: Arc<ConfigState>,
     events: EventBus,
+    /// The engine's own mix, for the engineer's local output: kept apart from the target table,
+    /// since it is no musician and no phone, but moved with every musician's mix when the groups
+    /// or the channel details change (see [follow_configuration]).
+    local_mix: Arc<MixState>,
     /// The running capture stream. Dropping it stops its callback, the only producer of its ring.
     stream: Option<cpal::Stream>,
     /// The engine thread: it reads the current stream's ring and feeds the sinks, and keeps the
@@ -1403,6 +1442,7 @@ impl EngineHandle {
             musicians: join_musicians(
                 &targets, &connected, &counters, &mixes, &announced, &links, &mirrors,
             ),
+            local_mix: self.local_mix.current(),
         }
     }
 
@@ -1509,13 +1549,15 @@ impl EngineHandle {
         self.source_channels = plan.source_channels;
         // Every phone is sent the new `config` (channel count and groups) when it differs, and every
         // musician, connected now or registering later, mixes with the new membership.
-        apply_groups(
-            &self.targets,
-            &self.config_state,
-            &self.events,
-            plan.source_channels,
-            plan.groups,
-        );
+        self.publish(|| {
+            apply_groups(
+                &self.targets,
+                &self.config_state,
+                &self.events,
+                plan.source_channels,
+                plan.groups,
+            )
+        });
         // The old device's levels describe a stream that is gone, and channels the new device lacks
         // would keep theirs frozen until a switch back; the new stream raises its own at once.
         self.levels.clear();
@@ -1544,13 +1586,15 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        let groups = edit_groups(
-            &self.targets,
-            &self.config_state,
-            &self.events,
-            self.source_channels,
-            &definitions,
-        )?;
+        let groups = self.publish(|| {
+            edit_groups(
+                &self.targets,
+                &self.config_state,
+                &self.events,
+                self.source_channels,
+                &definitions,
+            )
+        })?;
         self.group_definitions = definitions;
         Ok(groups)
     }
@@ -1588,12 +1632,45 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        Ok(edit_channels(
-            &self.targets,
-            &self.config_state,
-            &self.events,
-            &channels,
-        )?)
+        Ok(self.publish(|| {
+            edit_channels(&self.targets, &self.config_state, &self.events, &channels)
+        })?)
+    }
+
+    /// Runs `change`, which may publish a new configuration (groups, channel details or a device's
+    /// channel count) and move every musician's mix onto it, then moves the local mix onto it too
+    /// and announces it when its values moved: after the change's own events.
+    fn publish<T>(&self, change: impl FnOnce() -> T) -> T {
+        let previous = self.config_state.snapshot();
+        let result = change();
+        let live = self.config_state.snapshot();
+        if follow_configuration(&self.local_mix, &previous, &live) {
+            self.events.emit(EngineEvent::LocalMixChanged);
+        }
+        result
+    }
+
+    /// The engine's local mix, with its revision: the engineer's own mix for the local output
+    /// (see [crate::EngineHandle::set_local_mix]).
+    pub fn local_mix(&self) -> MixValues {
+        self.local_mix.current()
+    }
+
+    /// Applies a partial update to the engine's local mix and returns the mix now stored.
+    ///
+    /// It is merged exactly as the desk merges a musician's ([Self::set_mix]): absent fields keep
+    /// their values, levels are clamped, a list longer than its table is refused, both sides of a
+    /// linked pair stay equal, a hidden input stays silent and the groups are the live ones. It has
+    /// no engineer's controls and follows nobody. Every stored change takes a new revision and is
+    /// announced as [EngineEvent::LocalMixChanged]; an update that cannot be applied is an error
+    /// naming the problem, and then nothing changes and nothing is announced.
+    pub fn set_local_mix(&self, update: &MixUpdate) -> Result<MixValues, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let applied = self.local_mix.apply(update)?;
+        self.events.emit(EngineEvent::LocalMixChanged);
+        Ok(applied)
     }
 
     /// The engineer's channel details the engine keeps, whole: the list last set with
@@ -1949,6 +2026,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         group_layout,
     ));
     let events = EventBus::default();
+    let local_mix = Arc::new(config_state.new_mix());
 
     let control_thread = spawn_control_thread(
         config.control_port,
@@ -2008,6 +2086,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         peers,
         config_state,
         events,
+        local_mix,
         stream: Some(opened.stream),
         pipeline: Some(pipeline),
         control_thread: Some(control_thread),
@@ -3934,6 +4013,7 @@ mod tests {
         let pipeline =
             PipelineHandle::spawn(Pipeline::new(vec![Box::new(network)], Arc::clone(&levels)))
                 .expect("the engine thread starts");
+        let config_state = Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default()));
         let mut engine = EngineHandle {
             device_name: String::new(),
             capture_format: test_format(0),
@@ -3948,8 +4028,9 @@ mod tests {
             capture_stats: Arc::new(CaptureStats::default()),
             packet_stats,
             peers: Arc::new(Mutex::new(HashMap::new())),
-            config_state: Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default())),
+            config_state: Arc::clone(&config_state),
             events: EventBus::default(),
+            local_mix: Arc::new(config_state.new_mix()),
             stream: None,
             pipeline: Some(pipeline),
             control_thread: None,
@@ -4145,5 +4226,170 @@ mod tests {
         assert!(error.to_string().contains("has stopped"), "{error}");
         assert_eq!(session(&engine), before);
         assert!(session(&engine).3.iter().all(|group| !group.invalid));
+    }
+
+    /// [engine_without_device] with its phone socket kept, so the musician stays at that address.
+    fn local_engine() -> (
+        EngineHandle,
+        crate::pipeline::CaptureWriter,
+        std::net::UdpSocket,
+    ) {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (engine, capture) = engine_without_device(phone.local_addr().expect("address"));
+        (engine, capture, phone)
+    }
+
+    /// Everything on the bus so far.
+    fn drain(events: &Receiver<EngineEvent>) -> Vec<EngineEvent> {
+        events.try_iter().collect()
+    }
+
+    /// The local mix and the musician's agree on what is server configuration: the group each
+    /// channel feeds and the hidden channels.
+    fn assert_same_configuration(engine: &EngineHandle) {
+        let local = engine.local_mix();
+        let musician = engine.status().musicians[0].mix;
+        assert_eq!(local.channel_group, musician.channel_group);
+        assert_eq!(local.hidden_channels, musician.hidden_channels);
+    }
+
+    #[test]
+    fn the_local_mix_starts_neutral_on_the_live_groups_and_is_no_musician() {
+        let (mut engine, _capture, _phone) = local_engine();
+
+        let local = engine.local_mix();
+
+        assert_eq!(local.channel_gains, MixValues::default().channel_gains);
+        assert_eq!(local.volume_percent, 100);
+        assert_eq!(
+            &local.channel_group[..2],
+            &[Some(0), Some(0)],
+            "the stereo group"
+        );
+        assert!(local.revision > 0);
+        let status = engine.status();
+        assert_eq!(status.local_mix, local);
+        assert_eq!(status.musicians.len(), 1, "the local mix is no musician");
+        assert_same_configuration(&engine);
+        engine.stop().expect("the engine stops");
+    }
+
+    /// The desk's path, as for a musician: a partial update merged and stored under a new
+    /// revision, announced as the local mix's own event, and no musician touched. An update that
+    /// cannot be applied changes and announces nothing.
+    #[test]
+    fn setting_the_local_mix_changes_only_it_and_announces_it() {
+        let (mut engine, _capture, _phone) = local_engine();
+        let events = engine.subscribe();
+        let musician = engine.status().musicians[0].mix;
+        let before = engine.local_mix();
+
+        let applied = engine
+            .set_local_mix(&MixUpdate {
+                volume_percent: Some(40),
+                channel_gains: Some(vec![80]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        assert_eq!(applied.volume_percent, 40);
+        assert_eq!(&applied.channel_gains[..2], &[80, 100]);
+        assert!(applied.revision > before.revision);
+        assert_eq!(engine.local_mix(), applied);
+        assert_eq!(drain(&events), vec![EngineEvent::LocalMixChanged]);
+        assert_eq!(engine.status().musicians[0].mix, musician);
+
+        let refused = engine
+            .set_local_mix(&MixUpdate {
+                channel_gains: Some(vec![100; 33]),
+                ..MixUpdate::default()
+            })
+            .expect_err("an oversized list is refused");
+        assert!(refused.to_string().contains("at most 32"), "{refused}");
+        assert_eq!(engine.local_mix(), applied);
+        assert!(drain(&events).is_empty());
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Linking a pair reaches the local mix as it reaches every musician's: the pair is panned
+    /// apart and its second side takes the first side's level under a new revision, announced
+    /// after the channel details. A hidden input is silent in it.
+    #[test]
+    fn channel_details_move_the_local_mix_like_a_musicians() {
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .set_local_mix(&MixUpdate {
+                channel_gains: Some(vec![30, 70]),
+                pans: Some(vec![40, 60]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let events = engine.subscribe();
+
+        engine
+            .set_channels(vec![
+                linked(channel("Keys L", ChannelKind::Keys)),
+                channel("Keys R", ChannelKind::Keys),
+            ])
+            .expect("valid details");
+
+        let local = engine.local_mix();
+        assert_eq!(&local.pans[..2], &[0, 100]);
+        assert_eq!(&local.channel_gains[..2], &[30, 30]);
+        let announced = drain(&events);
+        assert_eq!(announced.first(), Some(&EngineEvent::ChannelsChanged));
+        assert_eq!(announced.last(), Some(&EngineEvent::LocalMixChanged));
+        assert_same_configuration(&engine);
+
+        engine
+            .set_channels(vec![
+                hidden(channel("Spare", ChannelKind::Other)),
+                channel("Voice", ChannelKind::Voice),
+            ])
+            .expect("valid details");
+        assert_eq!(engine.local_mix().hidden_channels, 1);
+        assert_same_configuration(&engine);
+        let mut heard = [0.0; 2];
+        crate::mix::MixPlan::new(&engine.local_mix(), 2).mix_into(&[0.5, 0.0], &mut heard);
+        assert_eq!(
+            heard,
+            [0.0, 0.0],
+            "the hidden input is silent in the local mix"
+        );
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A group edit moves the local mix's group levels by group id, as every musician's, and a
+    /// device switch points it at the groups the new device can feed.
+    #[test]
+    fn groups_move_the_local_mix_like_a_musicians() {
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .set_local_mix(&MixUpdate {
+                group_levels: Some(vec![40]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let events = engine.subscribe();
+
+        engine
+            .set_groups(vec![
+                definition("keys", "Keys", &[1]),
+                definition("pair", "Pair", &[2]),
+            ])
+            .expect("valid groups");
+
+        assert_eq!(&engine.local_mix().group_levels[..2], &[100, 40]);
+        let announced = drain(&events);
+        assert_eq!(announced.first(), Some(&EngineEvent::GroupsChanged));
+        assert_eq!(announced.last(), Some(&EngineEvent::LocalMixChanged));
+        assert_same_configuration(&engine);
+
+        let (_mono, opened) = test_capture(&engine, 1);
+        engine.install_capture(opened).expect("the switch commits");
+        assert_eq!(engine.local_mix().channel_group[1], None, "input 2 is gone");
+        assert_eq!(engine.local_mix().group_levels[1], 40, "its level is kept");
+        assert_same_configuration(&engine);
+        engine.stop().expect("the engine stops");
     }
 }

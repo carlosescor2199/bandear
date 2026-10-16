@@ -163,10 +163,102 @@ slice. Push and PRs are the user's decision.
     passed (3 new: the recovery re-import case, the no-engine address-keyed rename, the
     client-keyed rename); clippy: no warnings in the desktop crate.
   - Commit: this commit (`fix(desktop): never re-import legacy labels after a session recovery`).
-- [ ] T2 (runtime groups): stable group ids; `EngineHandle::set_groups`; layout generation
+- [x] T2 (runtime groups): stable group ids; `EngineHandle::set_groups`; layout generation
   re-sending `config`; register and add_target using the live layout; group-level remap on
   delete or reorder; groups persisted in the session and applied at start; Tauri command.
-  Route: delegated writer.
+  Route: delegated writer (trigger: 2+ non-trivial files across the engine, the desktop and the UI).
+  - Live configuration (`control.rs`): `ConfigState` holds one immutable `ConfigSnapshot` (channel
+    count, `GroupStatus` list with validity, mixer `GroupLayout`) behind `RwLock<Arc<_>>` plus an
+    `AtomicU64` generation. `publish` stores a changed snapshot and raises the generation under the
+    write lock (an unchanged one keeps it). Every `config` is built from the snapshot; each
+    connection's `ConfigFeed` remembers the generation it sent and re-sends on any change (watcher
+    poll, top of the read loop, and before every send). New mixes take their membership through
+    `Membership::new_mix`, evaluated under the registry's write lock (`register`, `add`), and
+    `apply_groups` publishes while holding the registry's read lock, so a registration racing an
+    edit or a switch never keeps the old membership. The engine lost its duplicated `groups` and
+    `current_layout` fields; the device switch publishes through the same `apply_groups`.
+  - Ids: `GroupDefinition.id` (command-line groups "1", "2", ... by order; the desk generates
+    `g` + 16 random hex digits, unique in the request), carried by `Group`, `GroupStatus`, the
+    `config` message (`id`, a field old phones ignore), `GroupDto` and `ChannelDto.groupId`.
+  - `EngineHandle::set_groups` (via `edit_groups`): `check_groups` (at most 16, non-empty unique
+    ids, non-empty names, a channel in one group even beyond the device; now public) then the
+    lenient revalidation (a missing channel only invalidates its group). When every id keeps its
+    position (rename, other channels, device switch) mixers only take the new membership; else
+    every mix runs `MixState::regroup` under its writer lock (new revision): a kept group's level
+    moves with it, a new group gets 100, a deleted group's level is dropped and unused slots are
+    100. `EngineEvent::GroupsChanged` is emitted before the `MixChanged` of each moved mix.
+  - Config before mix: `apply_groups` publishes before it moves any level; every mix report
+    (`mix_state` push via `current()`, `mix_ack` via `apply`) is read under the mix's writer lock
+    and sent through `send_with_config`, which sends `config` first when the generation moved, in
+    one hold of the writer. Proof: `after_a_group_edit_the_phone_gets_the_new_config_before_its_moved_levels`
+    (real socket) and the unit `a_message_to_a_phone_behind_the_configuration_follows_a_new_config`.
+    The desktop window gets the same order: the event pump answers `GroupsChanged` with a status at
+    once (`a_change_of_groups_sends_a_status_at_once_ahead_of_the_moved_mixes`).
+  - Desktop: `set_groups` Tauri command (`[{ id?, name, channels }]`, 1-based) checks, saves the
+    session's `groups` (now typed `[{ id, name, channels }]`; version stays 1 because every earlier
+    build wrote the reserved section empty and keeps whatever it reads; a misshapen section is moved
+    aside like any misshapen file), then applies live; a refused list or a failed save changes
+    nothing; an engine that is stopping refuses and the saved groups apply at the next start. Start
+    rule: a request that names no groups (the window's) gets the session's groups applied right
+    after the start through `set_groups`, so a channel the device lacks marks its group invalid
+    instead of failing the start; a request that names groups uses them strictly and leaves the
+    session alone. UI: `setGroups` in the engine API; the Mix screen joins channels to groups by
+    `groupId`; the fake bridge keeps groups like the session, applies them at start, re-checks them
+    on a device switch and implements `set_groups` with the same remap and event order.
+  - Android (read, not changed): `ControlChannel.parseGroups` reads `name`/`channels` with
+    `optString`/`optJSONArray`, so `id` is ignored; a mid-session `config` reaches
+    `MonitorReducer.applyConfig`, which replaces the definitions and sizes `groupLevels` to the new
+    group count by position (new ones neutral), and sends nothing; the following `mix_state` sets
+    the server's levels.
+  - RED: (a) `after_a_device_switch_a_connected_phone_is_sent_the_live_groups` got
+    `Vocals [2,3]` instead of `[]`, and `a_phone_registering_after_a_device_switch_mixes_with_the_live_groups`
+    mapped CH 3 to the invalid group (`Some(1)`), against the start-up layout reproduced with the
+    new API; (b) 7 failures with positional levels and no move (6 remap/regroup tests and the edit
+    test), then the ordering test alone ("the moved levels ... [70,30,...] arrived before the new
+    groups") once levels moved; id and check tests failed to compile; `GroupsChanged`: the two edit
+    tests and the pump test (`["mix-changed"]` first); (c) session, DTO and command tests failed to
+    compile (no `SessionGroup`/`set_groups`/`group_definitions`/`id`); UI 9 of 194 failed.
+  - GREEN: `cargo test -p personal-monitoring` 229 passed (19 new), three runs, control tests 31
+    passed three times; `cargo test -p mixlink-desktop` 74 passed (10 new); `cargo build -p
+    mixlink-desktop` after `cargo clean -p mixlink-desktop` ok; UI 194 passed (7 new); clippy: no
+    new warnings. Preview: the Mix screen shows CH 1-3 Drums and CH 5-6 Vocals joined by id.
+  - Size: about 2,800 authored changed lines over three commits (about 670, 1,080 and 1,050 with
+    this document), above
+    the 400-line heuristic mostly in tests (socket ordering, remap rules, session and fake bridge);
+    not split artificially.
+  - Commits: 2050f8f `fix(control): send the live groups after a device switch`; 57639f9
+    `feat(engine): edit groups while running with stable ids`; 8ef33ad `feat(desktop): keep
+    groups in the session and apply them live`.
+- [x] T2b (review fixes for T2, review `review-2d016eb5546e25ae`): a group edit is one step under
+  the engine lock with the session's inside it (the order every command holding both follows; a
+  start now reads the saved groups under it too), so the session and the engine always end with
+  the same groups (R3-set-groups-save-apply-not-atomic). With an engine running the engine takes
+  the groups first and they are saved only then; a stopping engine refuses and nothing changes;
+  with no engine they are saved for the next start. `set_groups` answers `{ groups, applied,
+  saved, saveError }` (a save that fails after the engine took them is reported, not an error),
+  the fake bridge answers the same and `formatGroupsSet` words it ("Groups saved; they apply at
+  the next start.") (R3-set-groups-error-after-persist). The session reads its sections one by
+  one: a damaged `groups`, `channels` or `presets` section is kept as
+  `session.json.<section>-damaged-<unix ms>`, starts empty, and the session is saved without it
+  at once, keeping the labels; only a file that is not JSON, has no usable version or unreadable
+  labels is moved aside whole; a section that cannot be written aside stops all saves
+  (R3-misshapen-group-discards-labels). Route: inline writer of the delegated T2 worker (bounded
+  fixes in three desktop files and the UI).
+  - The group edit runs through `edit_groups` over a `GroupEngine` trait (the engine in the app,
+    a stand-in in tests), so the running-engine branch is tested without audio hardware.
+  - RED: `an_engine_that_is_stopping_refuses_the_groups_and_nothing_is_saved` (the session held
+    the refused list) and `groups_a_running_engine_took_but_the_session_could_not_keep_say_so`
+    failed against the old save-then-apply order; the concurrency test
+    `two_group_edits_at_once_leave_the_session_and_the_engine_with_the_same_groups` (30 rounds,
+    both edits arriving while the engine lock is busy) passed against the old order too: Windows
+    hands the lock over in arrival order, so that interleaving needs a preemption between save and
+    lock; it now holds by construction and the test guards it. UI: `formatGroupsSet` did not exist
+    (the suite failed to load). Session: both new tests failed (the label was lost, `None`).
+  - GREEN: `cargo test -p mixlink-desktop` 80 passed (6 new, 1 replaced), three runs for the
+    commands; `cargo build -p mixlink-desktop` after `cargo clean -p mixlink-desktop` ok; UI 195
+    passed (1 new); `cargo fmt --check` clean; clippy: no warnings in the desktop crate.
+  - Commits: 9fe0901 `fix(desktop): edit groups as one step and say when they apply later`; this
+    commit (`fix(desktop): keep labels when one session section is damaged`).
 - [ ] T3 (channel metadata, engine and phone): the channel table in the engine and session;
   `config` carries names, kinds, hidden and links; hidden channels silent in every mix; link
   rules kept equal on the server; Android shows names, drops hidden channels and collapses
@@ -195,6 +287,23 @@ slice. Push and PRs are the user's decision.
   base 78dc65d. Its findings (R3-legacy-reimport-after-recovery,
   R3-set-musician-name-routing-unproved) are fixed by T1b.
 
+- T2 done (runtime groups); see its entry for evidence. Follow-ups: a phone's own `mix` that
+  carries `group_levels` positioned for the old groups and lands just after an edit is applied to
+  the new positions (phones send no ids; last writer wins, as decided); the window's pending group
+  edits are keyed by position, so T4's editor should settle or drop them when the groups change;
+  the window has no group editor yet (T4) and nothing shows the session notice (T7).
+- Review `review-2d016eb5546e25ae` over 78dc65d..8ef33ad approved and acknowledged; next review
+  base 8ef33ad. Its three WARNINGs (R3-set-groups-save-apply-not-atomic,
+  R3-set-groups-error-after-persist, R3-misshapen-group-discards-labels) are fixed by T2b. The
+  window shows `formatGroupsSet` once T4's group editor calls `setGroups`.
+- Review `review-150044cc10868604` over 8ef33ad..85e4409 (T2b) approved and acknowledged; next
+  review base 85e4409. Two SUGGESTIONs folded into T4:
+  - R3-concurrency-test-not-discriminating: the two-edits test also passed against the old
+    order (Windows hands the lock over in arrival order); force the interleaving with a hook
+    that parks one edit between apply and save.
+  - R3-format-groups-set-unguarded-save-error: `formatGroupsSet` can print a double period or
+    "not saved: null."; guard both.
+
 ## Next step
 
-T2.
+T3.

@@ -1,8 +1,8 @@
 //! The desktop session: what this desk keeps between runs, in one versioned JSON file in the app's
 //! config directory.
 //!
-//! The session is a desktop-app concern only: the engine never reads the file and nothing in it is
-//! sent to a client as stored. Version 1 has this shape:
+//! The session is a desktop-app concern only: the engine never reads the file, and only what the
+//! desk applies from it (the groups) ever reaches a client. Version 1 has this shape:
 //!
 //! ```json
 //! {
@@ -12,7 +12,9 @@
 //!     "address:192.168.1.40:50000": { "label": "Rack A" }
 //!   },
 //!   "channels": [],
-//!   "groups": [],
+//!   "groups": [
+//!     { "id": "g3f9a0c1d2e4b5a6", "name": "Drums", "channels": [1, 2, 3] }
+//!   ],
 //!   "presets": []
 //! }
 //! ```
@@ -22,17 +24,26 @@
 //!   target, or a phone that sent no id, is keyed `address:<ip:port>`, the address exactly as the
 //!   status reports it. A label is looked up by the client key first and the address key second,
 //!   so a phone keeps its label when DHCP gives it another IP.
-//! - `channels`, `groups` and `presets` are reserved for the channel table, the runtime groups and
-//!   the engineer's mix presets. Until the code that owns them lands they are written back exactly
-//!   as they were read.
+//! - `groups` holds the engineer's groups in their order: each with the stable id every musician's
+//!   group level follows, a name and 1-based channel numbers (as the engineer numbers them). They are
+//!   applied to every engine the desk starts (see [crate::commands::start_engine]) and replaced by
+//!   every edit ([crate::commands::set_groups]). The section was reserved in the first version and
+//!   every earlier build wrote it empty and kept whatever it read, so giving its entries a shape
+//!   does not change the version: an earlier build still reads and keeps it.
+//! - `channels` and `presets` are reserved for the channel table and the engineer's mix presets.
+//!   Until the code that owns them lands they are written back exactly as they were read.
 //!
 //! Every save writes a temporary file next to the session, flushes it to disk and renames it over
 //! the session, so a crash or a full disk leaves the old file or the new one, never a torn one, and
-//! a save that fails changes nothing. A session that cannot be read or parsed is moved aside as
-//! `session.json.corrupt-<unix milliseconds>` and the desk starts with an empty session; a session
-//! written by a newer version is left untouched and nothing is ever saved over it. Both are logged
-//! and kept in [SessionStore::notice], and neither stops the app from starting: labels are a
-//! convenience, and losing them must not stop the server.
+//! a save that fails changes nothing. The sections besides `musicians` are read one by one: a
+//! section that cannot be read is kept as it was in `session.json.<section>-damaged-<unix
+//! milliseconds>`, starts empty, and the session is saved without it at once, so the labels and
+//! every readable section survive. Only a file that is not JSON, has no usable version or whose
+//! `musicians` cannot be read is moved aside whole, as `session.json.corrupt-<unix milliseconds>`,
+//! and the desk starts with an empty session; a session written by a newer version is left
+//! untouched and nothing is ever saved over it. All of these are logged and kept in
+//! [SessionStore::notice], and none stops the app from starting: labels are a convenience, and
+//! losing them must not stop the server.
 //!
 //! `musicians.json`, the address-to-label map earlier versions kept, is imported once: when there
 //! is no session yet, its labels become `address:` entries and the session is written. The old
@@ -45,8 +56,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The session's file name inside the app config directory.
 pub const SESSION_FILE: &str = "session.json";
@@ -65,9 +77,9 @@ pub struct Session {
     /// Reserved for the channel table; kept as read.
     #[serde(default)]
     pub channels: Vec<Value>,
-    /// Reserved for the runtime groups; kept as read.
+    /// The engineer's groups, in their order.
     #[serde(default)]
-    pub groups: Vec<Value>,
+    pub groups: Vec<SessionGroup>,
     /// Reserved for the engineer's mix presets; kept as read.
     #[serde(default)]
     pub presets: Vec<Value>,
@@ -91,6 +103,16 @@ pub struct MusicianEntry {
     /// The engineer's local label, shown while the musician's phone announced no name of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// One of the engineer's groups as the desk keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGroup {
+    /// The group's stable id, generated by the desk when the group was created.
+    pub id: String,
+    pub name: String,
+    /// 1-based channel numbers.
+    pub channels: Vec<usize>,
 }
 
 /// The key of what the desk keeps about the phone with this stable client id.
@@ -196,6 +218,27 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The engineer's groups, in their order.
+    pub fn groups(&self) -> Vec<SessionGroup> {
+        self.lock().session.groups.clone()
+    }
+
+    /// Replaces the engineer's groups. The file is written before success is reported; a save
+    /// that fails, or is refused over a session this build must not replace, changes nothing.
+    pub fn set_groups(&self, groups: Vec<SessionGroup>) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            groups,
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     // The session is only replaced after a successful write, so even a poisoned lock guards a
     // session that matches the file; the desk keeps working rather than panicking.
     fn lock(&self) -> MutexGuard<'_, Loaded> {
@@ -220,11 +263,12 @@ fn set_entry_label(session: &mut Session, key: String, label: Option<String>) {
 fn load(path: &Path, legacy: &Path) -> Loaded {
     match fs::read(path) {
         Ok(bytes) => match parse(&bytes) {
-            Parsed::Current(session) => Loaded {
+            Parsed::Current(session, damaged) if damaged.is_empty() => Loaded {
                 session,
                 refusal: None,
                 notice: None,
             },
+            Parsed::Current(session, damaged) => set_sections_aside(path, session, damaged),
             Parsed::Newer(version) => {
                 let refusal = format!(
                     "the session file {} was written by a newer MixLink (version {version}); it is \
@@ -245,9 +289,17 @@ fn load(path: &Path, legacy: &Path) -> Loaded {
 }
 
 enum Parsed {
-    Current(Session),
+    /// A session this build reads, with the sections that could not be read (they start empty).
+    Current(Session, Vec<DamagedSection>),
     Newer(u64),
     Invalid(String),
+}
+
+/// A section of the session, other than the labels, that could not be read, as the file had it.
+struct DamagedSection {
+    name: &'static str,
+    raw: Value,
+    problem: String,
 }
 
 fn parse(bytes: &[u8]) -> Parsed {
@@ -264,21 +316,116 @@ fn parse(bytes: &[u8]) -> Parsed {
     if version != SESSION_VERSION {
         return Parsed::Invalid(format!("has version {version}, which no MixLink writes"));
     }
-    match serde_json::from_value(value) {
-        Ok(session) => Parsed::Current(session),
+    let Value::Object(mut fields) = value else {
+        return Parsed::Invalid("is not a session object".to_owned());
+    };
+    // Each section besides the labels is read on its own, so one that is damaged costs only
+    // itself; a file whose labels cannot be read is not a session this build can use.
+    let mut damaged = Vec::new();
+    let groups = take_section(&mut fields, "groups", &mut damaged);
+    let channels = take_section(&mut fields, "channels", &mut damaged);
+    let presets = take_section(&mut fields, "presets", &mut damaged);
+    match serde_json::from_value::<Session>(Value::Object(fields)) {
+        Ok(session) => Parsed::Current(
+            Session {
+                groups,
+                channels,
+                presets,
+                ..session
+            },
+            damaged,
+        ),
         Err(error) => Parsed::Invalid(format!("is not a session ({error})")),
     }
+}
+
+/// Takes the section `name` out of the session's fields and reads it on its own. A section that
+/// cannot be read starts empty and is listed in `damaged` with its raw JSON.
+fn take_section<T: DeserializeOwned + Default>(
+    fields: &mut Map<String, Value>,
+    name: &'static str,
+    damaged: &mut Vec<DamagedSection>,
+) -> T {
+    let Some(raw) = fields.remove(name) else {
+        return T::default();
+    };
+    match T::deserialize(&raw) {
+        Ok(section) => section,
+        Err(error) => {
+            damaged.push(DamagedSection {
+                name,
+                raw,
+                problem: error.to_string(),
+            });
+            T::default()
+        }
+    }
+}
+
+/// Keeps each section that could not be read in a file of its own next to the session,
+/// `session.json.<section>-damaged-<unix milliseconds>`, and saves the session without them at
+/// once: the labels and every readable section are kept, and the next start loads cleanly. A
+/// section that cannot be written aside would be lost by a save, so the session is then not saved
+/// over at all.
+fn set_sections_aside(path: &Path, session: Session, damaged: Vec<DamagedSection>) -> Loaded {
+    let millis = unix_millis();
+    let mut kept = Vec::with_capacity(damaged.len());
+    for section in &damaged {
+        let aside =
+            path.with_file_name(format!("{SESSION_FILE}.{}-damaged-{millis}", section.name));
+        let written = serde_json::to_string_pretty(&section.raw)
+            .map_err(io::Error::other)
+            .and_then(|json| fs::write(&aside, json));
+        if let Err(error) = written {
+            let notice = format!(
+                "the session file {} has a `{}` section that cannot be read ({}) and it could not \
+                 be kept aside ({error}); the section starts empty and the session is not saved \
+                 over",
+                path.display(),
+                section.name,
+                section.problem
+            );
+            return Loaded {
+                session,
+                refusal: Some(notice.clone()),
+                notice: Some(notice),
+            };
+        }
+        kept.push(format!(
+            "its `{}` section cannot be read ({}) and was kept in {}",
+            section.name,
+            section.problem,
+            aside.display()
+        ));
+    }
+    let saved = match write_atomically(path, &session) {
+        Ok(()) => String::new(),
+        Err(error) => format!(" ({error}; the next start finds the damaged sections again)"),
+    };
+    Loaded {
+        session,
+        refusal: None,
+        notice: Some(format!(
+            "the session file {}: {}; those sections start empty, and the musician labels and the \
+             rest of the session are kept{saved}",
+            path.display(),
+            kept.join("; ")
+        )),
+    }
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
 }
 
 /// Moves a session that cannot be used out of the way and starts an empty one, saved at once: a
 /// session existed, so `musicians.json` must not be imported on the next start. A file that cannot
 /// be moved either is not saved over, so it is never lost.
 fn set_aside(path: &Path, problem: &str) -> Loaded {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or_default();
-    let aside = path.with_file_name(format!("{SESSION_FILE}.corrupt-{millis}"));
+    let aside = path.with_file_name(format!("{SESSION_FILE}.corrupt-{}", unix_millis()));
     match fs::rename(path, &aside) {
         Ok(()) => {
             let saved = match write_atomically(path, &Session::default()) {
@@ -743,7 +890,7 @@ mod tests {
         let directory = test_directory("reserved");
         fs::write(
             directory.join(SESSION_FILE),
-            r#"{"version":1,"musicians":{},"channels":[{"name":"Kick"}],"groups":[{"id":1}],"presets":[]}"#,
+            r#"{"version":1,"musicians":{},"channels":[{"name":"Kick"}],"groups":[],"presets":[{"name":"Verse"}]}"#,
         )
         .expect("write");
 
@@ -753,11 +900,142 @@ mod tests {
 
         let saved = read_json(&directory.join(SESSION_FILE));
         assert_eq!(saved["channels"], serde_json::json!([{ "name": "Kick" }]));
-        assert_eq!(saved["groups"], serde_json::json!([{ "id": 1 }]));
+        assert_eq!(saved["presets"], serde_json::json!([{ "name": "Verse" }]));
         assert_eq!(
             saved["musicians"],
             serde_json::json!({ "address:192.168.1.30:50000": { "label": "Ana" } })
         );
+    }
+
+    fn group(id: &str, name: &str, channels: &[usize]) -> SessionGroup {
+        SessionGroup {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            channels: channels.to_vec(),
+        }
+    }
+
+    #[test]
+    fn groups_are_kept_with_their_ids_and_survive_a_reload() {
+        let directory = test_directory("groups");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("set");
+        let groups = vec![group("kit", "Drums", &[1, 2]), group("vox", "Vocals", &[5])];
+
+        session
+            .set_groups(groups.clone())
+            .expect("the groups are saved");
+
+        assert_eq!(session.groups(), groups);
+        assert_eq!(SessionStore::open(&directory).groups(), groups);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE)),
+            serde_json::json!({
+                "version": 1,
+                "musicians": { "address:192.168.1.30:50000": { "label": "Ana" } },
+                "channels": [],
+                "groups": [
+                    { "id": "kit", "name": "Drums", "channels": [1, 2] },
+                    { "id": "vox", "name": "Vocals", "channels": [5] }
+                ],
+                "presets": []
+            }),
+            "the same version 1 file: an earlier build reads the section as it always did"
+        );
+    }
+
+    #[test]
+    fn saving_groups_is_refused_over_a_newer_session_and_a_failed_save_changes_nothing() {
+        let newer_directory = test_directory("groups-newer");
+        fs::write(newer_directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let newer = SessionStore::open(&newer_directory);
+        assert!(newer
+            .set_groups(vec![group("kit", "Drums", &[1])])
+            .expect_err("refused")
+            .contains("newer"));
+        assert_eq!(newer.groups(), Vec::new());
+
+        let directory = test_directory("groups-failed-save");
+        let session = SessionStore::open(&directory);
+        session
+            .set_groups(vec![group("kit", "Drums", &[1])])
+            .expect("saved");
+        fs::create_dir(directory.join(format!("{SESSION_FILE}.tmp"))).expect("blocker");
+        session
+            .set_groups(Vec::new())
+            .expect_err("the write cannot happen");
+        assert_eq!(session.groups(), vec![group("kit", "Drums", &[1])]);
+    }
+
+    #[test]
+    fn a_damaged_groups_section_is_set_aside_on_its_own_and_the_labels_are_kept() {
+        let directory = test_directory("groups-damaged");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "channels":[{"name":"Kick"}],"groups":[{"id":1}],"presets":[]}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.label_for(None, ADDRESS),
+            Some("Ana".to_owned()),
+            "the labels are kept"
+        );
+        assert_eq!(session.groups(), Vec::new(), "the groups start empty");
+        let files = files_in(&directory);
+        assert!(
+            !files.iter().any(|name| name.contains(".corrupt-")),
+            "the file as a whole is not set aside: {files:?}"
+        );
+        let aside = files
+            .iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.groups-damaged-")))
+            .unwrap_or_else(|| panic!("the damaged section is kept for recovery: {files:?}"));
+        assert_eq!(
+            read_json(&directory.join(aside)),
+            serde_json::json!([{ "id": 1 }]),
+            "byte for byte as JSON"
+        );
+        let notice = session.notice().expect("the problem is reported");
+        assert!(
+            notice.contains("groups") && notice.contains(aside.as_str()),
+            "says which section and where it went: {notice}"
+        );
+        let saved = read_json(&directory.join(SESSION_FILE));
+        assert_eq!(saved["groups"], serde_json::json!([]));
+        assert_eq!(saved["channels"], serde_json::json!([{ "name": "Kick" }]));
+        assert_eq!(
+            saved["musicians"],
+            serde_json::json!({ "address:192.168.1.30:50000": { "label": "Ana" } })
+        );
+        let reopened = SessionStore::open(&directory);
+        assert_eq!(reopened.notice(), None, "the next start simply loads");
+        assert_eq!(reopened.label_for(None, ADDRESS), Some("Ana".to_owned()));
+    }
+
+    #[test]
+    fn a_damaged_reserved_section_is_set_aside_on_its_own_too() {
+        let directory = test_directory("channels-damaged");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "channels":5,"groups":[{"id":"kit","name":"Drums","channels":[1]}]}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(session.groups().len(), 1, "the readable sections are kept");
+        let aside = files_in(&directory)
+            .into_iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.channels-damaged-")))
+            .expect("the damaged section is kept for recovery");
+        assert_eq!(read_json(&directory.join(aside)), serde_json::json!(5));
+        assert!(session.notice().expect("reported").contains("channels"));
     }
 
     #[test]

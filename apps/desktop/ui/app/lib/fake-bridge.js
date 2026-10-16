@@ -4,7 +4,7 @@
 // events. Like a Tauri command, a refused call rejects with the error text, not an Error. Every
 // start, even a failed one, begins a new engine run, and every payload names its run.
 
-import { defaultMix, mergeMixUpdate, mixFromDto } from "./mix.js";
+import { MAX_GROUPS, defaultMix, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { clampLevel } from "./values.js";
 
 const DEFAULT_PORT = 50000;
@@ -44,11 +44,69 @@ function clone(value) {
 }
 
 function channelRows(count, groups) {
-  return Array.from({ length: count }, (_, index) => ({
-    number: index + 1,
-    group: groups.find((group) => !group.invalid && group.channels.includes(index))?.name ?? null,
-    level: 0,
+  return Array.from({ length: count }, (_, index) => {
+    // As the desktop does: an invalid group owns no channel.
+    const group = groups.find(
+      (candidate) => !candidate.invalid && candidate.channels.includes(index),
+    );
+    return { number: index + 1, group: group?.name ?? null, groupId: group?.id ?? null, level: 0 };
+  });
+}
+
+// The status's groups for the engineer's `definitions` (1-based channels) on a device with
+// `count` inputs, as the engine reports them: 0-based channels, and a group naming an input the
+// device lacks kept but invalid.
+function groupStatuses(definitions, count) {
+  return definitions.map(({ id, name, channels }) => ({
+    id,
+    name,
+    channels: channels.map((channel) => Math.max(channel - 1, 0)),
+    invalid: channels.some((channel) => channel < 1 || channel > count),
   }));
+}
+
+// The definitions behind a status's groups.
+function groupDefinitions(groups) {
+  return groups.map(({ id, name, channels }) => ({
+    id,
+    name,
+    channels: channels.map((channel) => channel + 1),
+  }));
+}
+
+// What the desk refuses, as the engine's `check_groups` does: more than 16 groups, an empty or
+// repeated id, an empty name, a channel in two groups.
+function checkGroups(definitions) {
+  if (definitions.length > MAX_GROUPS) {
+    throw `at most ${MAX_GROUPS} groups are supported, received ${definitions.length}`;
+  }
+  const ids = new Set();
+  const owners = new Map();
+  for (const { id, name, channels } of definitions) {
+    if (ids.has(id)) {
+      throw `group id "${id}" is used by more than one group`;
+    }
+    ids.add(id);
+    if (!name) {
+      throw `group "${id}" has an empty name`;
+    }
+    for (const channel of channels) {
+      if (owners.has(channel)) {
+        throw `channel ${channel} is listed in both "${owners.get(channel)}" and "${name}"`;
+      }
+      owners.set(channel, name);
+    }
+  }
+}
+
+// A musician's group levels after the groups went from `before` to `after` (lists of ids): each
+// kept group's level moves to its new place, a new group starts at 100, a deleted group's level is
+// dropped, as the engine's regroup does.
+function regroupedLevels(levels, before, after) {
+  return levels.map((_, position) => {
+    const previous = position < after.length ? before.indexOf(after[position]) : -1;
+    return previous === -1 ? 100 : levels[previous];
+  });
 }
 
 // `identity` is what the phone announced (`clientName`, `clientId`) and the desk's label (`name`,
@@ -76,14 +134,15 @@ function labelKey(row) {
 }
 
 /**
- * A running six-channel engine with two groups (Drums on CH 1-3, Vocals on CH 5-6) and four
+ * A running six-channel engine with two groups (Drums on CH 1-3 and Vocals on CH 5-6, by ids
+ * `drums` and `vocals`) and four
  * musicians whose links are good, a warning, unreported and lost. All four are phones with client
  * ids; the last announced no name and shows the desk's local label.
  */
 export function sampleStatus() {
   const groups = [
-    { name: "Drums", channels: [0, 1, 2], invalid: false },
-    { name: "Vocals", channels: [4, 5], invalid: false },
+    { id: "drums", name: "Drums", channels: [0, 1, 2], invalid: false },
+    { id: "vocals", name: "Vocals", channels: [4, 5], invalid: false },
   ];
   return {
     run: 1,
@@ -201,7 +260,11 @@ function withPort(address) {
  * the event comes first); `statusOnStart: false` starts without announcing a status, as a window
  * without an event pump. Every stored mix change takes a higher `revision`, as in the engine.
  * Local labels are kept as the desktop's session keeps them: for the phone's client id when it has
- * one, else for the address. Besides `invoke` and `listen` it offers
+ * one, else for the address. Groups too: `set_groups` keeps them (a new group gets an id), applies
+ * them while the engine runs (every musician's group levels follow their groups by id, and the new
+ * groups are announced in a status before the moved mixes), answers `{ groups, applied, saved,
+ * saveError }` as the desktop does, and every start that names no groups takes them. Besides
+ * `invoke` and `listen` it offers
  * `emit(event, payload)`, `changeFromPhone(address, update)` (a phone's mix change),
  * `movePhone(from, to)` (a phone back from a new IP, its row and label moving with it),
  * `emitMeters()` (one synthetic `meters` event), `startMeters(intervalMs)` and `startDemo()`
@@ -230,6 +293,34 @@ export function createFakeBridge({
     if (row.nameIsLocal && row.name) {
       labels.set(labelKey(row), row.name);
     }
+  }
+  // The engineer's groups as the desk's session keeps them (1-based channels): every start that
+  // names none takes them, and `set_groups` replaces them. `running` is what the engine has now.
+  let savedGroups = groupDefinitions(engine.groups);
+  let runningGroups = savedGroups;
+  let lastGroupId = 0;
+
+  // As the desktop does: a group the window sent back keeps its id, a new one gets a fresh one,
+  // and names are trimmed.
+  function withIds(groups) {
+    const taken = new Set(groups.map((group) => group.id).filter((id) => String(id ?? "").trim()));
+    return groups.map((group) => {
+      let id = group.id;
+      while (!String(id ?? "").trim() || (id !== group.id && taken.has(id))) {
+        lastGroupId += 1;
+        id = `g${lastGroupId}`;
+      }
+      taken.add(id);
+      return { id, name: String(group.name ?? "").trim(), channels: [...(group.channels ?? [])] };
+    });
+  }
+
+  // Shows `definitions` as the running engine's groups on the current device, a group naming an
+  // input the device lacks marked invalid.
+  function showGroups(definitions) {
+    runningGroups = definitions;
+    engine.groups = groupStatuses(definitions, engine.sourceChannels);
+    engine.channels = channelRows(engine.sourceChannels, engine.groups);
   }
 
   // Shows on `row` the label kept for its phone, else the one kept for its address. A name the
@@ -265,13 +356,14 @@ export function createFakeBridge({
     return { run, deviceName: engine.deviceName, captureFormat: clone(engine.captureFormat) };
   }
 
-  // Captures from `device`; one whose channel count is unknown keeps the current count.
+  // Captures from `device`; one whose channel count is unknown keeps the current count. As in the
+  // engine, the groups are re-checked against the new inputs, never rewritten.
   function useDevice(device) {
     engine.deviceName = device.name;
     if (device.channels > 0) {
       engine.captureFormat = { ...engine.captureFormat, channels: device.channels };
       engine.sourceChannels = device.channels;
-      engine.channels = channelRows(device.channels, engine.groups);
+      showGroups(runningGroups);
     }
   }
 
@@ -310,13 +402,18 @@ export function createFakeBridge({
       if (startError) {
         throw startError;
       }
+      // As the desktop does: a start that names no groups takes the kept ones; one that names
+      // some runs with those and keeps nothing.
+      const named = config?.groups ?? [];
+      runningGroups = named.length > 0 ? withIds(named) : savedGroups;
       // As the engine does: the named device, else the driver's first one when a driver is named.
       const offered = config?.host === "asio" ? sampleAsioDrivers() : devices;
-      const named = offered.find((device) => device.name === config?.deviceFilter);
-      const wanted = named ?? (config?.host && !config?.deviceFilter ? offered[0] : null);
+      const chosen = offered.find((device) => device.name === config?.deviceFilter);
+      const wanted = chosen ?? (config?.host && !config?.deviceFilter ? offered[0] : null);
       if (wanted) {
         useDevice(wanted);
       }
+      showGroups(runningGroups);
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
@@ -384,6 +481,36 @@ export function createFakeBridge({
         announceMix(address, "desktop", merged);
       }
       return clone(merged);
+    },
+    set_groups({ groups } = {}) {
+      const next = withIds(groups ?? []);
+      checkGroups(next);
+      savedGroups = next;
+      // As the desktop answers: a running engine took them, or they apply at the next start.
+      const outcome = { groups: clone(next), applied: isRunning, saved: true, saveError: null };
+      if (isRunning) {
+        const previous = JSON.stringify(engine.groups);
+        const before = engine.groups.map((group) => group.id);
+        showGroups(next);
+        if (JSON.stringify(engine.groups) === previous) {
+          // As in the engine, the same groups change nothing and announce nothing.
+          return outcome;
+        }
+        const after = engine.groups.map((group) => group.id);
+        // As the desktop does: the new groups go out first, then every mix whose levels moved.
+        emit("status", clone(engine));
+        const moved =
+          before.length !== after.length || before.some((id, index) => id !== after[index]);
+        if (moved) {
+          for (const row of engine.musicians) {
+            revision += 1;
+            row.groupLevels = regroupedLevels(row.groupLevels, before, after);
+            row.revision = revision;
+            announceMix(row.address, "desktop", mixFromDto(row));
+          }
+        }
+      }
+      return outcome;
     },
   };
 

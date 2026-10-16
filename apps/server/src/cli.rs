@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -38,12 +38,18 @@ pub struct EngineConfig {
 #[cfg(test)]
 pub(crate) type Arguments = EngineConfig;
 
-/// A group as the engineer typed it: a name and 1-based channel numbers.
+/// A group as the engineer defined it: a stable id, a name and 1-based channel numbers.
+///
+/// The id is what a group is known by while the engine runs: when the groups are edited, every
+/// musician's group level follows its group by id, so a group can be renamed, given other channels
+/// or moved in the list without its level moving to another group. Groups from the command line
+/// are numbered by their order ("1", "2", ...); a UI supplies its own ids.
 ///
 /// The conversion to the protocol's 0-based indices needs the captured channel count, so it happens
 /// in [validate_groups] once the input device has been selected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupDefinition {
+    pub id: String,
     pub name: String,
     pub channels: Vec<usize>,
 }
@@ -81,7 +87,8 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
                 let value = arguments
                     .next()
                     .ok_or("--group requires a Name=1,2,3 value")?;
-                groups.push(parse_group(&value)?);
+                // Numbered by order: the first --group is "1", the next "2", and so on.
+                groups.push(parse_group(&value, groups.len() + 1)?);
             }
             "--control-port" => {
                 let port = arguments
@@ -122,9 +129,9 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, B
     })
 }
 
-/// Parses one `Name=1,2,3` group value. Every error names the offending value, so a typo is easy to
-/// spot on a command line.
-fn parse_group(value: &str) -> Result<GroupDefinition, Box<dyn Error>> {
+/// Parses one `Name=1,2,3` group value, the `number`th on the command line, which is also its id.
+/// Every error names the offending value, so a typo is easy to spot on a command line.
+fn parse_group(value: &str, number: usize) -> Result<GroupDefinition, Box<dyn Error>> {
     let (name, channels) = value
         .split_once('=')
         .ok_or_else(|| format!("--group `{value}` must be written as Name=1,2,3"))?;
@@ -146,6 +153,7 @@ fn parse_group(value: &str) -> Result<GroupDefinition, Box<dyn Error>> {
     }
 
     Ok(GroupDefinition {
+        id: number.to_string(),
         name: name.to_owned(),
         channels: parsed,
     })
@@ -168,6 +176,48 @@ fn parse_buffer_frames(value: &str) -> Result<u32, Box<dyn Error>> {
     Ok(frames)
 }
 
+/// Checks what makes a set of groups unusable on any device: more than [MAX_GROUPS] groups, an
+/// empty or repeated id, an empty name, or a channel listed in two groups (or twice in one).
+///
+/// Channel numbers are not compared with a device here. At start-up [validate_groups] rejects one
+/// the device lacks; a running engine keeps such a group but marks it invalid, as after a device
+/// switch, so the engineer's definition survives until the channel is back.
+///
+/// Public so a UI can check groups it keeps for later the way a running engine would.
+pub fn check_groups(definitions: &[GroupDefinition]) -> Result<(), String> {
+    if definitions.len() > MAX_GROUPS {
+        return Err(format!(
+            "at most {MAX_GROUPS} groups are supported, received {}",
+            definitions.len()
+        ));
+    }
+    let mut ids = HashSet::with_capacity(definitions.len());
+    let mut owners: HashMap<usize, &str> = HashMap::new();
+    for definition in definitions {
+        if definition.id.trim().is_empty() {
+            return Err(format!("group \"{}\" has an empty id", definition.name));
+        }
+        if !ids.insert(definition.id.as_str()) {
+            return Err(format!(
+                "group id \"{}\" is used by more than one group",
+                definition.id
+            ));
+        }
+        if definition.name.trim().is_empty() {
+            return Err(format!("group \"{}\" has an empty name", definition.id));
+        }
+        for &channel in &definition.channels {
+            if let Some(previous) = owners.insert(channel, &definition.name) {
+                return Err(format!(
+                    "channel {channel} is listed in both \"{previous}\" and \"{}\"",
+                    definition.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates the engineer's groups against the captured channel count and converts the 1-based
 /// command-line channels into the 0-based indices the protocol and mixer use.
 ///
@@ -177,15 +227,8 @@ pub(crate) fn validate_groups(
     definitions: &[GroupDefinition],
     channel_count: usize,
 ) -> Result<GroupLayout, Box<dyn Error>> {
-    if definitions.len() > MAX_GROUPS {
-        return Err(format!(
-            "at most {MAX_GROUPS} groups are supported, received {}",
-            definitions.len()
-        )
-        .into());
-    }
+    check_groups(definitions)?;
 
-    let mut owner: Vec<Option<&str>> = vec![None; channel_count];
     let mut groups = Vec::with_capacity(definitions.len());
     for definition in definitions {
         let mut channels = Vec::with_capacity(definition.channels.len());
@@ -197,18 +240,10 @@ pub(crate) fn validate_groups(
                 )
                 .into());
             }
-            let index = channel - 1;
-            if let Some(previous) = owner[index] {
-                return Err(format!(
-                    "channel {channel} is listed in both \"{previous}\" and \"{}\"",
-                    definition.name
-                )
-                .into());
-            }
-            owner[index] = Some(&definition.name);
-            channels.push(index);
+            channels.push(channel - 1);
         }
         groups.push(Group {
+            id: definition.id.clone(),
             name: definition.name.clone(),
             channels,
         });
@@ -366,6 +401,60 @@ mod tests {
     }
 
     #[test]
+    fn command_line_groups_take_their_order_as_their_id() {
+        let arguments = parse_arguments_from(["--group", "Drums=1,2,3", "--group", "Vocals=4,5"])
+            .expect("arguments should parse");
+
+        assert_eq!(arguments.groups[0].id, "1");
+        assert_eq!(arguments.groups[1].id, "2");
+    }
+
+    fn group(id: &str, name: &str, channels: &[usize]) -> GroupDefinition {
+        GroupDefinition {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            channels: channels.to_vec(),
+        }
+    }
+
+    #[test]
+    fn groups_need_distinct_non_empty_ids_and_names() {
+        let repeated = check_groups(&[group("a", "Drums", &[1]), group("a", "Vocals", &[2])])
+            .expect_err("two groups cannot share an id");
+        let no_id = check_groups(&[group(" ", "Drums", &[1])]).expect_err("an id is needed");
+        let no_name = check_groups(&[group("a", "", &[1])]).expect_err("a name is needed");
+
+        assert!(repeated.contains("\"a\""), "names the id: {repeated}");
+        assert!(no_id.contains("Drums"), "names the group: {no_id}");
+        assert!(no_name.contains("\"a\""), "names the group's id: {no_name}");
+        assert_eq!(
+            check_groups(&[group("a", "Drums", &[1]), group("b", "Vocals", &[2])]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_channel_belongs_to_one_group_even_beyond_the_device() {
+        let error = check_groups(&[group("a", "Drums", &[9]), group("b", "Vocals", &[9])])
+            .expect_err("channel 9 cannot be in two groups");
+
+        assert!(error.contains("Drums") && error.contains("Vocals") && error.contains('9'));
+        assert_eq!(
+            check_groups(&[group("a", "Drums", &[9])]),
+            Ok(()),
+            "a channel the device lacks is not this check's concern"
+        );
+    }
+
+    #[test]
+    fn validated_groups_keep_their_ids() {
+        let layout =
+            validate_groups(&[group("kit", "Drums", &[1, 2])], 2).expect("groups should validate");
+
+        assert_eq!(layout.groups()[0].id, "kit");
+    }
+
+    #[test]
     fn rejects_group_without_an_equals_sign() {
         let error = parse_arguments_from(["--group", "Drums1,2"]).unwrap_err();
 
@@ -395,10 +484,7 @@ mod tests {
 
     #[test]
     fn validates_group_channels_against_the_captured_count() {
-        let definitions = vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 7],
-        }];
+        let definitions = vec![group("1", "Drums", &[1, 7])];
 
         let error = validate_groups(&definitions, 2).unwrap_err();
 
@@ -408,16 +494,7 @@ mod tests {
 
     #[test]
     fn rejects_a_channel_listed_in_two_groups_naming_both() {
-        let definitions = vec![
-            GroupDefinition {
-                name: "Drums".to_owned(),
-                channels: vec![1, 2],
-            },
-            GroupDefinition {
-                name: "Vocals".to_owned(),
-                channels: vec![2],
-            },
-        ];
+        let definitions = vec![group("1", "Drums", &[1, 2]), group("2", "Vocals", &[2])];
 
         let error = validate_groups(&definitions, 2).unwrap_err();
         let message = error.to_string();
@@ -429,10 +506,7 @@ mod tests {
 
     #[test]
     fn converts_validated_groups_to_zero_based_protocol_channels() {
-        let definitions = vec![GroupDefinition {
-            name: "Drums".to_owned(),
-            channels: vec![1, 2],
-        }];
+        let definitions = vec![group("1", "Drums", &[1, 2])];
 
         let layout = validate_groups(&definitions, 2).expect("groups should validate");
 
@@ -445,8 +519,9 @@ mod tests {
     fn rejects_more_groups_than_the_supported_maximum() {
         let definitions = (0..MAX_GROUPS + 1)
             .map(|index| GroupDefinition {
+                id: index.to_string(),
                 name: format!("Group {index}"),
-                channels: vec![1],
+                channels: vec![index + 1],
             })
             .collect::<Vec<_>>();
 

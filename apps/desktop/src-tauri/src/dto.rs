@@ -13,6 +13,8 @@ use personal_monitoring::{
     MixValues, MusicianStatus,
 };
 
+use crate::session::SessionGroup;
+
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
 /// Every field is optional so the window can send a partial object and let the defaults fill in.
@@ -38,11 +40,35 @@ pub struct StartRequest {
 
 /// One group as the window describes it. Channel numbers are 1-based, exactly as the CLI takes
 /// them, because the conversion to the protocol's 0-based indices happens in the engine.
+///
+/// `id` is the group's stable id as the status reports it. A group the window has just created has
+/// none, and the desk gives it a new one (see [crate::commands::set_groups]); from then on the
+/// window sends it back, so every musician's level for the group follows it through renames,
+/// moves and new channels.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupRequest {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub channels: Vec<usize>,
+}
+
+/// What [crate::commands::set_groups] did with an accepted list of groups.
+///
+/// `applied` says whether a running engine took the groups (every phone has them now); `saved`
+/// whether the session keeps them. With no engine running they are saved and apply at the next
+/// start (`applied: false, saved: true`). A running engine that took them while the save failed
+/// gives `applied: true, saved: false` with the reason in `saveError`. A list that is refused, by
+/// the check or by an engine that is stopping, is an error instead, and nothing changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsSetDto {
+    /// The groups in their order, each with its id (a new group's is the one the desk gave it).
+    pub groups: Vec<SessionGroup>,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
 }
 
 /// The capture format the engine selected, in plain values a webview can render.
@@ -273,10 +299,13 @@ impl From<MixUpdateRequest> for MixUpdate {
     }
 }
 
-/// One configured group, with the same 0-based source indices the engine uses.
+/// One configured group, with the same 0-based source indices the engine uses. Its position in
+/// the list is the index of its level in every musician's `groupLevels`.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDto {
+    /// The group's stable id: what the window joins channels and edits on, never the name.
+    pub id: String,
     pub name: String,
     pub channels: Vec<usize>,
     /// True when the current input device is missing a channel this group names. The group is still
@@ -313,7 +342,10 @@ impl From<&InputDevice> for InputDeviceDto {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelDto {
     pub number: u8,
+    /// The name of the channel's group, for display.
     pub group: Option<String>,
+    /// The id of the channel's group: two groups may share a name, so this is the join.
+    pub group_id: Option<String>,
     pub level: u8,
 }
 
@@ -391,6 +423,7 @@ impl From<&EngineStatus> for EngineStatusDto {
             .groups
             .iter()
             .map(|group| GroupDto {
+                id: group.id.clone(),
                 name: group.name.clone(),
                 channels: group.channels.clone(),
                 invalid: group.invalid,
@@ -399,16 +432,19 @@ impl From<&EngineStatus> for EngineStatusDto {
         // The engine publishes the group layout once; the per-channel membership the window needs
         // is derived here rather than being stored twice and risking the two views disagreeing.
         let channels = (0..usize::from(status.source_channels))
-            .map(|index| ChannelDto {
-                number: (index + 1) as u8,
+            .map(|index| {
                 // An invalid group is shown in the group list but does not own any channel, because
                 // the mixer ignores it; labelling a channel with it would overstate what is applied.
-                group: status
+                let group = status
                     .groups
                     .iter()
-                    .find(|group| !group.invalid && group.channels.contains(&index))
-                    .map(|group| group.name.clone()),
-                level: status.channel_levels.get(index).copied().unwrap_or(0),
+                    .find(|group| !group.invalid && group.channels.contains(&index));
+                ChannelDto {
+                    number: (index + 1) as u8,
+                    group: group.map(|group| group.name.clone()),
+                    group_id: group.map(|group| group.id.clone()),
+                    level: status.channel_levels.get(index).copied().unwrap_or(0),
+                }
             })
             .collect();
         Self {
@@ -463,6 +499,7 @@ mod tests {
     fn channels_label_by_number_with_their_group_and_level() {
         let status = status_with(
             vec![GroupStatus {
+                id: "kit".to_owned(),
                 name: "Drums".to_owned(),
                 channels: vec![0],
                 invalid: false,
@@ -497,6 +534,7 @@ mod tests {
     fn an_invalid_group_is_flagged_for_the_window_and_keeps_its_channels() {
         let status = status_with(
             vec![GroupStatus {
+                id: "vox".to_owned(),
                 name: "Vocals".to_owned(),
                 channels: vec![2, 3],
                 invalid: true,
@@ -903,9 +941,77 @@ mod tests {
     }
 
     #[test]
+    fn groups_and_the_channels_in_them_carry_the_groups_id() {
+        let status = status_with(
+            vec![
+                GroupStatus {
+                    id: "kit".to_owned(),
+                    name: "Drums".to_owned(),
+                    channels: vec![1],
+                    invalid: false,
+                },
+                GroupStatus {
+                    id: "kit-2".to_owned(),
+                    name: "Drums".to_owned(),
+                    channels: vec![0],
+                    invalid: false,
+                },
+            ],
+            vec![0, 0],
+        );
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+
+        assert_eq!(json["groups"][0]["id"], "kit");
+        assert_eq!(json["groups"][1]["id"], "kit-2");
+        assert_eq!(
+            json["channels"][0]["groupId"], "kit-2",
+            "joined by id, not name"
+        );
+        assert_eq!(json["channels"][1]["groupId"], "kit");
+    }
+
+    #[test]
+    fn a_group_edit_answers_what_was_done_in_camel_case() {
+        let answer = GroupsSetDto {
+            groups: vec![SessionGroup {
+                id: "kit".to_owned(),
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            }],
+            applied: false,
+            saved: true,
+            save_error: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(answer).expect("serializes"),
+            serde_json::json!({
+                "groups": [{ "id": "kit", "name": "Drums", "channels": [1, 2] }],
+                "applied": false,
+                "saved": true,
+                "saveError": null
+            })
+        );
+    }
+
+    #[test]
+    fn a_group_request_may_name_its_id_or_leave_it_to_the_desk() {
+        let requests: Vec<GroupRequest> = serde_json::from_str(
+            r#"[{"id":"kit","name":"Drums","channels":[1,2]},{"name":"Vocals","channels":[3]}]"#,
+        )
+        .expect("both shapes parse");
+
+        assert_eq!(requests[0].id.as_deref(), Some("kit"));
+        assert_eq!(requests[1].id, None);
+        assert_eq!(requests[1].channels, vec![3]);
+    }
+
+    #[test]
     fn a_channel_of_an_invalid_group_is_not_labelled_with_it() {
         let status = status_with(
             vec![GroupStatus {
+                id: "kit".to_owned(),
                 name: "Drums".to_owned(),
                 channels: vec![0, 1],
                 invalid: true,

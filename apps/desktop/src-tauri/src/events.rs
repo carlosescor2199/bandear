@@ -11,7 +11,9 @@
 //!   index-aligned with the status's `channels`; `musicians` holds the peak of the stereo mix each
 //!   musician is sent.
 //! - `status`, about 4 times a second: the `EngineStatusDto` that `engine_status` returns, with the
-//!   local names applied.
+//!   local names applied; and at once when the groups change (an edit, or a device switch that
+//!   changes which groups the device can feed), ahead of the `mix-changed` of every musician whose
+//!   group levels moved with an edit. Groups and the channels in them carry the group's `id`.
 //! - `mix-changed`, as soon as a mix changes:
 //!   `{ "run": n, "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`,
 //!   the whole mix stored after the change. A musician removed in between is not announced.
@@ -214,6 +216,13 @@ fn pump(
         // Waiting on the bus is also the pump's sleep: a change goes out at once, and a stop is
         // noticed within one meter interval.
         match events.recv_timeout(schedule.wait(Instant::now())) {
+            // The groups changed: the window gets them at once, ahead of the moved levels that
+            // follow on the bus, instead of at the next scheduled status.
+            Ok(EngineEvent::GroupsChanged) => {
+                if let Some(status) = source.status() {
+                    sink.emit(STATUS_EVENT, EngineStatusDto { run, ..status });
+                }
+            }
             Ok(event) => {
                 let lookup = |address| source.musician_mix(address);
                 if let Some(change) = mix_changed(&event, run, lookup) {
@@ -540,6 +549,52 @@ mod tests {
         assert_eq!(change["origin"], "phone");
         assert_eq!(change["mix"]["volumePercent"], 42);
         assert_eq!(change["run"], 7, "a mix change names the pump's run");
+
+        pump.stop();
+    }
+
+    /// An edit of the groups is followed at once by every musician's moved levels. The window gets
+    /// a status with the new groups first, so it never shows moved levels against the old groups
+    /// until the next scheduled status.
+    #[test]
+    fn a_change_of_groups_sends_a_status_at_once_ahead_of_the_moved_mixes() {
+        let (bus, events) = channel();
+        let recorder = Recorder::default();
+        let pump = EventPump::start(
+            events,
+            7,
+            FakeEngine {
+                _alive: Arc::new(()),
+            },
+            recorder.clone(),
+        );
+        assert!(wait_until(|| recorder.count(STATUS_EVENT) >= 1));
+        let before = recorder.len();
+
+        bus.send(EngineEvent::GroupsChanged)
+            .expect("the pump listens");
+        bus.send(EngineEvent::MixChanged {
+            address: address(MUSICIAN),
+            origin: MixOrigin::Engine,
+        })
+        .expect("the pump listens");
+
+        assert!(wait_until(|| recorder.count(MIX_CHANGED_EVENT) == 1));
+        let since: Vec<String> = recorder.0.lock().expect("recorder lock")[before..]
+            .iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| name != METERS_EVENT)
+            .collect();
+        assert_eq!(
+            since.first().map(String::as_str),
+            Some(STATUS_EVENT),
+            "the new groups go out first: {since:?}"
+        );
+        assert_eq!(
+            recorder.last(STATUS_EVENT).expect("a status")["run"],
+            7,
+            "it names the pump's run"
+        );
 
         pump.stop();
     }

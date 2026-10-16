@@ -10,7 +10,10 @@ pub mod events;
 pub mod session;
 
 use commands::DesktopState;
-use dto::{EngineStateDto, InputDeviceDto, MixDto, MixUpdateRequest, StartRequest, StartSummary};
+use dto::{
+    EngineStateDto, GroupRequest, GroupsSetDto, InputDeviceDto, MixDto, MixUpdateRequest,
+    StartRequest, StartSummary,
+};
 use events::EventPump;
 use session::SessionStore;
 use tauri::{Manager, State};
@@ -83,13 +86,25 @@ async fn set_musician_name(
     commands::set_musician_name(state.inner(), address, name)
 }
 
+/// Replaces the engineer's groups (`[{ id?, name, channels }]`, channels 1-based, a new group with
+/// no id) and answers what was done: `{ groups, applied, saved, saveError }`, each group with its id
+/// (see [commands::set_groups] and [dto::GroupsSetDto]).
+#[tauri::command]
+async fn set_groups(
+    state: State<'_, DesktopState>,
+    groups: Vec<GroupRequest>,
+) -> Result<GroupsSetDto, String> {
+    commands::set_groups(state.inner(), groups)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // The session (musician labels today) is a desktop-app concern and lives in the app's
-            // config directory, so it survives a restart without touching the engine or any client
-            // protocol. Opening it never fails: a damaged file is set aside and logged.
+            // The session (musician labels and the engineer's groups) is a desktop-app concern and
+            // lives in the app's config directory, so it survives a restart without touching the
+            // engine or any client protocol. Opening it never fails: a damaged file is set aside
+            // and logged.
             let directory = app.path().app_config_dir()?;
             // Every engine the window starts streams its meters, status and mix changes as events
             // (see [events]); the app handle is both where the pump reads and where it emits.
@@ -112,7 +127,8 @@ pub fn run() {
             add_target,
             remove_target,
             set_mix,
-            set_musician_name
+            set_musician_name,
+            set_groups
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

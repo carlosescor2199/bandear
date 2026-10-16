@@ -17,17 +17,56 @@ fn next_revision() -> u64 {
 const NO_GROUP: u8 = u8::MAX;
 
 /// A named group of source channels, with 0-based indices as the protocol and the mixer use them.
+///
+/// The id is the group's identity across edits (see [crate::GroupDefinition]); its position in the
+/// layout is the index of its level in every mix's `group_levels`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Group {
+    pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) channels: Vec<usize>,
 }
 
+/// The level a new group, and a slot no group uses, starts at: neutral, so the group changes
+/// nothing until the musician moves it.
+pub(crate) const NEUTRAL_GROUP_LEVEL: u8 = 100;
+
+/// Where each group's level comes from when the groups are edited: for every position of the new
+/// layout, the position the same group (by id) had in the old one, or `None` for a new group and
+/// for every slot past the new list.
+pub(crate) type GroupSources = [Option<usize>; MAX_GROUPS];
+
+/// Matches the groups of `new` to those of `old` by id (see [GroupSources]).
+pub(crate) fn group_sources(old: &GroupLayout, new: &GroupLayout) -> GroupSources {
+    let mut sources = [None; MAX_GROUPS];
+    for (slot, group) in sources.iter_mut().zip(new.groups()) {
+        *slot = old
+            .groups()
+            .iter()
+            .position(|previous| previous.id == group.id);
+    }
+    sources
+}
+
+/// A mix's group levels after an edit of the groups: each kept group's level moves to its new
+/// position, a new group starts at [NEUTRAL_GROUP_LEVEL], and a deleted group's level is dropped
+/// (its slot, like every slot past the new list, is neutral again). Renaming a group or giving it
+/// other channels keeps its level, because its id is unchanged.
+pub(crate) fn regrouped_levels(
+    levels: &[u8; MAX_GROUPS],
+    sources: &GroupSources,
+) -> [u8; MAX_GROUPS] {
+    std::array::from_fn(|position| {
+        sources[position].map_or(NEUTRAL_GROUP_LEVEL, |previous| levels[previous])
+    })
+}
+
 /// The groups plus the derived channel-to-group lookup.
 ///
-/// Membership is fixed at startup, so the lookup is built once and copied into every [MixValues]
-/// snapshot the network thread reads. A channel belongs to at most one group, which validation
-/// enforces; the lookup is therefore a single owner per channel.
+/// A layout is immutable: a change of groups (or of the device, which can invalidate one) builds a
+/// new layout, and each mix copies its lookup into the atomics the network thread reads. A channel
+/// belongs to at most one group, which validation enforces; the lookup is therefore a single owner
+/// per channel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GroupLayout {
     groups: Vec<Group>,
@@ -56,6 +95,34 @@ impl GroupLayout {
 
     pub(crate) fn channel_group(&self) -> [Option<usize>; MAX_MIX_CHANNELS] {
         self.channel_group
+    }
+
+    /// Whether every group of `other` sits where the group with its id sits here, with none
+    /// missing or added: then every group level is already in its place and an edit only renames
+    /// groups or changes their channels.
+    pub(crate) fn same_positions(&self, other: &GroupLayout) -> bool {
+        self.groups.len() == other.groups.len()
+            && self
+                .groups
+                .iter()
+                .zip(&other.groups)
+                .all(|(mine, theirs)| mine.id == theirs.id)
+    }
+}
+
+/// Where a new musician's mix takes its group membership from.
+///
+/// A fixed [GroupLayout] answers with itself; the engine's live configuration answers with the
+/// membership in force at the moment the mix is created. The target registry creates a mix under
+/// its own write lock, so a mix created while the groups change gets either the old membership
+/// (and is then moved with every other mix) or the new one, never a stale one left behind.
+pub(crate) trait Membership {
+    fn new_mix(&self) -> MixState;
+}
+
+impl Membership for GroupLayout {
+    fn new_mix(&self) -> MixState {
+        MixState::new(self)
     }
 }
 
@@ -183,7 +250,7 @@ impl Default for MixState {
             pans: std::array::from_fn(|index| AtomicU8::new(default_pan(index))),
             channel_muted: std::array::from_fn(|_| AtomicBool::new(false)),
             channel_solo: std::array::from_fn(|_| AtomicBool::new(false)),
-            group_levels: std::array::from_fn(|_| AtomicU8::new(100)),
+            group_levels: std::array::from_fn(|_| AtomicU8::new(NEUTRAL_GROUP_LEVEL)),
             channel_group: std::array::from_fn(|_| AtomicU8::new(NO_GROUP)),
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
@@ -201,7 +268,7 @@ impl Default for MixValues {
             pans: std::array::from_fn(default_pan),
             channel_muted: [false; MAX_MIX_CHANNELS],
             channel_solo: [false; MAX_MIX_CHANNELS],
-            group_levels: [100; MAX_GROUPS],
+            group_levels: [NEUTRAL_GROUP_LEVEL; MAX_GROUPS],
             channel_group: [None; MAX_MIX_CHANNELS],
             volume_percent: 100,
             max_level_percent: 100,
@@ -224,8 +291,8 @@ fn store_all_flags(slots: &[AtomicBool; MAX_MIX_CHANNELS], values: &[bool; MAX_M
 }
 
 impl MixState {
-    /// Builds a state that carries the server's fixed group membership. Each client's group levels
-    /// start neutral, so a client that never sends `group_levels` hears every channel ungrouped.
+    /// Builds a state that carries the given group membership. Each client's group levels start
+    /// neutral, so a client that never sends `group_levels` hears every channel ungrouped.
     pub(crate) fn new(layout: &GroupLayout) -> Self {
         let state = Self::default();
         state.set_group_layout(layout);
@@ -291,6 +358,22 @@ impl MixState {
         let mut merged = update.merge_into(self.snapshot())?;
         merged.revision = self.store(merged, &mut revision);
         Ok(merged)
+    }
+
+    /// Moves this mix onto an edited set of groups: switches the membership the mixer reads to
+    /// `layout` and moves the group levels by `sources` (see [regrouped_levels]). Returns the mix
+    /// now stored.
+    ///
+    /// It is one change under the writer lock, like [MixState::apply]: it takes a new revision, so
+    /// the musician's phone is sent the moved levels, and a change from the phone or the desktop
+    /// cannot land between the read of the old levels and the store of the moved ones.
+    pub(crate) fn regroup(&self, layout: &GroupLayout, sources: &GroupSources) -> MixValues {
+        let mut revision = self.writer.lock().expect("mix writer lock poisoned");
+        self.set_group_layout(layout);
+        let mut values = self.snapshot();
+        values.group_levels = regrouped_levels(&values.group_levels, sources);
+        values.revision = self.store(values, &mut revision);
+        values
     }
 
     /// The stored mix with exactly its revision, read under the writer lock. For a reader that
@@ -465,6 +548,137 @@ mod tests {
     use std::net::IpAddr;
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
+
+    fn group(id: &str, name: &str, channels: &[usize]) -> Group {
+        Group {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            channels: channels.to_vec(),
+        }
+    }
+
+    /// Drums, Bass and Keys, in that order, one channel each.
+    fn trio() -> GroupLayout {
+        GroupLayout::new(vec![
+            group("drums", "Drums", &[0]),
+            group("bass", "Bass", &[1]),
+            group("keys", "Keys", &[2]),
+        ])
+    }
+
+    /// Group levels with Drums at 10, Bass at 20 and Keys at 30, the rest neutral.
+    fn trio_levels() -> [u8; MAX_GROUPS] {
+        let mut levels = [NEUTRAL_GROUP_LEVEL; MAX_GROUPS];
+        levels[..3].copy_from_slice(&[10, 20, 30]);
+        levels
+    }
+
+    fn regrouped(new: &GroupLayout) -> [u8; MAX_GROUPS] {
+        regrouped_levels(&trio_levels(), &group_sources(&trio(), new))
+    }
+
+    #[test]
+    fn renaming_a_group_or_changing_its_channels_keeps_its_level() {
+        let edited = GroupLayout::new(vec![
+            group("drums", "Kit", &[0, 3]),
+            group("bass", "Bass", &[1]),
+            group("keys", "Keys", &[2]),
+        ]);
+
+        assert_eq!(regrouped(&edited), trio_levels());
+        assert!(trio().same_positions(&edited));
+    }
+
+    #[test]
+    fn reordering_groups_moves_each_level_with_its_group() {
+        let reordered = GroupLayout::new(vec![
+            group("keys", "Keys", &[2]),
+            group("drums", "Drums", &[0]),
+            group("bass", "Bass", &[1]),
+        ]);
+
+        assert_eq!(&regrouped(&reordered)[..4], &[30, 10, 20, 100]);
+        assert!(!trio().same_positions(&reordered));
+    }
+
+    #[test]
+    fn deleting_a_group_drops_its_level() {
+        let without_bass = GroupLayout::new(vec![
+            group("drums", "Drums", &[0]),
+            group("keys", "Keys", &[2]),
+        ]);
+
+        let levels = regrouped(&without_bass);
+
+        assert_eq!(
+            &levels[..2],
+            &[10, 30],
+            "Keys keeps its level in its new place"
+        );
+        assert!(
+            levels[2..]
+                .iter()
+                .all(|&level| level == NEUTRAL_GROUP_LEVEL),
+            "nothing is left of the deleted group: {levels:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_group_starts_at_the_neutral_level() {
+        let with_vocals = GroupLayout::new(vec![
+            group("vocals", "Vocals", &[3]),
+            group("drums", "Drums", &[0]),
+            group("bass", "Bass", &[1]),
+            group("keys", "Keys", &[2]),
+        ]);
+
+        assert_eq!(&regrouped(&with_vocals)[..4], &[100, 10, 20, 30]);
+    }
+
+    #[test]
+    fn a_new_group_never_inherits_a_deleted_groups_level_by_taking_its_place() {
+        let bass_replaced = GroupLayout::new(vec![
+            group("drums", "Drums", &[0]),
+            group("synth", "Bass", &[1]),
+            group("keys", "Keys", &[2]),
+        ]);
+
+        assert_eq!(&regrouped(&bass_replaced)[..3], &[10, 100, 30]);
+    }
+
+    #[test]
+    fn regrouping_a_mix_moves_its_levels_and_membership_under_a_new_revision() {
+        let state = MixState::new(&trio());
+        state.update(MixValues {
+            group_levels: trio_levels(),
+            max_level_percent: 90,
+            ..MixValues::default()
+        });
+        let before = state.current();
+        let reordered = GroupLayout::new(vec![
+            group("keys", "Keys", &[2]),
+            group("drums", "Drums", &[0]),
+        ]);
+
+        let moved = state.regroup(&reordered, &group_sources(&trio(), &reordered));
+
+        assert_eq!(moved, state.current(), "the moved mix is what is stored");
+        assert!(
+            moved.revision > before.revision,
+            "the phone is sent the move"
+        );
+        assert_eq!(&moved.group_levels[..3], &[30, 10, 100]);
+        assert_eq!(
+            moved.channel_group[2],
+            Some(0),
+            "Keys is now the first group"
+        );
+        assert_eq!(moved.channel_group[0], Some(1));
+        assert_eq!(moved.channel_group[1], None, "Bass is gone");
+        assert_eq!(moved.max_level_percent, 90, "nothing else changes");
+        // Keys' channel is still scaled by Keys' level, now read from its new position.
+        assert_eq!(mix_channels(&[0, 0, 10_000], 3, moved), [3_000, 0]);
+    }
 
     #[test]
     fn independent_mix_states_transform_the_same_input_differently() {
@@ -790,10 +1004,7 @@ mod tests {
 
     #[test]
     fn a_group_level_scales_every_member_and_keeps_their_balance() {
-        let layout = GroupLayout::new(vec![Group {
-            name: "Drums".to_owned(),
-            channels: vec![0, 1],
-        }]);
+        let layout = GroupLayout::new(vec![group("kit", "Drums", &[0, 1])]);
         let mut group_levels = [100u8; MAX_GROUPS];
         group_levels[0] = 50;
         let values = MixValues {
@@ -811,10 +1022,7 @@ mod tests {
 
     #[test]
     fn a_channel_in_no_group_ignores_every_group_level() {
-        let layout = GroupLayout::new(vec![Group {
-            name: "Drums".to_owned(),
-            channels: vec![0],
-        }]);
+        let layout = GroupLayout::new(vec![group("kit", "Drums", &[0])]);
         let mut group_levels = [100u8; MAX_GROUPS];
         group_levels[0] = 0;
         let values = MixValues {
@@ -872,10 +1080,7 @@ mod tests {
 
     #[test]
     fn a_mix_update_preserves_the_servers_group_membership() {
-        let layout = GroupLayout::new(vec![Group {
-            name: "Drums".to_owned(),
-            channels: vec![0],
-        }]);
+        let layout = GroupLayout::new(vec![group("kit", "Drums", &[0])]);
 
         let values = parse_mix_command(
             r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"group_levels":[50]}"#,
@@ -949,10 +1154,7 @@ mod tests {
 
     #[test]
     fn replacing_the_group_layout_stops_an_invalid_group_from_affecting_audio() {
-        let layout = GroupLayout::new(vec![Group {
-            name: "Drums".to_owned(),
-            channels: vec![0],
-        }]);
+        let layout = GroupLayout::new(vec![group("kit", "Drums", &[0])]);
         let state = MixState::new(&layout);
         let mut group_levels = [100u8; MAX_GROUPS];
         group_levels[0] = 50;
@@ -967,10 +1169,7 @@ mod tests {
 
         // The device no longer has that channel, so the group is mapped to nothing and the channel
         // mixes at its own gain. The stored group level is preserved for when the channel returns.
-        let invalid = GroupLayout::new(vec![Group {
-            name: "Drums".to_owned(),
-            channels: vec![],
-        }]);
+        let invalid = GroupLayout::new(vec![group("kit", "Drums", &[])]);
         state.set_group_layout(&invalid);
 
         assert_eq!(state.snapshot().channel_group[0], None);

@@ -15,6 +15,7 @@ import "./musician-tabs.js";
 import "./channel-strip.js";
 import "./group-strip.js";
 import "./master-strip.js";
+import "./mix-tools.js";
 
 // Organisms of the Channels and groups screen.
 import "./channel-table.js";

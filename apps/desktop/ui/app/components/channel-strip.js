@@ -2,11 +2,13 @@
 // instrument icon and name, group chip, pan (a balance for a pair, marked "Stereo"), input meter,
 // fader with its value, Mute and Solo, and the engineer's lock for this musician's phone, its
 // state in words ("Locked" or "Unlocked"). A lock only binds the phone: the desk still moves the
-// strip, so its controls stay live here.
+// strip, so its controls stay live here. While the musician's mix follows another's (a mirror),
+// the strip says so in words ("Follows Bass") and its level, pan, mute and solo take no move: they
+// move with the leader's.
 //
 // Property: `data`, one entry of channelStrips (mix-view.js):
 //   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout, locked,
-//   lockText }.
+//   lockText, following }.
 // Method: `setLevel(level)`, the input peak from the `meters` event (a pair's louder side).
 // Event: `mix-edit` { field, index, sides, stereo, value } (bubbling, composed) for a move of the
 //   fader ("channelGains") or the pan ("pans", a balance for a pair) and a press of Mute
@@ -66,6 +68,15 @@ const styles = sheet(`
   .readout[data-muted] {
     color: var(--ml-text-muted);
   }
+  .follows {
+    max-width: 100%;
+    overflow: hidden;
+    color: var(--ml-accent);
+    font-size: var(--ml-text-2xs);
+    font-weight: var(--ml-weight-bold);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   /* "Unlocked" fits the strip in the small type. */
   .lock::part(button) {
     min-width: 64px;
@@ -86,6 +97,7 @@ class MlChannelStrip extends HTMLElement {
       `<div class="strip" role="group">
         <div class="name"><span class="kind-icon"></span><span class="label"></span></div>
         <div class="chip"><ml-group-chip hidden></ml-group-chip></div>
+        <div class="follows" hidden></div>
         <div class="stereo" aria-hidden="true" hidden>${stereoIcon(12)}STEREO</div>
         <ml-pan></ml-pan>
         <div class="levels"><ml-meter></ml-meter><ml-fader></ml-fader></div>
@@ -101,6 +113,7 @@ class MlChannelStrip extends HTMLElement {
       strip: root.querySelector(".strip"),
       name: root.querySelector(".label"),
       kindIcon: root.querySelector(".kind-icon"),
+      follows: root.querySelector(".follows"),
       stereo: root.querySelector(".stereo"),
       chip: root.querySelector("ml-group-chip"),
       pan: root.querySelector("ml-pan"),
@@ -126,10 +139,17 @@ class MlChannelStrip extends HTMLElement {
     const kindChanged = this.#data === null || this.#data.kind !== data.kind;
     this.#data = data;
     const parts = this.#parts;
-    const { label, stereo } = data;
-    reflect(parts.strip, "aria-label", stereo ? `${label}, stereo pair` : label);
+    const { label, stereo, following } = data;
+    const named = stereo ? `${label}, stereo pair` : label;
+    reflect(parts.strip, "aria-label", following ? `${named}, follows ${following}'s mix` : named);
     setText(parts.name, label);
     parts.name.title = label;
+    parts.follows.hidden = !following;
+    setText(parts.follows, following ? `Follows ${following}` : "");
+    parts.follows.title = following ? `This mix follows ${following}'s: move ${following}'s instead` : "";
+    for (const control of [parts.pan, parts.fader, parts.mute, parts.solo]) {
+      reflect(control, "disabled", Boolean(following));
+    }
     if (kindChanged) {
       parts.kindIcon.innerHTML = kindIcon(data.kind, 14);
     }

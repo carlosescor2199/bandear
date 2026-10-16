@@ -1,10 +1,13 @@
 // The Mix screen (board 1 of the design): the container that joins the console app (store and
 // engine) to the presentational organisms. It renders what mix-view.js works out, at most once
 // per animation frame, routes the meters straight to the strips, and turns the organisms' events
-// into engine calls and mix edits.
+// into engine calls and mix edits. The tools beside the musician tabs (Mirror, Copy mix to…,
+// Presets) act on the open musician's mix, and their last outcome is said in words above the
+// strips.
 
 import "../components/index.js";
 import { editKey } from "../lib/mix.js";
+import { mixToolsView } from "../lib/mixes.js";
 import { musicianLabel } from "../lib/format.js";
 import { selectedMusician } from "../lib/console-state.js";
 import {
@@ -42,7 +45,12 @@ const NOTICES = Object.freeze({
 const LAYOUT = `
   <h1 class="ml-visually-hidden" tabindex="-1">Mix</h1>
   <ml-top-bar></ml-top-bar>
-  <div class="mix-tabs"><ml-musician-tabs></ml-musician-tabs></div>
+  <div class="mix-tabs">
+    <ml-musician-tabs></ml-musician-tabs>
+    <ml-mix-tools hidden></ml-mix-tools>
+  </div>
+  <p class="mix-message" role="status" data-tools hidden></p>
+  <p class="mix-message mix-message--error" role="alert" data-tools-error hidden></p>
   <p class="mix-message" role="status" data-departed hidden></p>
   <p class="mix-message mix-message--error" role="alert" data-error hidden></p>
   <p class="mix-message" role="status" data-controls hidden></p>
@@ -100,6 +108,9 @@ export function mountMixScreen(main, app) {
   const parts = {
     topBar: screen.querySelector("ml-top-bar"),
     tabs: screen.querySelector("ml-musician-tabs"),
+    tools: screen.querySelector("ml-mix-tools"),
+    toolsDone: screen.querySelector("[data-tools]"),
+    toolsError: screen.querySelector("[data-tools-error]"),
     departed: screen.querySelector("[data-departed]"),
     error: screen.querySelector("[data-error]"),
     controls: screen.querySelector("[data-controls]"),
@@ -135,11 +146,26 @@ export function mountMixScreen(main, app) {
     parts.noticeAction.textContent = copy.action ?? "";
   }
 
+  // The last outcome of the tools, `{ ok, message }`, said until the next one.
+  let toolsOutcome = null;
+
+  function renderTools(state) {
+    parts.tools.hidden = selectedMusician(state) === null;
+    if (!parts.tools.hidden) {
+      parts.tools.data = { ...mixToolsView(state, state.selected), address: state.selected };
+    }
+    parts.toolsDone.hidden = !toolsOutcome?.ok;
+    parts.toolsError.hidden = !toolsOutcome || toolsOutcome.ok;
+    parts.toolsDone.textContent = toolsOutcome?.ok ? toolsOutcome.message : "";
+    parts.toolsError.textContent = toolsOutcome && !toolsOutcome.ok ? toolsOutcome.message : "";
+  }
+
   function render() {
     const state = app.store.getState();
     const address = state.selected;
     parts.topBar.data = topBarView(state);
     parts.tabs.data = musicianTabs(state);
+    renderTools(state);
 
     const messages = mixMessages(state);
     for (const name of ["departed", "error", "controls", "command", "audio"]) {
@@ -214,6 +240,36 @@ export function mountMixScreen(main, app) {
     }
   }
 
+  // Runs one of the tools' commands for the open musician and says how it went.
+  async function tool(kind, run) {
+    const address = app.store.getState().selected;
+    if (!address) {
+      return;
+    }
+    toolsOutcome = await run(address);
+    parts.tools.answered(kind, toolsOutcome.ok);
+    scheduleRender();
+  }
+
+  screen.addEventListener("mirror-change", (event) =>
+    tool("mirror", (address) => app.setMirror(address, event.detail.leader)),
+  );
+  screen.addEventListener("mix-copy", (event) =>
+    tool("copy", (address) => app.copyMix(address, event.detail.to)),
+  );
+  screen.addEventListener("preset-save", (event) =>
+    tool("save", (address) => app.savePreset(address, event.detail.name)),
+  );
+  screen.addEventListener("preset-apply", (event) =>
+    tool("apply", () => app.applyPreset(event.detail.id, event.detail.to)),
+  );
+  screen.addEventListener("preset-rename", (event) =>
+    tool("rename", () => app.renamePreset(event.detail.id, event.detail.name)),
+  );
+  screen.addEventListener("preset-delete", (event) =>
+    tool("delete", () => app.deletePreset(event.detail.id)),
+  );
+  screen.addEventListener("presets-load", () => app.loadPresets());
   screen.addEventListener("engine-start", () => app.start());
   screen.addEventListener("engine-stop", () => app.stop());
   screen.addEventListener("musician-select", (event) => app.select(event.detail.address));

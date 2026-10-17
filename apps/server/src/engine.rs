@@ -28,6 +28,10 @@ use crate::output::{
     OpenedOutput, OutputControl, OutputDevice, OutputShared,
 };
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
+use crate::recorder::{
+    open_take, plan_tracks, recorder_sink, FileOpener, RecordRequest, Recorder, RecordingStatus,
+    TakeEnd, TakeOptions, TakeSummary, TrackOpener, STOP_WAIT,
+};
 use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
 /// The capture buffer the engine requests when the caller did not choose one.
@@ -353,6 +357,8 @@ pub struct EngineStatus {
     pub local_mix: MixValues,
     /// Where the local mix plays, and how (see [EngineHandle::set_local_output]).
     pub local_output: LocalOutputStatus,
+    /// The take being recorded, if any, and the last one (see [EngineHandle::recording]).
+    pub recording: RecordingStatus,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -1353,6 +1359,8 @@ pub struct EngineHandle {
     capture_device: Option<cpal::Device>,
     /// The engine block of the current capture, which sizes a new output's ring.
     block_frames: usize,
+    /// The recorder: the lines to its sink on the engine thread, and the take being recorded.
+    recorder: Recorder,
     /// The running capture stream. Dropping it stops its callback, the only producer of its ring.
     stream: Option<cpal::Stream>,
     /// The engine thread: it reads the current stream's ring and feeds the sinks, and keeps the
@@ -1502,6 +1510,7 @@ impl EngineHandle {
             ),
             local_mix: self.local_mix.current(),
             local_output: self.local_output(),
+            recording: self.recording(),
         }
     }
 
@@ -1537,10 +1546,14 @@ impl EngineHandle {
     /// re-validated (never rewritten), the channel details are shown for the inputs the new device
     /// has and kept for the rest ([Self::set_channels]), and connected clients are sent the new
     /// `config` when any of it changed.
+    ///
+    /// A switch is refused while a take records ([Self::start_recording]): a take never mixes two
+    /// devices, so the take is stopped first.
     pub fn switch_device(&mut self, filter: Option<&str>) -> Result<CaptureFormat, Box<dyn Error>> {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
+        self.recorder.refuse_source_change()?;
         let device = {
             let host = input_host(self.host);
             let devices = host
@@ -1593,11 +1606,12 @@ impl EngineHandle {
     ///
     /// A plan that cannot be made (a capture whose format and frames disagree), or an engine
     /// thread that is no longer running, leaves everything as it was: the running capture keeps
-    /// feeding the engine and the new one is dropped.
+    /// feeding the engine and the new one is dropped. So does a take that records.
     pub(crate) fn install_capture(
         &mut self,
         capture: OpenedCapture,
     ) -> Result<CaptureFormat, Box<dyn Error>> {
+        self.recorder.refuse_source_change()?;
         let plan = plan_switch_from_attempt(&self.group_definitions, capture.channels())?;
         let pipeline = self.pipeline.as_ref().ok_or("the engine is stopping")?;
 
@@ -1860,6 +1874,75 @@ impl EngineHandle {
                 self.device_name
             ));
         }
+    }
+
+    /// Starts recording a take: every armed input to its own file, and the local mix when asked
+    /// (see [RecordRequest]). Returns the recorder's status.
+    ///
+    /// The take is a new folder in `request.folder`, `<YYYY-MM-DD_HHMMSS>_<take name>` (local time
+    /// by `utc_offset_minutes`), never an existing one: a mono file per armed input, a stereo file
+    /// per armed linked pair (arming either side arms the pair) and a stereo file of the local mix,
+    /// named after the inputs' names at the start, and `take.json`. The track layout is fixed
+    /// here: the input device cannot be switched until the take stops ([Self::switch_device]).
+    /// Recording starts with the next block and never disturbs capture, the phones or the local
+    /// output: a disk that falls behind costs dropped frames (counted), and a disk error stops
+    /// only the take ([RecordingState::Failed]).
+    ///
+    /// An error, and nothing recorded or left behind, when a take already records, an armed input
+    /// is not on the device, nothing is armed, the format is not 24-bit integer or 32-bit float,
+    /// or the folder or a file cannot be made.
+    pub fn start_recording(
+        &mut self,
+        request: RecordRequest,
+    ) -> Result<RecordingStatus, Box<dyn Error>> {
+        self.start_recording_with(request, FileOpener, TakeOptions::default())
+    }
+
+    /// [Self::start_recording] with the files opened by `opener` and the take set up with
+    /// `options`, so a test can fail a disk on demand.
+    pub(crate) fn start_recording_with<O: TrackOpener>(
+        &mut self,
+        request: RecordRequest,
+        opener: O,
+        options: TakeOptions,
+    ) -> Result<RecordingStatus, Box<dyn Error>> {
+        if self.is_stopped() || self.pipeline.is_none() {
+            return Err("the engine is stopping".into());
+        }
+        self.recorder.check_idle()?;
+        let source_channels = usize::from(self.source_channels);
+        let tracks = plan_tracks(
+            &self.config_state.snapshot().channels,
+            source_channels,
+            &request.armed,
+            request.include_local,
+        )?;
+        let (feed, take) = open_take(
+            &request,
+            &self.device_name,
+            tracks,
+            source_channels,
+            std::time::SystemTime::now(),
+            opener,
+            options,
+        )?;
+        self.recorder.start(feed, take)?;
+        Ok(self.recording())
+    }
+
+    /// Stops the take and returns it once its files are finished and its `take.json` written.
+    /// A take that stopped on its own (a disk error) is collected the same way, with its reason.
+    /// An error when nothing records, or when the files are still being finished after a few
+    /// seconds (ask again).
+    pub fn stop_recording(&mut self) -> Result<TakeSummary, Box<dyn Error>> {
+        self.recorder.request_stop(TakeEnd::Stopped)?;
+        Ok(self.recorder.wait(STOP_WAIT)?)
+    }
+
+    /// The take being recorded: its state, folder, frames, dropped frames, bytes and tracks, and
+    /// the last take that ended.
+    pub fn recording(&self) -> RecordingStatus {
+        self.recorder.status()
     }
 
     /// The engineer's channel details the engine keeps, whole: the list last set with
@@ -2138,6 +2221,8 @@ impl EngineHandle {
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.stop()?;
         }
+        // Nothing feeds the take any more: its files are finished and it ends as the engine's.
+        self.recorder.engine_stopped();
         // Nothing feeds the local output any more: close it, and free what the sink handed back.
         self.local_output.active = None;
         self.local_output.reap();
@@ -2243,8 +2328,9 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let network = NetworkSink::new(Arc::clone(&target_registry), Arc::clone(&packet_stats))?;
     let local_meter = OutputMeter::default();
     let (local, output_control) = local_output_sink(Arc::clone(&local_mix), local_meter.clone());
+    let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
     let pipeline = PipelineHandle::spawn(Pipeline::new(
-        vec![Box::new(network), Box::new(local)],
+        vec![Box::new(network), Box::new(local), Box::new(recorder)],
         Arc::clone(&levels),
     ))?;
     let links = CaptureLinks {
@@ -2288,6 +2374,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         local_output: LocalOutput::new(output_control),
         capture_device: Some(device),
         block_frames,
+        recorder: Recorder::new(recorder_lines),
         stream: Some(opened.stream),
         pipeline: Some(pipeline),
         control_thread: Some(control_thread),
@@ -4226,8 +4313,9 @@ mod tests {
         let local_meter = OutputMeter::default();
         let (local, output_control) =
             local_output_sink(Arc::clone(&local_mix), local_meter.clone());
+        let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
         let pipeline = PipelineHandle::spawn(Pipeline::new(
-            vec![Box::new(network), Box::new(local)],
+            vec![Box::new(network), Box::new(local), Box::new(recorder)],
             Arc::clone(&levels),
         ))
         .expect("the engine thread starts");
@@ -4252,6 +4340,7 @@ mod tests {
             local_output: LocalOutput::new(output_control),
             capture_device: None,
             block_frames: DEFAULT_BLOCK_FRAMES,
+            recorder: Recorder::new(recorder_lines),
             stream: None,
             pipeline: Some(pipeline),
             control_thread: None,
@@ -4807,6 +4896,173 @@ mod tests {
             panic!("the output on the previous driver should have stopped");
         };
         assert!(reason.contains("ASIO driver"), "{reason}");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A take of input `armed` (0-based) in `parent`, 24-bit.
+    fn take_of(parent: &std::path::Path, armed: Vec<usize>) -> RecordRequest {
+        crate::recorder::tests::request(parent, armed, crate::wav::SampleFormat::Int24)
+    }
+
+    /// Every frame of the WAV file at `path`.
+    fn wav_samples(path: &std::path::Path) -> Vec<f32> {
+        let mut reader = crate::wav::WavReader::open(path).expect("the file reads");
+        let mut samples = vec![0.0; reader.frames() as usize * usize::from(reader.spec().channels)];
+        let frames = reader.read_frames(&mut samples).expect("the audio reads");
+        samples.truncate(frames * usize::from(reader.spec().channels));
+        samples
+    }
+
+    /// The armed input records to its own file, named after the input, while the phones keep
+    /// hearing every block; stopping finishes the take and reports it.
+    #[test]
+    fn a_take_records_the_armed_input_while_the_phones_keep_hearing() {
+        let parent = crate::recorder::tests::scratch_directory("engine-take");
+        let (mut engine, mut capture, phone) = local_engine();
+        engine
+            .set_channels(vec![
+                channel("Vocal", ChannelKind::Voice),
+                channel("Guitar", ChannelKind::Guitar),
+            ])
+            .expect("valid details");
+
+        let status = engine
+            .start_recording(take_of(&parent, vec![1]))
+            .expect("the take starts");
+        assert_eq!(status.state, crate::recorder::RecordingState::Recording);
+        assert_eq!(status.tracks, vec!["Guitar".to_owned()]);
+        for _ in 0..3 {
+            capture.write(&[0.5f32; 2 * 64]);
+        }
+        assert!(until(|| engine.recording().frames == 192));
+        assert!(phone_hears(&phone));
+        assert_eq!(engine.status().recording.frames, 192);
+
+        let summary = engine.stop_recording().expect("the take stops");
+
+        assert_eq!(summary.frames, 192);
+        assert_eq!(summary.ended, TakeEnd::Stopped);
+        assert_eq!(summary.device, "Test input (2)");
+        assert_eq!(summary.tracks.len(), 1);
+        assert_eq!(summary.tracks[0].file, "02 Guitar.wav");
+        assert_eq!(summary.tracks[0].channels, vec![2]);
+        assert_eq!(summary.tracks[0].instrument, Some(ChannelKind::Guitar));
+        assert_eq!(
+            wav_samples(&summary.folder.join("02 Guitar.wav")),
+            vec![0.5; 192]
+        );
+        let after = engine.recording();
+        assert_eq!(after.state, crate::recorder::RecordingState::Idle);
+        assert_eq!(after.last_take, Some(summary));
+        assert!(engine.stop_recording().is_err(), "nothing records now");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// While a take records the input device cannot change (a take never mixes two devices),
+    /// whether through `switch_device` or a capture already opened; after the take it can.
+    #[test]
+    fn a_device_switch_is_refused_while_recording() {
+        let parent = crate::recorder::tests::scratch_directory("engine-switch");
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .start_recording(take_of(&parent, vec![0]))
+            .expect("the take starts");
+        let before = session(&engine);
+
+        let refused = engine
+            .switch_device(None)
+            .expect_err("no switch while recording");
+        assert!(refused.to_string().contains("recording"), "{refused}");
+        let (_mono, opened) = test_capture(&engine, 1);
+        let refused = engine
+            .install_capture(opened)
+            .expect_err("no switch while recording");
+        assert!(refused.to_string().contains("recording"), "{refused}");
+        assert_eq!(session(&engine), before);
+
+        engine.stop_recording().expect("the take stops");
+        let (_mono, opened) = test_capture(&engine, 1);
+        engine
+            .install_capture(opened)
+            .expect("after the take the switch commits");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Stopping the engine ends the take cleanly: its files are finished and readable, and the
+    /// take says the engine ended it.
+    #[test]
+    fn stopping_the_engine_ends_the_take_cleanly() {
+        let parent = crate::recorder::tests::scratch_directory("engine-stop");
+        let (mut engine, mut capture, _phone) = local_engine();
+        engine
+            .start_recording(take_of(&parent, vec![0, 1]))
+            .expect("the take starts");
+        capture.write(&[0.25f32; 2 * 64]);
+        capture.write(&[0.25f32; 2 * 64]);
+        assert!(until(|| engine.recording().frames == 128));
+
+        engine.stop().expect("the engine stops");
+
+        let status = engine.recording();
+        assert_eq!(status.state, crate::recorder::RecordingState::Idle);
+        let take = status.last_take.expect("the take ended");
+        assert_eq!(take.ended, TakeEnd::EngineStopped);
+        assert_eq!(take.frames, 128);
+        assert_eq!(wav_samples(&take.folder.join("01 CH 1.wav")).len(), 128);
+        let json: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(take.folder.join("take.json")).expect("take.json exists"),
+        )
+        .expect("take.json is JSON");
+        assert_eq!(json["ended"]["how"], "engineStopped");
+    }
+
+    /// A disk error stops only the recording: the status says why, and capture, the phones and
+    /// the local output carry on.
+    #[test]
+    fn a_disk_error_stops_only_the_recording() {
+        let parent = crate::recorder::tests::scratch_directory("engine-disk");
+        let (mut engine, mut capture, phone) = local_engine();
+        let (player, opened) = test_output("Speakers", 2, 0);
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        let fail = Arc::new(AtomicBool::new(false));
+        engine
+            .start_recording_with(
+                take_of(&parent, vec![0]),
+                crate::recorder::tests::FailingOpener {
+                    failing: "01",
+                    fail: Arc::clone(&fail),
+                },
+                crate::recorder::tests::eager(),
+            )
+            .expect("the take starts");
+        capture.write(&[0.5f32; 2 * 64]);
+        assert!(until(|| engine.recording().bytes_written > 0));
+
+        fail.store(true, Ordering::Relaxed);
+        capture.write(&[0.5f32; 2 * 64]);
+        assert!(until(|| matches!(
+            engine.recording().state,
+            crate::recorder::RecordingState::Failed { .. }
+        )));
+
+        capture.write(&[0.5f32; 2 * 64]);
+        for _ in 0..3 {
+            assert!(phone_hears(&phone), "the phones keep hearing");
+        }
+        assert!(
+            until(|| player.queued() == 3 * 64),
+            "the local output plays"
+        );
+        assert_eq!(engine.local_output().state, LocalOutputState::Running);
+        let summary = engine
+            .stop_recording()
+            .expect("the failed take is collected");
+        let TakeEnd::DiskError { reason } = summary.ended else {
+            panic!("the disk ended the take: {:?}", summary.ended);
+        };
+        assert!(reason.contains("no space left"), "{reason}");
         engine.stop().expect("the engine stops");
     }
 }

@@ -67,6 +67,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         }],
         local_mix: Default::default(),
         local_output: Default::default(),
+        recording: Default::default(),
     }
 }
 

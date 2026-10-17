@@ -101,6 +101,9 @@ const FMT_OFFSET: u64 = JUNK_OFFSET + 8 + DS64_SIZE as u64;
 const DATA_SIZE_OFFSET: u64 = FMT_OFFSET + 8 + FMT_SIZE as u64 + 4;
 const HEADER_LEN: u64 = DATA_SIZE_OFFSET + 4;
 
+/// The bytes the writer's header takes before the audio: what a file holds beyond its frames.
+pub(crate) const HEADER_BYTES: u64 = HEADER_LEN;
+
 /// The largest size a 32-bit RIFF field holds: in RF64, 0xFFFFFFFF means "see ds64".
 const RIFF_SIZE_LIMIT: u64 = u32::MAX as u64 - 1;
 

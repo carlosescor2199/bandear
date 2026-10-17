@@ -953,6 +953,7 @@ mod tests {
             musicians: Vec::new(),
             local_mix: personal_monitoring::MixValues::default(),
             local_output: Default::default(),
+            recording: Default::default(),
         }
     }
 

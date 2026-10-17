@@ -14,7 +14,13 @@
 //   the `meters` event while a take records: no engine call, nothing that grows.
 
 import { sentenceWithReason } from "./format.js";
-import { isRecordingNow, lastTake, recordingStatus } from "./console-state.js";
+import { isRecordingNow, lastTake, recordingStatus, soundcheckStatus } from "./console-state.js";
+import {
+  RECORDING_BLOCKS_SOUNDCHECK,
+  SOUNDCHECK_BLOCKS_RECORDING,
+  isSoundchecking,
+} from "./soundcheck.js";
+import { soundcheckPlay, takeSoundcheck } from "./soundcheck-view.js";
 import {
   RECORD_FORMATS,
   formatDuration,
@@ -193,7 +199,11 @@ export function takeRows(state, offsetMinutes) {
   const recording = recordingStatus(state);
   return (state.takes.list ?? []).map((take) => {
     const live = isRecording(recording) && take.folder === recording.takeFolder;
-    return takeRow(live ? { ...take, seconds: recording.seconds } : take, offsetMinutes);
+    return {
+      ...takeRow(live ? { ...take, seconds: recording.seconds } : take, offsetMinutes),
+      // Its Soundcheck button (a take's Play is a soundcheck start, see soundcheck-view.js).
+      soundcheck: takeSoundcheck(state, take),
+    };
   });
 }
 
@@ -366,9 +376,45 @@ function markerRows(markers) {
 /**
  * The transport: what can be pressed, the position, the state in words, the markers and what a
  * take would record. `local.atStart` is true once Back to start was pressed after a take; until
- * then the position shows the last take's length and its markers.
+ * then the position shows the last take's length and its markers. Play is the virtual soundcheck
+ * (`play`, see soundcheckPlay: the take chosen in the card, `local.chosenTake`, or the last one);
+ * while a take plays in place of the inputs the position is the take's, Stop goes back to the live
+ * inputs and Back to start moves the take to its start.
  */
 export function transportView(state, local) {
+  const soundcheck = soundcheckStatus(state);
+  if (isSoundchecking(soundcheck)) {
+    return soundcheckTransport(state, local, soundcheck);
+  }
+  return { ...recordTransport(state, local), soundcheck: false, stopLabel: "Stop recording" };
+}
+
+function soundcheckTransport(state, local, soundcheck) {
+  const name = soundcheck.takeName ?? "the take";
+  const words = {
+    playing: `Soundcheck · "${name}" plays in place of the inputs`,
+    paused: `Soundcheck · "${name}" is paused`,
+    failed: "The soundcheck stopped on an error",
+  };
+  return {
+    ...recordTransport(state, local),
+    soundcheck: true,
+    recording: false,
+    stateKind: "soundcheck",
+    stateWord: words[soundcheck.state] ?? words.playing,
+    canRecord: false,
+    canStop: true,
+    stopLabel: "Back to live inputs",
+    canMark: false,
+    canRewind: soundcheck.state !== "failed" && soundcheck.positionFrames > 0,
+    position: formatDuration(soundcheck.positionSeconds),
+    markers: [],
+    markersOf: null,
+    play: soundcheckPlay(state, local.chosenTake ?? null),
+  };
+}
+
+function recordTransport(state, local) {
   const recording = recordingStatus(state);
   const live = isRecording(recording);
   const engineRuns = state.engine.phase === "running";
@@ -411,13 +457,16 @@ export function transportView(state, local) {
     markersOf,
     armed: tracksSummary(rows.length, Boolean(settings?.includeLocal)),
     format: `WAV · 48 kHz · ${FORMAT_WORDS[format] ?? format}`,
+    play: live
+      ? { can: false, action: null, folder: null, label: RECORDING_BLOCKS_SOUNDCHECK }
+      : soundcheckPlay(state, local.chosenTake ?? null),
   };
 }
 
 /**
  * The screen's messages: the last command's `outcome` `{ ok, text }`, a take that failed, a takes
- * listing that failed, and why arming is `locked` while a take records; each null when there is
- * nothing to say.
+ * listing that failed, and why arming is `locked` while a take records (or why nothing records
+ * while a soundcheck plays); each null when there is nothing to say.
  */
 export function recordMessages(state) {
   const recording = recordingStatus(state);
@@ -431,8 +480,16 @@ export function recordMessages(state) {
     takes: state.takes.error
       ? sentenceWithReason("The takes could not be listed", state.takes.error)
       : null,
-    locked: isRecordingNow(state) ? LOCKED_WHILE_RECORDING : null,
+    locked: lockedWords(state),
   };
+}
+
+// Why arming waits for the next take, or why nothing records while a soundcheck plays.
+function lockedWords(state) {
+  if (isRecordingNow(state)) {
+    return LOCKED_WHILE_RECORDING;
+  }
+  return isSoundchecking(soundcheckStatus(state)) ? SOUNDCHECK_BLOCKS_RECORDING : null;
 }
 
 /**

@@ -1,14 +1,19 @@
 // The Record screen (board 2 of the design): the transport, one track per recorded input with its
-// arm button, meter and waveform lane, the takes in the recordings folder and the recording
-// settings. The container renders what record-view.js works out, at most once per animation
+// arm button, meter and waveform lane, the takes in the recordings folder, the virtual soundcheck
+// card and the recording settings. The container renders what record-view.js works out, at most once per animation
 // frame, and turns the controls into console commands (see console-app.js), each outcome said in
 // words above the transport.
 //
 // What the screen decides (the transport's busy guard, the lanes' peak histories, arming, the
-// folder field) lives in record-controller.js, tested without a DOM; this file only reads and
-// writes elements. The waveform lanes are drawn from the `meters` event; no engine call is
-// involved. Playback, the takes' Play and Soundcheck and the virtual soundcheck card
-// come with virtual soundcheck (T6): Play shows here, disabled.
+// folder field, the soundcheck's Play, Stop, seek and loop) lives in record-controller.js, tested
+// without a DOM; this file only reads and writes elements. The waveform lanes are drawn from the
+// `meters` event; no engine call is involved.
+//
+// Play is the virtual soundcheck (see soundcheck-view.js): it plays the take the soundcheck card
+// picks, else the last take, through the engine in place of the live inputs, so the local output
+// and every phone hear it; there is no separate "listen only" playback. The takes table's
+// Soundcheck plays that take the same way, and the card shows where the take is, with its seek
+// slider, pause, loop and "back to live inputs".
 
 import "../components/meter.js";
 import "../components/record-track.js";
@@ -23,9 +28,12 @@ import {
   transportView,
 } from "../lib/record-view.js";
 import { formatUnreadable } from "../lib/recording.js";
+import { SOUNDCHECK_BLOCKS_RECORDING } from "../lib/soundcheck.js";
+import { soundcheckView } from "../lib/soundcheck-view.js";
 import { recordingStatus } from "../lib/console-state.js";
 
-const PLAYBACK_LATER = "Playback comes with virtual soundcheck";
+const PLAY_ICON = `<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4v16l13-8z"/></svg>`;
+const PAUSE_ICON = `<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>`;
 
 const LAYOUT = `
   <header class="screen-header">
@@ -40,9 +48,7 @@ const LAYOUT = `
       <button type="button" class="record-icon" data-rewind aria-label="Back to start" title="Back to start">
         <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg>
       </button>
-      <button type="button" class="record-icon" aria-label="Play" title="${PLAYBACK_LATER}" disabled>
-        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4v16l13-8z"/></svg>
-      </button>
+      <button type="button" class="record-icon" data-play aria-label="Play" data-icon="play">${PLAY_ICON}</button>
       <button type="button" class="record-icon" data-stop aria-label="Stop recording" title="Stop recording">
         <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
       </button>
@@ -106,7 +112,42 @@ const LAYOUT = `
       </div>
       <p class="record-empty" data-no-takes hidden></p>
     </section>
-    <aside class="record-side" aria-label="Recording settings">
+    <aside class="record-side" aria-label="Soundcheck and recording settings">
+      <section class="record-card record-soundcheck" aria-labelledby="record-soundcheck-title">
+        <div class="record-soundcheck-head">
+          <h2 id="record-soundcheck-title">Virtual soundcheck</h2>
+          <span class="record-badge" data-sc-badge></span>
+        </div>
+        <div class="record-soundcheck-pick" data-sc-off>
+          <label for="record-sc-take">Play back as the live inputs</label>
+          <select id="record-sc-take" data-sc-take></select>
+          <button type="button" class="record-button" data-sc-start>Start soundcheck</button>
+          <p class="record-hint" data-sc-hint hidden></p>
+        </div>
+        <div class="record-soundcheck-now" data-sc-on hidden>
+          <div class="record-soundcheck-take">
+            <span class="record-soundcheck-name" data-sc-name></span>
+            <span class="ml-mono" data-sc-time></span>
+          </div>
+          <input type="range" class="record-soundcheck-seek" min="0" step="0.1" data-sc-seek aria-label="Position in the take" />
+          <div class="record-folder-actions">
+            <button type="button" class="record-button" data-sc-pause>Pause</button>
+            <button type="button" class="record-button" data-sc-stop>Back to live inputs</button>
+          </div>
+          <p class="record-hint" data-sc-clock></p>
+          <p class="record-hint" data-sc-underruns></p>
+          <p class="mix-message mix-message--error" role="alert" data-sc-failure hidden></p>
+        </div>
+        <label class="record-check">
+          <input type="checkbox" data-sc-loop />
+          Loop the take
+        </label>
+        <p class="record-hint">
+          Each track plays into the input it was recorded from, in place of the interface, so every
+          mix, the local output and the phones can be set with nobody playing. The interface stays
+          open: going back to the live inputs is instant.
+        </p>
+      </section>
       <section class="record-card record-settings" aria-labelledby="record-settings-title">
         <h2 id="record-settings-title">Settings</h2>
         <form class="record-folder-form" data-folder-form>
@@ -202,7 +243,16 @@ function takeLine(row) {
   open.dataset.open = row.folder;
   open.textContent = "Open folder";
   open.setAttribute("aria-label", `Open the folder of ${row.name}`);
-  actions.append(open);
+  // A take's Play is its soundcheck: it plays through the engine in place of the live inputs.
+  const check = document.createElement("button");
+  check.type = "button";
+  check.className = "record-button";
+  check.dataset.soundcheck = row.folder;
+  check.textContent = row.soundcheck.playing ? "Playing" : "Soundcheck";
+  check.disabled = row.soundcheck.disabled;
+  check.title = row.soundcheck.title;
+  check.setAttribute("aria-label", row.soundcheck.title);
+  actions.append(check, open);
   tr.append(
     nameCell,
     cell(row.started),
@@ -225,6 +275,7 @@ export function mountRecordScreen(main, app) {
     outcomeError: $("[data-outcome-error]"),
     failure: $("[data-failure]"),
     rewind: $("[data-rewind]"),
+    play: $("[data-play]"),
     stop: $("[data-stop]"),
     record: $("[data-record]"),
     recordWord: $("[data-record-word]"),
@@ -258,12 +309,27 @@ export function mountRecordScreen(main, app) {
     notice: $("[data-notice]"),
     formatSelect: $("[data-format-select]"),
     includeLocal: $("[data-include-local]"),
+    scBadge: $("[data-sc-badge]"),
+    scOff: $("[data-sc-off]"),
+    scTake: $("[data-sc-take]"),
+    scStart: $("[data-sc-start]"),
+    scHint: $("[data-sc-hint]"),
+    scOn: $("[data-sc-on]"),
+    scName: $("[data-sc-name]"),
+    scTime: $("[data-sc-time]"),
+    scSeek: $("[data-sc-seek]"),
+    scPause: $("[data-sc-pause]"),
+    scStop: $("[data-sc-stop]"),
+    scClock: $("[data-sc-clock]"),
+    scUnderruns: $("[data-sc-underruns]"),
+    scFailure: $("[data-sc-failure]"),
+    scLoop: $("[data-sc-loop]"),
   };
 
   const controller = createRecordController(app, { onChange: () => render() });
   const local = controller.local;
-  // What was last written into the takes table and the markers list.
-  const drawn = { takesKey: null, markersKey: null };
+  // What was last written into the takes table, the markers list and the soundcheck's take list.
+  const drawn = { takesKey: null, markersKey: null, choicesKey: null };
 
   function show(element, text) {
     element.hidden = !text;
@@ -280,9 +346,19 @@ export function mountRecordScreen(main, app) {
     if (view.canRecord || view.recording) {
       parts.record.removeAttribute("title");
     } else {
-      parts.record.title = view.stateWord;
+      parts.record.title = view.soundcheck ? SOUNDCHECK_BLOCKS_RECORDING : view.stateWord;
     }
     parts.stop.disabled = busy || !view.canStop;
+    parts.stop.setAttribute("aria-label", view.stopLabel);
+    parts.stop.title = view.stopLabel;
+    parts.play.disabled = busy || !view.play.can;
+    parts.play.setAttribute("aria-label", view.play.label);
+    parts.play.title = view.play.label;
+    const icon = view.play.action === "pause" ? "pause" : "play";
+    if (parts.play.dataset.icon !== icon) {
+      parts.play.dataset.icon = icon;
+      parts.play.innerHTML = icon === "pause" ? PAUSE_ICON : PLAY_ICON;
+    }
     parts.mark.disabled = busy || !view.canMark;
     parts.rewind.disabled = !view.canRewind;
     parts.takeName.disabled = view.recording;
@@ -386,6 +462,46 @@ export function mountRecordScreen(main, app) {
     parts.includeLocal.checked = view.includeLocal;
   }
 
+  function renderSoundcheck(state) {
+    const view = soundcheckView(state, {
+      chosen: local.chosenTake,
+      drag: local.drag,
+      loopNext: local.loopNext,
+    });
+    const busy = local.busy !== null;
+    parts.scBadge.textContent = view.badge;
+    parts.scBadge.dataset.kind = { off: "off", paused: "warn", failed: "error" }[view.kind] ?? "ok";
+    parts.scOff.hidden = view.on;
+    parts.scOn.hidden = !view.on;
+    const choicesKey = JSON.stringify(view.choices);
+    if (choicesKey !== drawn.choicesKey) {
+      drawn.choicesKey = choicesKey;
+      parts.scTake.replaceChildren(
+        ...view.choices.map((choice) => new Option(choice.label, choice.folder)),
+      );
+    }
+    parts.scTake.value = view.chosen ?? "";
+    parts.scTake.disabled = view.choices.length === 0;
+    parts.scStart.disabled = busy || !view.canStart;
+    show(parts.scHint, view.startHint);
+    parts.scName.textContent = view.takeName ?? "";
+    parts.scTime.textContent = `${view.position} / ${view.length}`;
+    parts.scSeek.max = String(view.slider.max);
+    if (local.drag === null || document.activeElement !== parts.scSeek) {
+      parts.scSeek.value = String(view.slider.value);
+    }
+    parts.scSeek.disabled = Boolean(view.slider.disabled);
+    parts.scSeek.setAttribute("aria-valuetext", `${view.position} of ${view.length}`);
+    parts.scPause.disabled = busy || !(view.canPause || view.canResume);
+    parts.scPause.textContent = view.canPause ? "Pause" : view.resumeWord;
+    parts.scStop.disabled = busy || !view.canStop;
+    parts.scClock.textContent = view.clock;
+    parts.scUnderruns.textContent = view.underruns;
+    show(parts.scFailure, view.failure);
+    parts.scLoop.checked = view.looping;
+    parts.scLoop.disabled = !view.canLoop;
+  }
+
   function render() {
     const state = app.store.getState();
     controller.followTake(state);
@@ -397,6 +513,7 @@ export function mountRecordScreen(main, app) {
     renderTransport(state);
     renderTracks(state);
     renderTakes(state);
+    renderSoundcheck(state);
     renderSettings(state);
   }
 
@@ -440,17 +557,22 @@ export function mountRecordScreen(main, app) {
   parts.record.addEventListener("click", () =>
     controller.command("start", () => app.startRecording(parts.takeName.value)),
   );
-  parts.stop.addEventListener("click", () =>
-    controller.command("stop", async () => {
-      await app.stopRecording();
-      await app.refreshEstimate();
-    }),
-  );
+  // Stop goes back to the live inputs while a take plays in place of them, else stops the take.
+  parts.stop.addEventListener("click", () => controller.stop());
+  parts.play.addEventListener("click", () => controller.play());
   parts.mark.addEventListener("click", () => controller.command("mark", () => app.addMarker("")));
-  parts.rewind.addEventListener("click", () => {
-    local.atStart = true;
-    render();
+  parts.rewind.addEventListener("click", () => controller.rewind());
+  parts.scTake.addEventListener("change", () => controller.chooseTake(parts.scTake.value));
+  parts.scStart.addEventListener("click", () => {
+    if (parts.scTake.value) {
+      controller.soundcheckTake(parts.scTake.value);
+    }
   });
+  parts.scPause.addEventListener("click", () => controller.play());
+  parts.scStop.addEventListener("click", () => controller.stop());
+  parts.scSeek.addEventListener("input", () => controller.drag(parts.scSeek.value));
+  parts.scSeek.addEventListener("change", () => controller.seekTo(parts.scSeek.value));
+  parts.scLoop.addEventListener("change", () => controller.setLoop(parts.scLoop.checked));
   parts.refresh.addEventListener("click", async () => {
     await app.refreshTakes();
     render();
@@ -459,6 +581,10 @@ export function mountRecordScreen(main, app) {
     const button = event.target.closest("button[data-open]");
     if (button) {
       app.openTakeFolder(button.dataset.open).then(render);
+    }
+    const check = event.target.closest("button[data-soundcheck]");
+    if (check) {
+      controller.soundcheckTake(check.dataset.soundcheck);
     }
   });
   screen.addEventListener("track-arm", ({ detail: { key } }) => controller.arm(key));

@@ -613,8 +613,69 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     mixlink-desktop --all-targets` passes and desktop tests are 237 after `soundcheck:
     Default::default()` in the three `EngineStatus` literals (518acf9, 3 lines).
   - Commits: 518acf9 (desktop literals). Commit: this commit.
-- [ ] T6b (virtual soundcheck, desktop): Tauri commands over the T6a API, the takes' Play and
+- [x] T6b (virtual soundcheck, desktop): Tauri commands over the T6a API, the takes' Play and
   Soundcheck, and the virtual soundcheck card. Route: delegated writer.
+  - Review leftovers first: the late-output clock test (review-1a974944549d4abb WARNING) is split:
+    the engine-level test keeps only "the late output's callbacks become the clock" (condition
+    waits), and `a_late_output_clock_moves_the_take_by_the_frames_it_played_only` drives the engine
+    thread's path with `Pipeline::pump_at` at chosen instants and explicit callback counts (the
+    timer moves nothing after the switch; ten 64-frame callbacks are exactly ten blocks). No RED:
+    the behaviour was right, the test only stopped depending on wall-clock sleeps (10 repeated runs
+    green). review-66125d92f9e473fb's suggestions: a second arm press on a row before the first is
+    answered toggles from the pending intent (`armChange(state, row, armedNow)`), and every settings
+    request from the Record screen (arming, folder, default folder, format, local mix through
+    `controller.changeSettings`) renders again and says a rejection as the recording outcome (a
+    failed listing as the takes' error); RED 2 of 8 controller tests. Commits: 4a48c81 (85 lines),
+    5f3cde5 (169 lines).
+  - Desktop (`commands/soundcheck.rs`, `SoundcheckEngine` stand-in, typed `SoundcheckError`
+    downcast from the engine's `Box<dyn Error>`): `start_soundcheck(takeFolder, startFrame?,
+    looping?)` (only a take folder of the kept or default recordings folder, checked on the disk as
+    `open_take_folder` checks it, `take_in_recordings`), `pause_soundcheck`, `resume_soundcheck`,
+    `seek_soundcheck(frame)`, `set_soundcheck_loop(looping)`, `stop_soundcheck`, each answering
+    `SoundcheckDto { state: off|playing|paused|failed, reason, takeFolder, takeName,
+    positionFrames, positionSeconds, lengthFrames, lengthSeconds, looping, underrunFrames, clock:
+    timer|output }`, which the status carries as `soundcheck`; `EngineEvent::SoundcheckChanged`
+    sends a status at once (`status_at_once`). Every refusal has its own words (`refusal_words`,
+    one arm per variant), also used when the engine refuses a take during a soundcheck. Play on a
+    take is a soundcheck start: there is no separate "listen only" playback (module docs, lib.rs).
+  - Console (`lib/soundcheck.js`, `console-state.js`, `console-app.js`, `bridge.js`):
+    `startSoundcheck(folder, { startFrame, looping })`, `pauseSoundcheck`, `resumeSoundcheck`,
+    `seekSoundcheck(frame)` (one at a time, the latest winning), `setSoundcheckLoop`,
+    `stopSoundcheck`, each `{ ok, message, soundcheck }`, the answer shown on the status at once
+    (`actions.soundcheck`), the outcome said as `recordingOutcome` "soundcheck"; selectors
+    `soundcheckStatus`, `isSoundcheckNow`. Recording, a device switch and a driver change are
+    refused in words during a soundcheck (the audio setup says why), and no soundcheck starts while
+    a take records. The fake mirrors every command with the desktop's rules and words (layout
+    against the fake device, position on `clock`, end pauses or loops, `failSoundcheck`).
+  - UI (`lib/soundcheck-view.js`, `record-view.js`, `record-controller.js`, the Record screen):
+    the transport's Play plays the take the card picks (else the last take, else the newest) as a
+    soundcheck, then pauses and resumes it; Stop is "Back to live inputs" during a soundcheck, Back
+    to start moves the take to 0; each take row has Soundcheck (Playing on the take that plays);
+    the "Virtual soundcheck" card (above Settings) has the take picker and Start, then the take's
+    name, position/length with a seek slider (dragging shows the position, letting go seeks), Pause
+    or Play / Play again, Back to live inputs, a loop toggle (kept for the next start when off),
+    what paces it (local output or timer), dropouts and a failure; a SOUNDCHECK chip (accent, a link
+    to Record) sits in the shell's strip beside the REC chip on every screen; the screen says why
+    nothing records during a soundcheck.
+  - RED: desktop 10 of 248 failed against stubs (7 command tests, 2 status DTO tests, the
+    status-at-once test; the typed/words test was written with its code); UI 7 of 10 soundcheck
+    console tests failed before the fake mirrored the commands (the api, shapes and store tests
+    were written with their code), 7 of 7 view tests against stubs, 3 of 11 controller tests before
+    the controller's soundcheck.
+  - GREEN: server unit tests 432 -> 433; desktop 237 -> 248, `cargo check --all-targets` clean; UI
+    434 -> 436 -> 446 -> 456. Browser (`?fake#/record`, port 5199): a take recorded and stopped;
+    its row's Soundcheck played it in place of the inputs (the transport said so, the row said
+    Playing); at its end it paused ("At the end", "Play again"); the slider moved it to 0:06,
+    looping wrapped it, Pause held 0:05, Play went on; the SOUNDCHECK chip showed on Network and
+    system, whose audio setup was locked with the soundcheck's words; the chip led back to Record,
+    where Record was disabled and the screen said "Go back to the live inputs before recording";
+    Back to live inputs ended it and the chip went away; the transport's Play started the last
+    take; no console errors.
+  - Not built: the design's separate takes "Play" (folded into Soundcheck: Play is a soundcheck
+    start) and its "On" toggle (Start / Back to live inputs instead); a take's markers on the seek
+    slider.
+  - Commits: c6c02ae (desktop, 967 lines), f178fa7 (console and fake, 937 lines). Commit: this
+    commit.
 - [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
 
 ## Progress
@@ -676,7 +737,12 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   its three findings (the clock decided from a snapshot at start and written before a refused
   load, no test of the failed path, a stop whose wait ran out letting the engine thread free the
   ring) are fixed by T6a-fix. Next review base: b692863.
+- Review lineage review-1a974944549d4abb over b692863..4cbdbb9 (T6a-fix) approved and
+  acknowledged with one WARNING (the late-output clock test's fixed sleeps), fixed in T6b's first
+  work unit (4a48c81). Next review base: 4cbdbb9.
+- T6b done in five work units: 4a48c81, 5f3cde5, c6c02ae, f178fa7 and the screen commit; all after
+  4cbdbb9.
 
 ## Next step
 
-T6b.
+T7.

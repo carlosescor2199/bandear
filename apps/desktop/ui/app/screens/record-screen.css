@@ -408,11 +408,72 @@
   min-width: 0;
 }
 
-.record-settings {
+.record-settings,
+.record-soundcheck {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 14px var(--ml-space-4);
+}
+
+.record-soundcheck-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ml-space-2);
+}
+
+.record-soundcheck-pick,
+.record-soundcheck-now {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.record-soundcheck-pick label {
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-sm);
+}
+
+.record-soundcheck-pick select {
+  min-height: 34px;
+  padding: 0 8px;
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-sm);
+  background: var(--ml-ground);
+  color: var(--ml-text);
+  font: inherit;
+  font-size: var(--ml-text-md);
+}
+
+.record-soundcheck-pick .record-button {
+  align-self: flex-start;
+}
+
+.record-soundcheck-take {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ml-space-2);
+  font-size: var(--ml-text-md);
+}
+
+.record-soundcheck-name {
+  overflow: hidden;
+  font-weight: var(--ml-weight-bold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-soundcheck-seek {
+  width: 100%;
+  accent-color: var(--ml-accent);
+}
+
+.record-soundcheck .record-badge[data-kind="off"] {
+  border-color: var(--ml-border);
+  background: none;
+  color: var(--ml-text-secondary);
 }
 
 .record-folder-form,

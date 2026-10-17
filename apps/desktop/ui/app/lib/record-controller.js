@@ -9,12 +9,18 @@
 //   second press on a track before the first is answered toggles what the first asked.
 // - Settings requests never leave a promise rejected: the screen renders again whatever happens and
 //   a failure is said as the recording outcome.
+// - The virtual soundcheck: Play starts the take the card picks (else the last take) in place of
+//   the live inputs, pauses it or plays it on; a take row's Soundcheck starts that take; Stop goes
+//   back to the live inputs while a take plays; Back to start and the seek slider move it; the loop
+//   applies to the take playing, or is kept for the next start.
 // - The folder field: shows the desk's folder unless the engineer is typing; a refused folder stays
 //   in it to be corrected, a kept one shows as the desk has it and its takes are listed.
 
-import { actions, recordingStatus } from "./console-state.js";
+import { actions, isSoundcheckNow, recordingStatus, soundcheckStatus } from "./console-state.js";
 import { sentenceWithReason } from "./format.js";
 import { stripLevel } from "./mix-view.js";
+import { frameAt } from "./soundcheck.js";
+import { soundcheckChip, soundcheckPlay } from "./soundcheck-view.js";
 import {
   armChange,
   createPeakHistory,
@@ -36,8 +42,39 @@ function reason(error) {
  * the controller's own state changed and the screen should render again.
  */
 export function createRecordController(app, { onChange = () => {} } = {}) {
-  // A command on its way (its buttons wait), and Back to start pressed after a take.
-  const local = { busy: null, atStart: false };
+  // A command on its way (its buttons wait), Back to start pressed after a take, the take the
+  // soundcheck card picks for Play, where the seek slider is being dragged to (seconds), and the
+  // loop asked for the next soundcheck.
+  const local = { busy: null, atStart: false, chosenTake: null, drag: null, loopNext: false };
+
+  async function command(name, run) {
+    if (local.busy !== null) {
+      return false;
+    }
+    local.busy = name;
+    onChange();
+    try {
+      await run();
+    } finally {
+      local.busy = null;
+      onChange();
+    }
+    return true;
+  }
+
+  // A transport command whose answer the caller gets: null when another was on its way.
+  async function answered(name, run) {
+    let result = null;
+    await command(name, async () => {
+      result = await run();
+    });
+    return result;
+  }
+
+  // Whether a take plays in place of the inputs now.
+  function soundchecking() {
+    return isSoundcheckNow(app.store.getState());
+  }
   const histories = new Map();
   let take = null;
   let shownFolder = null;
@@ -140,19 +177,97 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
      * Runs the transport command `name`: until `run` is answered another is not run (returns
      * false); otherwise returns true once it is. A failure frees the buttons and is thrown.
      */
-    async command(name, run) {
-      if (local.busy !== null) {
-        return false;
+    command,
+
+    /**
+     * Play: starts the take chosen in the soundcheck card (else the last take) as a soundcheck,
+     * or pauses the take playing, or plays a paused one on (see soundcheckPlay). Answers the
+     * console's `{ ok, message }`, or null when Play cannot be pressed or a command is on its way.
+     */
+    play() {
+      const view = soundcheckPlay(app.store.getState(), local.chosenTake);
+      if (!view.can) {
+        return Promise.resolve(null);
       }
-      local.busy = name;
-      onChange();
-      try {
-        await run();
-      } finally {
-        local.busy = null;
+      const run = {
+        start: () => app.startSoundcheck(view.folder, { looping: local.loopNext }),
+        pause: () => app.pauseSoundcheck(),
+        resume: () => app.resumeSoundcheck(),
+      }[view.action];
+      return answered("play", run);
+    },
+
+    /** A take row's Soundcheck: plays the take in `folder` in place of the live inputs. */
+    soundcheckTake(folder) {
+      return answered("soundcheck", () =>
+        app.startSoundcheck(folder, { looping: local.loopNext }),
+      );
+    },
+
+    /**
+     * Stop: back to the live inputs while a take plays in place of them, else stops the take
+     * recording (and reads the disk estimate again).
+     */
+    stop() {
+      if (soundchecking()) {
+        return answered("stop", () => app.stopSoundcheck());
+      }
+      return answered("stop", async () => {
+        const result = await app.stopRecording();
+        await app.refreshEstimate();
+        return result;
+      });
+    },
+
+    /**
+     * Back to start: the take playing in place of the inputs moves to its start; otherwise the
+     * position shown goes back from the last take's length to 0:00.
+     */
+    async rewind() {
+      if (soundchecking()) {
+        const result = await app.seekSoundcheck(0);
         onChange();
+        return result;
       }
-      return true;
+      local.atStart = true;
+      onChange();
+      return null;
+    },
+
+    /** The take the soundcheck card picks for Play (null: the last take). */
+    chooseTake(folder) {
+      local.chosenTake = folder || null;
+      onChange();
+    },
+
+    /** The seek slider is being dragged to `seconds`: the position shows it until it is let go. */
+    drag(seconds) {
+      local.drag = Number(seconds);
+      onChange();
+    },
+
+    /** The seek slider let go at `seconds`: the take moves there. */
+    async seekTo(seconds) {
+      local.drag = null;
+      const { lengthFrames } = soundcheckStatus(app.store.getState());
+      const result = await app.seekSoundcheck(frameAt(seconds, lengthFrames));
+      onChange();
+      return result;
+    },
+
+    /**
+     * The loop: the take playing starts again at its end (or not); with the inputs live, the
+     * choice is kept for the next start.
+     */
+    async setLoop(on) {
+      if (soundchecking()) {
+        const result = await app.setSoundcheckLoop(on);
+        onChange();
+        return result;
+      }
+      local.loopNext = Boolean(on);
+      onChange();
+      return null;
     },
 
     /**
@@ -221,15 +336,24 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
 }
 
 /**
- * Shows the REC chip in `strip` (holding an <ml-rec-chip>) while the console `app` reports a take
- * recording, being finished or stopped on an error; hidden otherwise. Returns the unsubscribe.
+ * Shows the shell's status strip while it has a chip to show: the REC chip (`[data-chip="rec"]`,
+ * or the strip's first <ml-rec-chip>) while the console `app` reports a take recording, being
+ * finished or stopped on an error, and the SOUNDCHECK chip (`[data-chip="soundcheck"]`, when the
+ * strip has one) while a take plays in place of the inputs; hidden otherwise. Returns the
+ * unsubscribe.
  */
 export function mountRecChip(strip, app) {
-  const chip = strip.querySelector("ml-rec-chip");
+  const rec = strip.querySelector('[data-chip="rec"]') ?? strip.querySelector("ml-rec-chip");
+  const check = strip.querySelector('[data-chip="soundcheck"]');
   function render() {
-    const view = recChip(app.store.getState());
-    strip.hidden = view === null;
-    chip.data = view;
+    const state = app.store.getState();
+    const recView = recChip(state);
+    const checkView = check ? soundcheckChip(state) : null;
+    strip.hidden = recView === null && checkView === null;
+    rec.data = recView;
+    if (check) {
+      check.data = checkView;
+    }
   }
   render();
   return app.store.subscribe(render);

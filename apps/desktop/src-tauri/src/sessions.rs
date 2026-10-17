@@ -44,6 +44,8 @@
 //!   loading one pushes it through the desk's path and opens its output only when the running
 //!   driver offers it. A snapshot without one (saved before the local mix existed) leaves the
 //!   desk's own local mix and output as they are.
+//! - The session's `recording` section (how this desk records takes) is never saved in a snapshot:
+//!   it belongs to the desk, and loading a snapshot keeps the desk's own.
 //! - The id is the file's name: `s` and 16 hex digits for a snapshot the desk saved. Only a name of
 //!   letters, digits, `-` and `_` is ever read or written, so an id can never reach outside the
 //!   folder.

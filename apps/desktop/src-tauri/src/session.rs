@@ -54,6 +54,12 @@
 //!       "muted": false
 //!     },
 //!     "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 0 }
+//!   },
+//!   "recording": {
+//!     "folder": "D:\\Shows\\Takes",
+//!     "format": "int24",
+//!     "includeLocal": false,
+//!     "armed": [1, 2, 5]
 //!   }
 //! }
 //! ```
@@ -120,6 +126,13 @@
 //!   left off with a notice, never replaced by another device. Like `audio`, the section was added
 //!   within version 1 and is absent until something was kept: an earlier build reads the file and
 //!   drops it when it saves.
+//! - `recording` is how this desk records takes (see [crate::commands::recording]): the folder the
+//!   take folders are made in (absent or null for the desk's default, the user's Music folder +
+//!   `MixLink\Recordings`), the WAV format (`int24`, the default, or `float32`), whether the local
+//!   mix is recorded too, and the armed inputs as 1-based channel numbers (arming either side of a
+//!   linked pair records the pair). Any field may be left out and then has its default. It belongs
+//!   to this desk: a named session never carries it, and loading one keeps the desk's own. Like
+//!   `audio`, the section was added within version 1 and is absent until something was kept.
 //!
 //! Every save writes a temporary file next to the session, flushes it to disk and renames it over
 //! the session, so a crash or a full disk leaves the old file or the new one, never a torn one, and
@@ -182,6 +195,9 @@ pub struct Session {
     /// The engineer's local mix and the output it plays on; absent until either was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<SessionLocal>,
+    /// How this desk records takes; absent until the engineer changed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<SessionRecording>,
 }
 
 impl Default for Session {
@@ -194,6 +210,7 @@ impl Default for Session {
             presets: Vec::new(),
             audio: None,
             local: None,
+            recording: None,
         }
     }
 }
@@ -304,6 +321,53 @@ pub struct SessionOutput {
     pub device: String,
     #[serde(default)]
     pub first_channel: u16,
+}
+
+/// The sample format of a take's files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordFormat {
+    /// 24-bit integer PCM, the default: every bit a 24-bit interface captures.
+    #[default]
+    Int24,
+    /// 32-bit float.
+    Float32,
+}
+
+impl RecordFormat {
+    /// The format's name in the session and the window: `int24` or `float32`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RecordFormat::Int24 => "int24",
+            RecordFormat::Float32 => "float32",
+        }
+    }
+
+    /// The format named `name` (`int24` or `float32`), or `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "int24" => Some(RecordFormat::Int24),
+            "float32" => Some(RecordFormat::Float32),
+            _ => None,
+        }
+    }
+}
+
+/// How this desk records takes (see [crate::commands::recording]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecording {
+    /// The folder the take folders are made in; `None` for the desk's default folder.
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub format: RecordFormat,
+    /// Also record the engineer's local mix, as a stereo track.
+    #[serde(default)]
+    pub include_local: bool,
+    /// The armed inputs, 1-based (CH 1 is 1), ascending.
+    #[serde(default)]
+    pub armed: Vec<u16>,
 }
 
 /// What the desk keeps about one musician.
@@ -822,6 +886,27 @@ impl SessionStore {
         self.update_local(|local| local.output = output)
     }
 
+    /// How this desk records takes, or `None` before the engineer changed it (the defaults apply).
+    pub fn recording(&self) -> Option<SessionRecording> {
+        self.lock().session.recording.clone()
+    }
+
+    /// Keeps how this desk records takes. The file is written before success is reported; a save
+    /// that fails, or is refused over a session this build must not replace, changes nothing.
+    pub fn set_recording(&self, recording: SessionRecording) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            recording: Some(recording),
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     fn update_local(&self, change: impl FnOnce(&mut SessionLocal)) -> Result<(), String> {
         let mut loaded = self.lock();
         if let Some(refusal) = &loaded.refusal {
@@ -944,6 +1029,7 @@ pub(crate) fn read_session(
     let presets = take_section(&mut fields, "presets", damaged);
     let audio = take_section(&mut fields, "audio", damaged);
     let local = take_section(&mut fields, "local", damaged);
+    let recording = take_section(&mut fields, "recording", damaged);
     serde_json::from_value::<Session>(Value::Object(fields))
         .map(|session| Session {
             groups,
@@ -951,6 +1037,7 @@ pub(crate) fn read_session(
             presets,
             audio,
             local,
+            recording,
             ..session
         })
         .map_err(|error| format!("is not a session ({error})"))
@@ -2441,6 +2528,119 @@ mod tests {
                 output: None,
             })
         );
+    }
+
+    fn recording_settings() -> SessionRecording {
+        SessionRecording {
+            folder: Some("D:\\Shows\\Takes".to_owned()),
+            format: RecordFormat::Float32,
+            include_local: true,
+            armed: vec![1, 2, 5],
+        }
+    }
+
+    #[test]
+    fn the_recording_settings_survive_a_reload_beside_the_other_sections() {
+        let directory = test_directory("recording");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("saved");
+        assert_eq!(session.recording(), None, "the defaults until changed");
+
+        session.set_recording(recording_settings()).expect("saved");
+
+        assert_eq!(session.recording(), Some(recording_settings()));
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(reloaded.recording(), Some(recording_settings()));
+        assert_eq!(reloaded.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(reloaded.notice(), None);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["recording"],
+            serde_json::json!({
+                "folder": "D:\\Shows\\Takes",
+                "format": "float32",
+                "includeLocal": true,
+                "armed": [1, 2, 5]
+            }),
+            "a section of the same version 1 file"
+        );
+    }
+
+    #[test]
+    fn a_recording_section_may_leave_out_what_it_does_not_keep() {
+        let directory = test_directory("recording-short");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"recording":{"armed":[3]}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.recording(),
+            Some(SessionRecording {
+                folder: None,
+                format: RecordFormat::Int24,
+                include_local: false,
+                armed: vec![3],
+            }),
+            "the default folder, 24-bit and no local mix"
+        );
+        assert_eq!(session.notice(), None);
+        assert_eq!(SessionRecording::default().format, RecordFormat::Int24);
+    }
+
+    #[test]
+    fn a_damaged_recording_section_is_set_aside_on_its_own_and_the_rest_is_kept() {
+        let directory = test_directory("recording-damaged");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "local":{"output":{"device":"Speakers"}},
+                "recording":{"format":"mp3","armed":[1]}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.recording(),
+            None,
+            "the recording section starts empty"
+        );
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert!(session.local().is_some(), "the readable sections are kept");
+        let aside = files_in(&directory)
+            .into_iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.recording-damaged-")))
+            .expect("the damaged section is kept for recovery");
+        assert_eq!(
+            read_json(&directory.join(aside)),
+            serde_json::json!({ "format": "mp3", "armed": [1] })
+        );
+        assert!(session.notice().expect("reported").contains("recording"));
+    }
+
+    #[test]
+    fn saving_the_recording_settings_is_refused_over_a_newer_session_and_a_failed_save_changes_nothing(
+    ) {
+        let newer_directory = test_directory("recording-newer");
+        fs::write(newer_directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let newer = SessionStore::open(&newer_directory);
+        let error = newer
+            .set_recording(recording_settings())
+            .expect_err("refused");
+        assert!(error.contains("newer"), "{error}");
+        assert_eq!(newer.recording(), None);
+
+        let directory = test_directory("recording-failed-save");
+        let session = SessionStore::open(&directory);
+        session.set_recording(recording_settings()).expect("saved");
+        fs::create_dir(directory.join(format!("{SESSION_FILE}.tmp"))).expect("blocker");
+        session
+            .set_recording(SessionRecording::default())
+            .expect_err("the write cannot happen");
+        assert_eq!(session.recording(), Some(recording_settings()));
     }
 
     #[test]

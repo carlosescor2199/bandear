@@ -18,7 +18,10 @@
 //!   also goes out at once when the channel details it shows change (an edit, or a device switch:
 //!   it shows the details of the inputs the device has, while the engine keeps the rest for when
 //!   they come back, see `channel_table`), ahead of the `mix-changed` of every musician whose pans a
-//!   new stereo pair set; each channel carries its `name`, `kind`, `hidden` and `link`.
+//!   new stereo pair set; each channel carries its `name`, `kind`, `hidden` and `link`. Its
+//!   `recording` says whether a take records and how far it got (state, frames, seconds, dropped
+//!   frames, bytes, tracks, markers, free space and minutes left), and `lastTake` is the last take
+//!   that ended, so a start, a stop, a marker or a disk error shows within a status interval.
 //! - `mix-changed`, as soon as a mix changes:
 //!   `{ "run": n, "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`,
 //!   the whole mix stored after the change. A musician removed in between is not announced. The
@@ -546,6 +549,10 @@ mod tests {
             musicians: Vec::new(),
             local_mix: MixDto::from(&MixValues::default()),
             local_output: LocalOutputDto::from(&personal_monitoring::LocalOutputStatus::default()),
+            recording: crate::dto::RecordingDto::from(
+                &personal_monitoring::RecordingStatus::default(),
+            ),
+            last_take: None,
         }
     }
 

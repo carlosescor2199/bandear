@@ -2057,6 +2057,8 @@ fn save_session_with<E: DeskReader>(
     let desk = guard.as_ref().map(DeskReader::desk);
     let mixes = desk.as_ref().map(saved_mixes).unwrap_or_default();
     let mut current = session.current();
+    // How this desk records belongs to the desk, not to a show.
+    current.recording = None;
     if let Some(desk) = &desk {
         // The local mix the engine plays: an edit whose save failed, or levels a group or channel
         // change moved, are the engine's, not yet the session's.
@@ -2258,6 +2260,8 @@ fn load_session_with<E: SessionEngine>(
         local: saved_local
             .clone()
             .or_else(|| with_pending(previous.local, paused.pending())),
+        // How this desk records is the desk's own, whatever the saved session says.
+        recording: previous.recording,
         ..snapshot.session.clone()
     };
     let live = match guard.as_mut() {
@@ -2542,6 +2546,10 @@ mod tests {
             local_output: crate::dto::LocalOutputDto::from(
                 &personal_monitoring::LocalOutputStatus::default(),
             ),
+            recording: crate::dto::RecordingDto::from(
+                &personal_monitoring::RecordingStatus::default(),
+            ),
+            last_take: None,
         }
     }
 
@@ -5824,6 +5832,41 @@ mod tests {
             "the groups apply at the next start"
         );
         assert_eq!(outcome.session.name, "Show");
+    }
+
+    #[test]
+    fn the_recording_settings_stay_the_desks_own_through_a_save_and_a_load() {
+        let test = "session-recording";
+        let (session, snapshots, engine) = desk(test, None);
+        working_session(&session);
+        let desks = crate::session::SessionRecording {
+            folder: Some("D:\\Takes".to_owned()),
+            armed: vec![1, 2],
+            ..crate::session::SessionRecording::default()
+        };
+        session.set_recording(desks.clone()).expect("kept");
+
+        let saved = save_session_with(&engine, &session, &snapshots, "Show").expect("saved");
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(
+            read.snapshot.session.recording, None,
+            "a named session never carries this desk's recording settings"
+        );
+
+        let mut other = layout_session(&[], 0);
+        other.recording = Some(crate::session::SessionRecording {
+            folder: Some("E:\\Elsewhere".to_owned()),
+            include_local: true,
+            ..crate::session::SessionRecording::default()
+        });
+        saved_session(test, "other", &snapshot(other, &[]));
+        load_into(&engine, &session, &snapshots, "other").expect("loaded");
+
+        assert_eq!(
+            session.recording(),
+            Some(desks),
+            "a load keeps the desk's own recording settings"
+        );
     }
 
     /// [load_session_with] with no local mix waiting to be kept and the notice set aside.

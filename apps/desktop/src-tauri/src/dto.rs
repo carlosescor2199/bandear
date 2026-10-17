@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
     LinkHealth, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin, MixUpdate, MixValues,
-    MusicianKey, MusicianStatus, OutputDevice,
+    MusicianKey, MusicianStatus, OutputDevice, RecordingState, RecordingStatus, SampleFormat,
+    TakeEnd, TakeMarker, TakeSummary, TakeTrack,
 };
 
 use crate::session::{
@@ -866,6 +867,10 @@ pub struct EngineStatusDto {
     pub local_mix: MixDto,
     /// Where the local mix plays and how.
     pub local_output: LocalOutputDto,
+    /// The take being recorded, if any (see [crate::commands::recording]).
+    pub recording: RecordingDto,
+    /// The most recent take that ended while this engine ran, however it ended; null before one.
+    pub last_take: Option<TakeSummaryDto>,
 }
 
 impl From<&EngineStatus> for EngineStatusDto {
@@ -919,8 +924,296 @@ impl From<&EngineStatus> for EngineStatusDto {
             musicians: status.musicians.iter().map(MusicianDto::from).collect(),
             local_mix: MixDto::from(&status.local_mix),
             local_output: LocalOutputDto::from(&status.local_output),
+            recording: RecordingDto::from(&status.recording),
+            last_take: status
+                .recording
+                .last_take
+                .as_ref()
+                .map(TakeSummaryDto::from),
         }
     }
+}
+
+/// The rate every take is recorded at: the engine's internal rate.
+const TAKE_SAMPLE_RATE: u32 = 48_000;
+
+/// `frames` at `sample_rate` in seconds; 0 for a rate of 0.
+fn seconds_of(frames: u64, sample_rate: u32) -> f64 {
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    frames as f64 / f64::from(sample_rate)
+}
+
+/// A take's sample format by the name `take.json` and the window use: `int24` or `float32`.
+pub fn format_name(format: SampleFormat) -> &'static str {
+    match format {
+        SampleFormat::Int16 => "int16",
+        SampleFormat::Int24 => "int24",
+        SampleFormat::Int32 => "int32",
+        SampleFormat::Float32 => "float32",
+    }
+}
+
+/// A named point in a take: its frame from the take's first, the same in seconds, and its name.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeMarkerDto {
+    pub frame: u64,
+    pub seconds: f64,
+    pub name: String,
+}
+
+impl TakeMarkerDto {
+    /// `marker` of a take recorded at `sample_rate`.
+    pub fn of(marker: &TakeMarker, sample_rate: u32) -> Self {
+        Self {
+            frame: marker.frame,
+            seconds: seconds_of(marker.frame, sample_rate),
+            name: marker.name.clone(),
+        }
+    }
+}
+
+/// The recorder on the status (`recording`): whether a take records and how far it got.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingDto {
+    /// "idle", "recording", "stopping" (its files are being finished) or "failed" (a disk error
+    /// stopped it; `stop_recording` collects it).
+    pub state: &'static str,
+    /// Why it failed; null unless `state` is "failed".
+    pub reason: Option<String>,
+    /// The take's folder while there is a take; null when idle.
+    pub take_folder: Option<String>,
+    /// Frames recorded so far, and the same in seconds.
+    pub frames: u64,
+    pub seconds: f64,
+    /// Frames dropped because the disk fell behind.
+    pub dropped_frames: u64,
+    pub bytes_written: u64,
+    /// The take's track names, in file order.
+    pub tracks: Vec<String>,
+    pub markers: Vec<TakeMarkerDto>,
+    /// The free space on the take's disk; null without a take or when it cannot be read.
+    pub free_bytes: Option<u64>,
+    /// The whole minutes of this take that space still holds; null when unknown.
+    pub minutes_left: Option<u64>,
+}
+
+impl From<&RecordingStatus> for RecordingDto {
+    fn from(status: &RecordingStatus) -> Self {
+        let (state, reason) = match &status.state {
+            RecordingState::Idle => ("idle", None),
+            RecordingState::Recording => ("recording", None),
+            RecordingState::Stopping => ("stopping", None),
+            RecordingState::Failed { reason } => ("failed", Some(reason.clone())),
+        };
+        Self {
+            state,
+            reason,
+            take_folder: status
+                .take_folder
+                .as_ref()
+                .map(|folder| folder.display().to_string()),
+            frames: status.frames,
+            seconds: seconds_of(status.frames, TAKE_SAMPLE_RATE),
+            dropped_frames: status.dropped_frames,
+            bytes_written: status.bytes_written,
+            tracks: status.tracks.clone(),
+            markers: status
+                .markers
+                .iter()
+                .map(|marker| TakeMarkerDto::of(marker, TAKE_SAMPLE_RATE))
+                .collect(),
+            free_bytes: status.free_bytes,
+            minutes_left: status.minutes_left,
+        }
+    }
+}
+
+/// One file of a take.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeTrackDto {
+    /// The file's name inside the take folder.
+    pub file: String,
+    /// "input" (one input, mono), "pair" (a linked pair, stereo) or "local" (the local mix).
+    pub kind: String,
+    /// The inputs it holds, 1-based; empty for the local mix.
+    pub channels: Vec<u16>,
+    pub name: String,
+    /// The instrument kind's name when the take started; null for the local mix.
+    pub instrument: Option<String>,
+    /// The frames its file holds (0 while the take records).
+    pub frames: u64,
+}
+
+impl From<&TakeTrack> for TakeTrackDto {
+    fn from(track: &TakeTrack) -> Self {
+        Self {
+            file: track.file.clone(),
+            kind: track.kind.name().to_owned(),
+            channels: track.channels.clone(),
+            name: track.name.clone(),
+            instrument: track.instrument.map(|kind| kind.name().to_owned()),
+            frames: track.frames,
+        }
+    }
+}
+
+/// A take as `take.json` describes it: the one `stop_recording` answers, the status's `lastTake`
+/// and each entry `list_takes` reads.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeSummaryDto {
+    /// The take's folder, whole.
+    pub folder: String,
+    pub name: String,
+    /// When it started, UTC, RFC 3339.
+    pub started: String,
+    pub sample_rate: u32,
+    /// "int24" or "float32".
+    pub format: String,
+    /// The input device it was recorded from.
+    pub device: String,
+    pub tracks: Vec<TakeTrackDto>,
+    /// The frames every file holds, and the same in seconds.
+    pub frames: u64,
+    pub seconds: f64,
+    pub markers: Vec<TakeMarkerDto>,
+    pub dropped_frames: u64,
+    /// How it ended: "stopped", "engineStopped" or "diskError"; in a listing also "recording"
+    /// (the take being recorded now) or "interrupted" (it never ended: the app or the computer
+    /// stopped while it recorded, and its files hold what their last refresh did).
+    pub ended: String,
+    /// Why a disk error ended it; null otherwise.
+    pub reason: Option<String>,
+}
+
+/// One take as `list_takes` lists it: the same shape as a summary.
+pub type TakeListItemDto = TakeSummaryDto;
+
+impl From<&TakeSummary> for TakeSummaryDto {
+    fn from(take: &TakeSummary) -> Self {
+        let (ended, reason) = match &take.ended {
+            TakeEnd::Stopped => ("stopped", None),
+            TakeEnd::EngineStopped => ("engineStopped", None),
+            TakeEnd::DiskError { reason } => ("diskError", Some(reason.clone())),
+        };
+        Self {
+            folder: take.folder.display().to_string(),
+            name: take.name.clone(),
+            started: take.started.clone(),
+            sample_rate: take.sample_rate,
+            format: format_name(take.format).to_owned(),
+            device: take.device.clone(),
+            tracks: take.tracks.iter().map(TakeTrackDto::from).collect(),
+            frames: take.frames,
+            seconds: seconds_of(take.frames, take.sample_rate),
+            markers: take
+                .markers
+                .iter()
+                .map(|marker| TakeMarkerDto::of(marker, take.sample_rate))
+                .collect(),
+            dropped_frames: take.dropped_frames,
+            ended: ended.to_owned(),
+            reason,
+        }
+    }
+}
+
+/// How this desk records takes, as `recording_settings` answers it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSettingsDto {
+    /// The folder takes are made in, whole: the kept one, or the default.
+    pub folder: String,
+    /// The desk's default folder (the user's Music folder + `MixLink\Recordings`).
+    pub default_folder: String,
+    /// Whether `folder` is the default.
+    pub folder_is_default: bool,
+    /// "int24" or "float32".
+    pub format: &'static str,
+    pub include_local: bool,
+    /// The armed inputs, 1-based, ascending.
+    pub armed: Vec<u16>,
+    /// Why the default folder is not in the Music folder, when it could not be found; null
+    /// otherwise.
+    pub notice: Option<String>,
+}
+
+/// How the window asks the desk to record takes (`set_recording_settings`). `folder` null or blank
+/// is the default folder; `format` "int24" (the default) or "float32"; `armed` 1-based inputs. A
+/// field the desk does not know is rejected.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordingSettingsRequest {
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub include_local: bool,
+    #[serde(default)]
+    pub armed: Vec<u32>,
+}
+
+/// What `start_recording` did: the take that records, where, and which armed inputs it holds.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStartedDto {
+    /// The recorder now (state "recording", with the take's folder and tracks).
+    pub recording: RecordingDto,
+    /// The folder the take folder was made in.
+    pub folder: String,
+    /// The armed inputs the take records, 1-based (either side of a linked pair records the pair).
+    pub armed: Vec<u16>,
+    /// Armed inputs the running device does not have, 1-based: left out of the take.
+    pub skipped: Vec<u16>,
+    pub include_local: bool,
+    pub format: &'static str,
+}
+
+/// What `stop_recording` did: the finished take, or `finishing` when its files were still being
+/// finished after the engine's wait (the take is stopping; ask again).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStoppedDto {
+    pub finishing: bool,
+    /// The finished take; null while `finishing`.
+    pub take: Option<TakeSummaryDto>,
+    /// What the engine said while the files are still being finished; null otherwise.
+    pub message: Option<String>,
+}
+
+/// What a take with the current settings would take on the disk (`record_estimate`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskEstimateDto {
+    /// The folder takes are made in.
+    pub folder: String,
+    /// The bytes each second of the take adds; null when it cannot be worked out (see `problem`).
+    pub bytes_per_second: Option<u64>,
+    /// The free space on the folder's disk; null when it cannot be read.
+    pub free_bytes: Option<u64>,
+    /// The whole minutes that space holds; null when either is unknown.
+    pub minutes_left: Option<u64>,
+    /// Why the bytes per second are unknown (no engine runs, nothing is armed); null otherwise.
+    pub problem: Option<String>,
+}
+
+/// The takes in the recordings folder (`list_takes`), the newest first.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakesDto {
+    /// The folder that was read.
+    pub folder: String,
+    pub takes: Vec<TakeListItemDto>,
+    /// Take folders whose `take.json` could not be read, left out.
+    pub unreadable: usize,
+    /// The folder does not exist yet (no take was recorded there).
+    pub missing: bool,
 }
 
 #[cfg(test)]
@@ -1817,5 +2110,169 @@ mod tests {
 
         assert_eq!(dto.channels[0].group, None);
         assert!(dto.groups[0].invalid);
+    }
+
+    fn take(ended: TakeEnd) -> TakeSummary {
+        TakeSummary {
+            folder: std::path::PathBuf::from("D:\\Takes\\2026-10-16_190405_Soundcheck"),
+            name: "Soundcheck".to_owned(),
+            started: "2026-10-16T17:04:05Z".to_owned(),
+            sample_rate: 48_000,
+            format: SampleFormat::Int24,
+            device: "Volt 4".to_owned(),
+            tracks: vec![
+                TakeTrack {
+                    file: "01 Kick.wav".to_owned(),
+                    kind: personal_monitoring::TrackKind::Input,
+                    channels: vec![1],
+                    name: "Kick".to_owned(),
+                    instrument: Some(personal_monitoring::ChannelKind::Drums),
+                    frames: 96_000,
+                },
+                TakeTrack {
+                    file: "Local mix.wav".to_owned(),
+                    kind: personal_monitoring::TrackKind::Local,
+                    channels: Vec::new(),
+                    name: "Local mix".to_owned(),
+                    instrument: None,
+                    frames: 96_000,
+                },
+            ],
+            frames: 96_000,
+            markers: vec![TakeMarker {
+                frame: 24_000,
+                name: "Chorus".to_owned(),
+            }],
+            dropped_frames: 0,
+            ended,
+        }
+    }
+
+    #[test]
+    fn the_status_carries_the_take_being_recorded_and_the_last_take() {
+        let mut status = status_with(Vec::new(), vec![0, 0]);
+        status.recording = RecordingStatus {
+            state: RecordingState::Recording,
+            take_folder: Some(std::path::PathBuf::from(
+                "D:\\Takes\\2026-10-16_191000_Show",
+            )),
+            frames: 144_000,
+            dropped_frames: 256,
+            bytes_written: 1_000_000,
+            tracks: vec!["Kick".to_owned(), "Local mix".to_owned()],
+            markers: vec![TakeMarker {
+                frame: 48_000,
+                name: "Marker 1".to_owned(),
+            }],
+            free_bytes: Some(5_000_000_000),
+            minutes_left: Some(289),
+            last_take: Some(take(TakeEnd::Stopped)),
+        };
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+
+        assert_eq!(
+            json["recording"],
+            serde_json::json!({
+                "state": "recording",
+                "reason": null,
+                "takeFolder": "D:\\Takes\\2026-10-16_191000_Show",
+                "frames": 144_000,
+                "seconds": 3.0,
+                "droppedFrames": 256,
+                "bytesWritten": 1_000_000,
+                "tracks": ["Kick", "Local mix"],
+                "markers": [{ "frame": 48_000, "seconds": 1.0, "name": "Marker 1" }],
+                "freeBytes": 5_000_000_000u64,
+                "minutesLeft": 289
+            })
+        );
+        assert_eq!(json["lastTake"]["name"], "Soundcheck");
+        assert_eq!(json["lastTake"]["ended"], "stopped");
+    }
+
+    #[test]
+    fn an_idle_recorder_and_a_failed_take_are_said_with_their_reason() {
+        let idle = serde_json::to_value(EngineStatusDto::from(&status_with(Vec::new(), vec![])))
+            .expect("serializes");
+        assert_eq!(idle["recording"]["state"], "idle");
+        assert_eq!(idle["recording"]["takeFolder"], serde_json::Value::Null);
+        assert_eq!(idle["lastTake"], serde_json::Value::Null);
+
+        let failed = RecordingDto::from(&RecordingStatus {
+            state: RecordingState::Failed {
+                reason: "the disk is full".to_owned(),
+            },
+            ..RecordingStatus::default()
+        });
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.reason.as_deref(), Some("the disk is full"));
+    }
+
+    #[test]
+    fn a_take_summary_has_the_windows_shape() {
+        let json = serde_json::to_value(TakeSummaryDto::from(&take(TakeEnd::DiskError {
+            reason: "write failed".to_owned(),
+        })))
+        .expect("serializes");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "folder": "D:\\Takes\\2026-10-16_190405_Soundcheck",
+                "name": "Soundcheck",
+                "started": "2026-10-16T17:04:05Z",
+                "sampleRate": 48_000,
+                "format": "int24",
+                "device": "Volt 4",
+                "tracks": [
+                    {
+                        "file": "01 Kick.wav",
+                        "kind": "input",
+                        "channels": [1],
+                        "name": "Kick",
+                        "instrument": "drums",
+                        "frames": 96_000
+                    },
+                    {
+                        "file": "Local mix.wav",
+                        "kind": "local",
+                        "channels": [],
+                        "name": "Local mix",
+                        "instrument": null,
+                        "frames": 96_000
+                    }
+                ],
+                "frames": 96_000,
+                "seconds": 2.0,
+                "markers": [{ "frame": 24_000, "seconds": 0.5, "name": "Chorus" }],
+                "droppedFrames": 0,
+                "ended": "diskError",
+                "reason": "write failed"
+            })
+        );
+        let stopped = TakeSummaryDto::from(&take(TakeEnd::EngineStopped));
+        assert_eq!(stopped.ended, "engineStopped");
+        assert_eq!(stopped.reason, None);
+    }
+
+    #[test]
+    fn recording_settings_requests_reject_unknown_fields() {
+        let request: RecordingSettingsRequest = serde_json::from_str(
+            r#"{"folder":"D:\\Takes","format":"float32","includeLocal":true,"armed":[1,3]}"#,
+        )
+        .expect("reads");
+        assert_eq!(
+            request,
+            RecordingSettingsRequest {
+                folder: Some("D:\\Takes".to_owned()),
+                format: Some("float32".to_owned()),
+                include_local: true,
+                armed: vec![1, 3],
+            }
+        );
+        let error = serde_json::from_str::<RecordingSettingsRequest>(r#"{"armd":[1]}"#)
+            .expect_err("a misspelt field must not be a silent no-op");
+        assert!(error.to_string().contains("armd"), "names it: {error}");
     }
 }

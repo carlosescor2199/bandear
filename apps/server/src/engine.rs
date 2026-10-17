@@ -5671,8 +5671,7 @@ mod tests {
     }
 
     /// A local output that is not playing when the take starts (here one whose device failed)
-    /// leaves the take on the timer; once its callbacks come they are the clock, and the take
-    /// moves only with them, so it never drifts from what the output plays.
+    /// leaves the take on the timer; once its callbacks come they are the clock.
     #[test]
     fn an_output_that_plays_after_the_take_started_becomes_its_clock() {
         use crate::soundcheck::SoundcheckClock;
@@ -5704,27 +5703,85 @@ mod tests {
             }),
             "the output's callbacks became the clock"
         );
-        // A block on its way when the callbacks stopped may still land.
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let held = engine.soundcheck().position_frames;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Once a late output's callbacks are the clock, the take moves only with them: the time
+    /// that passes without a callback makes nothing due, and the callbacks make due exactly the
+    /// frames they played, so the take never drifts from what the output plays. Driven on the
+    /// engine thread's own path with instants chosen by the test, so no wall clock is involved.
+    #[test]
+    fn a_late_output_clock_moves_the_take_by_the_frames_it_played_only() {
+        use crate::pipeline::tests::{links, source};
+        use crate::pipeline::Pipeline;
+        use crate::soundcheck::{PlaybackClock, Soundcheck, SoundcheckClock};
+        use std::time::{Duration, Instant};
+        let links = links();
+        let (_writer, live) = source(1, 64, links.clone());
+        let mut pipeline = Pipeline::new(Vec::new(), Arc::clone(&links.levels));
+        pipeline.set_source(live);
+        // An output is installed but does not play when the take starts, as the engine finds a
+        // failed one; its callbacks pace the take from when they come, and only they do here.
+        let clock = Arc::new(PlaybackClock::new());
+        clock.follow_output(true);
+        clock.set_grace(Duration::from_secs(600));
+        let folder = crate::soundcheck::tests::constant_take("pipeline-late-output", 48_000, 0.5);
+        let request = soundcheck_of(&folder);
+        let take = crate::soundcheck::load_take(&folder, &[], 1).expect("the take loads");
+        let (mut reader, active) = crate::soundcheck::prepare(
+            take,
+            &request,
+            Arc::clone(&clock),
+            Arc::clone(&links.stats),
+        )
+        .expect("the take starts");
+        reader.start_on_timer();
+        let mut soundcheck = Soundcheck::default();
+        soundcheck.begin(active);
+        // The whole take fits the ring: once it is queued, no block waits for the disk.
+        assert!(until(|| soundcheck.queued() == 48_000));
+        pipeline.play(reader);
+        let start = Instant::now();
+        // 1334 µs is 64.03 frames: one block of time per step.
+        let at = |block: u64| start + Duration::from_micros(block * 1_334);
+        let position = |soundcheck: &Soundcheck| soundcheck.status().position_frames;
+
+        pipeline.pump_at(at(0));
+        assert!(pipeline.pump_at(at(10)) > 0, "the timer plays it");
+        assert_eq!(soundcheck.status().clock, SoundcheckClock::Timer);
+        assert!(position(&soundcheck) > 0);
+
+        clock.played(64);
+        assert!(
+            pipeline.pump_at(at(11)) >= 1,
+            "the callback made its frames due"
+        );
+        assert_eq!(soundcheck.status().clock, SoundcheckClock::Output);
+        let held = position(&soundcheck);
+
         assert_eq!(
-            engine.soundcheck().position_frames,
-            held,
+            pipeline.pump_at(at(1_000)),
+            0,
             "the timer no longer moves the take"
         );
-        let mut buffer = [0.0f32; 2 * 64];
+        assert_eq!(position(&soundcheck), held);
+        // Under a block carried from before plus ten callbacks of 64 frames: ten blocks.
         for _ in 0..10 {
-            player.fill(&mut buffer);
+            clock.played(64);
         }
-        assert!(until(|| engine.soundcheck().position_frames == held + 640));
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(pipeline.pump_at(at(1_001)), 10);
         assert_eq!(
-            engine.soundcheck().position_frames,
+            position(&soundcheck),
             held + 640,
             "exactly the frames the output played"
         );
-        engine.stop().expect("the engine stops");
+        assert_eq!(pipeline.pump_at(at(2_000)), 0);
+        assert_eq!(position(&soundcheck), held + 640);
+
+        pipeline.go_live();
+        if let Some(active) = soundcheck.take() {
+            active.end(Duration::from_secs(5));
+        }
     }
 
     /// A start that is refused changes nothing, not even the clock a take would follow: with an

@@ -8,13 +8,19 @@
     <link rel="stylesheet" href="app/shell.css" />
     <link rel="stylesheet" href="app/screens/mix-screen.css" />
     <link rel="stylesheet" href="app/screens/network-screen.css" />
+    <link rel="stylesheet" href="app/screens/record-screen.css" />
     <script type="module" src="app/shell.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#main" data-skip-link>Skip to content</a>
     <div class="shell">
       <nav class="sidebar" aria-label="Sections" data-shell-nav></nav>
-      <main id="main" class="main" tabindex="-1" data-shell-main></main>
+      <div class="shell-body">
+        <div class="shell-status" data-shell-status hidden>
+          <ml-rec-chip></ml-rec-chip>
+        </div>
+        <main id="main" class="main" tabindex="-1" data-shell-main></main>
+      </div>
     </div>
   </body>
 </html>

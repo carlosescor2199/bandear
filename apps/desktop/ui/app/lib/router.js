@@ -4,6 +4,7 @@
 
 export const ROUTES = Object.freeze([
   Object.freeze({ id: "mix", hash: "#/mix", label: "Mix", title: "Mix" }),
+  Object.freeze({ id: "record", hash: "#/record", label: "Record", title: "Record" }),
   Object.freeze({
     id: "channels",
     hash: "#/channels",

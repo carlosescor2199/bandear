@@ -2074,6 +2074,43 @@ impl EngineHandle {
         self.soundcheck.status()
     }
 
+    /// Pauses the take: the phones, the local output and the meters hear silence, the position
+    /// holds, and the inputs stay set aside. Returns the soundcheck's status.
+    /// [SoundcheckError::NotPlaying] without a take, [SoundcheckError::Failed] after a read error.
+    pub fn pause_soundcheck(&self) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.pause();
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Plays the take on from where it was paused; a take stopped at its end starts again at its
+    /// first frame. Returns the soundcheck's status. Refused as [Self::pause_soundcheck] is.
+    pub fn resume_soundcheck(&self) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.resume();
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Moves the take to `frame` (from 0, the take's length at most), playing or paused; the
+    /// status reports the new position at once. What was queued from the old position is never
+    /// played: the take is silent until the new frames are read (a few milliseconds), which is no
+    /// underrun. Returns the soundcheck's status. [SoundcheckError::PastEnd] past the take's end,
+    /// else refused as [Self::pause_soundcheck] is.
+    pub fn seek_soundcheck(&self, frame: u64) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.seek(frame)?;
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Whether the take starts again at its first frame when it reaches its end, rather than
+    /// stopping there; a take already stopped at its end stays there until it is resumed. Returns
+    /// the soundcheck's status. Refused as [Self::pause_soundcheck] is.
+    pub fn set_soundcheck_loop(&self, looping: bool) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.set_looping(looping);
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
     /// The engineer's channel details the engine keeps, whole: the list last set with
     /// [Self::set_channels], entries for inputs the current device lacks included, so an editor
     /// that changes one entry can send the whole list back without losing the others.
@@ -5459,6 +5496,120 @@ mod tests {
         engine
             .start_recording(take_of(&parent, vec![0]))
             .expect("after the soundcheck a take records");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Plays the output's callbacks, 64 frames each, until `done` holds for the soundcheck: at
+    /// most 200 of them, 2 ms apart.
+    fn callbacks_until(
+        engine: &EngineHandle,
+        player: &mut crate::output::OutputPlayer,
+        done: impl Fn(&SoundcheckStatus) -> bool,
+    ) -> bool {
+        let mut buffer = [0.0f32; 2 * 64];
+        for _ in 0..200 {
+            if done(&engine.soundcheck()) {
+                return true;
+            }
+            player.fill(&mut buffer);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        done(&engine.soundcheck())
+    }
+
+    /// The transport through the engine: a pause holds the position, a seek shows its frame at
+    /// once and plays on from it to the end, where the take stops; looping set there and a
+    /// resume start it again from its first frame. Each change is announced.
+    #[test]
+    fn the_soundcheck_pauses_seeks_and_loops_through_the_engine() {
+        use crate::soundcheck::SoundcheckState;
+        let (mut engine, _capture, _phone) = local_engine();
+        let (mut player, opened) = test_output("Speakers", 2, 0);
+        player.set_clock(Arc::clone(&engine.playback_clock));
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        engine
+            .playback_clock
+            .set_grace(std::time::Duration::from_secs(600));
+        let folder = crate::soundcheck::tests::constant_take("engine-transport", 4_800, 0.5);
+        engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect("the take plays");
+        assert!(until(|| engine.soundcheck.queued() == 4_800));
+        let events = engine.subscribe();
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            status.position_frames >= 128
+        }));
+
+        let paused = engine.pause_soundcheck().expect("a take plays");
+        assert_eq!(paused.state, SoundcheckState::Paused);
+        // A block already being played when the pause came may still finish.
+        for _ in 0..3 {
+            player.fill(&mut [0.0f32; 2 * 64]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let held = engine.soundcheck().position_frames;
+        for _ in 0..10 {
+            player.fill(&mut [0.0f32; 2 * 64]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(engine.soundcheck().position_frames, held, "the pause holds");
+
+        let resumed = engine.resume_soundcheck().expect("a take plays");
+        assert_eq!(resumed.state, SoundcheckState::Playing);
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            status.position_frames > held
+        }));
+
+        let moved = engine.seek_soundcheck(4_700).expect("within the take");
+        assert_eq!(moved.position_frames, 4_700, "the new frame shows at once");
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            status.state == SoundcheckState::Paused && status.position_frames == 4_800
+        }));
+
+        let looped = engine.set_soundcheck_loop(true).expect("a take plays");
+        assert!(looped.looping);
+        assert_eq!(looped.state, SoundcheckState::Paused, "it stays at the end");
+        let again = engine.resume_soundcheck().expect("a take plays");
+        assert_eq!(again.state, SoundcheckState::Playing);
+        assert_eq!(
+            again.position_frames, 0,
+            "resumed at its end, it starts again"
+        );
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            (64..4_700).contains(&status.position_frames)
+        }));
+
+        let refused = engine
+            .seek_soundcheck(4_801)
+            .expect_err("past the take's end");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::PastEnd {
+                frame: 4_801,
+                length: 4_800
+            })
+        );
+        assert_eq!(
+            drain(&events),
+            vec![EngineEvent::SoundcheckChanged; 5],
+            "pause, resume, seek, loop and resume"
+        );
+
+        engine.stop_soundcheck().expect("the soundcheck stops");
+        for refused in [
+            engine.pause_soundcheck(),
+            engine.resume_soundcheck(),
+            engine.seek_soundcheck(0),
+            engine.set_soundcheck_loop(false),
+        ] {
+            let refused = refused.expect_err("nothing plays");
+            assert_eq!(
+                soundcheck_refusal(&*refused),
+                Some(&SoundcheckError::NotPlaying)
+            );
+        }
         engine.stop().expect("the engine stops");
     }
 

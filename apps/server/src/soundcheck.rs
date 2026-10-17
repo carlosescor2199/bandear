@@ -51,7 +51,16 @@
 //! - a take records (a take never records playback), or another soundcheck plays.
 //!
 //! The take plays for as long as its shortest file (the frames every file holds). At its end it
-//! stops (the soundcheck stays, paused at the end) or, looping, starts again at its first frame.
+//! stops (the soundcheck stays, paused at the end; resuming starts it again at its first frame) or,
+//! looping, starts again at its first frame within the block.
+//!
+//! Transport. A pause plays silence and holds the position; the clock keeps running, so the phones
+//! and the local output stay fed. A seek is a handshake, so that no frame queued from the old
+//! position is ever played: the engine's side asks for it, the disk thread moves its files and
+//! stops queueing, the engine thread (silent meanwhile) drops everything queued and plays on from
+//! the disk's frame after a new preroll, and only then does the disk queue again. Looping can be
+//! turned on or off at any time: the disk only ever goes back to the first frame at the end of the
+//! take, so the frames after the take's end in the ring are always its first ones.
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek};
@@ -569,6 +578,16 @@ pub(crate) struct PlaybackShared {
     failed: AtomicBool,
     /// Why reading failed, written once by the disk thread; never read on the engine thread.
     reason: Mutex<Option<String>>,
+    /// The frame the engine's side last asked the take to move to.
+    seek_frame: AtomicU64,
+    /// How many moves the engine's side has asked for.
+    seek_requested: AtomicU64,
+    /// The last move the disk thread made (it queues nothing more until the engine thread has
+    /// taken it), and the frame it moved to.
+    seek_ready: AtomicU64,
+    seek_ready_frame: AtomicU64,
+    /// The last move the engine thread took: it dropped what was queued before it.
+    seek_done: AtomicU64,
 }
 
 impl PlaybackShared {
@@ -585,7 +604,39 @@ impl PlaybackShared {
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             reason: Mutex::new(None),
+            seek_frame: AtomicU64::new(position),
+            seek_requested: AtomicU64::new(0),
+            seek_ready: AtomicU64::new(0),
+            seek_ready_frame: AtomicU64::new(position),
+            seek_done: AtomicU64::new(0),
         }
+    }
+
+    /// Pauses the take (silence, the position held) or lets it play on.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Whether the take starts again at its first frame when it reaches its end.
+    pub(crate) fn set_looping(&self, looping: bool) {
+        self.looping.store(looping, Ordering::Release);
+    }
+
+    /// Asks the take to play on from `frame`: the disk thread moves there and stops queueing, the
+    /// engine thread then drops what was queued before the move (playing silence meanwhile) and
+    /// plays from `frame` once the ring holds the preroll again.
+    ///
+    /// The frame is stored before the request is counted, so whoever sees the request sees a
+    /// frame at least as new; the disk thread says which frame it moved to, and the engine thread
+    /// takes that one, so two moves asked for at once can never leave them at different frames.
+    pub(crate) fn request_seek(&self, frame: u64) {
+        self.seek_frame.store(frame, Ordering::Release);
+        self.seek_requested.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A move was asked for that the engine thread has not taken yet.
+    fn seek_pending(&self) -> bool {
+        self.seek_requested.load(Ordering::Acquire) != self.seek_done.load(Ordering::Acquire)
     }
 
     fn fail(&self, reason: String) {
@@ -629,6 +680,8 @@ pub(crate) struct DiskPlayer<R: Read + Seek = BufReader<File>> {
     length: u64,
     /// The next frame to read from the files.
     position: u64,
+    /// The last move asked for that this thread made (see [PlaybackShared::request_seek]).
+    generation: u64,
     /// Room for one chunk of device frames.
     chunk: Vec<f32>,
     /// Room for one chunk of a track's own frames (at most a stereo pair).
@@ -653,6 +706,27 @@ impl<R: Read + Seek> DiskPlayer<R> {
             return DiskStep::Exit;
         }
         if self.shared.failed.load(Ordering::Acquire) {
+            return DiskStep::Idle;
+        }
+        let requested = self.shared.seek_requested.load(Ordering::Acquire);
+        if requested != self.generation {
+            // Move, then queue nothing until the engine thread has dropped what was queued
+            // from before: everything queued so far was pushed before `seek_ready` says so.
+            let frame = self
+                .shared
+                .seek_frame
+                .load(Ordering::Acquire)
+                .min(self.length);
+            if let Err(error) = self.seek_all(frame) {
+                self.shared.fail(error);
+                return DiskStep::Idle;
+            }
+            self.generation = requested;
+            self.shared.disk_end.store(false, Ordering::Release);
+            self.shared.seek_ready_frame.store(frame, Ordering::Release);
+            self.shared.seek_ready.store(requested, Ordering::Release);
+        }
+        if self.shared.seek_done.load(Ordering::Acquire) != self.generation {
             return DiskStep::Idle;
         }
         if self.position >= self.length {
@@ -762,6 +836,8 @@ pub(crate) struct PlaybackReader {
     length: u64,
     preroll: usize,
     position: u64,
+    /// The last move this thread took (see [PlaybackShared::request_seek]).
+    generation: u64,
     /// The ring has held the preroll since it last ran short.
     primed: bool,
     /// Frames due that no block has taken yet.
@@ -822,12 +898,14 @@ impl PlaybackReader {
     }
 
     /// Fills `block` (whole frames of the device's inputs) with the next frames of the take, or
-    /// silence: while the ring fills to the preroll, while paused, at the end of a take that does
-    /// not loop, after a read error, and for what the ring lacks (counted as underrun).
+    /// silence: while a move is on its way, while the ring fills to the preroll, while paused, at
+    /// the end of a take that does not loop, after a read error, and for what the ring lacks
+    /// (counted as underrun).
     pub(crate) fn fill(&mut self, block: &mut [f32]) {
         let channels = self.channels.max(1);
         let frames = block.len() / channels;
-        let silent = self.shared.failed.load(Ordering::Acquire)
+        let silent = self.moving()
+            || self.shared.failed.load(Ordering::Acquire)
             || self.shared.paused.load(Ordering::Relaxed)
             || self.shared.ended.load(Ordering::Relaxed);
         if silent || !self.ready() {
@@ -868,6 +946,31 @@ impl PlaybackReader {
         }
         block[written * channels..].fill(0.0);
         shared.position.store(self.position, Ordering::Relaxed);
+    }
+
+    /// Whether a move asked for is still on its way. Once the disk thread has moved (and stopped
+    /// queueing), the move is taken here: what was queued before it is dropped, the take goes on
+    /// from the disk's frame (no longer at its end) after a new preroll, and the disk is told.
+    fn moving(&mut self) -> bool {
+        let shared = &*self.shared;
+        let requested = shared.seek_requested.load(Ordering::Acquire);
+        if requested == self.generation {
+            return false;
+        }
+        if shared.seek_ready.load(Ordering::Acquire) != requested {
+            return true;
+        }
+        let queued = self.consumer.slots();
+        if let Ok(chunk) = self.consumer.read_chunk(queued) {
+            chunk.commit_all();
+        }
+        self.generation = requested;
+        self.position = shared.seek_ready_frame.load(Ordering::Acquire);
+        self.primed = false;
+        shared.ended.store(false, Ordering::Relaxed);
+        shared.position.store(self.position, Ordering::Relaxed);
+        shared.seek_done.store(requested, Ordering::Release);
+        false
     }
 
     /// Whether the ring holds enough to play: the preroll, or everything the disk will queue.
@@ -944,6 +1047,7 @@ pub(crate) fn playback_link<R: Read + Seek>(
         channels,
         length: take.length,
         position: start_frame,
+        generation: 0,
         chunk: vec![0.0; CHUNK_FRAMES * channels],
         scratch: vec![0.0; CHUNK_FRAMES * width],
     };
@@ -957,6 +1061,7 @@ pub(crate) fn playback_link<R: Read + Seek>(
         length: take.length,
         preroll: options.preroll.min(ring_frames),
         position: start_frame,
+        generation: 0,
         primed: false,
         credit: 0,
         last_tick: Instant::now(),
@@ -1031,22 +1136,67 @@ impl ActiveSoundcheck {
         let _ = disk.join();
     }
 
+    fn wake_disk(&self) {
+        if let Some(disk) = &self.disk {
+            disk.thread().unpark();
+        }
+    }
+
+    /// Pauses the take: silence, the position held.
+    pub(crate) fn pause(&self) {
+        self.shared.set_paused(true);
+    }
+
+    /// Plays on; a take stopped at its end starts again at its first frame.
+    pub(crate) fn resume(&self) {
+        let shared = &self.shared;
+        if shared.ended.load(Ordering::Relaxed) && !shared.seek_pending() {
+            shared.request_seek(0);
+            self.wake_disk();
+        }
+        shared.set_paused(false);
+    }
+
+    /// Plays on from `frame` (the end at most), paused or not.
+    pub(crate) fn seek(&self, frame: u64) -> Result<(), SoundcheckError> {
+        if frame > self.length {
+            return Err(SoundcheckError::PastEnd {
+                frame,
+                length: self.length,
+            });
+        }
+        self.shared.request_seek(frame);
+        self.wake_disk();
+        Ok(())
+    }
+
+    /// Whether the take starts again at its first frame at its end. A take already stopped at
+    /// its end stays there until it is resumed.
+    pub(crate) fn set_looping(&self, looping: bool) {
+        self.shared.set_looping(looping);
+        self.wake_disk();
+    }
+
     fn status(&self) -> SoundcheckStatus {
         let shared = &self.shared;
+        // A move not yet taken shows where the take goes: its frame, and an end it leaves.
+        let pending = shared.seek_pending();
+        let ended = shared.ended.load(Ordering::Relaxed) && !pending;
         let state = match shared.failure() {
             Some(reason) => SoundcheckState::Failed { reason },
-            None if shared.paused.load(Ordering::Relaxed)
-                || shared.ended.load(Ordering::Relaxed) =>
-            {
-                SoundcheckState::Paused
-            }
+            None if shared.paused.load(Ordering::Relaxed) || ended => SoundcheckState::Paused,
             None => SoundcheckState::Playing,
+        };
+        let position = if pending {
+            shared.seek_frame.load(Ordering::Acquire)
+        } else {
+            shared.position.load(Ordering::Relaxed)
         };
         SoundcheckStatus {
             state,
             take_folder: Some(self.folder.clone()),
             take_name: Some(self.name.clone()),
-            position_frames: shared.position.load(Ordering::Relaxed),
+            position_frames: position,
             length_frames: self.length,
             looping: shared.looping.load(Ordering::Relaxed),
             underrun_frames: shared.underruns.load(Ordering::Relaxed),
@@ -1094,6 +1244,16 @@ impl Soundcheck {
     /// The take that plays, let go of.
     pub(crate) fn take(&mut self) -> Option<ActiveSoundcheck> {
         self.active.take()
+    }
+
+    /// The take that plays, to change how it plays: [SoundcheckError::NotPlaying] without one,
+    /// [SoundcheckError::Failed] once reading it failed (only stopping is left then).
+    pub(crate) fn playing(&self) -> Result<&ActiveSoundcheck, SoundcheckError> {
+        let active = self.active.as_ref().ok_or(SoundcheckError::NotPlaying)?;
+        match active.shared.failure() {
+            Some(reason) => Err(SoundcheckError::Failed { reason }),
+            None => Ok(active),
+        }
     }
 
     pub(crate) fn status(&self) -> SoundcheckStatus {
@@ -1731,5 +1891,97 @@ pub(crate) mod tests {
         assert_eq!(blocks.len(), 999);
         assert_eq!(blocks[0].value, sample(0, 0, 0));
         assert!(!links.stats.suspended.load(Ordering::Relaxed));
+    }
+
+    fn silent(block: &[[f32; 4]]) -> bool {
+        block.iter().all(|frame| *frame == [0.0; 4])
+    }
+
+    #[test]
+    fn a_paused_take_plays_silence_and_holds_its_position() {
+        let mut run = playing(&take_folder("pause"), 0, false, small());
+        fill_ring(&mut run.disk);
+        assert_eq!(next(&mut run.reader, 64), heard_range(0..64));
+
+        run.shared.set_paused(true);
+        assert!(silent(&next(&mut run.reader, 64)));
+        assert!(silent(&next(&mut run.reader, 64)));
+        assert_eq!(run.shared.position.load(Ordering::Relaxed), 64);
+
+        run.shared.set_paused(false);
+        assert_eq!(next(&mut run.reader, 64), heard_range(64..128));
+        assert_eq!(run.shared.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Until the disk has moved, the engine plays silence and never a queued frame from before
+    /// the move; then it drops them and plays from the new frame once the ring holds it.
+    #[test]
+    fn a_seek_drops_what_was_queued_and_plays_on_from_the_new_frame() {
+        let mut run = playing(&take_folder("seek"), 0, false, small());
+        fill_ring(&mut run.disk);
+        assert_eq!(next(&mut run.reader, 64), heard_range(0..64));
+
+        run.shared.request_seek(500);
+        assert!(silent(&next(&mut run.reader, 64)));
+        // The disk moves, then waits for the engine to take the move.
+        assert_eq!(run.disk.step(), DiskStep::Idle);
+        assert_eq!(run.disk.step(), DiskStep::Idle);
+        // The engine takes it, drops the old frames and waits for the new ones.
+        assert!(silent(&next(&mut run.reader, 64)));
+        assert_eq!(run.shared.position.load(Ordering::Relaxed), 500);
+        assert!(!run.shared.seek_pending());
+
+        fill_ring(&mut run.disk);
+        assert_eq!(next(&mut run.reader, 64), heard_range(500..564));
+        assert_eq!(run.shared.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Looping turned off stops the take at its end, and the frames the disk had queued past it
+    /// (from the first frame) are dropped when a seek takes the take back to its start.
+    #[test]
+    fn looping_turned_off_stops_at_the_end_and_a_seek_plays_again() {
+        let mut run = playing(&take_folder("again"), 0, true, small());
+        fill_ring(&mut run.disk);
+        run.shared.set_looping(false);
+
+        for block in 0..15 {
+            assert_eq!(
+                next(&mut run.reader, 64),
+                heard_range(64 * block..64 * (block + 1))
+            );
+        }
+        let last = next(&mut run.reader, 64);
+        assert_eq!(&last[..40], heard_range(960..1_000).as_slice());
+        assert!(silent(&last[40..]));
+        assert!(run.shared.ended.load(Ordering::Relaxed));
+
+        run.shared.request_seek(200);
+        assert_eq!(run.disk.step(), DiskStep::Idle);
+        assert!(silent(&next(&mut run.reader, 64)));
+        assert!(!run.shared.ended.load(Ordering::Relaxed));
+        fill_ring(&mut run.disk);
+        assert_eq!(next(&mut run.reader, 64), heard_range(200..264));
+    }
+
+    /// Looping turned on after the disk queued the end goes on from the first frame.
+    #[test]
+    fn looping_turned_on_late_goes_on_from_the_first_frame() {
+        let mut run = playing(&take_folder("loop-late"), 0, false, small());
+        fill_ring(&mut run.disk);
+        for block in 0..15 {
+            assert_eq!(
+                next(&mut run.reader, 64),
+                heard_range(64 * block..64 * (block + 1))
+            );
+        }
+
+        run.shared.set_looping(true);
+        fill_ring(&mut run.disk);
+        let wrapped = next(&mut run.reader, 64);
+
+        assert_eq!(&wrapped[..40], heard_range(960..1_000).as_slice());
+        assert_eq!(&wrapped[40..], heard_range(0..24).as_slice());
+        assert!(!run.shared.ended.load(Ordering::Relaxed));
+        assert_eq!(run.shared.underruns.load(Ordering::Relaxed), 0);
     }
 }

@@ -492,6 +492,29 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     relative folder refused and kept in the field, a whole path kept; Open folder said; no console
     errors.
   - Commits: 8dd38fc (view logic and the audio setup's lock, 1,031 lines). Commit: this commit.
+- [x] T5-fix (review-087ed4936a1744f6 findings, UI only). Route: delegated writer.
+  - Finding 1 (quick arm presses on the Record screen could drop one): an arm press now sends a
+    delta (`arm: { input, on, channels }`) that `settingsRequest` applies to the armed inputs of
+    the request's turn, so two presses made before the first is answered both land and a refused
+    one never rides in a later request. Commit b680c6c. RED was not recorded at the time; it was
+    reproduced afterwards by running b680c6c's tests against its parent's `console-app.js`,
+    `record-view.js` and `recording.js`: 3 of 43 in `recording.test.js` and `record-view.test.js`
+    failed ("the first arm stays", "keeps the earlier one"). GREEN: UI tests 426 -> 428.
+  - Finding 2 (the Record screen's container logic had no tests): `lib/record-controller.js`
+    (DOM-free) now holds the transport's busy guard (`command`), the lanes' peak histories
+    (`followTake` clears them when a new take folder appears, `takeMeters`, `history`, `laneOf`),
+    arming (`arm`), the folder field (`useFolder`, `useDefaultFolder`, `folderToShow`: a refused
+    folder stays in the field, a kept one shows and is listed) and `mountRecChip` (moved from
+    `shell.js`). `record-screen.js` and `shell.js` use it; no copy of that logic is left in them.
+    Tests: `tests/record-controller.test.js` (6). RED: 6 of 6 failed against a stub; then, against
+    the real controller, dropping the busy guard and the history clear failed 2 of 6, and clearing
+    the shown folder on a refusal failed 1 of 6 (each restored). GREEN: UI tests 428 -> 434.
+  - Browser (`?fake#/record`, port 5199): three tracks armed in one go all stayed armed ("3
+    tracks"); Record and Stop disabled while the start was on its way; the REC chip strip shown
+    while recording and hidden after Stop, the lanes kept their peaks; `Recordings` refused with
+    the whole-path message and kept in the field, `D:\Takes` kept and listed, Default folder back;
+    no console errors.
+  - Commits: b680c6c (finding 1, 88 lines). Commit: this commit (finding 2).
 - [ ] T6 (virtual soundcheck): the playback source in place of capture and its UI. Route:
   delegated writer.
 - [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
@@ -543,6 +566,9 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 - T4b-fix (a928046 and the UI commit) is pending review in the slice from c4ba1a7.
 - T4b-fix (a928046, 4f462dd) is still pending review in the slice from c4ba1a7; T5 (8dd38fc and
   the screen commit) follows it in that slice.
+- Review lineage review-087ed4936a1744f6 over c4ba1a7..2067f08 (T4b-fix and T5) approved and
+  acknowledged; its two findings (quick arm presses dropping one, the Record screen's container
+  logic untested) are fixed by T5-fix (b680c6c and its test commit). Next review base: 2067f08.
 
 ## Next step
 

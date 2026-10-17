@@ -26,3 +26,4 @@ import "./channels-screen.test.js";
 import "./local-mix.test.js";
 import "./recording.test.js";
 import "./record-view.test.js";
+import "./record-controller.test.js";

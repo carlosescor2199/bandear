@@ -126,6 +126,16 @@ test("a settings request is the whole settings with the change on top, the defau
   assert.equal(settingsRequest({ ...kept, folderIsDefault: true }).folder, null);
 });
 
+test("an arm change in a settings request applies to the armed inputs it is built on", () => {
+  const kept = { folder: "D:\\Takes", folderIsDefault: false, armed: [1, 4] };
+  const arm = (input, on) => ({ arm: { input, on, channels: LINKED } });
+
+  assert.deepEqual(settingsRequest(kept, arm(3, true)).armed, [1, 3, 4]);
+  assert.deepEqual(settingsRequest({ ...kept, armed: [1, 2] }, arm(3, false)).armed, [1], "a pair");
+  assert.deepEqual(settingsRequest(null, arm(2, true)).armed, [2]);
+  assert.equal("arm" in settingsRequest(kept, arm(3, true)), false, "never sent to the desk");
+});
+
 test("lengths, starts, stops and unreadable takes are said in words", () => {
   assert.equal(formatDuration(7.9), "0:07");
   assert.equal(formatDuration(205), "3:25");
@@ -279,6 +289,37 @@ test("a change queued behind a refused one builds on the accepted settings, not 
   assert.deepEqual(sent().at(-1), { folder: null, format: "float32", includeLocal: true, armed: [1] });
   assert.deepEqual(fake.savedRecording(), sent().at(-1));
   assert.deepEqual(app.store.getState().recordingSettings.armed, [1]);
+  app.dispose();
+});
+
+test("quick arm presses compose, and a refused one rides in no later request", async () => {
+  const { fake } = clocked();
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  const sent = () => commands(fake, "set_recording_settings").map(({ args }) => args.settings);
+  const arm = (input, on) => app.setRecordingSettings({ arm: { input, on, channels: LINKED } });
+
+  // Both are asked for before the first is answered, as two quick clicks on two tracks are.
+  const [first, second] = await Promise.all([arm(1, true), arm(4, true)]);
+  assert.equal(first.ok, true, first.message);
+  assert.equal(second.ok, true, second.message);
+  assert.deepEqual(app.store.getState().recordingSettings.armed, [1, 4], "the first arm stays");
+
+  // The middle one is refused; the ones after it build on the kept settings without it.
+  const [refused, pair, kick] = await Promise.all([arm(300, true), arm(3, true), arm(1, false)]);
+  assert.equal(refused.ok, false);
+  assert.equal(pair.ok, true, pair.message);
+  assert.equal(kick.ok, true, kick.message);
+  assert.deepEqual(app.store.getState().recordingSettings.armed, [3, 4]);
+  assert.equal(
+    sent().slice(-2).some(({ armed }) => armed.includes(300)),
+    false,
+    "the refused input is in no later request",
+  );
+
+  // Disarming the other side of a linked pair disarms it whole.
+  await arm(2, false);
+  assert.deepEqual(app.store.getState().recordingSettings.armed, [4]);
   app.dispose();
 });
 

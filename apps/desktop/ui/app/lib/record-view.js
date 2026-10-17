@@ -17,7 +17,6 @@ import { sentenceWithReason } from "./format.js";
 import { isRecordingNow, lastTake, recordingStatus } from "./console-state.js";
 import {
   RECORD_FORMATS,
-  armedAfter,
   formatDuration,
   formatTakeEnd,
   isArmed,
@@ -110,15 +109,15 @@ export function localTrackRow(state) {
 }
 
 /**
- * The settings change pressing a row's arm button asks for: the armed inputs with the row armed or
- * disarmed (a pair as one, see armedAfter), or the local mix on or off.
+ * The settings change pressing a row's arm button asks for: the row armed or disarmed (a pair as
+ * one, see armedAfter), or the local mix on or off. The arming is a delta (`arm`, see
+ * settingsRequest) applied when the request is built, so two quick presses on two rows both land.
  */
 export function armChange(state, row) {
   if (row.local) {
     return { includeLocal: !row.armed };
   }
-  const armed = state.recordingSettings?.armed ?? [];
-  return { armed: armedAfter(armed, row.input, !row.armed, deviceChannels(state)) };
+  return { arm: { input: row.input, on: !row.armed, channels: deviceChannels(state) } };
 }
 
 /**

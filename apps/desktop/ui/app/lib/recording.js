@@ -98,8 +98,10 @@ export function armedAfter(armed, input, on, channels) {
 
 /**
  * The whole `set_recording_settings` request for `settings` (a `recording_settings` answer, or
- * null for the defaults) with `change` (`{ folder?, format?, includeLocal?, armed? }`) on top. The
- * folder is null for the default folder.
+ * null for the defaults) with `change` (`{ folder?, format?, includeLocal?, armed?, arm? }`) on
+ * top. The folder is null for the default folder. `arm` (`{ input, on, channels }`) arms or
+ * disarms one input on the armed inputs the request is built on (see armedAfter), so arm presses
+ * made before an earlier one was answered compose instead of replacing each other.
  */
 export function settingsRequest(settings, change = {}) {
   const current = {
@@ -113,6 +115,10 @@ export function settingsRequest(settings, change = {}) {
     if (change[field] !== undefined) {
       next[field] = change[field];
     }
+  }
+  if (change.arm) {
+    const { input, on, channels } = change.arm;
+    next.armed = armedAfter(next.armed, input, on, channels);
   }
   if (typeof next.folder === "string" && next.folder.trim() === "") {
     next.folder = null;

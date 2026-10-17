@@ -335,8 +335,8 @@ impl Pipeline {
 
     /// Back to the capture stream set aside by [Self::play]: the frames it left in its ring are
     /// dropped (the callback has stopped queueing), then it queues and meters again. The take's
-    /// reader is let go of here, which frees nothing: the disk thread and the engine's side still
-    /// hold everything it shares (see [crate::soundcheck]).
+    /// reader is let go of here, which frees nothing: the disk thread still holds everything it
+    /// shares, even after the engine's side gave up waiting for it ([PlaybackReader::release]).
     pub(crate) fn go_live(&mut self) {
         let Some(playback) = self.playback.take() else {
             return;
@@ -349,6 +349,7 @@ impl Pipeline {
         }
         self.levels.clear();
         playback.capture().suspended.store(false, Ordering::Release);
+        playback.release();
     }
 
     /// Hands every whole block waiting in the ring to the sinks, in order; returns how many.

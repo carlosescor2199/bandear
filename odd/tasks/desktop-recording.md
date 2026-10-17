@@ -573,6 +573,46 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     new (its 7 findings are older).
   - Commits: 3e276c7 (playback, 2,249 lines: over the guide, kept whole since the loader alone
     would be dead code). Commit: this commit (transport).
+- [x] T6a-fix (review-ed045e4a8c9591d7 findings, engine). Route: delegated writer.
+  - Finding 1 (the clock decided from one snapshot at start, and written before the take loaded):
+    `start_soundcheck` no longer touches `PlaybackClock::follow_output`, which only the output
+    changes set (an output is installed). The engine thread decides the clock at every block
+    from the callbacks themselves (`PlaybackReader::due`): an installed output's callbacks take
+    over from the timer as soon as they come, the mirror of the grace handover. An output that
+    does not play at start leaves the take on the timer from its first block
+    (`PlaybackReader::start_on_timer`, the reader's own state, set before it is sent). Atomics
+    only; nothing allocates or locks on the engine thread or the output callback.
+  - Finding 2 (no test of the failed path): a test seam (`soundcheck::tests::flaky`: the take's
+    files in memory, failing reads or seeks on demand) and `EngineHandle::play_take` (what
+    `start_soundcheck` does once the take is loaded). Tests: a seek the disk cannot make and a
+    read error mid-take fail the take (reason names the file, silence from then on with the
+    queued frames dropped, nothing more queued, `Soundcheck::playing` refuses with `Failed`, the
+    disk thread exits once let go); through the engine, a read error after playback started
+    shows `Failed { reason }` in the status and `EngineStatus`, the four transport calls return
+    `SoundcheckError::Failed`, meters fall to silence with live input still set aside and the
+    position held, no event is sent, and `stop_soundcheck` takes the engine back to the live
+    inputs. They revealed no defect.
+  - Finding 3 (a stop whose wait ran out let the engine thread free the ring): when
+    `ActiveSoundcheck::end` runs out of time it no longer closes the disk thread; it leaves it to
+    end once it sees the engine thread let go (it frees the ring and the shared state then).
+    `ActiveSoundcheck::close` (set `closed`, join) is kept for when no engine thread holds the
+    reader (the engine thread ended, or the take never reached it). The engine thread lets go
+    through `PlaybackReader::release`, which drops its share of the shared state before the ring,
+    so the disk thread, alive until the ring is let go of, always holds the last of both.
+  - RED: finding 1, `an_output_that_plays_after_the_take_started_becomes_its_clock` failed ("the
+    output's callbacks became the clock"); `a_refused_start_leaves_the_clock_as_it_was` failed
+    ("the refusal changed the clock") with the flag written before the take loads, as at
+    b692863 (the seam split alone already moved the load first). Finding 3,
+    `a_stop_that_gives_up_waiting_frees_nothing_on_the_engine_thread` failed with 3 frees on the
+    engine thread (the ring, the shared state and the test's clock; the test now holds the clock
+    as the engine does). Finding 2's three tests passed against the unfixed code (nothing to fix);
+    they were shown able to fail by a mutation (the reader not silent on failure and `playing`
+    not refusing): 3 of 3 failed, then restored.
+  - GREEN: server unit tests 426 -> 432; 10 runs of the soundcheck tests and of the new engine
+    tests; clippy reports nothing new (its 7 findings are older). `cargo check -p
+    mixlink-desktop --all-targets` passes and desktop tests are 237 after `soundcheck:
+    Default::default()` in the three `EngineStatus` literals (518acf9, 3 lines).
+  - Commits: 518acf9 (desktop literals). Commit: this commit.
 - [ ] T6b (virtual soundcheck, desktop): Tauri commands over the T6a API, the takes' Play and
   Soundcheck, and the virtual soundcheck card. Route: delegated writer.
 - [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
@@ -632,6 +672,10 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   controller's `onChange` is not called when a request rejects (an unhandled promise). Next review
   base: 491f8ee.
 - T6 split into T6a (engine, done in 3e276c7 and the transport commit) and T6b (desktop).
+- Review lineage review-ed045e4a8c9591d7 over 491f8ee..b692863 (T6a) approved and acknowledged;
+  its three findings (the clock decided from a snapshot at start and written before a refused
+  load, no test of the failed path, a stop whose wait ran out letting the engine thread free the
+  ring) are fixed by T6a-fix. Next review base: b692863.
 
 ## Next step
 

@@ -2005,7 +2005,8 @@ impl EngineHandle {
     /// as live, and inputs the take did not record are silent. Its local-mix track is not played.
     /// The capture device keeps running, set aside: its audio is neither heard nor metered until
     /// [Self::stop_soundcheck] takes the engine back to it. The take follows the local output's
-    /// clock when one plays, else a timer (see [crate::soundcheck]).
+    /// clock when one plays, else a timer, and an output that starts playing later takes over
+    /// from the timer (see [crate::soundcheck]).
     ///
     /// A [SoundcheckError], and nothing changed, when the engine is stopping, a take records, a
     /// soundcheck already plays, `take.json` or a track's file is missing or unreadable, the take
@@ -2017,33 +2018,50 @@ impl EngineHandle {
         &mut self,
         request: SoundcheckRequest,
     ) -> Result<SoundcheckStatus, Box<dyn Error>> {
-        if self.is_stopped() {
+        if self.is_stopped() || self.pipeline.is_none() {
             return Err(SoundcheckError::EngineStopping.into());
         }
-        let Some(pipeline) = self.pipeline.as_ref() else {
-            return Err(SoundcheckError::EngineStopping.into());
-        };
         if self.soundcheck.is_active() {
             return Err(SoundcheckError::AlreadyPlaying.into());
         }
         if self.recorder.refuse_source_change().is_err() {
             return Err(SoundcheckError::Recording.into());
         }
-        let follow_output = self.local_output.active.as_ref().is_some_and(|active| {
-            active.shared.status(&active.request).state == LocalOutputState::Running
-        });
-        self.playback_clock.follow_output(follow_output);
-        let (reader, active) = crate::soundcheck::prepare(
-            &request,
+        let take = crate::soundcheck::load_take(
+            &request.take_folder,
             &self.config_state.snapshot().channels,
             usize::from(self.source_channels),
+        )?;
+        self.play_take(take, &request)
+    }
+
+    /// Plays `take`, loaded and checked for this device, as [Self::start_soundcheck] asks.
+    pub(crate) fn play_take<R: std::io::Read + std::io::Seek + Send + 'static>(
+        &mut self,
+        take: crate::soundcheck::LoadedTake<R>,
+        request: &SoundcheckRequest,
+    ) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return Err(SoundcheckError::EngineStopping.into());
+        };
+        let (mut reader, active) = crate::soundcheck::prepare(
+            take,
+            request,
             Arc::clone(&self.playback_clock),
             Arc::clone(&self.capture_stats),
         )?;
+        // The clock follows whichever output is installed (see [Self::install_output]) as soon as
+        // its callbacks come; one that does not play now leaves the take on the timer until then.
+        let output_plays = self.local_output.active.as_ref().is_some_and(|active| {
+            active.shared.status(&active.request).state == LocalOutputState::Running
+        });
+        if !output_plays {
+            reader.start_on_timer();
+        }
         self.playback_clock.set_active(true);
         if let Err(reason) = pipeline.play(reader) {
             self.playback_clock.set_active(false);
-            active.end(std::time::Duration::ZERO);
+            active.close();
             return Err(SoundcheckError::Unavailable { reason }.into());
         }
         self.soundcheck.begin(active);
@@ -5649,6 +5667,180 @@ mod tests {
             .channel_levels
             .iter()
             .all(|level| *level > 0));
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A local output that is not playing when the take starts (here one whose device failed)
+    /// leaves the take on the timer; once its callbacks come they are the clock, and the take
+    /// moves only with them, so it never drifts from what the output plays.
+    #[test]
+    fn an_output_that_plays_after_the_take_started_becomes_its_clock() {
+        use crate::soundcheck::SoundcheckClock;
+        let (mut engine, _capture, _phone) = local_engine();
+        let (mut player, opened) = test_output("Speakers", 2, 0);
+        player.set_clock(Arc::clone(&engine.playback_clock));
+        opened.shared.fail("the device was unplugged".to_owned());
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        // Once the output's callbacks pace the take, only they do in this test.
+        engine
+            .playback_clock
+            .set_grace(std::time::Duration::from_secs(600));
+        let folder = crate::soundcheck::tests::constant_take("engine-late-output", 48_000, 0.5);
+
+        let started = engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect("the take plays");
+        assert_eq!(started.clock, SoundcheckClock::Timer);
+        assert!(
+            until(|| engine.soundcheck().position_frames > 0),
+            "the timer plays it"
+        );
+
+        assert!(
+            callbacks_until(&engine, &mut player, |status| {
+                status.clock == SoundcheckClock::Output
+            }),
+            "the output's callbacks became the clock"
+        );
+        // A block on its way when the callbacks stopped may still land.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let held = engine.soundcheck().position_frames;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            engine.soundcheck().position_frames,
+            held,
+            "the timer no longer moves the take"
+        );
+        let mut buffer = [0.0f32; 2 * 64];
+        for _ in 0..10 {
+            player.fill(&mut buffer);
+        }
+        assert!(until(|| engine.soundcheck().position_frames == held + 640));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            engine.soundcheck().position_frames,
+            held + 640,
+            "exactly the frames the output played"
+        );
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A start that is refused changes nothing, not even the clock a take would follow: with an
+    /// output installed, its callbacks stay the clock to follow.
+    #[test]
+    fn a_refused_start_leaves_the_clock_as_it_was() {
+        let (mut engine, _capture, _phone) = local_engine();
+        let (_player, opened) = test_output("Speakers", 2, 0);
+        opened.shared.fail("the device was unplugged".to_owned());
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        assert!(engine.playback_clock.follows_output());
+        let empty = crate::recorder::tests::scratch_directory("engine-refused-clock");
+
+        let refused = engine
+            .start_soundcheck(soundcheck_of(&empty))
+            .expect_err("no take there");
+
+        assert!(
+            matches!(
+                soundcheck_refusal(&*refused),
+                Some(SoundcheckError::TakeUnreadable { .. })
+            ),
+            "{refused}"
+        );
+        assert!(
+            engine.playback_clock.follows_output(),
+            "the refusal changed the clock"
+        );
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A read error after the take started: the status says why, every change but stopping is
+    /// refused with that reason, and the engine plays silence with the inputs still set aside (the
+    /// failure shows in the status only). Stopping takes the engine back to the live inputs.
+    #[test]
+    fn a_take_that_fails_to_read_plays_silence_until_it_is_stopped() {
+        use crate::soundcheck::SoundcheckState;
+        let (mut engine, mut capture, _phone) = local_engine();
+        let folder = crate::soundcheck::tests::constant_take("engine-read-fails", 48_000, 0.5);
+        let request = SoundcheckRequest {
+            take_folder: folder.clone(),
+            start_frame: 0,
+            looping: true,
+        };
+        let take =
+            crate::soundcheck::load_take(&folder, &engine.config_state.snapshot().channels, 2)
+                .expect("the take loads");
+        let (take, faults) = crate::soundcheck::tests::flaky(take);
+        engine.play_take(take, &request).expect("the take plays");
+        assert!(
+            until(|| engine.meters().channel_levels[0] > 0),
+            "the take plays"
+        );
+        let events = engine.subscribe();
+
+        // The take is shorter than the ring: the disk reads again once it has looped and the
+        // engine thread has taken a chunk's worth.
+        faults.fail_reads();
+
+        assert!(until(|| matches!(
+            engine.soundcheck().state,
+            SoundcheckState::Failed { .. }
+        )));
+        let SoundcheckState::Failed { reason } = engine.soundcheck().state else {
+            unreachable!("the take failed");
+        };
+        assert!(
+            reason.contains("reading \"01 CH 1.wav\" failed"),
+            "{reason}"
+        );
+        assert_eq!(engine.status().soundcheck.state, engine.soundcheck().state);
+        for refused in [
+            engine.pause_soundcheck(),
+            engine.resume_soundcheck(),
+            engine.seek_soundcheck(0),
+            engine.set_soundcheck_loop(false),
+        ] {
+            let refused = refused.expect_err("only stopping is left");
+            assert_eq!(
+                soundcheck_refusal(&*refused),
+                Some(&SoundcheckError::Failed {
+                    reason: reason.clone()
+                })
+            );
+        }
+        assert!(
+            until(|| engine.meters().channel_levels[0] == 0),
+            "the engine plays silence"
+        );
+        let position = engine.soundcheck().position_frames;
+        capture.write(&[1.0f32; 2 * 64]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            engine
+                .meters()
+                .channel_levels
+                .iter()
+                .all(|level| *level == 0),
+            "the inputs stay set aside"
+        );
+        assert_eq!(engine.soundcheck().position_frames, position);
+        assert!(engine.capture_stats.suspended.load(Ordering::Acquire));
+        assert_eq!(drain(&events), Vec::new());
+
+        let off = engine.stop_soundcheck().expect("stopping is what is left");
+
+        assert_eq!(off, SoundcheckStatus::default());
+        assert!(!engine.capture_stats.suspended.load(Ordering::Acquire));
+        capture.write(&[0.5f32; 2 * 64]);
+        assert!(until(|| engine
+            .meters()
+            .channel_levels
+            .iter()
+            .all(|level| *level > 0)));
         engine.stop().expect("the engine stops");
     }
 }

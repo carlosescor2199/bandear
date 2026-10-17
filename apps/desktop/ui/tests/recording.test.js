@@ -245,6 +245,76 @@ test("the console reads the recording settings once connected and two quick chan
   app.dispose();
 });
 
+test("a change queued behind a refused one builds on the accepted settings, not the refused", async () => {
+  const { fake } = clocked();
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  const sent = () => commands(fake, "set_recording_settings").map(({ args }) => args.settings);
+
+  // All three are queued before the first is answered: the folder is refused, the toggle after it
+  // must not send it again.
+  const [armed, refused, local] = await Promise.all([
+    app.setRecordingSettings({ armed: [1] }),
+    app.setRecordingSettings({ folder: "Recordings" }),
+    app.setRecordingSettings({ includeLocal: true }),
+  ]);
+
+  assert.equal(armed.ok, true, armed.message);
+  assert.equal(refused.ok, false);
+  assert.equal(local.ok, true, local.message);
+  assert.deepEqual(sent().at(-1), { folder: null, format: "int24", includeLocal: true, armed: [1] });
+  const settings = app.store.getState().recordingSettings;
+  assert.equal(settings.folderIsDefault, true);
+  assert.equal(settings.includeLocal, true);
+  assert.deepEqual(settings.armed, [1]);
+
+  // A failed save (a valid change the desk could not keep) is not carried either.
+  fake.failNext("set_recording_settings", "the session could not be saved");
+  const [unsaved, format] = await Promise.all([
+    app.setRecordingSettings({ armed: [4] }),
+    app.setRecordingSettings({ format: "float32" }),
+  ]);
+  assert.equal(unsaved.ok, false);
+  assert.equal(format.ok, true, format.message);
+  assert.deepEqual(sent().at(-1), { folder: null, format: "float32", includeLocal: true, armed: [1] });
+  assert.deepEqual(fake.savedRecording(), sent().at(-1));
+  assert.deepEqual(app.store.getState().recordingSettings.armed, [1]);
+  app.dispose();
+});
+
+test("the disk estimate is read once connected and again when an engine starts", async () => {
+  const { fake } = clocked({ savedRecording: { folder: null, format: "int24", includeLocal: false, armed: [1] } });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+
+  const connected = app.store.getState().estimate;
+  assert.notEqual(connected, null, "read on connect");
+  assert.equal(connected.problem, null);
+  assert.ok(connected.bytesPerSecond > 0);
+
+  await app.stop();
+  assert.equal(app.store.getState().estimate, null, "forgotten at the run's end");
+  const reads = commands(fake, "record_estimate").length;
+
+  await app.start();
+  const started = app.store.getState().estimate;
+  assert.equal(commands(fake, "record_estimate").length, reads + 1, "read once the engine runs");
+  assert.notEqual(started, null);
+  assert.equal(started.problem, null, "the running engine's");
+  app.dispose();
+});
+
+test("with no engine to start, the estimate read on connect says why there is none", async () => {
+  const fake = createFakeBridge();
+  const app = createConsoleApp({ bridge: fake, autoStart: false });
+  await app.ready;
+
+  const estimate = app.store.getState().estimate;
+  assert.notEqual(estimate, null, "read on connect");
+  assert.match(estimate.problem, /not running/);
+  app.dispose();
+});
+
 test("the fake refuses the settings the desk refuses", async () => {
   const fake = createFakeBridge();
   const settings = (change) => ({ folder: null, format: "int24", includeLocal: false, armed: [], ...change });

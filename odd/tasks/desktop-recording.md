@@ -427,6 +427,29 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     browser preview: no screen changed (T5 builds it).
   - Commits: d825ca5 (status and session, 713 lines), 6c8bbc8 (commands, 1,802 lines). Commit:
     this commit (UI logic and fake).
+- [x] T4b-fix (the four advisory findings of the T4a-fix/T4b reviews). Route: delegated writer.
+  - A session load wrote back the desk's recording settings as read when it began, so a settings
+    save (which does not take the engine lock) landing meanwhile was undone. `SessionStore::replace`
+    now takes the recording section from the store when it writes, under the lock `set_recording`
+    uses; the load passes none. Test: the stand-in engine's `Park` (now watching the whole session)
+    holds the load after the engine took its groups while a settings change is saved; the change
+    survives in memory and in the file (10 repeated runs green).
+  - The default recordings folder is never inside the config folder: `default_recordings_folder`
+    takes the config folder, and the Music folder, the data folder (the config folder on macOS)
+    and the temp folder each give way to the next when inside it, ending at `MixLink Recordings`
+    beside it; the notice says why and where. `DesktopState::new` goes through it too, and
+    `kept_folder` refuses a folder inside the config folder before matching the default.
+  - UI: `setRecordingSettings` builds each request when its turn comes, on the store's last
+    answered settings plus its own fields, so a refused or failed change never rides along in a
+    change queued behind it. The disk estimate is read on connect (engine found or not) and after
+    every engine start.
+  - RED: desktop 4 of 237 failed (the forced load interleaving, the default inside the config
+    folder, `DesktopState::new`'s default, the typed default inside the config folder; the
+    signature was stubbed first so the RED is by assertion). UI 3 of 401 failed (the queued change
+    after a refusal, the estimate on connect with and without an engine); with only the connect
+    read in, the start read failed alone (1 of 401).
+  - GREEN: desktop tests 233 -> 237, `cargo build` clean; UI tests 398 -> 401.
+  - Commits: a928046 (desktop, 245 lines). Commit: this commit (UI).
 - [ ] T5 (Record screen): the Record section per the design, the REC chip, takes table and
   settings. Route: delegated writer.
 - [ ] T6 (virtual soundcheck): the playback source in place of capture and its UI. Route:
@@ -472,6 +495,12 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 - T4a-fix (a089b41) is pending review in the slice from a4d4bf1.
 - T4b done in three work units: d825ca5, 6c8bbc8 and the UI commit; all after a4d4bf1, so the
   next review slice from a4d4bf1 holds T4a-fix and T4b.
+- T4a-fix and T4b were reviewed in two parts, both approved and acknowledged:
+  review-d91be407e09f69aa (a4d4bf1..6c8bbc8) and review-b830744f9a762630 (6c8bbc8..c4ba1a7). Their
+  four advisory findings (a load undoing a recording settings save, a default folder inside the
+  config folder, a queued settings change carrying a refused one, no estimate on connect or start)
+  are fixed by T4b-fix. Next review base: c4ba1a7.
+- T4b-fix (a928046 and the UI commit) is pending review in the slice from c4ba1a7.
 
 ## Next step
 

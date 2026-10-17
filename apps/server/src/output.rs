@@ -20,6 +20,9 @@
 //! with ASIO at 256 frames), and never by more than one callback plus four blocks before frames are
 //! dropped: 31.3 ms and 26.7 ms in those two cases, plus the device's own output buffer.
 //!
+//! While a take plays back in place of the inputs, the output's callback is its clock: each
+//! callback tells the take's [PlaybackClock] the frames it played (see [crate::soundcheck]).
+//!
 //! The output callback never allocates, locks or panics. Opening follows the engine's host rules
 //! (see [offered_outputs]): never ASIO by default, and under ASIO only the outputs of the driver the
 //! capture already holds.
@@ -43,6 +46,7 @@ use crate::engine::OutputMeter;
 use crate::mix::{MixPlan, MixState, OUTPUT_CHANNELS};
 use crate::pipeline::{Block, Sink, SourceFormat, DEFAULT_BLOCK_FRAMES, MAX_BLOCK_FRAMES};
 use crate::protocol::to_pcm16;
+use crate::soundcheck::PlaybackClock;
 
 /// The smallest output ring, in stereo frames: half a second at 48 kHz.
 const RING_MIN_FRAMES: usize = TARGET_SAMPLE_RATE as usize / 2;
@@ -175,6 +179,9 @@ pub(crate) struct OutputPlayer {
     primed: bool,
     /// The ring has reached its target at least once: silence from then on is an underrun.
     started: bool,
+    /// The clock a take played back follows (see [crate::soundcheck]): every callback tells it
+    /// the frames the device played.
+    clock: Option<Arc<PlaybackClock>>,
 }
 
 /// Both ends of a new output ring, for a device with `channels` outputs playing the pair that
@@ -199,6 +206,7 @@ pub(crate) fn output_link(
         first,
         primed: false,
         started: false,
+        clock: None,
     };
     (feed, player, shared)
 }
@@ -239,6 +247,12 @@ impl OutputSample for i32 {
 }
 
 impl OutputPlayer {
+    /// Makes this output the clock of a take played back: each callback tells `clock` the frames
+    /// the device played.
+    pub(crate) fn set_clock(&mut self, clock: Arc<PlaybackClock>) {
+        self.clock = Some(clock);
+    }
+
     /// Fills one device buffer of interleaved frames: the local mix's left and right into the
     /// chosen pair, silence in every other channel. Called from the output callback: it never
     /// allocates, locks or panics.
@@ -299,6 +313,11 @@ impl OutputPlayer {
                 .underrun_frames
                 .fetch_add(missing as u64, Ordering::Relaxed);
             self.primed = false;
+        }
+        // The device played `frames`, whatever they held: that is the time a take played back
+        // follows.
+        if let Some(clock) = &self.clock {
+            clock.played(frames);
         }
     }
 }
@@ -610,13 +629,15 @@ pub(crate) struct OpenedOutput {
 ///
 /// `buffer_frames` is the capture's buffer: an ASIO driver runs one buffer size for input and
 /// output, so it is used (within the driver's range) when `host` is ASIO; elsewhere the device
-/// keeps its own period. A device error later marks only this output failed.
+/// keeps its own period. A device error later marks only this output failed. Every callback ticks
+/// `clock`, which a take played back follows.
 pub(crate) fn open_output(
     device: &Device,
     host: AudioHost,
     request: &LocalOutputRequest,
     buffer_frames: Option<u32>,
     block_frames: usize,
+    clock: Arc<PlaybackClock>,
 ) -> Result<OpenedOutput, Box<dyn Error>> {
     let needed = request.first_channel.saturating_add(2);
     let supported = select_output_config(device, needed)?;
@@ -627,11 +648,12 @@ pub(crate) fn open_output(
         }
         _ => BufferSize::Default,
     };
-    let (feed, player, shared) = output_link(
+    let (feed, mut player, shared) = output_link(
         usize::from(config.channels),
         usize::from(request.first_channel),
         block_frames,
     );
+    player.set_clock(clock);
     let stream = match supported.sample_format() {
         SampleFormat::F32 => open_typed::<f32>(device, config, player, &shared),
         SampleFormat::I16 => open_typed::<i16>(device, config, player, &shared),

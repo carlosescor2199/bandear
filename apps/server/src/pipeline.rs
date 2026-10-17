@@ -27,8 +27,12 @@
 //! Device switches never interleave two devices: every capture stream has its own ring and that
 //! ring's single producer (an rtrb `Producer` cannot be cloned), and the engine thread reads exactly
 //! one ring at a time, moving to a new stream's ring between two blocks.
+//!
+//! A take can stand in for the capture (a virtual soundcheck, see [crate::soundcheck]): the engine
+//! thread then takes its blocks, in the capture's layout, from the take's ring as the take's clock
+//! makes them due, and the capture callback lets its audio go until the engine goes back to it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle, Thread};
@@ -39,6 +43,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::decimate::Decimator;
 use crate::engine::{LevelMeter, METER_IDLE_FRAMES, METER_IDLE_WAIT};
+use crate::soundcheck::PlaybackReader;
 
 /// The longest block the engine thread hands the sinks: 8192 frames, 171 ms. A stereo packet of it
 /// is 32,788 bytes, well inside one UDP datagram and the phone's receive buffer.
@@ -105,6 +110,9 @@ pub(crate) struct CaptureStats {
     /// Callback passes dropped whole because their frames did not fit: each is audio the phones
     /// never get, which the status counts with the packets the network failed to send.
     pub(crate) dropped_blocks: AtomicU64,
+    /// A take plays in place of capture (see [crate::soundcheck]): the callback lets its audio go
+    /// without metering, counting or queueing it. Set and cleared by the engine thread.
+    pub(crate) suspended: AtomicBool,
 }
 
 /// The shared state a capture callback writes to: the input meters, the counters and the engine
@@ -186,6 +194,10 @@ impl CaptureWriter {
     /// Each pass of up to [SCRATCH_FRAMES] output frames goes into the ring whole or not at all,
     /// so a full ring drops audio in callback-sized pieces and never splits a frame.
     pub(crate) fn write<T: CaptureSample>(&mut self, data: &[T]) {
+        if self.links.stats.suspended.load(Ordering::Acquire) {
+            // A take plays in place of this capture: its audio goes nowhere and is not metered.
+            return;
+        }
         let pass = SCRATCH_FRAMES * self.decimator.ratio() * self.channels;
         for input in data.chunks(pass) {
             let frames = self.decimator.process(input, T::to_f32, &mut self.scratch);
@@ -244,11 +256,19 @@ pub(crate) enum PipelineCommand {
     /// Read this stream's ring from the next block on; the previous ring is dropped with any
     /// frames still in it.
     Source(SourceReader),
+    /// Play a take in place of the capture from the next block on (see [crate::soundcheck]): the
+    /// capture stream is set aside, not closed.
+    Playback(PlaybackReader),
+    /// Back to the capture stream set aside by [Self::Playback], dropping what it left in its
+    /// ring; the take's reader is let go of.
+    Live,
 }
 
 /// The engine thread's state: the ring it reads, the block it fills and the sinks it feeds.
 pub(crate) struct Pipeline {
     source: Option<SourceReader>,
+    /// A take playing in place of `source`, which is kept for the way back.
+    playback: Option<PlaybackReader>,
     block: Vec<f32>,
     sequence: u64,
     sinks: Vec<Box<dyn Sink>>,
@@ -263,7 +283,7 @@ pub(crate) struct Pipeline {
 }
 
 /// `duration` in frames at 48 kHz, rounded down.
-fn frames_in(duration: Duration) -> usize {
+pub(crate) fn frames_in(duration: Duration) -> usize {
     (duration.as_micros() * u128::from(TARGET_SAMPLE_RATE) / 1_000_000) as usize
 }
 
@@ -271,6 +291,7 @@ impl Pipeline {
     pub(crate) fn new(sinks: Vec<Box<dyn Sink>>, levels: Arc<LevelMeter>) -> Self {
         Self {
             source: None,
+            playback: None,
             block: Vec::new(),
             sequence: 0,
             sinks,
@@ -297,11 +318,51 @@ impl Pipeline {
     fn apply(&mut self, command: PipelineCommand) {
         match command {
             PipelineCommand::Source(source) => self.set_source(source),
+            PipelineCommand::Playback(playback) => self.play(playback),
+            PipelineCommand::Live => self.go_live(),
         }
     }
 
+    /// Plays `playback` in place of the capture from the next block on, in blocks of the capture's
+    /// layout. The capture callback is told to let its audio go, and the input meters start again
+    /// from the take's first block.
+    pub(crate) fn play(&mut self, playback: PlaybackReader) {
+        playback.capture().suspended.store(true, Ordering::Release);
+        self.levels.clear();
+        // The engine never sends a second take before the first is let go of.
+        self.playback = Some(playback);
+    }
+
+    /// Back to the capture stream set aside by [Self::play]: the frames it left in its ring are
+    /// dropped (the callback has stopped queueing), then it queues and meters again. The take's
+    /// reader is let go of here, which frees nothing: the disk thread and the engine's side still
+    /// hold everything it shares (see [crate::soundcheck]).
+    pub(crate) fn go_live(&mut self) {
+        let Some(playback) = self.playback.take() else {
+            return;
+        };
+        if let Some(source) = self.source.as_mut() {
+            let queued = source.consumer.slots();
+            if let Ok(chunk) = source.consumer.read_chunk(queued) {
+                chunk.commit_all();
+            }
+        }
+        self.levels.clear();
+        playback.capture().suspended.store(false, Ordering::Release);
+    }
+
     /// Hands every whole block waiting in the ring to the sinks, in order; returns how many.
+    #[cfg(test)]
     pub(crate) fn pump(&mut self) -> usize {
+        self.pump_at(Instant::now())
+    }
+
+    /// Hands every whole block waiting in the ring to the sinks, in order, or, while a take plays,
+    /// every block its clock has made due by `now`; returns how many.
+    pub(crate) fn pump_at(&mut self, now: Instant) -> usize {
+        if self.playback.is_some() {
+            return self.pump_playback(now);
+        }
         let Some(source) = self.source.as_mut() else {
             return 0;
         };
@@ -325,6 +386,47 @@ impl Pipeline {
             blocks += 1;
         }
         blocks
+    }
+
+    /// Hands the sinks every block of the take its clock has made due by `now`, in the capture's
+    /// layout, metered as the capture callback meters its own; returns how many.
+    fn pump_playback(&mut self, now: Instant) -> usize {
+        let Self {
+            source,
+            playback,
+            block,
+            sequence,
+            sinks,
+            levels,
+            received,
+            ..
+        } = self;
+        let (Some(source), Some(playback)) = (source.as_ref(), playback.as_mut()) else {
+            return 0;
+        };
+        let format = source.format;
+        if format.channels == 0
+            || block.len() != format.block_frames * format.channels
+            || playback.channels() != format.channels
+        {
+            return 0;
+        }
+        let due = playback.due(now, format.block_frames);
+        for _ in 0..due {
+            playback.fill(block.as_mut_slice());
+            levels.observe(block.as_slice(), format.channels);
+            let handed = Block {
+                samples: block.as_slice(),
+                channels: format.channels,
+                sequence: *sequence,
+            };
+            for sink in sinks.iter_mut() {
+                sink.process(&handed);
+            }
+            *sequence = sequence.wrapping_add(1);
+            *received += format.block_frames;
+        }
+        due
     }
 
     /// Lets every meter fall by the audio time no block covered, checked every [METER_IDLE_WAIT].
@@ -369,11 +471,16 @@ impl Pipeline {
         }
     }
 
-    /// How long the engine thread may sleep before [Self::tick] has something to do.
+    /// How long the engine thread may sleep before [Self::tick] has something to do, or, while a
+    /// take plays, before its next block is due on the timer.
     fn wait(&self, now: Instant) -> Duration {
-        match self.checked {
+        let meters = match self.checked {
             Some(checked) => METER_IDLE_WAIT.saturating_sub(now.saturating_duration_since(checked)),
             None => Duration::ZERO,
+        };
+        match (&self.playback, &self.source) {
+            (Some(playback), Some(source)) => meters.min(playback.wait(source.format.block_frames)),
+            _ => meters,
         }
     }
 }
@@ -411,6 +518,24 @@ impl PipelineHandle {
         Ok(())
     }
 
+    /// Plays `playback` in place of the capture from the next block on.
+    pub(crate) fn play(&self, playback: PlaybackReader) -> Result<(), String> {
+        self.send(PipelineCommand::Playback(playback))
+    }
+
+    /// Takes the engine thread back to the capture stream after a take played.
+    pub(crate) fn go_live(&self) -> Result<(), String> {
+        self.send(PipelineCommand::Live)
+    }
+
+    fn send(&self, command: PipelineCommand) -> Result<(), String> {
+        self.commands
+            .send(command)
+            .map_err(|_| "the engine thread has stopped".to_owned())?;
+        self.thread.thread().unpark();
+        Ok(())
+    }
+
     /// Stops the engine thread and waits for it.
     pub(crate) fn stop(self) -> Result<(), String> {
         drop(self.commands);
@@ -436,8 +561,8 @@ fn run(mut pipeline: Pipeline, commands: Receiver<PipelineCommand>) {
                 Err(TryRecvError::Disconnected) => return,
             }
         }
-        pipeline.pump();
         let now = Instant::now();
+        pipeline.pump_at(now);
         pipeline.tick(now);
         thread::park_timeout(pipeline.wait(now));
     }

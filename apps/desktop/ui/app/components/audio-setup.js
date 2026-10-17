@@ -150,6 +150,7 @@ class MlAudioSetup extends HTMLElement {
       `<section aria-labelledby="audio-title">
         <h2 id="audio-title">Audio input</h2>
         <div class="grid">
+          <p class="caution full" role="status" data-recording-lock hidden></p>
           <label for="host">Driver</label>
           <select id="host"></select>
           <p class="caution full" data-asio hidden>
@@ -202,6 +203,7 @@ class MlAudioSetup extends HTMLElement {
       device: $("#device"),
       buffer: $("#buffer"),
       asio: $("[data-asio]"),
+      recordingLock: $("[data-recording-lock]"),
       devicesError: $("[data-devices-error]"),
       warning: $("[data-warning]"),
       warningText: $("[data-warning-text]"),
@@ -244,6 +246,9 @@ class MlAudioSetup extends HTMLElement {
     this.#data = data;
     const parts = this.#parts;
     fill(parts.host, data.hosts, data.host);
+    parts.host.disabled = Boolean(data.hostDisabled);
+    parts.recordingLock.hidden = !data.recordingLock;
+    setText(parts.recordingLock, data.recordingLock ?? "");
     parts.asio.hidden = !data.asioPending;
     const choices = data.asioPending
       ? [{ value: "", label: "Choose an ASIO driver…" }, ...data.devices]
@@ -261,6 +266,7 @@ class MlAudioSetup extends HTMLElement {
     parts.applyRow.hidden = !data.asioPending;
     parts.apply.disabled = !data.canApplyAsio;
     fill(parts.buffer, data.buffers, data.buffer);
+    parts.buffer.disabled = Boolean(data.bufferDisabled);
     setText(parts.format, data.readouts.format);
     setText(parts.rate, data.readouts.sampleRate);
     setText(parts.port, data.readouts.controlPort);

@@ -16,6 +16,7 @@ import {
   validateAddress,
   windowTitle,
 } from "../app/lib/network-view.js";
+import { IDLE_RECORDING, RECORDING_BLOCKS_SWITCH } from "../app/lib/recording.js";
 
 function reduce(list, state = initialState) {
   return list.reduce(consoleReducer, state);
@@ -187,6 +188,26 @@ test("with no engine the device cannot be switched, and the numbers are blank", 
     true,
     "nothing to pick",
   );
+});
+
+test("while a take records, the driver, device and buffer are locked and the setup says why", () => {
+  const free = audioSetupView(withDevices(running, "auto", sampleDevices()), NO_DRAFT);
+  assert.equal(free.recordingLock, null);
+  assert.equal(free.hostDisabled, false);
+  assert.equal(free.bufferDisabled, false);
+
+  const status = { ...sampleStatus(), recording: { ...IDLE_RECORDING, state: "recording" } };
+  const recording = reduce([actions.status(status), actions.devices("auto", sampleDevices())]);
+  const view = audioSetupView(recording, NO_DRAFT);
+  assert.equal(view.recordingLock, RECORDING_BLOCKS_SWITCH);
+  assert.equal(view.hostDisabled, true);
+  assert.equal(view.deviceDisabled, true);
+  assert.equal(view.bufferDisabled, true);
+
+  const stopping = reduce([
+    actions.status({ ...status, recording: { ...IDLE_RECORDING, state: "stopping" } }),
+  ]);
+  assert.equal(audioSetupView(stopping, NO_DRAFT).recordingLock, RECORDING_BLOCKS_SWITCH);
 });
 
 test("the audio selects show the remembered choice, and the running device while one runs", () => {

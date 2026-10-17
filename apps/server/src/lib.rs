@@ -25,7 +25,8 @@ pub use health::{LinkHealth, LinkStatus};
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
 pub use recorder::{
-    RecordRequest, RecordingState, RecordingStatus, TakeEnd, TakeSummary, TakeTrack, TrackKind,
+    free_space, minutes_left, DiskEstimate, RecordRequest, RecordingState, RecordingStatus,
+    TakeEnd, TakeMarker, TakeSummary, TakeTrack, TrackKind,
 };
 pub use targets::{MirrorStatus, MusicianKey};
 pub use wav::{SampleFormat, WavError, WavReader, WavSpec, WavTarget, WavWriter};

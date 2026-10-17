@@ -60,6 +60,9 @@ const TAKE_FILE: &str = "take.json";
 /// The longest take or track name kept in a file name, in characters.
 const MAX_NAME_CHARS: usize = 60;
 
+/// The longest marker name, in characters.
+const MAX_MARKER_CHARS: usize = 64;
+
 /// How many folders named alike a take tries before giving up.
 const MAX_FOLDER_ATTEMPTS: u32 = 100;
 
@@ -113,6 +116,26 @@ pub enum TakeEnd {
     DiskError { reason: String },
 }
 
+/// A named point in a take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TakeMarker {
+    /// The frame it marks, counted from the take's first frame: the first frame of the block
+    /// being recorded when it was added.
+    pub frame: u64,
+    pub name: String,
+}
+
+/// What a take of a request would take on the disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskEstimate {
+    /// The bytes every second of the take adds, over all its files.
+    pub bytes_per_second: u64,
+    /// The free space on the folder's disk; `None` when it cannot be read.
+    pub free_bytes: Option<u64>,
+    /// The whole minutes that free space holds.
+    pub minutes_left: Option<u64>,
+}
+
 /// A finished take, as `take.json` describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TakeSummary {
@@ -127,6 +150,7 @@ pub struct TakeSummary {
     pub tracks: Vec<TakeTrack>,
     /// The frames in every file.
     pub frames: u64,
+    pub markers: Vec<TakeMarker>,
     /// Frames the disk could not keep up with, left out of every file.
     pub dropped_frames: u64,
     pub ended: TakeEnd,
@@ -179,8 +203,86 @@ pub struct RecordingStatus {
     pub bytes_written: u64,
     /// The take's track names, in file order.
     pub tracks: Vec<String>,
+    /// The take's markers so far.
+    pub markers: Vec<TakeMarker>,
+    /// The free space on the take's disk; `None` without a take or when it cannot be read.
+    pub free_bytes: Option<u64>,
+    /// The whole minutes of this take the free space still holds.
+    pub minutes_left: Option<u64>,
     /// The most recent take that ended, however it ended.
     pub last_take: Option<TakeSummary>,
+}
+
+/// The free space, in bytes, on the disk that holds `path` (or its nearest existing parent), for
+/// this user; `None` when it cannot be read, and on systems other than Windows.
+pub fn free_space(path: &Path) -> Option<u64> {
+    let existing = path.ancestors().find(|folder| folder.is_dir())?;
+    disk::free_bytes(existing)
+}
+
+#[cfg(windows)]
+mod disk {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// `GetDiskFreeSpaceExW`: each output is a `ULARGE_INTEGER`, which is a `u64`; any may be
+        /// null.
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    /// The bytes free to this user on the disk of `directory`, which exists.
+    pub(super) fn free_bytes(directory: &Path) -> Option<u64> {
+        let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut free = 0u64;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call, `free` is a u64
+        // the call may write, and the other two outputs are null, which the call allows.
+        let succeeded = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (succeeded != 0).then_some(free)
+    }
+}
+
+#[cfg(not(windows))]
+mod disk {
+    use std::path::Path;
+
+    /// The standard library reads no free space; elsewhere it is not reported.
+    pub(super) fn free_bytes(_directory: &Path) -> Option<u64> {
+        None
+    }
+}
+
+/// The whole minutes `free_bytes` hold at `bytes_per_second`; `None` when nothing is written.
+pub fn minutes_left(free_bytes: u64, bytes_per_second: u64) -> Option<u64> {
+    (bytes_per_second > 0).then(|| free_bytes / bytes_per_second / 60)
+}
+
+/// The bytes a second of `tracks` takes in `format`, over all their files.
+pub(crate) fn take_bytes_per_second(tracks: &[PlannedTrack], format: SampleFormat) -> u64 {
+    tracks
+        .iter()
+        .map(|track| {
+            WavSpec {
+                channels: track.width() as u16,
+                sample_rate: TARGET_SAMPLE_RATE,
+                format,
+            }
+            .bytes_per_second()
+        })
+        .sum()
 }
 
 /// One track of a take being set up: its description and the source channels it holds.
@@ -438,9 +540,18 @@ pub(crate) struct TakeShared {
     failure: Mutex<Option<String>>,
     /// How the engine ended the take. Never locked on the engine thread.
     end: Mutex<Option<TakeEnd>>,
+    /// The take's markers, in the order added. Never locked on the engine thread.
+    markers: Mutex<Vec<TakeMarker>>,
 }
 
 impl TakeShared {
+    fn markers(&self) -> Vec<TakeMarker> {
+        self.markers
+            .lock()
+            .map(|markers| markers.clone())
+            .unwrap_or_default()
+    }
+
     /// No frame follows: the disk thread finishes the take.
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
@@ -750,7 +861,9 @@ struct TakeInfo {
 }
 
 impl TakeInfo {
-    fn summary(&self, frames: u64, dropped_frames: u64, ended: TakeEnd) -> TakeSummary {
+    /// The take of `frames` frames that ended as `ended`, with the markers and dropped frames
+    /// `shared` holds.
+    fn summary(&self, shared: &TakeShared, frames: u64, ended: TakeEnd) -> TakeSummary {
         TakeSummary {
             folder: self.folder.clone(),
             name: self.name.clone(),
@@ -760,7 +873,8 @@ impl TakeInfo {
             device: self.device.clone(),
             tracks: self.tracks.clone(),
             frames,
-            dropped_frames,
+            markers: shared.markers(),
+            dropped_frames: shared.dropped.load(Ordering::Relaxed),
             ended,
         }
     }
@@ -778,9 +892,16 @@ struct TakeJson<'a> {
     device: &'a str,
     tracks: Vec<TrackJson<'a>>,
     frames: u64,
+    markers: Vec<MarkerJson<'a>>,
     dropped_frames: u64,
     /// `null` while the take records: a take a crash ended says so.
     ended: Option<EndJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct MarkerJson<'a> {
+    frame: u64,
+    name: &'a str,
 }
 
 #[derive(Serialize)]
@@ -833,6 +954,14 @@ fn write_take_file(summary: &TakeSummary, recording: bool) -> io::Result<()> {
             })
             .collect(),
         frames: summary.frames,
+        markers: summary
+            .markers
+            .iter()
+            .map(|marker| MarkerJson {
+                frame: marker.frame,
+                name: &marker.name,
+            })
+            .collect(),
         dropped_frames: summary.dropped_frames,
         ended: (!recording).then_some(match &summary.ended {
             TakeEnd::Stopped => EndJson::Stopped,
@@ -956,7 +1085,7 @@ fn run_disk<T: WavTarget>(
             .and_then(|end| end.clone())
             .unwrap_or(TakeEnd::Stopped),
     };
-    let mut summary = info.summary(written, shared.dropped.load(Ordering::Relaxed), ended);
+    let mut summary = info.summary(&shared, written, ended);
     if let Err(error) = write_take_file(&summary, false) {
         if !matches!(summary.ended, TakeEnd::DiskError { .. }) {
             summary.ended = TakeEnd::DiskError {
@@ -1034,6 +1163,8 @@ pub(crate) struct RunningTake {
     shared: Arc<TakeShared>,
     disk: Option<JoinHandle<TakeSummary>>,
     info: TakeInfo,
+    /// The bytes a second of the take adds over all its files.
+    bytes_per_second: u64,
     /// The engine was asked to stop it.
     stopping: bool,
 }
@@ -1052,12 +1183,11 @@ impl RunningTake {
     /// Waits for the disk thread and returns the take it finished.
     fn join(mut self) -> TakeSummary {
         let frames = self.shared.written.load(Ordering::Acquire);
-        let dropped = self.shared.dropped.load(Ordering::Relaxed);
         match self.disk.take().map(JoinHandle::join) {
             Some(Ok(summary)) => summary,
             _ => self.info.summary(
+                &self.shared,
                 frames,
-                dropped,
                 TakeEnd::DiskError {
                     reason: "the recorder's disk thread failed".to_owned(),
                 },
@@ -1119,7 +1249,8 @@ pub(crate) fn open_take<O: TrackOpener>(
             }
         }
     }
-    if let Err(error) = write_take_file(&info.summary(0, 0, TakeEnd::Stopped), true) {
+    let fresh = TakeShared::default();
+    if let Err(error) = write_take_file(&info.summary(&fresh, 0, TakeEnd::Stopped), true) {
         drop(files);
         let _ = fs::remove_dir_all(&folder);
         return Err(format!("could not write {TAKE_FILE}: {error}"));
@@ -1144,6 +1275,7 @@ pub(crate) fn open_take<O: TrackOpener>(
             shared,
             disk: Some(disk),
             info,
+            bytes_per_second: take_bytes_per_second(&tracks, request.format),
             stopping: false,
         },
     ))
@@ -1279,6 +1411,7 @@ impl Recorder {
             None if take.stopping => RecordingState::Stopping,
             None => RecordingState::Recording,
         };
+        let free_bytes = free_space(&take.info.folder);
         RecordingStatus {
             state,
             take_folder: Some(take.info.folder.clone()),
@@ -1291,8 +1424,41 @@ impl Recorder {
                 .iter()
                 .map(|track| track.name.clone())
                 .collect(),
+            markers: take.shared.markers(),
+            free_bytes,
+            minutes_left: free_bytes.and_then(|free| minutes_left(free, take.bytes_per_second)),
             last_take: self.last.clone(),
         }
+    }
+
+    /// Marks the frame being recorded with `name` (`Marker n` when blank, at most
+    /// [MAX_MARKER_CHARS] characters): the first frame of the block the sink records next, so a
+    /// marker is accurate to the block. An error when no take records.
+    pub(crate) fn add_marker(&self, name: &str) -> Result<TakeMarker, String> {
+        let Some(take) = self.take.as_ref().filter(|take| !take.stopping) else {
+            return Err("no take is recording".to_owned());
+        };
+        let mut markers = take
+            .shared
+            .markers
+            .lock()
+            .map_err(|_| "the take's markers were poisoned".to_owned())?;
+        // Checked under the lock the disk thread reads the markers with, after it stops a take, so
+        // a marker is never added to a take whose take.json is already written.
+        if let Some(reason) = take.shared.failure() {
+            return Err(format!("the take stopped recording: {reason}"));
+        }
+        let trimmed = name.trim();
+        let marker = TakeMarker {
+            frame: take.shared.frames.load(Ordering::Acquire),
+            name: if trimmed.is_empty() {
+                format!("Marker {}", markers.len() + 1)
+            } else {
+                trimmed.chars().take(MAX_MARKER_CHARS).collect()
+            },
+        };
+        markers.push(marker.clone());
+        Ok(marker)
     }
 }
 
@@ -1814,11 +1980,113 @@ pub(crate) mod tests {
         let summary = bench.stop();
         assert_eq!(summary.ended, TakeEnd::DiskError { reason });
         assert_eq!(read_wav(&folder.join("01 Vocal.wav")).1.len(), 128);
-        assert_eq!(read_wav(&folder.join("02 CH 2.wav")).1.len(), 192);
+        // The failing refresh may come before or after the third block is written: the other
+        // file is finished with every frame the take wrote either way.
+        let other = read_wav(&folder.join("02 CH 2.wav")).1.len();
+        assert!(other == 128 || other == 192, "{other}");
+        assert_eq!(other as u64, summary.frames);
         let json = read_json(&folder.join(TAKE_FILE));
         assert_eq!(json["ended"]["how"], "diskError");
         assert!(json["ended"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("no space left")));
+    }
+
+    /// A marker lands on the first frame of the block being recorded, in the files' frames; a
+    /// blank name is numbered; `take.json` lists the markers, and a take that ended takes none.
+    #[test]
+    fn markers_land_on_the_frame_being_recorded() {
+        let parent = scratch_directory("markers");
+        let mut bench = bench();
+        let folder = bench.start(&request(&parent, vec![0], SampleFormat::Int24), FileOpener);
+        let input = numbered(0, 64, 4);
+        for _ in 0..3 {
+            bench.sink.process(&block(&input, 4));
+        }
+
+        let verse = bench.recorder.add_marker("Verse").expect("a take records");
+        for _ in 0..2 {
+            bench.sink.process(&block(&input, 4));
+        }
+        let blank = bench.recorder.add_marker("  ").expect("a take records");
+        let long = bench
+            .recorder
+            .add_marker(&"x".repeat(80))
+            .expect("a take records");
+
+        assert_eq!(
+            (verse.frame, verse.name.as_str()),
+            (192, "Verse"),
+            "after three blocks of 64"
+        );
+        assert_eq!((blank.frame, blank.name.as_str()), (320, "Marker 2"));
+        assert_eq!(long.name.chars().count(), 64);
+        assert_eq!(
+            bench.recorder.status().markers,
+            vec![verse.clone(), blank.clone(), long.clone()]
+        );
+        let summary = bench.stop();
+        assert_eq!(summary.markers, vec![verse, blank, long]);
+        let json = read_json(&folder.join(TAKE_FILE));
+        assert_eq!(
+            json["markers"][0],
+            serde_json::json!({ "frame": 192, "name": "Verse" })
+        );
+        assert_eq!(
+            json["markers"][1],
+            serde_json::json!({ "frame": 320, "name": "Marker 2" })
+        );
+        let refused = bench
+            .recorder
+            .add_marker("Late")
+            .expect_err("no take records");
+        assert!(refused.contains("recording"), "{refused}");
+    }
+
+    /// The minutes left are the free space over the bytes per second of every armed track.
+    #[test]
+    fn minutes_left_are_the_free_space_over_the_armed_tracks_rate() {
+        // CH 1 (mono), CH 3-4 (stereo) and the local mix (stereo): five channels.
+        let tracks = plan_tracks(&four_inputs(), 4, &[0, 2], true).expect("a valid plan");
+        assert_eq!(
+            take_bytes_per_second(&tracks, SampleFormat::Int24),
+            5 * 3 * 48_000
+        );
+        assert_eq!(
+            take_bytes_per_second(&tracks, SampleFormat::Float32),
+            5 * 4 * 48_000
+        );
+
+        assert_eq!(minutes_left(144_000 * 60 * 10, 144_000), Some(10));
+        assert_eq!(minutes_left(144_000 * 60 * 10 - 1, 144_000), Some(9));
+        assert_eq!(minutes_left(0, 144_000), Some(0));
+        assert_eq!(minutes_left(1_000, 0), None, "nothing is written");
+    }
+
+    /// The free space is read for a folder, or for its nearest parent when it is not made yet;
+    /// the status of a take reports it with the minutes it holds.
+    #[test]
+    fn free_space_is_read_for_the_takes_disk() {
+        let parent = scratch_directory("space");
+        let free = free_space(&parent);
+        let unmade = free_space(&parent.join("not").join("made"));
+        if cfg!(windows) {
+            assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
+            assert!(unmade.is_some(), "the nearest parent is read");
+        } else {
+            assert_eq!((free, unmade), (None, None));
+        }
+
+        let mut bench = bench();
+        bench.start(&request(&parent, vec![0], SampleFormat::Int24), FileOpener);
+        let status = bench.recorder.status();
+        assert_eq!(status.free_bytes.is_some(), cfg!(windows));
+        assert_eq!(
+            status.minutes_left,
+            status
+                .free_bytes
+                .and_then(|bytes| minutes_left(bytes, 144_000))
+        );
+        bench.stop();
     }
 }

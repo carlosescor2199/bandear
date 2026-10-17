@@ -5067,7 +5067,8 @@ mod tests {
             )
             .expect("the take starts");
         capture.write(&[0.5f32; 2 * 64]);
-        assert!(until(|| engine.recording().bytes_written > 0));
+        // The block is written and its header refreshed before the disk fails.
+        assert!(until(|| engine.recorder.written() == 64));
 
         fail.store(true, Ordering::Relaxed);
         capture.write(&[0.5f32; 2 * 64]);

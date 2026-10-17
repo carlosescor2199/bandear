@@ -65,6 +65,14 @@
 //   (and keeps it as the store's `recordingOutcome`) and reads the status after it. While a take
 //   records, a device switch and a driver change are refused in words before anything reaches the
 //   engine, which refuses a switch too: a take never mixes two devices.
+// - The virtual soundcheck (the Record screen; see soundcheck.js): `startSoundcheck(folder, {
+//   startFrame, looping })` plays a take in place of the live inputs (a take's Play is this; there
+//   is no separate playback), `pauseSoundcheck`, `resumeSoundcheck`, `seekSoundcheck(frame)` (one
+//   at a time, the latest winning), `setSoundcheckLoop(looping)` and `stopSoundcheck()` (back to
+//   the live inputs). Each answers `{ ok, message, soundcheck }`, shows the answer on the status at
+//   once and says the outcome as the store's `recordingOutcome` ("soundcheck"). While a soundcheck
+//   plays, a recording, a device switch and a driver change are refused in words, and while a take
+//   records no soundcheck starts; the engine refuses each too.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -75,6 +83,7 @@ import {
   initialState,
   isLiveRun,
   isRecordingNow,
+  isSoundcheckNow,
   mixOf,
   musicianByAddress,
   pendingEdits,
@@ -98,6 +107,13 @@ import {
   formatStopped,
   settingsRequest,
 } from "./recording.js";
+import {
+  RECORDING_BLOCKS_SOUNDCHECK,
+  SOUNDCHECK_BLOCKS_RECORDING,
+  SOUNDCHECK_BLOCKS_SWITCH,
+  SOUNDCHECK_REFUSED,
+  formatSoundcheckDone,
+} from "./soundcheck.js";
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
@@ -604,6 +620,12 @@ export function createConsoleApp({
       store.dispatch(actions.commandFailed("switch", RECORDING_BLOCKS_SWITCH));
       return { ok: false, error: RECORDING_BLOCKS_SWITCH };
     }
+    if (isSoundcheckNow(state)) {
+      // A restart would drop the take playing in place of the inputs, and the engine refuses a
+      // switch under it.
+      store.dispatch(actions.commandFailed("switch", SOUNDCHECK_BLOCKS_SWITCH));
+      return { ok: false, error: SOUNDCHECK_BLOCKS_SWITCH };
+    }
     if (keepDevice && state.audioNotice?.kind === "fallback") {
       store.dispatch(actions.audio(change));
       choiceUnsaved = true;
@@ -630,6 +652,10 @@ export function createConsoleApp({
   async function switchDevice(name) {
     if (isRecordingNow(store.getState())) {
       store.dispatch(actions.commandFailed("switch", RECORDING_BLOCKS_SWITCH));
+      return;
+    }
+    if (isSoundcheckNow(store.getState())) {
+      store.dispatch(actions.commandFailed("switch", SOUNDCHECK_BLOCKS_SWITCH));
       return;
     }
     if (switchMethod(store.getState().audio) === "restart") {
@@ -938,6 +964,10 @@ export function createConsoleApp({
   // Starts a take called `name` with the kept settings, its folder named in the window's local
   // time, then reads the status (which shows it recording) and the takes.
   async function startRecording(name) {
+    if (isSoundcheckNow(store.getState())) {
+      // A take records the live inputs, never a soundcheck's playback; the engine refuses too.
+      return recordingSaid("start", false, SOUNDCHECK_BLOCKS_RECORDING);
+    }
     const takeName = String(name ?? "").trim();
     let started;
     try {
@@ -1018,6 +1048,63 @@ export function createConsoleApp({
       );
     }
     return recordingSaid("open", true, `Opened ${folder}.`);
+  }
+
+  // Runs the soundcheck command `action` ("start", "pause", "resume", "seek", "loop", "stop"):
+  // `send` asks the desk; its answer, the soundcheck now, shows at once on the run's status
+  // (`readAfter` reads the whole status after it too), and the outcome is said as the store's
+  // recording outcome ("soundcheck"). Answers `{ ok, message, soundcheck }`.
+  async function soundcheckCommand(action, send, { readAfter = false } = {}) {
+    const shown = store.getState().engine.run;
+    let answer;
+    try {
+      answer = await send();
+    } catch (error) {
+      return recordingSaid(
+        "soundcheck",
+        false,
+        sentenceWithReason(SOUNDCHECK_REFUSED[action], message(error)),
+      );
+    }
+    store.dispatch(actions.soundcheck(answer, shown));
+    if (readAfter) {
+      await readStatus();
+    }
+    return recordingSaid("soundcheck", true, formatSoundcheckDone(action, answer), {
+      soundcheck: answer,
+    });
+  }
+
+  // Plays the take in `folder` in place of the live inputs; never while a take records.
+  async function startSoundcheck(folder, { startFrame = 0, looping = false } = {}) {
+    if (isRecordingNow(store.getState())) {
+      return recordingSaid("soundcheck", false, RECORDING_BLOCKS_SOUNDCHECK);
+    }
+    return soundcheckCommand("start", () => api.startSoundcheck(folder, startFrame, looping), {
+      readAfter: true,
+    });
+  }
+
+  // Seeks go out one at a time and the last one asked wins: a slider dragged across the take sends
+  // the first move and then only the latest, never every step.
+  let seekWanted = null;
+  let seeking = null;
+  function seekSoundcheck(frame) {
+    seekWanted = frame;
+    seeking ??= (async () => {
+      let result = null;
+      try {
+        while (seekWanted !== null) {
+          const next = seekWanted;
+          seekWanted = null;
+          result = await soundcheckCommand("seek", () => api.seekSoundcheck(next));
+        }
+      } finally {
+        seeking = null;
+      }
+      return result;
+    })();
+    return seeking;
   }
 
   // The window's title follows the input device, as the old window's did.
@@ -1201,6 +1288,24 @@ export function createConsoleApp({
     refreshEstimate,
     /** Opens a take folder in the system's file manager; answers `{ ok, message }`. */
     openTakeFolder,
+    /**
+     * Plays the take in `folder` (as a take lists it) in place of the live inputs, from
+     * `startFrame`, looping when `looping`: the virtual soundcheck, and what a take's Play does.
+     * Refused in words while a take records. Answers `{ ok, message, soundcheck }`.
+     */
+    startSoundcheck,
+    /** Pauses the soundcheck's take; answers `{ ok, message, soundcheck }`. */
+    pauseSoundcheck: () => soundcheckCommand("pause", () => api.pauseSoundcheck()),
+    /** Plays the take on (from its start once it stopped at its end). */
+    resumeSoundcheck: () => soundcheckCommand("resume", () => api.resumeSoundcheck()),
+    /** Moves the take to `frame`; quick moves send only the latest after the first. */
+    seekSoundcheck,
+    /** Whether the take starts again at its end. */
+    setSoundcheckLoop: (looping) =>
+      soundcheckCommand("loop", () => api.setSoundcheckLoop(Boolean(looping))),
+    /** Stops the soundcheck: back to the live inputs at once. */
+    stopSoundcheck: () =>
+      soundcheckCommand("stop", () => api.stopSoundcheck(), { readAfter: true }),
     select(address) {
       store.dispatch(actions.select(address));
     },

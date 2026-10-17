@@ -49,8 +49,10 @@
 //              failed. A run's end keeps them.
 //   estimate   what a take with the kept settings would take on the disk (`record_estimate`), or
 //              null; a run's end forgets it, since its rate depends on the running device.
-//   recordingOutcome { action, ok, message }: the last recording command's outcome in words
-//              ("settings", "start", "stop", "marker", "open"), or null.
+//   recordingOutcome { action, ok, message }: the last recording or soundcheck command's outcome
+//              in words ("settings", "start", "stop", "marker", "open", "soundcheck"), or null.
+//              Whether a take plays in place of the inputs is the status's `soundcheck`
+//              (soundcheckStatus), which a soundcheck command's answer updates at once.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -73,6 +75,7 @@ import { pairUnits } from "./channels.js";
 import { DEFAULT_AUDIO, audioChoice, restoredAudio } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
 import { isRecording, recordingOf } from "./recording.js";
+import { isSoundchecking, soundcheckOf } from "./soundcheck.js";
 import {
   ENGINEER_FIELDS,
   MIX_FIELDS,
@@ -238,6 +241,11 @@ export const actions = Object.freeze({
     type: "recording-outcome",
     outcome: action === null ? null : { action, ok, message },
   }),
+  /**
+   * A soundcheck command's answer (the soundcheck now, see soundcheck.js) for engine run `run`:
+   * shown at once on that run's status, ahead of the next status.
+   */
+  soundcheck: (soundcheck, run) => ({ type: "soundcheck", soundcheck, run }),
   /** The console is (re)connecting to the engine's events and status. */
   connecting: () => ({ type: "connection", connection: { status: "connecting", error: null } }),
   connected: () => ({ type: "connection", connection: READY }),
@@ -636,6 +644,13 @@ export function consoleReducer(state, action) {
       return { ...state, estimate: action.estimate ?? null };
     case "recording-outcome":
       return { ...state, recordingOutcome: action.outcome };
+    case "soundcheck":
+      return state.engine.status && action.soundcheck && isShownRun(state, action.run)
+        ? {
+            ...state,
+            engine: { ...state.engine, status: { ...state.engine.status, soundcheck: action.soundcheck } },
+          }
+        : state;
     default:
       return state;
   }
@@ -689,6 +704,22 @@ export function recordingStatus(state) {
 /** True while a take records or its files are being finished: the input device cannot change. */
 export function isRecordingNow(state) {
   return isRecording(recordingStatus(state));
+}
+
+/**
+ * The virtual soundcheck as the shown status reports it (see soundcheck.js), or the idle one, the
+ * inputs live, while no engine runs.
+ */
+export function soundcheckStatus(state) {
+  return soundcheckOf(state.engine.status);
+}
+
+/**
+ * True while a take plays in place of the inputs (playing, paused or failed): nothing records and
+ * the input device cannot change.
+ */
+export function isSoundcheckNow(state) {
+  return isSoundchecking(soundcheckStatus(state));
 }
 
 /** The last take that ended while the shown engine ran, or null. */

@@ -3,9 +3,10 @@
 //! They live apart from the `#[tauri::command]` wrappers in the crate root so that an example
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return. The engineer's local mix and its output have their own module,
-//! [local].
+//! [local], and so does recording takes, [recording].
 
 pub mod local;
+pub mod recording;
 
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
@@ -22,6 +23,7 @@ use personal_monitoring::{
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
 use self::local::{apply_kept_local, kept_local, with_pending, LocalEngine};
+use self::recording::{FolderOpener, RecordingsFolder, SystemFileManager};
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
@@ -73,11 +75,19 @@ pub struct DesktopState {
     /// Keeps the local mix in the session off the engine lock (see [local::saver]). Paused inside
     /// the engine lock by a start and a load; it writes taking only the session's lock.
     local_saver: LocalMixSaver,
+    /// The desk's default recordings folder (see [recording]).
+    recordings: RecordingsFolder,
+    /// Opens a take folder in the system's file manager (see [recording::open_take_folder]).
+    folder_opener: Box<dyn FolderOpener>,
 }
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
+    /// Takes go to a `Recordings` folder beside the session until [Self::with_recordings_folder]
+    /// names the desk's default.
     pub fn new(session: SessionStore) -> Self {
+        let recordings =
+            recording::default_recordings_folder(None, Some(session.directory().to_path_buf()));
         let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
         let session = Arc::new(session);
         let local_saver = {
@@ -97,7 +107,16 @@ impl DesktopState {
             snapshots,
             local_notice: Mutex::new(None),
             local_saver,
+            recordings,
+            folder_opener: Box::new(SystemFileManager),
         }
+    }
+
+    /// Makes `recordings` the desk's default recordings folder (see
+    /// [recording::default_recordings_folder]).
+    pub fn with_recordings_folder(mut self, recordings: RecordingsFolder) -> Self {
+        self.recordings = recordings;
+        self
     }
 
     /// Keeps `notice` as what the status says about the kept local output, or clears it.

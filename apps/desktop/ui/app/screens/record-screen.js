@@ -469,10 +469,10 @@ export function mountRecordScreen(main, app) {
   });
   parts.folderDefault.addEventListener("click", () => controller.useDefaultFolder());
   parts.formatSelect.addEventListener("change", () =>
-    app.setRecordingSettings({ format: parts.formatSelect.value }).then(render),
+    controller.changeSettings({ format: parts.formatSelect.value }),
   );
   parts.includeLocal.addEventListener("change", () =>
-    app.setRecordingSettings({ includeLocal: parts.includeLocal.checked }).then(render),
+    controller.changeSettings({ includeLocal: parts.includeLocal.checked }),
   );
 
   const unsubscribe = app.store.subscribe(scheduleRender);

@@ -5,11 +5,15 @@
 // - The transport: one command at a time; the buttons wait until it is answered (`local.busy`).
 // - The waveform lanes: while a take records, each armed track keeps a bounded history of its
 //   peaks (createPeakHistory), cleared when the next take folder appears.
-// - Arming: a press is a delta (armChange), so quick presses on several tracks all land.
+// - Arming: a press is a delta (armChange), so quick presses on several tracks all land, and a
+//   second press on a track before the first is answered toggles what the first asked.
+// - Settings requests never leave a promise rejected: the screen renders again whatever happens and
+//   a failure is said as the recording outcome.
 // - The folder field: shows the desk's folder unless the engineer is typing; a refused folder stays
 //   in it to be corrected, a kept one shows as the desk has it and its takes are listed.
 
-import { recordingStatus } from "./console-state.js";
+import { actions, recordingStatus } from "./console-state.js";
+import { sentenceWithReason } from "./format.js";
 import { stripLevel } from "./mix-view.js";
 import {
   armChange,
@@ -23,6 +27,10 @@ import {
 /** The peaks a lane keeps: about 20 seconds at the 30 meters a second the engine sends. */
 export const LANE_CAPACITY = 600;
 
+function reason(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * The controller for the console `app` (its `store` and commands). `onChange` is called whenever
  * the controller's own state changed and the screen should render again.
@@ -33,6 +41,31 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
   const histories = new Map();
   let take = null;
   let shownFolder = null;
+  // Per row key, what the arm press on its way asked for (`{ on }`).
+  const intents = new Map();
+
+  // Runs the settings request `run`; whatever happens the screen renders again, and a request
+  // that fails is said as the store's recording outcome and answered `{ ok: false, message }`.
+  async function settings(run) {
+    try {
+      return await run();
+    } catch (error) {
+      const words = sentenceWithReason("The recording settings were not changed", reason(error));
+      app.store.dispatch(actions.recordingOutcome("settings", false, words));
+      return { ok: false, message: words };
+    } finally {
+      onChange();
+    }
+  }
+
+  // Lists the takes; a listing that fails is kept to be said as the takes' error.
+  async function listTakes() {
+    try {
+      await app.refreshTakes();
+    } catch (error) {
+      app.store.dispatch(actions.takesFailed(reason(error)));
+    }
+  }
 
   function historyOf(key) {
     let history = histories.get(key);
@@ -122,36 +155,54 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
       return true;
     },
 
-    /** Arms or disarms the row `key` (a track or the local mix); null for a row not shown. */
+    /**
+     * Arms or disarms the row `key` (a track or the local mix); null for a row not shown. A press
+     * made while an earlier one on the same row is on its way toggles what that one asked, so a
+     * double press ends where it began.
+     */
     async arm(key) {
       const state = app.store.getState();
       const row = [...trackRows(state), localTrackRow(state)].find((item) => item?.key === key);
       if (!row) {
         return null;
       }
-      const result = await app.setRecordingSettings(armChange(state, row));
-      onChange();
-      return result;
+      const armedNow = intents.has(key) ? intents.get(key).on : row.armed;
+      const intent = { on: !armedNow };
+      intents.set(key, intent);
+      try {
+        return await settings(() => app.setRecordingSettings(armChange(state, row, armedNow)));
+      } finally {
+        if (intents.get(key) === intent) {
+          intents.delete(key);
+        }
+      }
+    },
+
+    /** Asks for the settings `change` (the format, the local mix) and renders again. */
+    changeSettings(change) {
+      return settings(() => app.setRecordingSettings(change));
     },
 
     /** Asks for the recordings folder `text`; a kept one is listed and shown in the field. */
-    async useFolder(text) {
-      const result = await app.setRecordingSettings({ folder: text });
-      if (result.ok) {
-        shownFolder = null;
-        await app.refreshTakes();
-      }
-      onChange();
-      return result;
+    useFolder(text) {
+      return settings(async () => {
+        const result = await app.setRecordingSettings({ folder: text });
+        if (result.ok) {
+          shownFolder = null;
+          await listTakes();
+        }
+        return result;
+      });
     },
 
     /** Goes back to the default recordings folder and lists its takes. */
-    async useDefaultFolder() {
+    useDefaultFolder() {
       shownFolder = null;
-      const result = await app.setRecordingSettings({ folder: null });
-      await app.refreshTakes();
-      onChange();
-      return result;
+      return settings(async () => {
+        const result = await app.setRecordingSettings({ folder: null });
+        await listTakes();
+        return result;
+      });
     },
 
     /**

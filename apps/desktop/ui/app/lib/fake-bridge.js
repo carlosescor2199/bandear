@@ -16,6 +16,7 @@ import {
 import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
+import { IDLE_RECORDING, RECORD_FORMATS } from "./recording.js";
 import { checkSessionName } from "./sessions.js";
 import { clampLevel } from "./values.js";
 
@@ -53,6 +54,17 @@ const METER_INTERVAL_MS = 33;
 
 /** The outputs the fake's ASIO driver has: under ASIO it offers only these, its own. */
 const ASIO_OUTPUTS = 4;
+
+/** The fake desk's default recordings folder: the Music folder + MixLink\Recordings. */
+export const FAKE_RECORDINGS_FOLDER = "C:\\Users\\Demo\\Music\\MixLink\\Recordings";
+
+/** The fake desk's own settings folder, which no recordings folder may be in. */
+export const FAKE_CONFIG_FOLDER = "C:\\Users\\Demo\\AppData\\Roaming\\MixLink";
+
+/** The rate every take is recorded at. */
+const RECORD_RATE = 48000;
+
+const RECORDING_FIELDS = Object.freeze(["folder", "format", "includeLocal", "armed"]);
 
 function clone(value) {
   return structuredClone(value);
@@ -367,6 +379,9 @@ export function sampleStatus() {
     // The engineer's local mix, the engine's default, and no local output, the default.
     localMix: { ...defaultMix(), revision: 1 },
     localOutput: offOutput(),
+    // No take records, and none has ended yet.
+    recording: clone(IDLE_RECORDING),
+    lastTake: null,
   };
 }
 
@@ -542,6 +557,21 @@ function withPort(address) {
  * `meters` carry the local mix's peak (`local`). `savedLocal` seeds what the session keeps, and
  * `savedLocal()` reads it; `failLocalOutput(reason)` stops the output in use, as an unplugged
  * device does.
+ *
+ * Recording takes too, with the desktop's rules (see recording.js): `recording_settings` and
+ * `set_recording_settings` keep the settings as the session does (`savedRecording` seeds them and
+ * `savedRecording()` reads them; the default folder is `recordingsFolder`, and a folder that is
+ * not a whole path, goes up with `..` or is in FAKE_CONFIG_FOLDER is refused). `start_recording`
+ * lays the tracks out as the engine does (an armed input past the device left out and named, a
+ * linked pair as one stereo track, the local mix last) in a folder named in the window's local
+ * time; its frames advance with `clock`, and the status carries `recording` and `lastTake`.
+ * `add_marker` marks the frame recorded now (blank: the next "Marker n"), `stop_recording` ends
+ * the take into the folder's list (`holdStop(times)` makes stops answer that the files are still
+ * being finished), and a stop or restart of the engine ends it as `engineStopped`; a take stops a
+ * device switch. `record_estimate` gives the bytes a second of the armed tracks against
+ * `freeBytes`; `list_takes` lists `savedTakes` and the takes recorded, the newest first, with
+ * `unreadableTakes` left out; `open_take_folder` opens only a listed take (`openedFolders()`
+ * reads them); `failRecording(reason)` stops the take as a disk error does.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -557,6 +587,11 @@ export function createFakeBridge({
   savedSessions = [],
   sessionNotice = null,
   clock = () => Date.now(),
+  recordingsFolder = FAKE_RECORDINGS_FOLDER,
+  savedRecording = null,
+  savedTakes = [],
+  unreadableTakes = 0,
+  freeBytes = 500_000_000_000,
 } = {}) {
   const engine = clone(status);
   engine.localMix ??= { ...defaultMix(), revision: 0 };
@@ -612,6 +647,23 @@ export function createFakeBridge({
     clone(savedSessions).map(({ id, ...saved }) => [id, { mixes: {}, problem: null, ...saved }]),
   );
   let lastSessionId = 0;
+  // How the desk records takes, as its session keeps them (the folder null for the default).
+  let keptRecording = {
+    folder: null,
+    format: "int24",
+    includeLocal: false,
+    armed: [],
+    ...(savedRecording ? clone(savedRecording) : {}),
+  };
+  // The takes that ended, as their take.json describe them; the take being recorded (`{ folder,
+  // name, started, startedAt, endedAt, format, device, tracks, markers, stopping, failure }`), the
+  // last take that ended while this engine ran, the stops still to answer "finishing", and every
+  // folder opened in the file manager.
+  const takeBook = clone(savedTakes);
+  let take = null;
+  let lastTake = null;
+  let finishingStops = 0;
+  const openedFolders = [];
 
   // A rule of mixes.js or mix.js broken, as the desk refuses it: the error text, not an Error.
   function checked(rule) {
@@ -715,10 +767,228 @@ export function createFakeBridge({
     }
   }
 
-  // The status as the desktop answers it, every row saying whom it follows.
+  // The status as the desktop answers it, every row saying whom it follows, with the take being
+  // recorded as it stands now and the last take that ended.
   function statusNow() {
     showMirrors();
+    engine.recording = recordingNow();
+    engine.lastTake = lastTake ? clone(lastTake) : null;
     return clone(engine);
+  }
+
+  // ---- Recording takes, with the desktop's rules (see recording.js and commands/recording.rs).
+
+  // The folder takes are made in: the kept one, or the default.
+  function recordingsFolderOf(kept) {
+    return kept.folder ?? recordingsFolder;
+  }
+
+  function settingsAnswer() {
+    return {
+      folder: recordingsFolderOf(keptRecording),
+      defaultFolder: recordingsFolder,
+      folderIsDefault: keptRecording.folder === null,
+      format: keptRecording.format,
+      includeLocal: keptRecording.includeLocal,
+      armed: [...keptRecording.armed],
+      notice: null,
+    };
+  }
+
+  // A Windows path's parts, in lower case for comparing.
+  function pathParts(path) {
+    return path
+      .toLowerCase()
+      .split(/[\\/]+/)
+      .filter((part) => part !== "");
+  }
+
+  function isInside(path, folder) {
+    const [inner, outer] = [pathParts(path), pathParts(folder)];
+    return outer.every((part, index) => inner[index] === part);
+  }
+
+  // The folder a setting keeps, as the desktop checks it: null for the default.
+  function keptFolder(folder) {
+    const text = typeof folder === "string" ? folder.trim() : "";
+    if (text === "") {
+      return null;
+    }
+    if (!/^([A-Za-z]:[\\/]|\\\\|\/)/.test(text)) {
+      throw `the recordings folder must be a whole path, such as D:\\Recordings, and \`${text}\` is not`;
+    }
+    if (text.split(/[\\/]+/).includes("..")) {
+      throw `the recordings folder must not go up with \`..\`: \`${text}\``;
+    }
+    if (isInside(text, recordingsFolder) && isInside(recordingsFolder, text)) {
+      return null;
+    }
+    if (isInside(text, FAKE_CONFIG_FOLDER)) {
+      throw `the recordings folder cannot be in MixLink's own settings folder (${FAKE_CONFIG_FOLDER}): \`${text}\``;
+    }
+    return text;
+  }
+
+  // The tracks a take of `armed` (1-based) lays out on the running device, as the engine plans
+  // them: a mono file per input, a stereo file per linked pair (either side arms it), in input
+  // order, and the local mix last.
+  function planTracks(armed, includeLocal) {
+    const count = engine.sourceChannels;
+    const tracks = [];
+    for (let index = 0; index < count; index += 1) {
+      const channel = engine.channels[index] ?? {};
+      const pair = Boolean(channel.link) && index + 1 < count;
+      const sources = pair ? [index, index + 1] : [index];
+      const first = index + 1;
+      index += sources.length - 1;
+      if (!sources.some((source) => armed.includes(source + 1))) {
+        continue;
+      }
+      const pad = (number) => String(number).padStart(2, "0");
+      const fallback = pair ? `CH ${first}-${first + 1}` : `CH ${first}`;
+      const prefix = pair ? `${pad(first)}-${pad(first + 1)}` : pad(first);
+      const name = channel.name?.trim() ? channel.name : fallback;
+      tracks.push({
+        file: `${prefix} ${safeName(name, fallback)}.wav`,
+        kind: pair ? "pair" : "input",
+        channels: sources.map((source) => source + 1),
+        name,
+        instrument: channel.kind ?? "other",
+      });
+    }
+    if (includeLocal) {
+      tracks.push({
+        file: "Local mix.wav",
+        kind: "local",
+        channels: [],
+        name: "Local mix",
+        instrument: null,
+      });
+    }
+    return tracks;
+  }
+
+  // `name` made safe for a file name, as the engine makes it.
+  function safeName(name, fallback) {
+    const cleaned = String(name)
+      .replace(/[<>:"/\\|?*]/g, "-")
+      .slice(0, 60)
+      .trim()
+      .replace(/\.+$/, "");
+    return cleaned || fallback;
+  }
+
+  function bytesPerSecond(tracks, format) {
+    const bytes = format === "float32" ? 4 : 3;
+    const width = (track) => (track.kind === "local" ? 2 : track.channels.length);
+    return tracks.reduce((sum, track) => sum + width(track) * RECORD_RATE * bytes, 0);
+  }
+
+  // The armed inputs the running device has, and the ones it does not.
+  function splitArmed(armed) {
+    return [
+      armed.filter((input) => input <= engine.sourceChannels),
+      armed.filter((input) => input > engine.sourceChannels),
+    ];
+  }
+
+  // The frames the take has recorded: they advance with the clock until it is asked to stop.
+  function framesOf(running) {
+    const end = running.endedAt ?? clock();
+    return Math.max(0, Math.floor(((end - running.startedAt) * RECORD_RATE) / 1000));
+  }
+
+  function markerOf({ frame, name }) {
+    return { frame, seconds: frame / RECORD_RATE, name };
+  }
+
+  // The take as `take.json` describes it once it ended as `ended`.
+  function summaryOf(running, ended, reason = null) {
+    const frames = framesOf(running);
+    return {
+      folder: running.folder,
+      name: running.name,
+      started: running.started,
+      sampleRate: RECORD_RATE,
+      format: running.format,
+      device: running.device,
+      tracks: running.tracks.map((track) => ({ ...track, frames })),
+      frames,
+      seconds: frames / RECORD_RATE,
+      markers: running.markers.map(markerOf),
+      droppedFrames: 0,
+      ended,
+      reason,
+    };
+  }
+
+  // The recorder as the status reports it.
+  function recordingNow() {
+    if (!take) {
+      return clone(IDLE_RECORDING);
+    }
+    const frames = framesOf(take);
+    const rate = bytesPerSecond(take.tracks, take.format);
+    const written = Math.floor((frames * rate) / RECORD_RATE);
+    const free = Math.max(0, freeBytes - written);
+    let state = "recording";
+    if (take.failure) {
+      state = "failed";
+    } else if (take.stopping) {
+      state = "stopping";
+    }
+    return {
+      state,
+      reason: take.failure,
+      takeFolder: take.folder,
+      frames,
+      seconds: frames / RECORD_RATE,
+      droppedFrames: 0,
+      bytesWritten: written,
+      tracks: take.tracks.map((track) => track.name),
+      markers: take.markers.map(markerOf),
+      freeBytes: free,
+      minutesLeft: rate > 0 ? Math.floor(free / rate / 60) : null,
+    };
+  }
+
+  // Ends the take as `ended`: its summary joins the folder and is the last take.
+  function finishTake(ended, reason = null) {
+    take.endedAt ??= clock();
+    const summary = summaryOf(take, ended, reason);
+    takeBook.push(summary);
+    lastTake = summary;
+    take = null;
+    return clone(summary);
+  }
+
+  // The take folder's name, `<YYYY-MM-DD_HHMMSS>_<name>` in local time by `offset` minutes, never
+  // one the folder has.
+  function takeFolder(root, name, offset) {
+    const local = new Date(clock() + offset * 60_000);
+    const pad = (number) => String(number).padStart(2, "0");
+    const stamp =
+      `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(local.getUTCDate())}_` +
+      `${pad(local.getUTCHours())}${pad(local.getUTCMinutes())}${pad(local.getUTCSeconds())}`;
+    const base = `${root}\\${stamp}_${safeName(name, "Take")}`;
+    const taken = new Set(takeBook.map((summary) => summary.folder));
+    let folder = base;
+    for (let copy = 2; taken.has(folder); copy += 1) {
+      folder = `${base} (${copy})`;
+    }
+    return folder;
+  }
+
+  // Every take the recordings folder holds, the take being recorded included, the newest first.
+  function listedTakes() {
+    const root = `${recordingsFolderOf(keptRecording)}\\`.toLowerCase();
+    const all = [...takeBook.map(clone), ...(take ? [summaryOf(take, "recording")] : [])];
+    return all
+      .filter((summary) => summary.folder.toLowerCase().startsWith(root))
+      .sort(
+        (one, other) =>
+          other.started.localeCompare(one.started) || other.folder.localeCompare(one.folder),
+      );
   }
 
   // As the engine does: `row`'s mix takes `leader`'s channels and group levels under a new
@@ -1201,6 +1471,12 @@ export function createFakeBridge({
     start_engine({ config } = {}) {
       // As in the desktop, a start ends the previous engine and takes a run even when it fails.
       run += 1;
+      if (take) {
+        // As the engine does: a take ends with its engine.
+        finishTake("engineStopped");
+      }
+      // A new engine has had no take yet.
+      lastTake = null;
       isRunning = false;
       if (startError) {
         throw startError;
@@ -1253,6 +1529,10 @@ export function createFakeBridge({
       return summary();
     },
     stop_engine() {
+      if (take) {
+        // As the engine does: the take ends with it, its files finished.
+        finishTake("engineStopped");
+      }
       isRunning = false;
       return null;
     },
@@ -1287,6 +1567,9 @@ export function createFakeBridge({
     },
     switch_device({ device }) {
       requireRunning();
+      if (take && !take.failure) {
+        throw "a take is recording: stop the recording before switching the input device (a take never mixes two devices)";
+      }
       const found = devices.find((candidate) => candidate.name === device);
       if (!found || found.channels === 0) {
         throw `no usable input device named "${device}"`;
@@ -1794,6 +2077,171 @@ export function createFakeBridge({
         localOutputNotice,
       };
     },
+    recording_settings() {
+      return settingsAnswer();
+    },
+    set_recording_settings({ settings = {} } = {}) {
+      // As the desktop reads it: no field it does not know, then each one checked; a refusal
+      // changes nothing.
+      for (const field of Object.keys(settings ?? {})) {
+        if (!RECORDING_FIELDS.includes(field)) {
+          throw `unknown field \`${field}\`, expected one of \`folder\`, \`format\`, \`includeLocal\`, \`armed\``;
+        }
+      }
+      const name = typeof settings.format === "string" ? settings.format.trim() : "";
+      const format = name === "" ? RECORD_FORMATS[0] : name;
+      if (!RECORD_FORMATS.includes(format)) {
+        throw `the format \`${name}\` is none of int24, float32`;
+      }
+      for (const input of settings.armed ?? []) {
+        if (!Number.isInteger(input) || input < 1 || input > 255) {
+          throw `CH ${input} cannot be armed: inputs are numbered from 1 to 255`;
+        }
+      }
+      keptRecording = {
+        folder: keptFolder(settings.folder),
+        format,
+        includeLocal: Boolean(settings.includeLocal),
+        armed: [...new Set(settings.armed ?? [])].sort((one, other) => one - other),
+      };
+      return settingsAnswer();
+    },
+    start_recording({ takeName = "", utcOffsetMinutes = null } = {}) {
+      const offset = utcOffsetMinutes ?? 0;
+      if (Math.abs(offset) > 14 * 60) {
+        throw `the time zone offset of ${offset} minutes is more than 14 hours`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running: start it to record";
+      }
+      if (take && !take.failure) {
+        throw "a take is already recording: stop it first";
+      }
+      if (take) {
+        // As the engine does: a take a disk error stopped is collected before a new one starts.
+        finishTake("diskError", take.failure);
+      }
+      const [armed, skipped] = splitArmed(keptRecording.armed);
+      if (armed.length === 0 && !keptRecording.includeLocal) {
+        throw skipped.length === 0
+          ? "nothing is armed: arm at least one input, or record the local mix"
+          : `nothing is armed on this device: ${skipped.map((input) => `CH ${input}`).join(", ")} ` +
+              `are past its ${engine.sourceChannels} inputs; arm one of its inputs, or record the ` +
+              "local mix";
+      }
+      const name = String(takeName ?? "").trim() || "Take";
+      const root = recordingsFolderOf(keptRecording);
+      const startedAt = clock();
+      take = {
+        folder: takeFolder(root, name, offset),
+        name,
+        started: new Date(startedAt).toISOString().replace(/\.\d{3}Z$/, "Z"),
+        startedAt,
+        endedAt: null,
+        format: keptRecording.format,
+        device: engine.deviceName,
+        tracks: planTracks(armed, keptRecording.includeLocal),
+        markers: [],
+        stopping: false,
+        failure: null,
+      };
+      return {
+        recording: recordingNow(),
+        folder: root,
+        armed,
+        skipped,
+        includeLocal: keptRecording.includeLocal,
+        format: keptRecording.format,
+      };
+    },
+    stop_recording() {
+      if (!isRunning) {
+        throw "the engine is not running, so nothing is recording";
+      }
+      if (!take) {
+        throw "nothing is recording";
+      }
+      take.stopping = true;
+      take.endedAt ??= clock();
+      if (finishingStops > 0) {
+        finishingStops -= 1;
+        return {
+          finishing: true,
+          take: null,
+          message: "the take's files are still being finished; try again",
+        };
+      }
+      const ended = take.failure ? "diskError" : "stopped";
+      return { finishing: false, take: finishTake(ended, take.failure), message: null };
+    },
+    add_marker({ name = "" } = {}) {
+      if (!isRunning) {
+        throw "the engine is not running, so no take is recording";
+      }
+      if (!take || take.stopping) {
+        throw "no take is recording";
+      }
+      if (take.failure) {
+        throw `the take stopped recording: ${take.failure}`;
+      }
+      const trimmed = String(name ?? "").trim();
+      let named = trimmed.slice(0, 64);
+      if (!trimmed) {
+        const taken = new Set(take.markers.map((marker) => marker.name));
+        let number = take.markers.length + 1;
+        while (taken.has(`Marker ${number}`)) {
+          number += 1;
+        }
+        named = `Marker ${number}`;
+      }
+      const marker = { frame: framesOf(take), name: named };
+      take.markers.push(marker);
+      return markerOf(marker);
+    },
+    record_estimate() {
+      const folder = recordingsFolderOf(keptRecording);
+      const unknown = (problem) => ({
+        folder,
+        bytesPerSecond: null,
+        freeBytes,
+        minutesLeft: null,
+        problem,
+      });
+      if (!isRunning) {
+        return unknown("the engine is not running: the tracks depend on the input device");
+      }
+      const [armed] = splitArmed(keptRecording.armed);
+      const tracks = planTracks(armed, keptRecording.includeLocal);
+      if (tracks.length === 0) {
+        return unknown("arm at least one input, or record the local mix");
+      }
+      const rate = bytesPerSecond(tracks, keptRecording.format);
+      return {
+        folder,
+        bytesPerSecond: rate,
+        freeBytes,
+        minutesLeft: Math.floor(freeBytes / rate / 60),
+        problem: null,
+      };
+    },
+    list_takes() {
+      const takes = listedTakes();
+      return {
+        folder: recordingsFolderOf(keptRecording),
+        takes,
+        unreadable: unreadableTakes,
+        missing: takes.length === 0 && unreadableTakes === 0,
+      };
+    },
+    open_take_folder({ folder } = {}) {
+      // As the desktop does: only a take folder directly inside the recordings folder.
+      const root = recordingsFolderOf(keptRecording);
+      if (!listedTakes().some((listed) => listed.folder === folder)) {
+        throw `${folder} is not a take folder in the recordings folder ${root}`;
+      }
+      openedFolders.push(folder);
+      return null;
+    },
   };
 
   // A change made on the musician's phone: merged as the engine would (a locked channel kept as it
@@ -1906,6 +2354,28 @@ export function createFakeBridge({
     /** The local mix and output the session keeps, `{ mix, output }`: null before either. */
     savedLocal() {
       return keptLocal ? clone(keptLocal) : null;
+    },
+    /** The recording settings the session keeps, `{ folder, format, includeLocal, armed }`. */
+    savedRecording() {
+      return clone(keptRecording);
+    },
+    /** Every take folder opened in the file manager, in order. */
+    openedFolders() {
+      return [...openedFolders];
+    },
+    /** The next `times` stops answer that the take's files are still being finished. */
+    holdStop(times = 1) {
+      finishingStops = times;
+    },
+    /** The take being recorded stops on its own with `reason`, as a full disk stops it. */
+    failRecording(reason) {
+      if (take && !take.failure) {
+        take.failure = reason;
+        take.endedAt ??= clock();
+        if (isRunning) {
+          emit("status", statusNow());
+        }
+      }
     },
     /** The local output in use stops on its own with `reason`, as an unplugged device does. */
     failLocalOutput(reason) {

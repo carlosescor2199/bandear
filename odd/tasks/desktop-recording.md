@@ -379,8 +379,54 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     `markers_survive_a_poisoned_lock`). The dropped-blocks marker test has no RED (already
     correct, now proven); the engine test's wait has no RED. GREEN: server unit tests 400 -> 405
     on 3 runs, and 15 repeated runs of the recording tests. Commit: this commit.
-- [ ] T4b (recorder and takes, desktop): Tauri commands and settings over the T4a API (folder,
-  format, include local mix, arming), status and events. Route: delegated writer.
+- [x] T4b (recorder and takes, desktop): Tauri commands and settings over the T4a API (folder,
+  format, include local mix, arming), status and events. Route: delegated writer (writer and 2+
+  non-trivial files triggers).
+  - Session: a `recording` section `{ folder, format: "int24" | "float32", includeLocal, armed }`
+    (version 1, folder null for the default, inputs 1-based), loaded on its own and set aside when
+    damaged. It is the desk's own: a named session never carries it and a load keeps the desk's.
+    The default folder is the Music folder + `MixLink\Recordings` (Tauri `audio_dir`); when it
+    cannot be resolved, the app's local data folder + `Recordings` (else the temp folder), and the
+    settings' `notice` says so.
+  - Commands (`commands/recording.rs`, `RecordEngine` stand-in trait, engine lock then session):
+    `recording_settings()` and `set_recording_settings(settings)` (a whole path, no `..`, not in
+    the config folder; the default typed out is the default; armed 1-255 sorted once each);
+    `start_recording(takeName, utcOffsetMinutes)` (no engine, a take recording, nothing armed on
+    the device and no local mix are refused; armed inputs past the device are left out and named in
+    `skipped`; the folder is created first; blank name "Take") answering `{ recording, folder,
+    armed, skipped, includeLocal, format }`; `stop_recording()` answering `{ finishing, take,
+    message }` (the engine's "still being finished" is `finishing: true`, not an error); the stop
+    holds the engine lock while the files finish (milliseconds; at most the engine's 10 s wait);
+    `add_marker(name)`; `record_estimate()` `{ folder, bytesPerSecond, freeBytes, minutesLeft,
+    problem }` (never an error: no engine or nothing armed is `problem`); `list_takes()` `{ folder,
+    takes, unreadable, missing }`, each direct subfolder's `take.json`, newest first, unreadable or
+    newer ones counted, `ended: null` listed as `interrupted` with the frames its WAV files hold
+    (or `recording` for the take being recorded); `open_take_folder(folder)` only for a folder with
+    a `take.json` directly in the recordings folder, checked with `canonicalize`, then Explorer
+    started directly with the quoted path (`raw_arg`; `open`/`xdg-open` elsewhere) through an
+    injected `FolderOpener`, never a shell.
+  - DTOs: the status carries `recording { state, reason, takeFolder, frames, seconds,
+    droppedFrames, bytesWritten, tracks, markers: [{ frame, seconds, name }], freeBytes,
+    minutesLeft }` and `lastTake` (`TakeSummaryDto`, also `TakeListItemDto`), so a change shows
+    within the 4 Hz status.
+  - UI logic (no screen): `recording.js` (arming with pairs, the whole settings request,
+    durations and outcome words), store state `recordingSettings`, `takes`, `estimate`,
+    `recordingOutcome` and selectors `recordingStatus`, `isRecordingNow`, `lastTake`;
+    `console-app` `loadRecordingSettings`, `setRecordingSettings(change)` (one at a time, each on
+    the last asked, so quick toggles both land), `startRecording(name)`, `stopRecording()` (asks
+    again 5 times 300 ms apart while finishing), `addMarker`, `refreshTakes`, `refreshEstimate`,
+    `openTakeFolder`; a device switch and a driver change are refused in words while a take
+    records. The fake mirrors every command (frames on `clock`, markers, estimate, takes list,
+    engine stop ending the take, refused switch, `holdStop`, `failRecording`).
+  - RED: desktop, 24 of 233 failed against stubs (18 command tests, 4 session, 1 status DTO, the
+    save/load test); the idle-recorder DTO test passed against the idle stub. UI: the suite did not
+    load (no fake exports), then 9 of 398 failed before `console-app` and the fake; the 5 helper,
+    store and api tests were written after their code and checked by 2 mutations (disarming one
+    side only, settings dropped at a run's end): 2 of 398 failed.
+  - GREEN: desktop tests 206 -> 215 (d825ca5) -> 233, `cargo build` clean; UI tests 384 -> 398. No
+    browser preview: no screen changed (T5 builds it).
+  - Commits: d825ca5 (status and session, 713 lines), 6c8bbc8 (commands, 1,802 lines). Commit:
+    this commit (UI logic and fake).
 - [ ] T5 (Record screen): the Record section per the design, the REC chip, takes table and
   settings. Route: delegated writer.
 - [ ] T6 (virtual soundcheck): the playback source in place of capture and its UI. Route:
@@ -423,7 +469,10 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   fixed by T4a-fix. Next review base: a4d4bf1.
 - T4 split into T4a (engine, done in baa4676 and a4d4bf1) and T4b
   (desktop).
+- T4a-fix (a089b41) is pending review in the slice from a4d4bf1.
+- T4b done in three work units: d825ca5, 6c8bbc8 and the UI commit; all after a4d4bf1, so the
+  next review slice from a4d4bf1 holds T4a-fix and T4b.
 
 ## Next step
 
-T4b.
+T5.

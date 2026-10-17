@@ -52,6 +52,18 @@
 //   taken, the next start opens it (the engine is never restarted). `unsavedEdits()` counts the
 //   edits a load would drop, so the panel can ask first. Each answers `{ ok, message }` and reads
 //   the list again.
+// - Recording takes (the Record screen; see recording.js): the recording settings (read once
+//   connected, `loadRecordingSettings` again) change with `setRecordingSettings(change)`, one change
+//   at a time and each built on the one before it, so two quick toggles both land; a refusal leaves
+//   the settings as they were and the next change builds on those. `startRecording(name)` starts a
+//   take with them, its folder named in the window's local time; `stopRecording()` stops it and,
+//   while its files are still being finished, asks again a few times a short wait apart before
+//   saying so; `addMarker(name)` marks it; `refreshTakes()` lists the takes, `refreshEstimate()`
+//   reads what a take would take on the disk (again after every settings change), and
+//   `openTakeFolder(folder)` opens one in the file manager. Each command answers `{ ok, message }`
+//   (and keeps it as the store's `recordingOutcome`) and reads the status after it. While a take
+//   records, a device switch and a driver change are refused in words before anything reaches the
+//   engine, which refuses a switch too: a take never mixes two devices.
 
 import { createEngineApi } from "./bridge.js";
 import { createCoalescer } from "./coalesce.js";
@@ -61,6 +73,7 @@ import {
   consoleReducer,
   initialState,
   isLiveRun,
+  isRecordingNow,
   mixOf,
   musicianByAddress,
   pendingEdits,
@@ -77,6 +90,13 @@ import {
 } from "./engine-config.js";
 import { formatChannelsSet, formatGroupsSet, musicianLabel, sentenceWithReason } from "./format.js";
 import { formatLocalOutputSet } from "./local-mix.js";
+import {
+  RECORDING_BLOCKS_SWITCH,
+  formatDuration,
+  formatStarted,
+  formatStopped,
+  settingsRequest,
+} from "./recording.js";
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
@@ -87,15 +107,34 @@ import { createStore } from "./store.js";
 const STATUS_RETRIES = 3;
 const STATUS_RETRY_MS = 500;
 
+// A stop whose take's files are still being finished: how often and how far apart to ask again.
+const STOP_RETRIES = 5;
+const STOP_RETRY_MS = 300;
+
 function message(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function wait(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
 /**
  * The controller over `bridge`. `autoStart` starts an engine when none runs; `statusRetryMs` is the
- * wait between status reads after a start whose status could not be read.
+ * wait between status reads after a start whose status could not be read; `stopRetries` and
+ * `stopRetryMs` how often and how far apart a stop is asked again while the take's files are still
+ * being finished.
  */
-export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STATUS_RETRY_MS }) {
+export function createConsoleApp({
+  bridge,
+  autoStart = true,
+  statusRetryMs = STATUS_RETRY_MS,
+  stopRetries = STOP_RETRIES,
+  stopRetryMs = STOP_RETRY_MS,
+}) {
   const api = createEngineApi(bridge);
   const store = createStore(consoleReducer, initialState);
   const meterListeners = new Set();
@@ -439,6 +478,11 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
       await loadSessions();
     }
     await readSessionNotice();
+    // The recording settings are the desk's too; a failed read leaves them unknown until the Record
+    // screen reads them again.
+    if (store.getState().recordingSettings === null) {
+      await loadRecordingSettings();
+    }
     if (answer.state === "notRunning" && autoStart) {
       if (unread) {
         // Never the defaults in place of a kept input that could not be read: Try again reads it
@@ -549,6 +593,11 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   // Answers like `start`.
   async function applyAudio(change, { deviceFilter = null, keepDevice = false } = {}) {
     const state = store.getState();
+    if (isRecordingNow(state)) {
+      // A restart would end the take, and a new driver or input would change its source.
+      store.dispatch(actions.commandFailed("switch", RECORDING_BLOCKS_SWITCH));
+      return { ok: false, error: RECORDING_BLOCKS_SWITCH };
+    }
     if (keepDevice && state.audioNotice?.kind === "fallback") {
       store.dispatch(actions.audio(change));
       choiceUnsaved = true;
@@ -573,6 +622,10 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
   // ASIO the device picked becomes the applied driver). The input switched to becomes the applied
   // one, kept for every later start; a refused switch changes nothing.
   async function switchDevice(name) {
+    if (isRecordingNow(store.getState())) {
+      store.dispatch(actions.commandFailed("switch", RECORDING_BLOCKS_SWITCH));
+      return;
+    }
     if (switchMethod(store.getState().audio) === "restart") {
       await applyAudio({}, { deviceFilter: name });
       return;
@@ -807,6 +860,167 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     return mixEdits + editsOnTheirWay;
   }
 
+  // Reads the recording settings into the store. Resolves to null, or to the error of a failed
+  // read (the settings stay as they were known, or unknown).
+  async function loadRecordingSettings() {
+    try {
+      store.dispatch(actions.recordingSettings(await api.recordingSettings()));
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Keeps `{ action, ok, message }` as the last recording outcome and answers it with `extra`.
+  function recordingSaid(action, ok, words, extra = {}) {
+    store.dispatch(actions.recordingOutcome(action, ok, words));
+    return { ok, message: words, ...extra };
+  }
+
+  // Settings changes go out one at a time, each built on the settings the change before it asked
+  // for (`wantedSettings`), so a second toggle made before the first was answered keeps the first.
+  // A refusal goes back to the settings the desk answered last.
+  let settingsLane = Promise.resolve();
+  let wantedSettings = null;
+
+  function setRecordingSettings(change) {
+    const request = settingsRequest(wantedSettings ?? store.getState().recordingSettings, change);
+    wantedSettings = request;
+    const send = async () => {
+      let answer;
+      try {
+        answer = await api.setRecordingSettings(request);
+      } catch (error) {
+        if (wantedSettings === request) {
+          wantedSettings = null;
+        }
+        return recordingSaid(
+          "settings",
+          false,
+          sentenceWithReason("The recording settings were not changed", message(error)),
+        );
+      }
+      store.dispatch(actions.recordingSettings(answer));
+      if (wantedSettings === request) {
+        wantedSettings = null;
+      }
+      await refreshEstimate();
+      return recordingSaid("settings", true, "The recording settings were saved.");
+    };
+    const result = settingsLane.then(send);
+    settingsLane = result.catch(() => null);
+    return result;
+  }
+
+  // Reads what a take with the kept settings would take on the disk. Resolves to null, or to the
+  // error of a failed read (the estimate is then forgotten).
+  async function refreshEstimate() {
+    try {
+      store.dispatch(actions.estimate(await api.recordEstimate()));
+      return null;
+    } catch (error) {
+      store.dispatch(actions.estimate(null));
+      return error;
+    }
+  }
+
+  // Lists the takes in the recordings folder. Resolves to null, or to the error of a failed
+  // listing (the last list known stays, and the failure is kept to be said).
+  async function refreshTakes() {
+    try {
+      store.dispatch(actions.takes(await api.listTakes()));
+      return null;
+    } catch (error) {
+      store.dispatch(actions.takesFailed(message(error)));
+      return error;
+    }
+  }
+
+  // Starts a take called `name` with the kept settings, its folder named in the window's local
+  // time, then reads the status (which shows it recording) and the takes.
+  async function startRecording(name) {
+    const takeName = String(name ?? "").trim();
+    let started;
+    try {
+      started = await api.startRecording(takeName, -new Date().getTimezoneOffset());
+    } catch (error) {
+      return recordingSaid(
+        "start",
+        false,
+        sentenceWithReason("The recording did not start", message(error)),
+      );
+    }
+    await readStatus();
+    await refreshTakes();
+    return recordingSaid("start", true, formatStarted(started, takeName || "Take"));
+  }
+
+  // Stops the take. While its files are still being finished, asks again `stopRetries` times
+  // `stopRetryMs` apart before saying so; the take keeps stopping and Stop can be pressed again.
+  async function stopRecording() {
+    let answer;
+    try {
+      answer = await api.stopRecording();
+      for (let retry = 0; answer.finishing && retry < stopRetries && !disposed; retry += 1) {
+        await wait(stopRetryMs);
+        answer = await api.stopRecording();
+      }
+    } catch (error) {
+      await readStatus();
+      return recordingSaid(
+        "stop",
+        false,
+        sentenceWithReason("The recording was not stopped", message(error)),
+      );
+    }
+    await readStatus();
+    if (answer.finishing) {
+      return recordingSaid(
+        "stop",
+        false,
+        "The take's files are still being finished, so it has not stopped yet. Press Stop again " +
+          "in a moment.",
+      );
+    }
+    await refreshTakes();
+    return recordingSaid("stop", true, formatStopped(answer.take), { take: answer.take });
+  }
+
+  // Marks the take being recorded with `name` (blank: the next "Marker n").
+  async function addMarker(name) {
+    let marker;
+    try {
+      marker = await api.addMarker(String(name ?? ""));
+    } catch (error) {
+      return recordingSaid(
+        "marker",
+        false,
+        sentenceWithReason("The marker was not added", message(error)),
+      );
+    }
+    await readStatus();
+    return recordingSaid(
+      "marker",
+      true,
+      `Marked "${marker.name}" at ${formatDuration(marker.seconds)}.`,
+      { marker },
+    );
+  }
+
+  // Opens a take folder (as a take lists it) in the system's file manager.
+  async function openTakeFolder(folder) {
+    try {
+      await api.openTakeFolder(folder);
+    } catch (error) {
+      return recordingSaid(
+        "open",
+        false,
+        sentenceWithReason("The take folder was not opened", message(error)),
+      );
+    }
+    return recordingSaid("open", true, `Opened ${folder}.`);
+  }
+
   // The window's title follows the input device, as the old window's did.
   let title = windowTitle(initialState);
   store.subscribe((state) => {
@@ -964,6 +1178,29 @@ export function createConsoleApp({ bridge, autoStart = true, statusRetryMs = STA
     loadSession,
     /** How many edits a load would drop now; see loadSession. */
     unsavedEdits,
+    /** Reads the recording settings again; resolves to null, or to the error of a failed read. */
+    loadRecordingSettings,
+    /**
+     * Changes the recording settings with `change`, `{ folder?, format?, includeLocal?, armed? }`
+     * (the folder null or blank for the default, the inputs 1-based; see armedAfter for arming a
+     * pair), on top of the last change asked for; answers `{ ok, message }`.
+     */
+    setRecordingSettings,
+    /** Starts a take called `name` with the kept settings; answers `{ ok, message }`. */
+    startRecording,
+    /**
+     * Stops the take, asking again while its files are being finished; answers `{ ok, message,
+     * take }`, `take` the finished take when it stopped.
+     */
+    stopRecording,
+    /** Marks the take being recorded; answers `{ ok, message, marker }`. */
+    addMarker,
+    /** Lists the takes again; resolves to null, or to the error of a failed listing. */
+    refreshTakes,
+    /** Reads the disk estimate again; resolves to null, or to the error of a failed read. */
+    refreshEstimate,
+    /** Opens a take folder in the system's file manager; answers `{ ok, message }`. */
+    openTakeFolder,
     select(address) {
       store.dispatch(actions.select(address));
     },

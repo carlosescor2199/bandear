@@ -201,6 +201,45 @@ export function createEngineApi(bridge) {
      * cannot use rejects, and nothing changed.
      */
     loadSession: (id) => bridge.invoke("load_session", { id }),
+    /**
+     * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
+     * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
+     */
+    recordingSettings: () => bridge.invoke("recording_settings"),
+    /**
+     * Keeps `settings`, the whole `{ folder, format, includeLocal, armed }` (the folder null for
+     * the default; see settingsRequest), and resolves to them as recordingSettings answers. A
+     * folder that is not a whole path, goes up with `..` or is in MixLink's settings folder, an
+     * unknown format or an input out of 1-255 rejects, and nothing changed.
+     */
+    setRecordingSettings: (settings) => bridge.invoke("set_recording_settings", { settings }),
+    /**
+     * Starts recording a take called `takeName` with the kept settings; `utcOffsetMinutes` (the
+     * window's offset from UTC) names its folder in local time. Resolves to `{ recording, folder,
+     * armed, skipped, includeLocal, format }`; with no engine, a take recording, nothing armed on
+     * the device and no local mix, or a folder that cannot be made, it rejects.
+     */
+    startRecording: (takeName, utcOffsetMinutes = null) =>
+      bridge.invoke("start_recording", { takeName, utcOffsetMinutes }),
+    /**
+     * Stops the take: resolves to `{ finishing: false, take }`, or `{ finishing: true, message }`
+     * while its files are still being finished (ask again). It rejects when nothing records.
+     */
+    stopRecording: () => bridge.invoke("stop_recording"),
+    /** Marks the take being recorded; resolves to `{ frame, seconds, name }`. */
+    addMarker: (name) => bridge.invoke("add_marker", { name }),
+    /**
+     * What a take with the kept settings would take on the disk: `{ folder, bytesPerSecond,
+     * freeBytes, minutesLeft, problem }`, `problem` saying why the rate is unknown.
+     */
+    recordEstimate: () => bridge.invoke("record_estimate"),
+    /**
+     * The takes in the recordings folder, the newest first: `{ folder, takes, unreadable, missing
+     * }` (see recording.js for a take's shape).
+     */
+    listTakes: () => bridge.invoke("list_takes"),
+    /** Opens a take folder (as a take lists it) in the system's file manager. */
+    openTakeFolder: (folder) => bridge.invoke("open_take_folder", { folder }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

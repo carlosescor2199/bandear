@@ -17,7 +17,7 @@ use dto::{
     LocalOutputRequestDto, LocalOutputSetDto, MirrorRequest, MirrorSetDto, MixDto,
     MixUpdateRequest, MixesSetDto, OutputDeviceDto, PresetsDto, RecordingSettingsDto,
     RecordingSettingsRequest, RecordingStartedDto, RecordingStoppedDto, SessionLoadedDto,
-    SessionSavedDto, StartRequest, StartSummary, TakeMarkerDto, TakesDto,
+    SessionSavedDto, SoundcheckDto, StartRequest, StartSummary, TakeMarkerDto, TakesDto,
 };
 use events::EventPump;
 use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
@@ -371,6 +371,57 @@ async fn open_take_folder(state: State<'_, DesktopState>, folder: String) -> Res
     commands::recording::open_take_folder(state.inner(), folder)
 }
 
+/// Plays the take in `takeFolder` (a take folder of the recordings folder) in place of the live
+/// inputs, from `startFrame` (0 when absent), looping when `looping`, and answers the soundcheck
+/// `{ state, reason, takeFolder, takeName, positionFrames, positionSeconds, lengthFrames,
+/// lengthSeconds, looping, underrunFrames, clock }` (see [commands::soundcheck::start_soundcheck]).
+/// The takes list's Play is this command: a take is heard through the engine, never on its own.
+#[tauri::command]
+async fn start_soundcheck(
+    state: State<'_, DesktopState>,
+    take_folder: String,
+    start_frame: Option<u64>,
+    looping: Option<bool>,
+) -> Result<SoundcheckDto, String> {
+    commands::soundcheck::start_soundcheck(state.inner(), take_folder, start_frame, looping)
+}
+
+/// Pauses the soundcheck's take and answers the soundcheck.
+#[tauri::command]
+async fn pause_soundcheck(state: State<'_, DesktopState>) -> Result<SoundcheckDto, String> {
+    commands::soundcheck::pause_soundcheck(state.inner())
+}
+
+/// Plays the soundcheck's take on (from its start when it stopped at its end).
+#[tauri::command]
+async fn resume_soundcheck(state: State<'_, DesktopState>) -> Result<SoundcheckDto, String> {
+    commands::soundcheck::resume_soundcheck(state.inner())
+}
+
+/// Moves the soundcheck's take to `frame` and answers the soundcheck.
+#[tauri::command]
+async fn seek_soundcheck(
+    state: State<'_, DesktopState>,
+    frame: u64,
+) -> Result<SoundcheckDto, String> {
+    commands::soundcheck::seek_soundcheck(state.inner(), frame)
+}
+
+/// Whether the soundcheck's take starts again at its end.
+#[tauri::command]
+async fn set_soundcheck_loop(
+    state: State<'_, DesktopState>,
+    looping: bool,
+) -> Result<SoundcheckDto, String> {
+    commands::soundcheck::set_soundcheck_loop(state.inner(), looping)
+}
+
+/// Stops the soundcheck and goes back to the live inputs.
+#[tauri::command]
+async fn stop_soundcheck(state: State<'_, DesktopState>) -> Result<SoundcheckDto, String> {
+    commands::soundcheck::stop_soundcheck(state.inner())
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -443,7 +494,13 @@ pub fn run() {
             add_marker,
             record_estimate,
             list_takes,
-            open_take_folder
+            open_take_folder,
+            start_soundcheck,
+            pause_soundcheck,
+            resume_soundcheck,
+            seek_soundcheck,
+            set_soundcheck_loop,
+            stop_soundcheck
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")

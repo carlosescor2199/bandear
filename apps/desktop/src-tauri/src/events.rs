@@ -21,7 +21,10 @@
 //!   new stereo pair set; each channel carries its `name`, `kind`, `hidden` and `link`. Its
 //!   `recording` says whether a take records and how far it got (state, frames, seconds, dropped
 //!   frames, bytes, tracks, markers, free space and minutes left), and `lastTake` is the last take
-//!   that ended, so a start, a stop, a marker or a disk error shows within a status interval.
+//!   that ended, so a start, a stop, a marker or a disk error shows within a status interval. Its
+//!   `soundcheck` says whether a take plays in place of the inputs, where it is and what paces it;
+//!   a change made from the desk sends a status at once, and the position moves within a status
+//!   interval.
 //! - `mix-changed`, as soon as a mix changes:
 //!   `{ "run": n, "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`,
 //!   the whole mix stored after the change. A musician removed in between is not announced. The
@@ -91,6 +94,16 @@ pub fn local_mix_changed(
         return None;
     }
     Some(LocalMixChangedDto::new(&read()?, run))
+}
+
+/// Whether `event` sends a status at once instead of at the next scheduled one: the groups or the
+/// channel details changed (the window gets them ahead of the moved levels or pans that follow on
+/// the bus), or the soundcheck did (a take started, stopped, paused, resumed, moved or looped).
+fn status_at_once(event: &EngineEvent) -> bool {
+    matches!(
+        event,
+        EngineEvent::GroupsChanged | EngineEvent::ChannelsChanged | EngineEvent::SoundcheckChanged
+    )
 }
 
 /// What one pass of the pump has to send.
@@ -243,10 +256,7 @@ fn pump(
         // Waiting on the bus is also the pump's sleep: a change goes out at once, and a stop is
         // noticed within one meter interval.
         match events.recv_timeout(schedule.wait(Instant::now())) {
-            // The groups or the channel details changed: the window gets them at once, ahead of
-            // the moved levels or pans that follow on the bus, instead of at the next scheduled
-            // status.
-            Ok(EngineEvent::GroupsChanged | EngineEvent::ChannelsChanged) => {
+            Ok(event) if status_at_once(&event) => {
                 if let Some(status) = source.status() {
                     sink.emit(STATUS_EVENT, EngineStatusDto { run, ..status });
                 }
@@ -553,6 +563,9 @@ mod tests {
                 &personal_monitoring::RecordingStatus::default(),
             ),
             last_take: None,
+            soundcheck: crate::dto::SoundcheckDto::from(
+                &personal_monitoring::SoundcheckStatus::default(),
+            ),
         }
     }
 
@@ -703,6 +716,21 @@ mod tests {
         );
 
         pump.stop();
+    }
+
+    /// A soundcheck change (a take started or stopped, paused, resumed, moved or looped from the
+    /// desk) goes out as a status at once, like a change of groups or channel details; a mix change
+    /// does not.
+    #[test]
+    fn a_soundcheck_change_sends_a_status_at_once() {
+        assert!(status_at_once(&EngineEvent::SoundcheckChanged));
+        assert!(status_at_once(&EngineEvent::GroupsChanged));
+        assert!(status_at_once(&EngineEvent::ChannelsChanged));
+        assert!(!status_at_once(&EngineEvent::LocalMixChanged));
+        assert!(!status_at_once(&EngineEvent::MixChanged {
+            address: address(MUSICIAN),
+            origin: MixOrigin::Engine,
+        }));
     }
 
     /// Linking a pair is followed at once by every musician's moved pans. The window gets a status

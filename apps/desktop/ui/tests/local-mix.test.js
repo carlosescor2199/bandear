@@ -97,7 +97,7 @@ test("a choice reads back from the select's value, whatever the device is called
 });
 
 test("with an engine the select shows the outputs listed and the one in use", () => {
-  const listed = reduce([actions.outputs(sampleOutputs())], withOutput(playingDemo));
+  const listed = reduce([actions.outputs(sampleOutputs(), 1)], withOutput(playingDemo));
 
   const view = localOutputView(listed);
 
@@ -116,7 +116,7 @@ test("with an engine the select shows the outputs listed and the one in use", ()
 test("the state of the output is said in words with its counters, a failure as an alert", () => {
   const counted = localOutputView(
     reduce(
-      [actions.outputs(sampleOutputs())],
+      [actions.outputs(sampleOutputs(), 1)],
       withOutput({ ...playingDemo, underrunFrames: 1, droppedFrames: 12480 }),
     ),
   );
@@ -128,7 +128,7 @@ test("the state of the output is said in words with its counters, a failure as a
 
   const failed = localOutputView(
     reduce(
-      [actions.outputs(sampleOutputs())],
+      [actions.outputs(sampleOutputs(), 1)],
       withOutput({ ...playingDemo, state: "failed", reason: "the device was unplugged" }),
     ),
   );
@@ -140,7 +140,7 @@ test("the state of the output is said in words with its counters, a failure as a
       "another output.",
   );
 
-  const off = localOutputView(reduce([actions.outputs(sampleOutputs())], withOutput({})));
+  const off = localOutputView(reduce([actions.outputs(sampleOutputs(), 1)], withOutput({})));
   assert.equal(off.value, "");
   assert.deepEqual(off.state, {
     kind: "off",
@@ -154,13 +154,13 @@ test("a kept output the engine did not open is said, and one not offered now sti
     "The saved local mix output, Volt 4 · outputs 1/2, was not opened: the running audio " +
     "driver does not offer it. The local mix plays nowhere until you choose an output.";
   const said = localOutputView(
-    reduce([actions.outputs(sampleOutputs())], withOutput({ notice })),
+    reduce([actions.outputs(sampleOutputs(), 1)], withOutput({ notice })),
   );
   assert.equal(said.notice, notice);
 
   const gone = localOutputView(
     reduce(
-      [actions.outputs([])],
+      [actions.outputs([], 1)],
       withOutput({ ...playingDemo, state: "failed", reason: "unplugged" }),
     ),
   );
@@ -181,7 +181,9 @@ test("with no engine, or before the outputs are listed, the select waits and say
   assert.equal(listing.disabled, true);
   assert.equal(listing.state.text, "Listing the outputs…");
 
-  const failed = localOutputView(reduce([actions.outputsFailed("no audio service")], withOutput({})));
+  const failed = localOutputView(
+    reduce([actions.outputsFailed("no audio service", 1)], withOutput({})),
+  );
   assert.equal(failed.error, "The outputs could not be listed: no audio service.");
   assert.equal(failed.disabled, false, "None can still be chosen");
 });
@@ -569,6 +571,7 @@ test("the console lists the outputs and changes the local output, saying what it
   assert.deepEqual(chosen, {
     ok: true,
     message: "The local mix plays on Demo interface · outputs 3/4.",
+    superseded: false,
   });
   assert.equal(app.store.getState().engine.status.localOutput.state, "running");
 
@@ -613,4 +616,164 @@ test("a loaded session says it took the saved local mix, and why its output was 
     words,
   );
   assert.ok(!older.includes("local mix"), older);
+});
+
+// T2b-fix: output lists and choices in step with the engine, and the screens' wiring
+
+test("an output list answered for an engine run that has ended is not taken", async () => {
+  const fake = createFakeBridge({ running: true });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  fake.holdAnswers("output_devices");
+
+  const listing = app.loadOutputs();
+  await app.start();
+  assert.ok(app.store.getState().engine.run > 1, "a new run");
+  fake.releaseAnswers();
+  await listing;
+
+  assert.equal(app.store.getState().outputs.list, null, "the ended run's outputs are not shown");
+  app.dispose();
+});
+
+test("quick output choices go out one at a time and the last one wins, message and status alike", async () => {
+  const fake = createFakeBridge({ running: true });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  fake.holdAnswers("set_local_output");
+
+  const first = app.setLocalOutput({ device: DEMO, firstChannel: 0 });
+  await settle();
+  const second = app.setLocalOutput({ device: DEMO, firstChannel: 2 });
+  const third = app.setLocalOutput({ device: SPEAKERS, firstChannel: 0 });
+  await settle();
+  assert.equal(commands(fake, "set_local_output").length, 1, "one choice in flight");
+  for (let step = 0; step < 6; step += 1) {
+    fake.releaseAnswers();
+    await settle();
+  }
+  const [one, two, three] = await Promise.all([first, second, third]);
+
+  assert.deepEqual(
+    commands(fake, "set_local_output").map(({ args }) => args.output),
+    [
+      { device: DEMO, firstChannel: 0 },
+      { device: SPEAKERS, firstChannel: 0 },
+    ],
+    "the choice overtaken while waiting never goes out",
+  );
+  assert.equal(one.superseded, true);
+  assert.equal(two.superseded, true);
+  assert.equal(three.superseded, false);
+  assert.equal(three.message, "The local mix plays on Speakers (Realtek Audio) · outputs 1/2.");
+  assert.equal(app.store.getState().engine.status.localOutput.device, SPEAKERS);
+  app.dispose();
+});
+
+test("the outputs are listed once for each engine run, and not while none runs", async () => {
+  const { followOutputs } = await import("../app/lib/local-mix.js");
+  const loads = [];
+  const follow = followOutputs(() => loads.push("load"));
+  const at = (run) => ({ engine: { run, status: run === null ? null : {} } });
+
+  for (const run of [null, 1, 1, 1, null, null, 2, 2, 3]) {
+    follow(at(run));
+  }
+
+  assert.equal(loads.length, 3, "runs 1, 2 and 3, once each");
+});
+
+test("a choice in the select reaches the console, and only the last choice's outcome is said", async () => {
+  const { localOutputChoice } = await import("../app/lib/local-mix.js");
+  const asked = [];
+  const said = [];
+  const choose = localOutputChoice({
+    app: {
+      setLocalOutput: async (output) => {
+        asked.push(output);
+        return asked.length === 1
+          ? { ok: true, superseded: true, message: "old" }
+          : { ok: true, superseded: false, message: "new" };
+      },
+    },
+    said: (outcome) => said.push(outcome.message),
+  });
+
+  await choose(outputValue(DEMO, 2));
+  await choose("");
+
+  assert.deepEqual(asked, [{ device: DEMO, firstChannel: 2 }, null], "None is no output");
+  assert.deepEqual(said, ["new"], "an overtaken choice says nothing");
+});
+
+test("the audio setup shows the output's state, alert, notice, error and last outcome as their words say", async () => {
+  const { localOutputParts } = await import("../app/lib/local-mix.js");
+  const failed = localOutputView(
+    reduce(
+      [actions.outputsFailed("no audio service", 1)],
+      withOutput({ ...playingDemo, state: "failed", reason: "unplugged", notice: "Not opened." }),
+    ),
+  );
+
+  const parts = localOutputParts({ ...failed, said: { ok: false, message: "Refused." } });
+
+  assert.deepEqual(parts.select, {
+    options: failed.options,
+    value: outputValue(DEMO, 2),
+    disabled: false,
+  });
+  assert.deepEqual(parts.state, { kind: "failed", text: "Stopped: the local mix plays nowhere." });
+  assert.deepEqual(parts.alert, {
+    hidden: false,
+    text: "Demo interface · outputs 3/4 stopped: unplugged. Choose it again, or another output.",
+  });
+  assert.deepEqual(parts.notice, { hidden: false, text: "Not opened." });
+  assert.deepEqual(parts.error, {
+    hidden: false,
+    text: "The outputs could not be listed: no audio service.",
+  });
+  assert.deepEqual(parts.said, { text: "Refused.", ok: "false" });
+  assert.equal(parts.hint, LOCAL_OUTPUT_HINT);
+
+  const quiet = localOutputParts({ ...localOutputView(withOutput({})), said: null });
+  assert.deepEqual(quiet.alert, { hidden: true, text: "" });
+  assert.deepEqual(quiet.notice, { hidden: true, text: "" });
+  assert.deepEqual(quiet.said, { text: "", ok: null });
+});
+
+test("the master meter shows the local mix's peak on the Local mix tab and a musician's on theirs", async () => {
+  const { masterLevels } = await import("../app/lib/mix-view.js");
+  const meters = {
+    channels: [10, 20],
+    musicians: { [LEAD]: { left: 40, right: 50 } },
+    local: { left: 7, right: 9 },
+  };
+
+  assert.deepEqual(masterLevels(meters, LOCAL_MIX), { left: 7, right: 9 });
+  assert.deepEqual(masterLevels(meters, LEAD), { left: 40, right: 50 });
+  assert.deepEqual(masterLevels(meters, "192.168.1.99:50000"), { left: 0, right: 0 });
+  assert.deepEqual(masterLevels({ channels: [], musicians: {} }, LOCAL_MIX), { left: 0, right: 0 });
+});
+
+test("the fake reads the pair's first output as the desktop does", async () => {
+  const fake = createFakeBridge({ running: true });
+
+  for (const [firstChannel, says] of [
+    [-2, /firstChannel/],
+    [1.5, /firstChannel/],
+    ["2", /firstChannel/],
+    [70000, /firstChannel/],
+  ]) {
+    await assert.rejects(
+      fake.invoke("set_local_output", { output: { device: DEMO, firstChannel } }),
+      says,
+      String(firstChannel),
+    );
+  }
+  await assert.rejects(
+    fake.invoke("set_local_output", { output: { device: DEMO } }),
+    /missing field `firstChannel`/,
+  );
+  const odd = await fake.invoke("set_local_output", { output: { device: DEMO, firstChannel: 1 } });
+  assert.equal(odd.localOutput.firstChannel, 1, "an odd pair within the device, as the engine takes it");
 });

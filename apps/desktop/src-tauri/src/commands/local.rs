@@ -4,8 +4,10 @@
 //!
 //! The local mix is the engine's own mix for this computer; no phone ever hears it. The window
 //! edits it with a musician's strips, without a level cap, the engineer's limit or locks, presets,
-//! copies or mirrors. Every edit is applied by the engine first and then kept in the session, by
-//! group id as a saved session keeps a mix, so the next start plays it again.
+//! copies or mirrors. Every edit is applied by the engine first, under the engine lock, and then
+//! kept in the session by group id, as a saved session keeps a mix, so the next start plays it
+//! again. The session is written off the engine lock and at most every few hundred milliseconds
+//! while a fader moves ([saver]); stopping the engine and quitting the app write what is waiting.
 //!
 //! The output follows the engine's rules ([EngineHandle::set_local_output]): off by default, at
 //! 48 kHz, and only on a device the running driver offers ([EngineHandle::output_devices]): under
@@ -15,6 +17,8 @@
 //! why (`localOutput.notice`). The desk never plays the local mix on another device in its place,
 //! and the choice stays kept, so a later start on a driver that offers it opens it again.
 
+pub(crate) mod saver;
+
 use std::sync::Mutex;
 
 use personal_monitoring::{
@@ -22,12 +26,13 @@ use personal_monitoring::{
     OutputDevice,
 };
 
+use self::saver::LocalMixSaver;
 use super::{saved_update, session_mix_of, DeskReader, DesktopState};
 use crate::dto::{
     LocalOutputDto, LocalOutputRequestDto, LocalOutputSetDto, MixDto, MixUpdateRequest,
     OutputDeviceDto,
 };
-use crate::session::{SessionLocal, SessionOutput, SessionStore};
+use crate::session::{SessionLocal, SessionMix, SessionOutput, SessionStore};
 
 /// What the local mix and its output need from the running engine: the engine in the app, a
 /// stand-in in the tests, which run without audio hardware.
@@ -74,19 +79,40 @@ impl LocalEngine for EngineHandle {
 /// than the mix is refused. The local mix has no level cap, so `maxLevelPercent` is refused. With
 /// no engine running, or one that is stopping, the change is refused and nothing changes.
 ///
-/// The engine takes the change first: the local output plays it at once and the `mix-changed`
-/// event with the id `local` announces it. Then it is kept in the session for the next start, the
-/// group levels by group id; a save that fails is logged, not an error, since the change plays.
-/// Both happen under the engine lock, with the session's inside it. Not logged otherwise: a fader
-/// sends many of these a second.
+/// The engine takes the change first, under the engine lock: the local output plays it at once and
+/// the `mix-changed` event with the id `local` announces it. The mix is then only marked for the
+/// session ([LocalMixSaver::mark]), by group id, and written off the engine lock at most every
+/// [saver::SAVE_INTERVAL]: a fader sends many of these a second, and no disk write may hold the
+/// engine (or the meters and status that read it) up. A save that fails is logged, once, not
+/// answered as an error, since the change plays. Not logged otherwise.
 pub fn set_local_mix(state: &DesktopState, mix: MixUpdateRequest) -> Result<MixDto, String> {
-    edit_local_mix(&state.engine, &state.session, mix)
+    edit_local_mix(&state.engine, &state.local_saver, mix)
 }
 
-/// [set_local_mix] over any engine slot and session.
+/// Writes the local mix still waiting to be kept, now: when the app quits. Never under the engine
+/// lock.
+pub fn flush_local_mix(state: &DesktopState) {
+    state.local_saver.flush();
+}
+
+/// The session's local section with `pending`, a local mix marked and not written yet, in it.
+pub(super) fn with_pending(
+    local: Option<SessionLocal>,
+    pending: Option<SessionMix>,
+) -> Option<SessionLocal> {
+    match pending {
+        Some(mix) => Some(SessionLocal {
+            mix: Some(mix),
+            ..local.unwrap_or_default()
+        }),
+        None => local,
+    }
+}
+
+/// [set_local_mix] over any engine slot and saver.
 fn edit_local_mix<E: LocalEngine + DeskReader>(
     engine: &Mutex<Option<E>>,
-    session: &SessionStore,
+    saver: &LocalMixSaver,
     mix: MixUpdateRequest,
 ) -> Result<MixDto, String> {
     if mix.max_level_percent.is_some() {
@@ -103,9 +129,8 @@ fn edit_local_mix<E: LocalEngine + DeskReader>(
         .ok_or_else(|| "the engine is not running".to_owned())?;
     let applied = engine.set_local_mix(&mix.into())?;
     let desk = engine.desk();
-    if let Err(error) = session.set_local_mix(session_mix_of(&applied, &desk)) {
-        eprintln!("[mixlink-desktop] set_local_mix: the local mix plays but was not kept: {error}");
-    }
+    // Marked only: the saver writes it after the engine lock is released.
+    saver.mark(session_mix_of(&applied, &desk));
     Ok(MixDto::from(&applied))
 }
 
@@ -164,7 +189,7 @@ pub fn set_local_output(
 }
 
 /// [set_local_output] over any engine slot, session and notice.
-fn choose_output<E: LocalEngine>(
+pub(super) fn choose_output<E: LocalEngine>(
     engine: &Mutex<Option<E>>,
     session: &SessionStore,
     notice: &Mutex<Option<String>>,
@@ -484,26 +509,70 @@ mod tests {
         engine.lock().expect("engine lock")
     }
 
-    #[test]
-    fn a_local_mix_change_plays_first_and_is_then_kept_by_group_id_for_the_next_start() {
-        let session = SessionStore::open(&session_directory("mix-kept"));
-        let engine = running(two_inputs_two_groups());
+    type Shared = std::sync::Arc<Mutex<Option<LocalStandIn>>>;
 
-        let answer = edit_local_mix(
-            &engine,
-            &session,
-            MixUpdateRequest {
-                channel_gains: Some(vec![80, 40, 9]),
-                pans: Some(vec![50, 50, 50]),
-                group_levels: Some(vec![70, 30]),
-                volume_percent: Some(85),
-                ..MixUpdateRequest::default()
+    /// A saver with no thread of its own that keeps every mix it writes in `session`, and notes
+    /// for each write whether the engine lock was free.
+    fn saver_into(
+        session: &std::sync::Arc<SessionStore>,
+        engine: &Shared,
+        lock_free: &std::sync::Arc<Mutex<Vec<bool>>>,
+    ) -> LocalMixSaver {
+        let (session, engine, lock_free) = (
+            std::sync::Arc::clone(session),
+            std::sync::Arc::clone(engine),
+            std::sync::Arc::clone(lock_free),
+        );
+        LocalMixSaver::manual(
+            move |mix: &SessionMix| {
+                lock_free
+                    .lock()
+                    .expect("notes")
+                    .push(engine.try_lock().is_ok());
+                session.set_local_mix(mix.clone())
             },
+            |_| {},
         )
-        .expect("the engine takes it");
+    }
 
+    fn shared(engine: Option<LocalStandIn>) -> Shared {
+        std::sync::Arc::new(Mutex::new(engine))
+    }
+
+    #[test]
+    fn a_local_mix_change_plays_first_and_is_then_kept_by_group_id_off_the_engine_lock() {
+        let session = std::sync::Arc::new(SessionStore::open(&session_directory("mix-kept")));
+        let engine = shared(Some(two_inputs_two_groups()));
+        let lock_free = std::sync::Arc::default();
+        let saver = saver_into(&session, &engine, &lock_free);
+
+        let mut answer = None;
+        for volume in [10, 40, 85] {
+            answer = Some(
+                edit_local_mix(
+                    &engine,
+                    &saver,
+                    MixUpdateRequest {
+                        channel_gains: Some(vec![80, 40, 9]),
+                        pans: Some(vec![50, 50, 50]),
+                        group_levels: Some(vec![70, 30]),
+                        volume_percent: Some(volume),
+                        ..MixUpdateRequest::default()
+                    },
+                )
+                .expect("the engine takes it"),
+            );
+        }
+
+        let answer = answer.expect("answered");
         assert_eq!(answer.volume_percent, 85, "the mix now applied");
-        assert_eq!(answer.revision, 1);
+        assert_eq!(answer.revision, 3);
+        assert_eq!(
+            session.local(),
+            None,
+            "an edit only marks the mix: nothing is written under the engine lock"
+        );
+        saver.flush();
         assert_eq!(
             session.local(),
             Some(SessionLocal {
@@ -515,39 +584,53 @@ mod tests {
                 }),
                 output: None,
             }),
-            "the device's inputs and the group levels by id, never a level cap"
+            "the last change, the device's inputs and the group levels by id, never a level cap"
+        );
+        assert_eq!(
+            *lock_free.lock().expect("notes"),
+            vec![true],
+            "one write, with the engine lock free"
         );
     }
 
     #[test]
     fn a_local_mix_change_with_no_engine_or_one_that_stops_is_refused_and_nothing_is_kept() {
-        let session = SessionStore::open(&session_directory("mix-refused"));
-        let idle: Mutex<Option<LocalStandIn>> = Mutex::new(None);
-        let stopping = running(LocalStandIn {
+        let session = std::sync::Arc::new(SessionStore::open(&session_directory("mix-refused")));
+        let idle = shared(None);
+        let stopping = shared(Some(LocalStandIn {
             stopping: true,
             ..two_inputs_two_groups()
-        });
+        }));
+        let lock_free = std::sync::Arc::default();
+        let saver = saver_into(&session, &idle, &lock_free);
         let change = || MixUpdateRequest {
             volume_percent: Some(10),
             ..MixUpdateRequest::default()
         };
 
-        let error = edit_local_mix(&idle, &session, change()).expect_err("refused");
+        let error = edit_local_mix(&idle, &saver, change()).expect_err("refused");
         assert!(error.contains("not running"), "{error}");
-        let error = edit_local_mix(&stopping, &session, change()).expect_err("refused");
+        let error = edit_local_mix(&stopping, &saver, change()).expect_err("refused");
         assert!(error.contains("stopping"), "{error}");
+        saver.flush();
 
         assert_eq!(session.local(), None, "nothing is kept");
+        assert!(
+            lock_free.lock().expect("notes").is_empty(),
+            "nothing written"
+        );
     }
 
     #[test]
     fn the_local_mix_has_no_level_cap() {
-        let session = SessionStore::open(&session_directory("mix-no-cap"));
-        let engine = running(two_inputs_two_groups());
+        let session = std::sync::Arc::new(SessionStore::open(&session_directory("mix-no-cap")));
+        let engine = shared(Some(two_inputs_two_groups()));
+        let lock_free = std::sync::Arc::default();
+        let saver = saver_into(&session, &engine, &lock_free);
 
         let error = edit_local_mix(
             &engine,
-            &session,
+            &saver,
             MixUpdateRequest {
                 max_level_percent: Some(50),
                 volume_percent: Some(60),
@@ -555,6 +638,7 @@ mod tests {
             },
         )
         .expect_err("refused");
+        saver.flush();
 
         assert!(error.contains("no level cap"), "{error}");
         assert!(
@@ -566,6 +650,37 @@ mod tests {
             "the engine took nothing"
         );
         assert_eq!(session.local(), None);
+    }
+
+    #[test]
+    fn a_pending_local_mix_joins_the_kept_section_and_keeps_its_output() {
+        let kept = SessionLocal {
+            mix: None,
+            output: Some(output(VOLT, 2)),
+        };
+        let marked = SessionMix {
+            channels: vec![channel(5)],
+            groups: BTreeMap::new(),
+            volume_percent: 20,
+            muted: true,
+        };
+
+        assert_eq!(with_pending(Some(kept.clone()), None), Some(kept.clone()));
+        assert_eq!(
+            with_pending(Some(kept), Some(marked.clone())),
+            Some(SessionLocal {
+                mix: Some(marked.clone()),
+                output: Some(output(VOLT, 2)),
+            })
+        );
+        assert_eq!(
+            with_pending(None, Some(marked.clone())),
+            Some(SessionLocal {
+                mix: Some(marked),
+                output: None,
+            })
+        );
+        assert_eq!(with_pending(None, None), None);
     }
 
     #[test]

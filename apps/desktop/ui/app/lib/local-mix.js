@@ -188,6 +188,63 @@ export function localTab(state) {
 }
 
 /**
+ * The Network and system screen's listing of the outputs: `follow(state)` for every store change
+ * calls `load` once for each engine run the console shows, never while none runs (the outputs
+ * depend on the driver that run opened). Answers whether it loaded.
+ */
+export function followOutputs(load) {
+  let listed = null;
+  return (state) => {
+    const run = state.engine.status ? state.engine.run : null;
+    if (run === listed) {
+      return false;
+    }
+    listed = run;
+    if (run === null) {
+      return false;
+    }
+    load();
+    return true;
+  };
+}
+
+/**
+ * The "Local mix out" select's choice, `value` from outputOptions ("" for None), sent to the
+ * console `app` (`setLocalOutput`); `said(outcome)` hears the outcome of the last choice only, so
+ * the words never speak of a choice a newer one overtook. Resolves to the outcome.
+ */
+export function localOutputChoice({ app, said }) {
+  return async (value) => {
+    const outcome = await app.setLocalOutput(parseOutputValue(value));
+    if (!outcome.superseded) {
+      said(outcome);
+    }
+    return outcome;
+  };
+}
+
+/**
+ * What <ml-audio-setup> shows of the local output, from localOutputView plus `said` (the last
+ * change's `{ ok, message }`, or null): the select, the state in words, and the alert, notice and
+ * error lines, each hidden when it has nothing to say.
+ */
+export function localOutputParts(local) {
+  const line = (text) => ({ hidden: !text, text: text ?? "" });
+  return {
+    select: { options: local.options, value: local.value, disabled: local.disabled },
+    state: { kind: local.state.kind, text: local.state.text },
+    alert: line(local.state.alert),
+    notice: line(local.notice),
+    error: line(local.error),
+    said: {
+      text: local.said?.message ?? "",
+      ok: local.said ? String(local.said.ok) : null,
+    },
+    hint: local.hint ?? "",
+  };
+}
+
+/**
  * What a change of the local output did, from the `set_local_output` answer `{ output, applied,
  * saved, saveError }`: playing there now (or nowhere), kept for the next start with no engine, or
  * playing but not kept.

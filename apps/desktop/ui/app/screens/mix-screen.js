@@ -16,6 +16,7 @@ import {
   channelEdits,
   channelStrips,
   groupStrips,
+  masterLevels,
   masterStrip,
   mixMessages,
   mixNotice,
@@ -225,9 +226,8 @@ export function mountMixScreen(main, app) {
         strip.setLevel(stripLevel(strip.data.sides, channels));
       }
     }
-    const selected = app.store.getState().selected;
-    const output = selected === LOCAL_MIX ? local : musicians[selected];
-    parts.master.setLevels(output?.left ?? 0, output?.right ?? 0);
+    const { left, right } = masterLevels({ musicians, local }, app.store.getState().selected);
+    parts.master.setLevels(left, right);
   }
 
   // A channel strip's move goes to every input it stands for (both sides of a pair, its balance

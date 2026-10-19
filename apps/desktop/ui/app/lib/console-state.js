@@ -39,7 +39,8 @@
 //              `mixError` take it as they take an address. It has no level cap, limit or locks, so
 //              edits of those are never kept for it.
 //   outputs    { list, error }: the output devices the running engine offers for the local mix
-//              (`output_devices`), null until listed; a run's end forgets them.
+//              (`output_devices`), null until listed; a run's end forgets them, and a listing
+//              answered for a run other than the one shown is not taken.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -158,10 +159,16 @@ export const actions = Object.freeze({
   audioNotice: (notice) => ({ type: "audio-notice", notice }),
   /** The input devices listed for `host`, or the reason they could not be listed. */
   devices: (host, list, error = null) => ({ type: "devices", devices: { host, list, error } }),
-  /** The output devices the running engine offers for the local mix (`output_devices`). */
-  outputs: (list) => ({ type: "outputs", outputs: { list, error: null } }),
-  /** The output devices could not be listed, for `message`; the last list known stays. */
-  outputsFailed: (message) => ({ type: "outputs-failed", message }),
+  /**
+   * The output devices the engine of run `run` offers for the local mix (`output_devices`): taken
+   * only while that run is the one shown, since another run's driver may offer others.
+   */
+  outputs: (list, run) => ({ type: "outputs", run, outputs: { list, error: null } }),
+  /**
+   * The output devices of run `run` could not be listed, for `message`; the last list known stays.
+   * Taken only while that run is the one shown, as `outputs`.
+   */
+  outputsFailed: (message, run) => ({ type: "outputs-failed", run, message }),
   /** The engineer's mix presets as the desk answered them. */
   presets: (presets) => ({ type: "presets", presets }),
   /** The engineer's saved sessions as the desk listed them. */
@@ -200,6 +207,14 @@ export const actions = Object.freeze({
 export function isLiveRun(state, run) {
   const { run: current, endedRun } = state.engine;
   return Number.isInteger(run) && run > endedRun && (current === null || run >= current);
+}
+
+/**
+ * True when `run` is the engine run whose status the console shows now, and live: an answer about
+ * that engine (its outputs) applies; one about an ended or a newer, not yet shown, run does not.
+ */
+function isShownRun(state, run) {
+  return Number.isInteger(run) && run === state.engine.run && isLiveRun(state, run);
 }
 
 /** A status row as the console keeps it: every field but the mix, and the mix nested. */
@@ -547,9 +562,11 @@ export function consoleReducer(state, action) {
     case "devices":
       return { ...state, devices: action.devices };
     case "outputs":
-      return { ...state, outputs: action.outputs };
+      return isShownRun(state, action.run) ? { ...state, outputs: action.outputs } : state;
     case "outputs-failed":
-      return { ...state, outputs: { ...state.outputs, error: action.message } };
+      return isShownRun(state, action.run)
+        ? { ...state, outputs: { ...state.outputs, error: action.message } }
+        : state;
     case "presets":
       return { ...state, presets: action.presets };
     case "sessions":

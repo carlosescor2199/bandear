@@ -357,6 +357,15 @@ pub fn run() {
             delete_session,
             load_session
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the MixLink desktop shell");
+        .build(tauri::generate_context!())
+        .expect("error while building the MixLink desktop shell")
+        .run(|app, event| {
+            // The local mix is kept off the engine lock, a few times a second at most: what is
+            // still waiting is written before the app goes.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<DesktopState>() {
+                    commands::local::flush_local_mix(state.inner());
+                }
+            }
+        });
 }

@@ -902,7 +902,16 @@ export function createFakeBridge({
     if (typeof output.device !== "string" || output.device === "") {
       throw "an output needs the name of its device";
     }
-    return { device: output.device, firstChannel: Number(output.firstChannel ?? 0) };
+    // As the desktop reads it (a u16): required, a whole number from 0 to 65535. Like the engine,
+    // it takes any pair within the device, odd ones included; the select offers 1/2, 3/4 and so on.
+    if (!Object.hasOwn(output, "firstChannel")) {
+      throw "missing field `firstChannel`";
+    }
+    const first = output.firstChannel;
+    if (!Number.isInteger(first) || first < 0 || first > 65535) {
+      throw `invalid value ${JSON.stringify(first)} for \`firstChannel\`, expected a whole number from 0 to 65535`;
+    }
+    return { device: output.device, firstChannel: first };
   }
 
   // Keeps `change` of the local section (its mix or its output) in the desk's session.

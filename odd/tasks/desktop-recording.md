@@ -234,11 +234,31 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   - GREEN: desktop tests 170 -> 176 (84ce3be) -> 196, `cargo check --all-targets` and `cargo build`
     clean; UI tests 350 -> 375. Preview `?fake#/mix` and `#/network`: no console errors; tab, edit,
     output choice and the tab's word checked.
-  - Follow-ups: save the local mix with a debounce (each coalesced fader step now writes the
-    session under the engine lock); live with the Volt: WASAPI OUTPUT 1/2 counters over a long run,
-    ASIO listing the Volt driver's own outputs and reopening the kept output at start, and a
-    WASAPI-kept output showing the notice and staying off under ASIO.
-  - Commits: 84ce3be (session), b70131d (commands, DTOs, events). Commit: this commit.
+  - Follow-ups: save the local mix with a debounce (done in T2b-fix); live with the Volt: WASAPI
+    OUTPUT 1/2 counters over a long run, ASIO listing the Volt driver's own outputs and reopening
+    the kept output at start, and a WASAPI-kept output showing the notice and staying off under
+    ASIO.
+  - Commits: 84ce3be (session), b70131d (commands, DTOs, events), 25530e6 (UI).
+  - [x] T2b-fix (review findings of review-dab3acc47185a219 and review-8a82f3af04262a69): the
+    local-mix save leaves the engine lock (part 1 R3-002): an edit applies under the lock and only
+    marks the mix; a saver thread writes the latest at most every 400 ms, and stop, quit and drop
+    write what waits; a failed write is kept to retry and logged once until it changes; a start and
+    a load pause the saver to read or replace the session with the mix still waiting (a load
+    keeps it with the desk's own local mix, drops it for a loaded one). A load's output notice is
+    written inside the engine lock (part 1 R3-001), and the status is built by `status_dto`, which
+    the test drives with the notice (a running `EngineHandle` needs hardware, so the test drives
+    `load_session_with`, the whole load). UI: an output listing answered for an ended run is not
+    taken (part 2 R3-001); output choices go one at a time, an overtaken one never goes out and
+    only the last choice's words are said (R3-002); the listing per run, the select's choice, the
+    audio setup's lines and the master meter's local peak are DOM-free functions with tests
+    (R3-003); the fake reads `firstChannel` as the desktop does, a required whole number 0-65535,
+    any pair within the device (R3-004: the desktop and the engine take odd pairs too, so the fake
+    does not require even ones).
+    RED: desktop by 4 mutations (no in-lock notice write, a write on every edit under the lock,
+    no throttle, a failure logged every time): 4 of 203 failed, one per mutation. UI: 7 of 31 new
+    tests failing before the change. GREEN: desktop 196 -> 203 (3 runs), `cargo build` clean; UI
+    375 -> 382; preview with no console errors (two quick choices end on the last one).
+    Commits: 1decd1d (backend). Commit: this commit.
 - [ ] T3 (WAV/RF64 writer): pure, heavily tested writer for 24-bit and 32-bit float, mono and
   stereo, RF64 upgrade, crash-safe headers; and a reader for playback. Route: delegated writer.
 - [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
@@ -267,8 +287,11 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   skips) are fixed by T2a-fix. Next review base: f83180f.
   Live checks still owed for T7: an ASIO output on the Volt next to its capture (cpal opens both
   directions on one driver), and drift over a long WASAPI run.
-- T2b done in three work units: 84ce3be, b70131d and the UI commit. Next review base: f83180f
-  (T2a-fix and T2b not reviewed yet).
+- T2b done in three work units: 84ce3be, b70131d and 25530e6.
+- T2a-fix and T2b were reviewed in two parts (over the reviewer's budget), both approved and
+  acknowledged: review-dab3acc47185a219 (f83180f..b70131d) and review-8a82f3af04262a69
+  (b70131d..25530e6). Their findings (part 1 R3-001 and R3-002, part 2 R3-001 to R3-004) are fixed
+  by T2b-fix. Next review base: 25530e6.
 
 ## Next step
 

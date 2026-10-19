@@ -1,29 +1,29 @@
-//! Packet redundancy: the desk can have a musician's audio sent twice, each datagram again a few
-//! blocks later, so a packet Wi-Fi loses can still arrive as its copy.
+//! Packet redundancy: the desk can have a musician's audio sent twice, so a packet Wi-Fi loses can
+//! still arrive as its copy.
 //!
 //! The copy is the exact same datagram, header and sequence included: the PMON format does not
-//! change, and a phone that does not use copies drops it as a duplicate, which it always did (its
-//! sequence is not newer than the last one played). A phone that does use them waits for a missing
-//! sequence while copies are arriving and plays the copy in its place, reporting it as `recovered`
-//! in its `stats` (see [crate::CAPABILITY_REDUNDANCY_RECOVERED]).
+//! change, and a phone that does not need the copy drops it as a duplicate, which it always did (its
+//! sequence is not newer than the last one played).
 //!
-//! The copy goes out `delay_blocks` blocks after the original, right after that block's own
-//! datagram: a Wi-Fi burst that takes a packet must last that long to take its copy too. The delay
-//! is 1 to [MAX_REDUNDANCY_DELAY_BLOCKS] blocks, [DEFAULT_REDUNDANCY_DELAY_BLOCKS] by default: at
-//! the usual 256-frame blocks (5.3 ms) two blocks ride out a burst of up to about 10 ms, which is
-//! what interference and a neighbour's transmission typically cost, while the phone waits at most
-//! that long for a copy (its cushion must cover it). A longer delay rides out longer bursts and
-//! costs the phone that much more cushion; one block costs the least and covers single losses.
+//! By default (delay 0) the copy goes right after its original, in the same block's send: no
+//! latency is added, and a phone that lost the original has the copy before the next datagram, so
+//! it plays it in order, as every phone always did. That covers isolated losses, the usual kind.
+//!
+//! The desk may instead delay the copy 1 to [MAX_REDUNDANCY_DELAY_BLOCKS] blocks, right after that
+//! later block's own datagram: a Wi-Fi burst that takes a packet must then last that long to take
+//! its copy too. A delayed copy arrives after newer audio, so only a phone that holds packets back
+//! for that many blocks before playing them can use it ([Redundancy::hold_blocks]). The hold costs
+//! that phone the delay in latency (at the usual 256-frame blocks, 5.3 ms a block).
 //!
 //! Redundancy costs that musician's link double the bandwidth (every datagram is sent twice) and
 //! nothing for the others. The engine keeps the setting per musician (by their phone's client id,
 //! else their address) for as long as it runs, whether or not they are here, as it keeps a playback
 //! buffer.
 //!
-//! Real time: the copies of a musician's datagrams are held in a [HeldCopies] allocated off the
+//! Real time: delayed copies of a musician's datagrams are held in a [HeldCopies] allocated off the
 //! engine thread, when the desk turns redundancy on or the musician's row is created or moved; the
 //! engine thread only copies bytes into it and out of it and sends them, with no allocation and no
-//! lock.
+//! lock. An immediate copy is the datagram just sent, sent again: nothing is held.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -33,14 +33,15 @@ use crate::pipeline::MAX_BLOCK_FRAMES;
 use crate::protocol::HEADER_SIZE;
 use crate::targets::MusicianKey;
 
-/// The shortest delay of a copy, in blocks.
-pub const MIN_REDUNDANCY_DELAY_BLOCKS: u8 = 1;
+/// The shortest delay of a copy, in blocks: 0 sends it right after its original.
+pub const MIN_REDUNDANCY_DELAY_BLOCKS: u8 = 0;
 
 /// The longest delay of a copy, in blocks: about 21 ms at 256-frame blocks.
 pub const MAX_REDUNDANCY_DELAY_BLOCKS: u8 = 4;
 
-/// The delay the desk uses when it names none (see the module documentation for the choice).
-pub const DEFAULT_REDUNDANCY_DELAY_BLOCKS: u8 = 2;
+/// The delay the desk uses when it names none: an immediate copy, which adds no latency and needs
+/// nothing of the phone (see the module documentation).
+pub const DEFAULT_REDUNDANCY_DELAY_BLOCKS: u8 = 0;
 
 /// The longest datagram the engine sends: a header and the stereo 16-bit samples of the longest
 /// block.
@@ -53,13 +54,13 @@ pub enum Redundancy {
     /// Each datagram is sent once (the default).
     #[default]
     Off,
-    /// Each datagram is sent again `delay_blocks` blocks later.
+    /// Each datagram is sent again `delay_blocks` blocks later (0: right after itself).
     On { delay_blocks: u8 },
 }
 
 impl Redundancy {
-    /// Redundancy with copies `delay_blocks` blocks late, or an error naming the range when it is
-    /// outside [MIN_REDUNDANCY_DELAY_BLOCKS]-[MAX_REDUNDANCY_DELAY_BLOCKS].
+    /// Redundancy with copies `delay_blocks` blocks late (0: immediate), or an error naming the
+    /// range when it is outside [MIN_REDUNDANCY_DELAY_BLOCKS]-[MAX_REDUNDANCY_DELAY_BLOCKS].
     pub fn on(delay_blocks: u32) -> Result<Self, String> {
         let range = u32::from(MIN_REDUNDANCY_DELAY_BLOCKS)..=u32::from(MAX_REDUNDANCY_DELAY_BLOCKS);
         if !range.contains(&delay_blocks) {
@@ -80,6 +81,12 @@ impl Redundancy {
             Redundancy::On { delay_blocks } => Some(delay_blocks),
         }
     }
+
+    /// The blocks a phone must hold packets back to play a late copy in place of a lost original:
+    /// the delay of the copies; 0 while off or with immediate copies, which arrive in order.
+    pub fn hold_blocks(self) -> u8 {
+        self.delay_blocks().unwrap_or(0)
+    }
 }
 
 /// What [crate::EngineHandle::set_redundancy] did, and for whom.
@@ -94,7 +101,8 @@ pub struct RedundancySetting {
 }
 
 /// The datagrams of one musician waiting to be sent again: one slot per block of delay, each with
-/// room for the longest datagram, allocated once when it is made.
+/// room for the longest datagram, allocated once when it is made. For immediate copies it holds
+/// nothing: the network sink sends the datagram it just sent again.
 ///
 /// Only the engine thread uses it once it is in the target table, so its atomics are never
 /// contended: they are what lets the table share it with that thread without a lock, the same way
@@ -110,13 +118,13 @@ pub(crate) struct HeldCopies {
 }
 
 impl HeldCopies {
-    /// Room for `delay_blocks` datagrams of up to [MAX_DATAGRAM_BYTES], all empty. Allocates: never
-    /// on the engine thread.
+    /// Room for `delay_blocks` datagrams of up to [MAX_DATAGRAM_BYTES], all empty; none for
+    /// immediate copies. Allocates: never on the engine thread.
     pub(crate) fn new(delay_blocks: u8) -> Self {
-        let slots = usize::from(delay_blocks.max(1));
+        let slots = usize::from(delay_blocks);
         let slot_words = MAX_DATAGRAM_BYTES.div_ceil(8);
         Self {
-            delay_blocks: delay_blocks.max(1),
+            delay_blocks,
             slot_words,
             words: (0..slots * slot_words).map(|_| AtomicU64::new(0)).collect(),
             lengths: (0..slots).map(|_| AtomicUsize::new(0)).collect(),
@@ -130,8 +138,12 @@ impl HeldCopies {
 
     /// One block's turn: when a datagram was held `delay_blocks` blocks ago, it is copied into
     /// `copy` (which must already have room for it, so nothing allocates) and the answer is true;
-    /// then `current` is held in its place. A datagram longer than a slot is not held.
+    /// then `current` is held in its place. A datagram longer than a slot is not held. A store for
+    /// immediate copies holds nothing and answers false.
     pub(crate) fn exchange(&self, current: &[u8], copy: &mut Vec<u8>) -> bool {
+        if self.delay_blocks == 0 {
+            return false;
+        }
         let slot = self.next.load(Ordering::Relaxed);
         let words = &self.words[slot * self.slot_words..(slot + 1) * self.slot_words];
         let held = self.lengths[slot].load(Ordering::Relaxed);
@@ -176,11 +188,12 @@ mod tests {
 
     #[test]
     fn redundancy_is_on_with_a_delay_within_its_range() {
+        assert_eq!(Redundancy::on(0), Ok(Redundancy::On { delay_blocks: 0 }));
         assert_eq!(Redundancy::on(1), Ok(Redundancy::On { delay_blocks: 1 }));
         assert_eq!(Redundancy::on(4), Ok(Redundancy::On { delay_blocks: 4 }));
-        for delay in [0, 5, 300] {
+        for delay in [5, 300] {
             let error = Redundancy::on(delay).expect_err("out of range");
-            assert!(error.contains("from 1 to 4 blocks"), "{error}");
+            assert!(error.contains("from 0 to 4 blocks"), "{error}");
             assert!(error.contains(&format!("got {delay}")), "{error}");
         }
         assert_eq!(Redundancy::default(), Redundancy::Off);
@@ -188,8 +201,29 @@ mod tests {
         assert_eq!(Redundancy::On { delay_blocks: 3 }.delay_blocks(), Some(3));
         assert_eq!(
             Redundancy::on(u32::from(DEFAULT_REDUNDANCY_DELAY_BLOCKS)),
-            Ok(Redundancy::On { delay_blocks: 2 })
+            Ok(Redundancy::On { delay_blocks: 0 }),
+            "the copy goes right after its original unless the desk asks for a delay"
         );
+    }
+
+    /// The hold a phone needs to play a late copy: the delay while on, none while off or with
+    /// immediate copies (which arrive before the next datagram).
+    #[test]
+    fn the_hold_is_the_delay_of_the_copies() {
+        assert_eq!(Redundancy::Off.hold_blocks(), 0);
+        assert_eq!(Redundancy::On { delay_blocks: 0 }.hold_blocks(), 0);
+        assert_eq!(Redundancy::On { delay_blocks: 3 }.hold_blocks(), 3);
+    }
+
+    /// Immediate copies need no store: nothing is held, so nothing is ever sent from one.
+    #[test]
+    fn a_store_for_immediate_copies_holds_nothing() {
+        let held = HeldCopies::new(0);
+        assert_eq!(held.delay_blocks(), 0);
+        let mut copy = Vec::with_capacity(MAX_DATAGRAM_BYTES);
+        for block in 0..3 {
+            assert!(!held.exchange(&datagram(block, 100), &mut copy));
+        }
     }
 
     fn datagram(sequence: u8, length: usize) -> Vec<u8> {
@@ -203,6 +237,7 @@ mod tests {
     #[test]
     fn each_datagram_comes_back_exactly_after_its_delay() {
         for delay in 1..=MAX_REDUNDANCY_DELAY_BLOCKS {
+            // Delay 0 holds nothing (see a_store_for_immediate_copies_holds_nothing).
             let held = HeldCopies::new(delay);
             let mut copy = Vec::with_capacity(MAX_DATAGRAM_BYTES);
             let lengths = [1_044, 21, 1_043, 8, 7, 1_044, 64, 1];

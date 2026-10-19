@@ -187,14 +187,21 @@ impl Sink for NetworkSink {
                         .store(send_error_code(error.kind()), Ordering::Relaxed);
                 }
             }
-            // With redundancy on, the datagram held a few blocks ago goes again right after this
-            // block's own, and this one is held in its place: bytes copied into room made before,
-            // nothing allocated. A failed copy keeps its kind like any send; the audio itself went.
+            // With redundancy on, a copy goes right after this block's own datagram: this very
+            // datagram for immediate copies, else the one held a few blocks ago, this one held in
+            // its place (bytes copied into room made before, nothing allocated). A failed copy keeps
+            // its kind like any send; the audio itself went.
             if let Some(held) = &destination.held {
-                self.copy.clear();
-                self.copy.reserve(self.packet.len());
-                if held.exchange(&self.packet, &mut self.copy) {
-                    match self.socket.send_to(&self.copy, destination.address) {
+                let copy = if held.delay_blocks() == 0 {
+                    Some(&self.packet)
+                } else {
+                    self.copy.clear();
+                    self.copy.reserve(self.packet.len());
+                    held.exchange(&self.packet, &mut self.copy)
+                        .then_some(&self.copy)
+                };
+                if let Some(copy) = copy {
+                    match self.socket.send_to(copy, destination.address) {
                         Ok(_) => {
                             destination
                                 .counters
@@ -667,6 +674,37 @@ mod tests {
         assert_eq!(counters.duplicates.load(Ordering::Relaxed), 3);
     }
 
+    /// Immediate copies (delay 0, the default) go right after their original, in the same block's
+    /// send: a phone that lost the original has the copy before the next datagram.
+    #[test]
+    fn an_immediate_copy_follows_its_original_at_once() {
+        use crate::redundancy::Redundancy;
+        use crate::targets::MusicianKey;
+
+        let phone = bind("127.0.0.1:0");
+        let address = phone.local_addr().expect("phone address");
+        let targets = registry(&[address]);
+        targets
+            .set_redundancy(
+                &MusicianKey::Address(address),
+                Redundancy::On { delay_blocks: 0 },
+            )
+            .expect("the phone is here");
+        let counters = Arc::clone(&targets.read()[0].counters);
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+
+        send_blocks(&mut sink, 0..3);
+
+        let received: Vec<Vec<u8>> = (0..6).map(|_| datagram(&phone)).collect();
+        let sequences: Vec<u64> = received.iter().map(|packet| sequence_of(packet)).collect();
+        assert_eq!(sequences, [0, 0, 1, 1, 2, 2]);
+        assert_eq!(received[1], received[0], "the copy is the same datagram");
+        assert_eq!(received[5], received[4]);
+        assert!(receive(&phone, Duration::from_millis(100)).is_none());
+        assert_eq!(counters.sent.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.duplicates.load(Ordering::Relaxed), 3);
+    }
+
     /// Redundancy is per musician: another phone gets each datagram once, and turning it off stops
     /// the copies from the next block.
     #[test]
@@ -754,7 +792,8 @@ mod tests {
 
     /// The whole per-block path after warm-up, as it runs live: a 24-bit, 96 kHz stereo callback
     /// converted, filtered, decimated and metered into the ring, then each block mixed for three
-    /// phones, metered, encoded and sent (the first phone's twice, with redundancy on), and mixed
+    /// phones, metered, encoded and sent (the first phone's twice, its copies two blocks late, and
+    /// the last phone's twice, each copy right away), and mixed
     /// and metered for the local mix, with no local output and then with one playing. Not one heap
     /// allocation or free on the way.
     #[test]
@@ -785,6 +824,15 @@ mod tests {
                 crate::redundancy::Redundancy::On { delay_blocks: 2 },
             )
             .expect("the first phone is here");
+        // The last phone takes immediate copies, the default, which hold nothing.
+        if addresses.len() > 1 {
+            targets
+                .set_redundancy(
+                    &crate::targets::MusicianKey::Address(addresses[addresses.len() - 1]),
+                    crate::redundancy::Redundancy::On { delay_blocks: 0 },
+                )
+                .expect("the last phone is here");
+        }
         // The phones drain their sockets on their own threads, which are not watched.
         let draining = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let drains: Vec<_> = phones

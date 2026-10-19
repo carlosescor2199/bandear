@@ -1538,6 +1538,7 @@ mod tests {
             capabilities: Vec::new(),
             mirror: None,
             playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
+            redundancy: personal_monitoring::Redundancy::Off,
         };
 
         let dto = MusicianDto::from(&musician);
@@ -1560,6 +1561,7 @@ mod tests {
             capabilities: Vec::new(),
             mirror: None,
             playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
+            redundancy: personal_monitoring::Redundancy::Off,
         };
 
         let dto = MusicianDto::from(&musician);
@@ -1671,6 +1673,7 @@ mod tests {
             capabilities: Vec::new(),
             mirror: None,
             playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
+            redundancy: personal_monitoring::Redundancy::Off,
         }
     }
 

@@ -66,6 +66,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
             capabilities: Vec::new(),
             mirror: None,
             playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
+            redundancy: personal_monitoring::Redundancy::Off,
         }],
         local_mix: Default::default(),
         local_output: Default::default(),

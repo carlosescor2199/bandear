@@ -10,6 +10,7 @@ use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixS
 use crate::network::TargetCounters;
 use crate::playback::PlaybackBuffer;
 use crate::protocol::{StatsCommand, CAPABILITY_PLAYBACK_BUFFER};
+use crate::redundancy::{HeldCopies, Redundancy};
 
 /// Whom the engineer's controls for a musician are kept for: the stable client id their phone
 /// announced, or, for a configured target and a phone that announced none, their address (joined
@@ -290,6 +291,26 @@ fn supports_buffer(entry: &TargetEntry) -> bool {
         .any(|name| name == CAPABILITY_PLAYBACK_BUFFER)
 }
 
+/// A new store for the copies `redundancy` sends again; `None` while it is off. Allocates, so it is
+/// only ever called off the engine thread.
+fn new_held(redundancy: Redundancy) -> Option<Arc<HeldCopies>> {
+    redundancy
+        .delay_blocks()
+        .map(|delay_blocks| Arc::new(HeldCopies::new(delay_blocks)))
+}
+
+/// Puts `redundancy` in force on `entry`: a store that already holds copies at that delay is kept
+/// (its copies are still due), any other is replaced, and off drops it.
+fn hold_copies(entry: &mut TargetEntry, redundancy: Redundancy) {
+    let kept = entry
+        .held
+        .as_ref()
+        .is_some_and(|held| Some(held.delay_blocks()) == redundancy.delay_blocks());
+    if !kept {
+        entry.held = new_held(redundancy);
+    }
+}
+
 /// One configured musician destination: the UDP address plus the state that belongs to it.
 ///
 /// The three values travel together on purpose. The network thread needs exactly this triple for
@@ -311,6 +332,11 @@ pub(crate) struct TargetEntry {
     /// lock-free atomics, and the meter read decays it.
     pub(crate) output_meter: OutputMeter,
     pub(crate) origin: TargetOrigin,
+    /// The copies of this musician's datagrams waiting to be sent again, while the desk has
+    /// redundancy on for them (see [crate::redundancy]); `None` while it is off. Made off the engine
+    /// thread whenever the setting kept for whoever is on the row changes; only the network thread
+    /// uses it.
+    pub(crate) held: Option<Arc<HeldCopies>>,
 }
 
 /// The live routing table: which UDP targets exist, each with its mix state and send counters.
@@ -345,6 +371,10 @@ pub(crate) struct TargetRegistry {
     /// client id, else their IP; a musician with none kept is on Auto. Kept for as long as the
     /// engine runs, whether or not the musician is here, and never held with another book's lock.
     buffers: Mutex<HashMap<BookKey, PlaybackBuffer>>,
+    /// The redundancy the desk set per musician (see [crate::redundancy]), by their phone's client
+    /// id, else their IP; a musician with none kept has it off. Kept like the playback buffers, and
+    /// taken after the table's lock, never with another book's.
+    redundancies: Mutex<HashMap<BookKey, Redundancy>>,
     propagation: Mutex<()>,
     /// The link histories of phones whose rows were removed (the grace period ran out, or the
     /// engineer removed them), by client id, the most recent last; at most
@@ -384,6 +414,7 @@ impl TargetRegistry {
                 link_history: LinkHistory::shared(),
                 output_meter: OutputMeter::default(),
                 origin: TargetOrigin::Configured,
+                held: None,
             });
         }
         Ok(Self {
@@ -391,6 +422,7 @@ impl TargetRegistry {
             controls: Mutex::new(HashMap::new()),
             mirrors: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
+            redundancies: Mutex::new(HashMap::new()),
             propagation: Mutex::new(()),
             departed_histories: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -873,6 +905,9 @@ impl TargetRegistry {
             disconnected_at: None,
         };
         let mut entries = self.entries.write().expect("target registry lock poisoned");
+        // Whoever registers takes the redundancy kept for them, or none: never the previous
+        // occupant's.
+        let redundancy = Self::kept_redundancy(&self.redundancy_book(), client_id, peer);
         let returning = client_id.and_then(|id| {
             entries.iter().position(|entry| {
                 entry.address.ip() != peer && entry.origin.client_id() == Some(id)
@@ -889,6 +924,7 @@ impl TargetRegistry {
             let entry = &mut entries[index];
             entry.address = address;
             entry.origin = origin;
+            hold_copies(entry, redundancy);
             let controls_changed = self.restore_kept_controls(entry);
             let (mirror_changed, followed) = self.restore_mirror(&entries, &entries[index]);
             return Registration {
@@ -918,6 +954,7 @@ impl TargetRegistry {
             }
             existing.address = address;
             existing.origin = origin;
+            hold_copies(existing, redundancy);
             let controls_changed = if same_musician {
                 self.restore_kept_controls(existing)
             } else {
@@ -941,6 +978,7 @@ impl TargetRegistry {
             link_history: self.take_departed_history(client_id),
             output_meter: OutputMeter::default(),
             origin,
+            held: new_held(redundancy),
         };
         let controls_changed = self.restore_kept_controls(&entry);
         let (mirror_changed, followed) = self.restore_mirror(&entries, &entry);
@@ -1036,6 +1074,11 @@ impl TargetRegistry {
             link_history: LinkHistory::shared(),
             output_meter: OutputMeter::default(),
             origin: TargetOrigin::Configured,
+            held: new_held(Self::kept_redundancy(
+                &self.redundancy_book(),
+                None,
+                address.ip(),
+            )),
         };
         self.restore_kept_controls(&entry);
         self.restore_mirror(&entries, &entry);
@@ -1223,6 +1266,103 @@ impl TargetRegistry {
             })
             .map(|entry| entry.address)
             .collect()
+    }
+
+    fn redundancy_book(&self) -> MutexGuard<'_, HashMap<BookKey, Redundancy>> {
+        self.redundancies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The redundancy kept for the musician with this client id at this IP: the one kept for their
+    /// phone first, then the one kept for their IP; off when none is.
+    fn kept_redundancy(
+        book: &HashMap<BookKey, Redundancy>,
+        client_id: Option<&str>,
+        ip: IpAddr,
+    ) -> Redundancy {
+        client_id
+            .and_then(|id| book.get(&BookKey::Client(id.to_owned())).copied())
+            .or_else(|| book.get(&BookKey::Ip(ip)).copied())
+            .unwrap_or_default()
+    }
+
+    /// The redundancy kept for each musician here, by IP, as the status reports it.
+    pub(crate) fn redundancies(&self, entries: &[TargetEntry]) -> HashMap<IpAddr, Redundancy> {
+        let book = self.redundancy_book();
+        entries
+            .iter()
+            .map(|entry| {
+                let ip = entry.address.ip();
+                (
+                    ip,
+                    Self::kept_redundancy(&book, entry.origin.client_id(), ip),
+                )
+            })
+            .collect()
+    }
+
+    /// Sets the redundancy of the musician `key` names (by their phone's client id, or an address
+    /// by IP), keeps it for them as [Self::set_playback_buffer] keeps a buffer (off is kept as
+    /// nothing kept), and puts it in force on their row at once. Every phone takes it: a copy is the
+    /// same datagram, which a phone that does not use it drops as a duplicate. Answers the key it is
+    /// kept under and the musician's row; a key that names nobody here is an error.
+    pub(crate) fn set_redundancy(
+        &self,
+        key: &MusicianKey,
+        redundancy: Redundancy,
+    ) -> Result<(MusicianKey, SocketAddr), String> {
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        let entry = entries
+            .iter_mut()
+            .find(|entry| names(key, entry))
+            .ok_or_else(|| format!("{} is not here", describe_key(key)))?;
+        let kept_for = musician_key(entry);
+        {
+            let mut book = self.redundancy_book();
+            if matches!(kept_for, MusicianKey::Client(_)) {
+                book.remove(&BookKey::Ip(entry.address.ip()));
+            }
+            match redundancy {
+                Redundancy::Off => book.remove(&BookKey::from(&kept_for)),
+                on => book.insert(BookKey::from(&kept_for), on),
+            };
+        }
+        hold_copies(entry, redundancy);
+        Ok((kept_for, entry.address))
+    }
+
+    /// Replaces every redundancy setting kept with `kept`, as a desk starting an engine or loading
+    /// a session does: one kept before and not in `kept` is forgotten (off), also for a musician who
+    /// is not here, and every row here takes the one now kept for it.
+    pub(crate) fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) {
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        let book = {
+            let mut book = self.redundancy_book();
+            book.clear();
+            for (key, redundancy) in kept {
+                if *redundancy != Redundancy::Off {
+                    book.insert(BookKey::from(key), *redundancy);
+                }
+            }
+            book.clone()
+        };
+        for entry in entries.iter_mut() {
+            let redundancy =
+                Self::kept_redundancy(&book, entry.origin.client_id(), entry.address.ip());
+            hold_copies(entry, redundancy);
+        }
+    }
+
+    /// Adds the packets the musician at `ip` reports a redundant copy recovered to their running
+    /// total. An IP with no target is a no-op.
+    pub(crate) fn count_recovered(&self, ip: IpAddr, recovered: u64) {
+        if let Some(entry) = self.read().iter().find(|entry| entry.address.ip() == ip) {
+            entry
+                .counters
+                .recovered
+                .fetch_add(recovered, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The link history of the target at `ip`, if there is one.
@@ -3117,5 +3257,155 @@ mod tests {
             "both are back on Auto"
         );
         assert!(registry.buffer_book().is_empty());
+    }
+
+    const TWO_BLOCKS: Redundancy = Redundancy::On { delay_blocks: 2 };
+
+    /// The delay of the copies the row at `peer` holds, `None` when it holds none.
+    fn held_delay(registry: &TargetRegistry, peer: &str) -> Option<u8> {
+        registry
+            .read()
+            .iter()
+            .find(|entry| entry.address.ip() == ip(peer))
+            .and_then(|entry| entry.held.as_ref().map(|held| held.delay_blocks()))
+    }
+
+    /// Redundancy works for every phone (a copy is the same datagram), is kept by client id, and
+    /// follows the phone to a new IP and back after its row was removed.
+    #[test]
+    fn redundancy_is_kept_for_the_phone_and_follows_it_to_a_new_ip_and_back_after_it_left() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        // An older phone that announces nothing still takes it.
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(held_delay(&registry, "192.168.1.10"), None);
+
+        let (kept_for, address) = registry
+            .set_redundancy(&MusicianKey::Client(PHONE_A.to_owned()), TWO_BLOCKS)
+            .expect("Ana is here");
+        assert_eq!(kept_for, MusicianKey::Client(PHONE_A.to_owned()));
+        assert_eq!(address, self::address("192.168.1.10:50000"));
+        assert_eq!(held_delay(&registry, "192.168.1.10"), Some(2));
+
+        register_phone(&registry, "192.168.1.3", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(held_delay(&registry, "192.168.1.3"), Some(2));
+
+        registry.remove("192.168.1.3:50000").expect("removed");
+        register_phone(&registry, "192.168.1.20", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(held_delay(&registry, "192.168.1.20"), Some(2));
+        assert_eq!(
+            registry
+                .redundancies(&registry.read())
+                .get(&ip("192.168.1.20")),
+            Some(&TWO_BLOCKS)
+        );
+
+        registry
+            .set_redundancy(&MusicianKey::Client(PHONE_A.to_owned()), Redundancy::Off)
+            .expect("Ana is here");
+        assert_eq!(held_delay(&registry, "192.168.1.20"), None);
+        assert!(registry.redundancy_book().is_empty(), "off keeps nothing");
+    }
+
+    /// Someone else taking the row over gets their own setting, never the previous occupant's; a
+    /// new delay replaces the store, the same one keeps it with its copies.
+    #[test]
+    fn a_row_taken_over_gets_its_new_musicians_redundancy() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry
+            .set_redundancy(&MusicianKey::Client(PHONE_A.to_owned()), TWO_BLOCKS)
+            .expect("Ana is here");
+        let store = |registry: &TargetRegistry| {
+            Arc::clone(registry.read()[0].held.as_ref().expect("a store"))
+        };
+        let before = store(&registry);
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        assert!(
+            Arc::ptr_eq(&before, &store(&registry)),
+            "the same delay keeps it"
+        );
+        registry
+            .set_redundancy(
+                &MusicianKey::Client(PHONE_A.to_owned()),
+                Redundancy::On { delay_blocks: 3 },
+            )
+            .expect("Ana is here");
+        assert_eq!(held_delay(&registry, "192.168.1.10"), Some(3));
+
+        register_phone(&registry, "192.168.1.10", 50000, "Eva", Some(PHONE_B));
+        assert_eq!(
+            held_delay(&registry, "192.168.1.10"),
+            None,
+            "Eva has none kept"
+        );
+    }
+
+    /// A configured target is keyed by its address, and one added later takes what is kept for its
+    /// IP; a key naming nobody is an error.
+    #[test]
+    fn a_configured_target_keeps_redundancy_by_address() {
+        let rack = address("192.168.1.30:50000");
+        let registry = TargetRegistry::new(&[rack], &GroupLayout::default()).expect("registry");
+        let (kept_for, _) = registry
+            .set_redundancy(
+                &MusicianKey::Address(rack),
+                Redundancy::On { delay_blocks: 1 },
+            )
+            .expect("the rack is here");
+        assert_eq!(kept_for, MusicianKey::Address(rack));
+        registry.remove("192.168.1.30:50000").expect("removed");
+        registry
+            .add("192.168.1.30:50000", &GroupLayout::default())
+            .expect("added again");
+        assert_eq!(held_delay(&registry, "192.168.1.30"), Some(1));
+
+        let error = registry
+            .set_redundancy(&MusicianKey::Client(PHONE_B.to_owned()), TWO_BLOCKS)
+            .expect_err("nobody");
+        assert!(error.contains("is not here"), "{error}");
+    }
+
+    /// A desk starting or loading a session replaces every setting: the rows here take theirs at
+    /// once, one not listed goes off, and one for a musician who is not here waits for them.
+    #[test]
+    fn replacing_the_redundancy_puts_each_rows_setting_in_force() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        register_phone(&registry, "192.168.1.11", 50000, "Eva", None);
+        registry
+            .set_redundancy(
+                &MusicianKey::Address(address("192.168.1.11:50000")),
+                TWO_BLOCKS,
+            )
+            .expect("Eva is here");
+
+        registry.replace_redundancies(&[
+            (
+                MusicianKey::Client(PHONE_A.to_owned()),
+                Redundancy::On { delay_blocks: 4 },
+            ),
+            (MusicianKey::Client(PHONE_B.to_owned()), TWO_BLOCKS),
+        ]);
+        assert_eq!(held_delay(&registry, "192.168.1.10"), Some(4));
+        assert_eq!(held_delay(&registry, "192.168.1.11"), None);
+
+        register_phone(&registry, "192.168.1.12", 50000, "Bo", Some(PHONE_B));
+        assert_eq!(held_delay(&registry, "192.168.1.12"), Some(2));
+    }
+
+    #[test]
+    fn the_packets_a_phone_reports_recovered_add_up() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry.count_recovered(ip("192.168.1.10"), 3);
+        registry.count_recovered(ip("192.168.1.10"), 4);
+        registry.count_recovered(ip("192.168.1.99"), 5);
+        assert_eq!(
+            registry.read()[0]
+                .counters
+                .recovered
+                .load(std::sync::atomic::Ordering::Relaxed),
+            7
+        );
     }
 }

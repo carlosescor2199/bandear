@@ -859,6 +859,9 @@ async fn handle_control_connection(
                                     &command,
                                     LinkMoment::now(),
                                 );
+                                if let Some(recovered) = command.recovered {
+                                    targets.count_recovered(peer.ip(), recovered);
+                                }
                                 None
                             }
                             Err(error) => Some(control_error(error)?),
@@ -3467,6 +3470,37 @@ mod tests {
         assert!(
             !seen.iter().any(|kind| kind == "playback"),
             "an older phone is never sent a buffer: {seen:?}"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The packets a phone reports a redundant copy recovered add up on its musician's counters;
+    /// a report without the field adds nothing.
+    #[tokio::test]
+    async fn the_recovered_packets_a_phone_reports_add_up() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            EventBus::default(),
+        );
+        let mut phone = connect_client(address).await;
+        send_then_sync(&mut phone, REGISTER_ANA).await;
+        for recovered in [r#","recovered":3"#, "", r#","recovered":2"#] {
+            send_then_sync(
+                &mut phone,
+                &format!(
+                    r#"{{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0{recovered}}}"#
+                ),
+            )
+            .await;
+        }
+        assert_eq!(
+            targets.read()[0].counters.recovered.load(Ordering::Relaxed),
+            5
         );
 
         stop_server(address, &stopped, server).await;

@@ -142,6 +142,8 @@ internal class PmonPlayer(
         // The cushion asked of the track: adapted once per second of audio, or the desk's fixed one.
         val cushion = CushionController()
         var capacityFrames = 0
+        // The buffer size the track applied, as it reports it (0 until a track was sized).
+        var appliedBufferFrames = 0
         val audioTimestamp = AudioTimestamp()
         val buffer = ByteArray(65_507)
 
@@ -172,6 +174,7 @@ internal class PmonPlayer(
                             timestampRead = track != null && track.getTimestamp(audioTimestamp),
                             framesWritten = framesWritten,
                             presentedFrame = audioTimestamp.framePosition,
+                            appliedBufferFrames = appliedBufferFrames,
                         )
                         linkStats.poll(
                             nowMs,
@@ -227,12 +230,11 @@ internal class PmonPlayer(
                             sourceSampleRate = packet.sampleRate
                             playbackRate = selectPlaybackRate(packet.sampleRate)
                             packetFrames = packet.samples.size / PlaybackLatency.CHANNELS
-                            val track = createAudioTrack(playbackRate, packetFrames)
+                            val track = openLowLatencyTrack(playbackRate, packetFrames)
                             capacityFrames = track.bufferCapacityInFrames
-                            track.play()
                             // A buffer the desk set before the audio started applies from the first packet.
                             cushion.follow(mixState.deskBufferMs, packetFrames, playbackRate, capacityFrames)
-                            applyPlaybackBufferTarget(track, packetFrames, cushion.cushionPackets)
+                            appliedBufferFrames = applyPlaybackBufferTarget(track, packetFrames, cushion.cushionPackets)
                             audioTrack = track
                         } else if (packet.sampleRate != sourceSampleRate) {
                             throw PmonPacketParseException(
@@ -293,21 +295,24 @@ internal class PmonPlayer(
                             packetsWithDiscardedSamples,
                             playbackBacklogMs,
                         )
-                        val rate = playbackRate ?: packet.sampleRate
-                        // The desk's buffer, read once per packet (one volatile read): a change applies at
-                        // once, well within the second the desk expects.
-                        val deskBuffer = mixState.deskBufferMs
-                        if (deskBuffer != cushion.fixedMs &&
-                            cushion.follow(deskBuffer, packetFrames, rate, capacityFrames)
-                        ) {
-                            applyPlaybackBufferTarget(audioTrack, packetFrames, cushion.cushionPackets)
+                        // The desk's buffer is read once per packet (one volatile read), so a change
+                        // applies at once, well within the second the desk expects; once per second of
+                        // audio played, whatever the block size, the track's underrun count is read,
+                        // and a fixed buffer never moves.
+                        val step = cushion.onPacket(
+                            deskBufferMs = mixState.deskBufferMs,
+                            packetFrames = packetFrames,
+                            packetSamples = packet.samples.size,
+                            playbackRate = playbackRate,
+                            packetRate = packet.sampleRate,
+                            capacityFrames = capacityFrames,
+                        )
+                        var resize = step and CushionController.STEP_APPLY != 0
+                        if (step and CushionController.STEP_ADJUST != 0 && cushion.adjust(audioTrack.underrunCount)) {
+                            resize = true
                         }
-                        // Once per second of audio played, whatever the block size: the track's underrun
-                        // count is read only then, and a fixed buffer never moves.
-                        if (cushion.onPlayed(packet.samples.size / PlaybackLatency.CHANNELS, rate) &&
-                            cushion.adjust(audioTrack.underrunCount)
-                        ) {
-                            applyPlaybackBufferTarget(audioTrack, packetFrames, cushion.cushionPackets)
+                        if (resize) {
+                            appliedBufferFrames = applyPlaybackBufferTarget(audioTrack, packetFrames, cushion.cushionPackets)
                         }
                     } catch (error: Exception) {
                         listener.onError(error.message ?: "invalid PMON packet")
@@ -341,17 +346,42 @@ internal class PmonPlayer(
     }
 
     /**
-     * Opens the track with room for the longest fixed buffer the desk may set
-     * ([PlaybackLatency.trackCapacityFrames], 16-bit stereo), or the platform minimum when that is
-     * larger. The buffer size asked right after ([applyPlaybackBufferTarget]) is what is queued.
+     * Opens and starts the track, with room for the longest fixed buffer the desk may set
+     * ([PlaybackLatency.trackCapacityFrames], 16-bit stereo) when the platform honours a smaller
+     * buffer size on it, else at the platform minimum as before the desk could set a buffer.
+     *
+     * The large capacity only costs no latency if the buffer size set right after is what is queued,
+     * so the smallest Auto cushion (one packet) is asked and the size the track reports is checked
+     * ([PlaybackLatency.keepsLowLatency]). A track that will not shrink is released and reopened at
+     * the minimum: Auto plays as tight as before, and a fixed buffer goes only as long as that track
+     * holds (its capacity is what the cushion is clamped to), the cushion reported being the size
+     * the track applied.
      */
-    private fun createAudioTrack(sampleRate: Int, packetFrames: Int): AudioTrack {
+    private fun openLowLatencyTrack(sampleRate: Int, packetFrames: Int): AudioTrack {
         val minimum = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
         if (minimum <= 0) throw IllegalStateException("sample rate $sampleRate is not supported")
+        val large = createAudioTrack(
+            sampleRate,
+            maxOf(minimum, PlaybackLatency.trackCapacityFrames(sampleRate, packetFrames) * BYTES_PER_FRAME),
+        )
+        large.play()
+        val applied = applyPlaybackBufferTarget(large, packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
+        val wanted = PlaybackLatency.targetBufferFrames(packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
+        if (PlaybackLatency.keepsLowLatency(wanted, applied, minimum / BYTES_PER_FRAME, sampleRate)) {
+            return large
+        }
+        large.pause()
+        large.flush()
+        large.release()
+        return createAudioTrack(sampleRate, minimum).also { it.play() }
+    }
+
+    /** Builds a low-latency stream track at [sampleRate] with a capacity of [bufferBytes]. */
+    private fun createAudioTrack(sampleRate: Int, bufferBytes: Int): AudioTrack {
         return AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -371,9 +401,7 @@ internal class PmonPlayer(
                     .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                     .build(),
             )
-            .setBufferSizeInBytes(
-                maxOf(minimum, PlaybackLatency.trackCapacityFrames(sampleRate, packetFrames) * BYTES_PER_FRAME),
-            )
+            .setBufferSizeInBytes(bufferBytes)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .build()
@@ -392,14 +420,16 @@ internal class PmonPlayer(
      * default can sit tens of milliseconds behind the render position and pay that on every sample.
      * The platform clamps the request up to its own hardware minimum, so a target below the floor
      * degrades to the floor rather than failing; a refused call leaves the buffer as it was.
+     * Answers the buffer size the track reports afterwards, in frames, or -1 when it cannot say.
      */
-    private fun applyPlaybackBufferTarget(track: AudioTrack, packetFrames: Int, cushionPackets: Int) {
+    private fun applyPlaybackBufferTarget(track: AudioTrack, packetFrames: Int, cushionPackets: Int): Int =
         try {
             track.setBufferSizeInFrames(
                 PlaybackLatency.targetBufferFrames(packetFrames, cushionPackets),
             )
+            track.bufferSizeInFrames
         } catch (_: IllegalStateException) {
             // Keep the buffer the track was created with.
+            -1
         }
-    }
 }

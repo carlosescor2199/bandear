@@ -91,6 +91,61 @@ class CushionControllerTest {
         assertEquals(19, cushion.cushionPackets)
     }
 
+    private fun applies(step: Int) = step and CushionController.STEP_APPLY != 0
+
+    private fun adjustDue(step: Int) = step and CushionController.STEP_ADJUST != 0
+
+    @Test
+    fun aPacketFollowsTheDesksBufferWithItsOwnFramesRateAndTrack() {
+        val cushion = CushionController()
+        // 40 ms at 48 kHz in 256-frame packets is 8 packets; swapping the packet frames with the
+        // track's capacity, or the rate with either, would give 1 packet or the whole track.
+        val step = cushion.onPacket(
+            deskBufferMs = 40,
+            packetFrames = 256,
+            packetSamples = 512,
+            playbackRate = 48_000,
+            packetRate = 44_100,
+            capacityFrames = 4_800,
+        )
+        assertTrue(applies(step))
+        assertEquals(8, cushion.cushionPackets)
+        assertEquals(40, cushion.fixedMs)
+        // A track that holds 4 800 frames clamps a long buffer to its 18 whole packets.
+        assertTrue(applies(cushion.onPacket(500, 256, 512, 48_000, 44_100, 4_800)))
+        assertEquals(18, cushion.cushionPackets)
+    }
+
+    @Test
+    fun theSameDeskBufferAgainAsksNothingOfTheTrack() {
+        val cushion = CushionController()
+        assertTrue(applies(cushion.onPacket(40, 256, 512, 48_000, 48_000, capacity)))
+        assertFalse(applies(cushion.onPacket(40, 256, 512, 48_000, 48_000, capacity)))
+        // Auto from the start changes nothing either: the controller already adapts.
+        assertFalse(applies(CushionController().onPacket(PlaybackLatency.DESK_BUFFER_AUTO, 256, 512, 48_000, 48_000, capacity)))
+    }
+
+    @Test
+    fun aSecondIsCountedInFramesOfThePacketNotItsSamples() {
+        val cushion = CushionController()
+        // 48 000 interleaved stereo samples are 24 000 frames: half a second at 48 kHz. Counted as
+        // samples it would already be a whole second.
+        assertFalse(adjustDue(cushion.onPacket(PlaybackLatency.DESK_BUFFER_AUTO, 24_000, 48_000, 48_000, 48_000, capacity)))
+        assertTrue(adjustDue(cushion.onPacket(PlaybackLatency.DESK_BUFFER_AUTO, 24_000, 48_000, 48_000, 48_000, capacity)))
+    }
+
+    @Test
+    fun withoutATrackRateTheSecondIsThePacketsRate() {
+        // 22 050 frames: half a second at the packet's 44.1 kHz. With no track rate the packet's rate
+        // counts, so the second packet completes the second; at a 22.05 kHz track rate one does.
+        val noTrack = CushionController()
+        assertFalse(adjustDue(noTrack.onPacket(PlaybackLatency.DESK_BUFFER_AUTO, 256, 44_100, null, 44_100, capacity)))
+        assertTrue(adjustDue(noTrack.onPacket(PlaybackLatency.DESK_BUFFER_AUTO, 256, 44_100, null, 44_100, capacity)))
+
+        val slowTrack = CushionController()
+        assertTrue(adjustDue(slowTrack.onPacket(PlaybackLatency.DESK_BUFFER_AUTO, 256, 44_100, 22_050, 44_100, capacity)))
+    }
+
     @Test
     fun autoResumesAdaptingFromTheCushionPlayedWithinItsBounds() {
         val cushion = CushionController()

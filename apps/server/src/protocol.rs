@@ -102,7 +102,8 @@ pub(crate) const MAX_MUSICIAN_NAME_LENGTH: usize = 64;
 pub(crate) const MAX_CLIENT_ID_LENGTH: usize = 64;
 
 /// A `register` control message: the musician's name, the UDP port the client listens on and,
-/// from newer phones, the client id that phone generated once and keeps.
+/// from newer phones, the client id that phone generated once and keeps. Newer phones also announce
+/// what they support in `capabilities` (see [CAPABILITY_STATS_V2] and the others).
 ///
 /// There is deliberately no address field. The server takes the address from the socket, so a
 /// client cannot claim to be someone else's address even if it includes one in the message.
@@ -115,6 +116,67 @@ pub(crate) struct RegisterCommand {
     /// The phone's stable id, or `None` when it sent none or one the server does not keep.
     #[serde(default, deserialize_with = "lenient_client_id")]
     pub(crate) client_id: Option<String>,
+    /// What the phone announced it supports, in the order sent: each kept name 1 to
+    /// [MAX_CAPABILITY_LENGTH] lowercase letters, digits, dots, hyphens or underscores, at most
+    /// [MAX_CAPABILITIES] of them, each once. Empty for a phone that sent none (an older build);
+    /// anything unreadable is dropped rather than failing the registration.
+    #[serde(default, deserialize_with = "lenient_capabilities")]
+    pub(crate) capabilities: Vec<String>,
+}
+
+/// The phone's `stats` carry the extra fields `jitter_ms`, `cushion_ms` and `backlog_ms` (see
+/// [StatsCommand]).
+pub const CAPABILITY_STATS_V2: &str = "stats.v2";
+/// The phone plays with a playback buffer the desk sets (Auto or a fixed length).
+pub const CAPABILITY_PLAYBACK_BUFFER: &str = "playback.buffer";
+/// The phone's `stats` carry `recovered`: the packets only a redundant copy brought in time.
+pub const CAPABILITY_REDUNDANCY_RECOVERED: &str = "redundancy.recovered";
+/// Every capability this server knows the meaning of. A phone may announce others: they are kept
+/// and shown, and gate nothing.
+pub const KNOWN_CAPABILITIES: [&str; 3] = [
+    CAPABILITY_STATS_V2,
+    CAPABILITY_PLAYBACK_BUFFER,
+    CAPABILITY_REDUNDANCY_RECOVERED,
+];
+
+/// The most capabilities kept from one registration.
+pub(crate) const MAX_CAPABILITIES: usize = 16;
+/// The longest capability name kept.
+pub(crate) const MAX_CAPABILITY_LENGTH: usize = 32;
+
+/// Reads `capabilities` without ever failing the registration (see
+/// [RegisterCommand::capabilities]): a value that is not a list is read as none, and an entry that
+/// is not a name the server keeps is skipped.
+fn lenient_capabilities<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let mut kept: Vec<String> = Vec::new();
+    for name in value
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if kept.len() == MAX_CAPABILITIES {
+            break;
+        }
+        if is_capability_name(name) && !kept.iter().any(|known| known == name) {
+            kept.push(name.to_owned());
+        }
+    }
+    Ok(kept)
+}
+
+/// Whether `raw` is a capability name the server keeps: 1 to [MAX_CAPABILITY_LENGTH] lowercase
+/// ASCII letters, digits, dots, hyphens or underscores.
+fn is_capability_name(raw: &str) -> bool {
+    (1..=MAX_CAPABILITY_LENGTH).contains(&raw.len())
+        && raw.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
 }
 
 /// Returns `raw` when it is a client id the server keeps: 1 to [MAX_CLIENT_ID_LENGTH] ASCII
@@ -821,6 +883,77 @@ mod tests {
             assert_eq!(command.client_id, None, "client_id {client_id} is ignored");
             assert_eq!(command.udp_port, 50000);
         }
+    }
+
+    #[test]
+    fn a_registration_keeps_the_capabilities_the_phone_announced() {
+        let command = parse_register_command(
+            r#"{"type":"register","name":"Ana","udp_port":50000,"capabilities":["stats.v2","playback.buffer","redundancy.recovered","future_thing-2"]}"#,
+        )
+        .expect("a registration with capabilities should parse");
+
+        assert_eq!(
+            command.capabilities,
+            vec![
+                CAPABILITY_STATS_V2,
+                CAPABILITY_PLAYBACK_BUFFER,
+                CAPABILITY_REDUNDANCY_RECOVERED,
+                "future_thing-2",
+            ],
+            "known and unknown names alike, in the order sent"
+        );
+        assert_eq!(command.udp_port, 50000);
+    }
+
+    #[test]
+    fn a_registration_without_capabilities_has_none() {
+        let command =
+            parse_register_command(r#"{"type":"register","name":"Ana","udp_port":50000}"#)
+                .expect("an older phone announces nothing");
+
+        assert!(command.capabilities.is_empty());
+    }
+
+    /// Capabilities must never cost the musician their audio: whatever is unreadable is dropped.
+    #[test]
+    fn unreadable_capabilities_are_dropped_and_the_registration_still_parses() {
+        let too_long = format!(r#""{}""#, "a".repeat(MAX_CAPABILITY_LENGTH + 1));
+        for (capabilities, kept) in [
+            ("null", vec![]),
+            (r#""stats.v2""#, vec![]),
+            ("42", vec![]),
+            (r#"{"stats.v2":true}"#, vec![]),
+            (
+                r#"["stats.v2", 7, null, ["x"], "Stats.V2", "", "has space"]"#,
+                vec!["stats.v2"],
+            ),
+            (
+                r#"["stats.v2","stats.v2","playback.buffer"]"#,
+                vec!["stats.v2", "playback.buffer"],
+            ),
+            (&format!(r#"[{too_long},"stats.v2"]"#), vec!["stats.v2"]),
+        ] {
+            let command = parse_register_command(&format!(
+                r#"{{"type":"register","name":"Ana","udp_port":50000,"capabilities":{capabilities}}}"#
+            ))
+            .unwrap_or_else(|error| panic!("capabilities {capabilities} broke the parse: {error}"));
+
+            assert_eq!(command.capabilities, kept, "capabilities {capabilities}");
+        }
+    }
+
+    #[test]
+    fn at_most_sixteen_capabilities_are_kept() {
+        let many: Vec<String> = (0..20).map(|index| format!(r#""cap{index}""#)).collect();
+        let command = parse_register_command(&format!(
+            r#"{{"type":"register","name":"Ana","udp_port":50000,"capabilities":[{}]}}"#,
+            many.join(",")
+        ))
+        .expect("a long list still registers");
+
+        assert_eq!(command.capabilities.len(), MAX_CAPABILITIES);
+        assert_eq!(command.capabilities[0], "cap0");
+        assert_eq!(command.capabilities[15], "cap15");
     }
 
     #[test]

@@ -726,6 +726,9 @@ async fn handle_control_connection(
                                 &*config_state,
                             );
                             let address = registration.address;
+                            // What the phone supports belongs to this registration: an older build
+                            // announces nothing, which leaves nothing.
+                            targets.set_capabilities(peer.ip(), command.capabilities);
                             // The registration put the engineer's limit, locks and mirror for this
                             // musician in force (or took a previous occupant's away): announced as a
                             // change through the engine, so this phone is sent its mix with them
@@ -2620,6 +2623,43 @@ mod tests {
         assert!(
             status.underruns_per_second.is_some(),
             "a fresh report has rates"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A registration's capabilities are kept on the musician's row; one from an older phone (no
+    /// list) leaves none, and either way the registration is answered with nothing, as before.
+    #[tokio::test]
+    async fn a_registration_records_the_capabilities_the_phone_announced() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+        let capabilities = |targets: &TargetRegistry| {
+            targets
+                .read()
+                .iter()
+                .find(|entry| entry.address.ip() == target_ip)
+                .map(|entry| entry.origin.capabilities().to_vec())
+        };
+
+        let mut client = connect_client(address).await;
+        send_then_sync(
+            &mut client,
+            r#"{"type":"register","name":"Ana","udp_port":50123,"capabilities":["stats.v2","playback.buffer",3]}"#,
+        )
+        .await;
+        assert_eq!(
+            capabilities(&targets),
+            Some(vec!["stats.v2".to_owned(), "playback.buffer".to_owned()])
+        );
+
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        assert_eq!(
+            capabilities(&targets),
+            Some(Vec::new()),
+            "a registration that announces none has none"
         );
 
         stop_server(address, &stopped, server).await;

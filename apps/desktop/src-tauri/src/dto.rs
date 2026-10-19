@@ -220,6 +220,9 @@ pub struct MusicianDto {
     /// Lost packets as a percentage of the packets the phone expected.
     pub loss_percent: Option<f64>,
     pub receive_timeouts_per_second: Option<f64>,
+    /// What the musician's phone announced it supports (for example "stats.v2"), in the order
+    /// sent; empty for a configured target and for a phone that predates capabilities.
+    pub capabilities: Vec<String>,
     /// Whose mix this musician's follows (see [crate::commands::set_mirror]); null when it
     /// follows nobody.
     pub mirror: Option<MirrorDto>,
@@ -828,6 +831,7 @@ impl From<&MusicianStatus> for MusicianDto {
             underruns_per_second: musician.link.underruns_per_second,
             loss_percent: musician.link.loss_percent,
             receive_timeouts_per_second: musician.link.receive_timeouts_per_second,
+            capabilities: musician.capabilities.clone(),
             mirror: musician.mirror.as_ref().map(MirrorDto::from),
         }
     }
@@ -1391,6 +1395,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            capabilities: Vec::new(),
             mirror: None,
         };
 
@@ -1411,6 +1416,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            capabilities: Vec::new(),
             mirror: None,
         };
 
@@ -1466,6 +1472,7 @@ mod tests {
     #[test]
     fn a_row_says_whose_mix_the_musician_follows_and_whether_the_leader_is_here() {
         let follower = MusicianStatus {
+            capabilities: Vec::new(),
             mirror: Some(MirrorStatus {
                 leader: MusicianKey::Client("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
                 name: "Bass".to_owned(),
@@ -1474,6 +1481,7 @@ mod tests {
             ..musician_with_link(LinkStatus::default())
         };
         let away = MusicianStatus {
+            capabilities: Vec::new(),
             mirror: Some(MirrorStatus {
                 leader: MusicianKey::Address("192.168.1.40:50000".parse().expect("test address")),
                 name: "Rack".to_owned(),
@@ -1518,6 +1526,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link,
+            capabilities: Vec::new(),
             mirror: None,
         }
     }
@@ -1618,6 +1627,46 @@ mod tests {
             silent["packetsPerSecond"], 0.0,
             "a phone hearing nothing is a number the window can tell from a lost link"
         );
+    }
+
+    #[test]
+    fn the_phones_capabilities_reach_the_window_and_the_other_fields_keep_their_names() {
+        let mut phone = musician_with_link(LinkStatus::default());
+        phone.capabilities = vec!["stats.v2".to_owned(), "playback.buffer".to_owned()];
+        let older = musician_with_link(LinkStatus::default());
+
+        let phone = serde_json::to_value(MusicianDto::from(&phone)).expect("serializes");
+        let older = serde_json::to_value(MusicianDto::from(&older)).expect("serializes");
+
+        assert_eq!(
+            phone["capabilities"],
+            serde_json::json!(["stats.v2", "playback.buffer"])
+        );
+        assert_eq!(
+            older["capabilities"],
+            serde_json::json!([]),
+            "an older phone"
+        );
+        for field in [
+            "address",
+            "clientName",
+            "clientId",
+            "name",
+            "nameIsLocal",
+            "controlConnected",
+            "volumePercent",
+            "packetsSent",
+            "packetsDiscarded",
+            "lastSendError",
+            "linkHealth",
+            "packetsPerSecond",
+            "underrunsPerSecond",
+            "lossPercent",
+            "receiveTimeoutsPerSecond",
+            "mirror",
+        ] {
+            assert!(older.get(field).is_some(), "{field} is still on the row");
+        }
     }
 
     #[test]

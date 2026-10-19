@@ -149,6 +149,10 @@ pub struct MusicianStatus {
     /// [LinkHealth::Bad] with no rates when its reports stopped while the control channel is still
     /// connected: the phone is there but its link is lost.
     pub link: LinkStatus,
+    /// What the musician's phone announced it supports when it registered (for example
+    /// [crate::CAPABILITY_STATS_V2]), in the order sent; empty for a configured target and for a
+    /// phone that predates capabilities.
+    pub capabilities: Vec<String>,
     /// Whose mix this musician's follows, when the engineer made it follow one (see
     /// [EngineHandle::set_mirror]); `None` when it follows nobody.
     pub mirror: Option<MirrorStatus>,
@@ -690,6 +694,7 @@ pub(crate) fn replace_target_kept(
 pub(crate) struct Announced {
     pub(crate) name: Option<String>,
     pub(crate) client_id: Option<String>,
+    pub(crate) capabilities: Vec<String>,
 }
 
 /// What every target announced, by IP: a registered phone's name and client id, each when it sent
@@ -703,6 +708,7 @@ pub(crate) fn announced_identities(entries: &[TargetEntry]) -> HashMap<IpAddr, A
                 Announced {
                     name: entry.origin.name().map(str::to_owned),
                     client_id: entry.origin.client_id().map(str::to_owned),
+                    capabilities: entry.origin.capabilities().to_vec(),
                 },
             )
         })
@@ -735,6 +741,7 @@ pub(crate) fn join_musicians(
                 mix: mixes.get(&ip).copied().unwrap_or_default(),
                 counters: counters.get(&ip).copied().unwrap_or_default(),
                 link: links.get(&ip).copied().unwrap_or_default(),
+                capabilities: announced.capabilities,
                 mirror: mirrors.get(&ip).cloned(),
             }
         })
@@ -2617,6 +2624,7 @@ mod tests {
             &layout,
         );
         registry.register(ip("192.168.1.5"), 50000, None, None, &layout);
+        registry.set_capabilities(ip("192.168.1.4"), vec!["stats.v2".to_owned()]);
 
         let announced = announced_identities(&registry.read());
 
@@ -2633,6 +2641,7 @@ mod tests {
             Announced {
                 name: Some("Ana".to_owned()),
                 client_id: Some(PHONE_ID.to_owned()),
+                capabilities: vec!["stats.v2".to_owned()],
             }
         );
         assert_eq!(
@@ -2641,6 +2650,10 @@ mod tests {
                 .and_then(|phone| phone.client_id.clone()),
             None,
             "an older phone sends no id"
+        );
+        assert!(
+            announced[&ip("192.168.1.5")].capabilities.is_empty(),
+            "an older phone announces no capabilities"
         );
     }
 
@@ -2711,6 +2724,7 @@ mod tests {
             Announced {
                 name: Some("Ana".to_owned()),
                 client_id: Some(PHONE_ID.to_owned()),
+                ..Announced::default()
             },
         );
 

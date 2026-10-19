@@ -219,6 +219,9 @@ pub(crate) enum TargetOrigin {
         /// The stable id the client announced, if it sent one the server keeps. It is what lets a
         /// phone that comes back from a new IP keep this entry instead of starting a second one.
         client_id: Option<String>,
+        /// What the client announced it supports (see [crate::protocol::RegisterCommand]); empty
+        /// for an older phone. Each registration replaces it.
+        capabilities: Vec<String>,
         /// When the last control channel for this target closed; `None` while connected or while
         /// the grace period has not started.
         disconnected_at: Option<Instant>,
@@ -237,6 +240,14 @@ impl TargetOrigin {
         match self {
             TargetOrigin::Configured => None,
             TargetOrigin::Registered { client_id, .. } => client_id.as_deref(),
+        }
+    }
+
+    /// What the client announced it supports; nothing for a configured target.
+    pub(crate) fn capabilities(&self) -> &[String] {
+        match self {
+            TargetOrigin::Configured => &[],
+            TargetOrigin::Registered { capabilities, .. } => capabilities,
         }
     }
 }
@@ -817,6 +828,7 @@ impl TargetRegistry {
         let origin = TargetOrigin::Registered {
             name,
             client_id: client_id.map(str::to_owned),
+            capabilities: Vec::new(),
             disconnected_at: None,
         };
         let mut entries = self.entries.write().expect("target registry lock poisoned");
@@ -1026,6 +1038,19 @@ impl TargetRegistry {
     pub(crate) fn clear_link_report(&self, ip: IpAddr) {
         if let Some(slot) = self.link_report(ip) {
             *slot.lock().expect("link report lock poisoned") = None;
+        }
+    }
+
+    /// Records what the registered client at `ip` announced it supports, in place of what it
+    /// announced before. A configured target, or an IP with no target, is left alone.
+    pub(crate) fn set_capabilities(&self, ip: IpAddr, announced: Vec<String>) {
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        if let Some(TargetOrigin::Registered { capabilities, .. }) = entries
+            .iter_mut()
+            .find(|entry| entry.address.ip() == ip)
+            .map(|entry| &mut entry.origin)
+        {
+            *capabilities = announced;
         }
     }
 }
@@ -1911,6 +1936,47 @@ mod tests {
         assert_eq!(
             registered_name(&registry, ip("192.168.1.10")).as_deref(),
             Some("Eva")
+        );
+    }
+
+    /// Capabilities belong to the registration that announced them: a re-registration replaces
+    /// them (an older build that takes the row over announces none), and a configured target has
+    /// none to set.
+    #[test]
+    fn a_registration_keeps_the_capabilities_it_announced_until_the_next_one() {
+        let registry =
+            TargetRegistry::new(&[address("192.168.1.3:50000")], &GroupLayout::default())
+                .expect("registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry.set_capabilities(
+            ip("192.168.1.10"),
+            vec!["stats.v2".to_owned(), "playback.buffer".to_owned()],
+        );
+        let capabilities_at = |at: &str| {
+            registry
+                .read()
+                .iter()
+                .find(|entry| entry.address.ip() == ip(at))
+                .map(|entry| entry.origin.capabilities().to_vec())
+        };
+        assert_eq!(
+            capabilities_at("192.168.1.10"),
+            Some(vec!["stats.v2".to_owned(), "playback.buffer".to_owned()])
+        );
+
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", None);
+        assert_eq!(
+            capabilities_at("192.168.1.10"),
+            Some(Vec::new()),
+            "a registration that announces nothing has nothing"
+        );
+
+        registry.set_capabilities(ip("192.168.1.3"), vec!["stats.v2".to_owned()]);
+        registry.set_capabilities(ip("192.168.1.99"), vec!["stats.v2".to_owned()]);
+        assert_eq!(
+            capabilities_at("192.168.1.3"),
+            Some(Vec::new()),
+            "configured: none"
         );
     }
 

@@ -1,22 +1,19 @@
 use std::cmp::Reverse;
 use std::error::Error;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{
-    BufferSize, Device, InputCallbackInfo, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
-    SupportedStreamConfig, SupportedStreamConfigRange,
+    BufferSize, Device, InputCallbackInfo, SampleFormat, SizedSample, Stream, StreamConfig,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
 };
 
-use crate::engine::LevelMeter;
+use crate::decimate::sample_rate_reduction_ratio;
 use crate::mix::MAX_MIX_CHANNELS;
-use crate::network::PacketStats;
-use crate::protocol::AudioPacket;
+use crate::pipeline::{
+    block_frames, CaptureLinks, CaptureSample, CaptureWriter, SourceFormat, SourceReader,
+};
 
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 48_000;
-const MAX_SAMPLES_PER_PACKET: usize = u16::MAX as usize;
 
 /// One selectable input device and the channel count the engine would capture from it.
 ///
@@ -316,9 +313,10 @@ fn is_supported_sample_format(sample_format: SampleFormat) -> bool {
 
 /// Applies an explicit buffer size to a stream configuration.
 ///
-/// This is the single biggest lever on capture latency here: the engine packages exactly one packet
-/// per input callback, so the callback size is also the packet interval. Kept pure and separate from
-/// stream construction so the mapping is testable without an audio host.
+/// This is the single biggest lever on capture latency here: the engine's block, and so the packet
+/// the phones are sent, is one callback long (see [block_frames]), so the callback size is also the
+/// packet interval. Kept pure and separate from stream construction so the mapping is testable
+/// without an audio host.
 fn with_buffer_size(mut config: StreamConfig, buffer_frames: Option<u32>) -> StreamConfig {
     if let Some(frames) = buffer_frames {
         config.buffer_size = BufferSize::Fixed(frames);
@@ -346,7 +344,15 @@ pub(crate) fn describe_buffer(buffer_frames: Option<u32>) -> String {
     }
 }
 
-/// Builds and opens the input stream, returning it with the buffer size that actually took effect.
+/// One capture stream, open and ready to play: the stream itself, the buffer size that actually
+/// took effect, and the engine thread's end of its ring.
+pub(crate) struct OpenedStream {
+    pub(crate) stream: Stream,
+    pub(crate) buffer_frames: Option<u32>,
+    pub(crate) reader: SourceReader,
+}
+
+/// Builds and opens the input stream with its own capture ring (see [crate::pipeline]).
 ///
 /// An explicitly requested buffer that the driver rejects is not fatal: the session falls back to the
 /// device default, which is exactly what the engine used before this option existed, and reports
@@ -355,12 +361,8 @@ pub(crate) fn build_input_stream(
     device: &Device,
     supported_config: &SupportedStreamConfig,
     buffer_frames: Option<u32>,
-    packet_sender: SyncSender<AudioPacket>,
-    samples_seen: Arc<AtomicU64>,
-    packet_stats: Arc<PacketStats>,
-    levels: Arc<LevelMeter>,
-    sequence: Arc<AtomicU64>,
-) -> Result<(Stream, Option<u32>), Box<dyn Error>> {
+    links: &CaptureLinks,
+) -> Result<OpenedStream, Box<dyn Error>> {
     let sample_format = supported_config.sample_format();
     let base = supported_config.config();
     let supported_buffer = supported_config.buffer_size();
@@ -368,273 +370,81 @@ pub(crate) fn build_input_stream(
         buffer_frames.map(|frames| clamp_buffer_frames(frames, &supported_buffer));
     let requested = with_buffer_size(base.clone(), requested_frames);
 
-    let attempt = open_stream(
-        device,
-        &requested,
-        sample_format,
-        packet_sender.clone(),
-        Arc::clone(&samples_seen),
-        Arc::clone(&packet_stats),
-        Arc::clone(&levels),
-        Arc::clone(&sequence),
-    );
-
-    match attempt {
-        Ok(stream) => Ok((stream, requested_frames)),
+    match open_stream(device, &requested, sample_format, requested_frames, links) {
+        Ok((stream, reader)) => Ok(OpenedStream {
+            stream,
+            buffer_frames: requested_frames,
+            reader,
+        }),
         Err(error) => match requested_frames {
             Some(frames) => {
                 eprintln!(
                     "Requested input buffer of {frames} frames was rejected ({error}); falling back to the device default buffer."
                 );
                 let fallback = with_buffer_size(base, None);
-                let stream = open_stream(
-                    device,
-                    &fallback,
-                    sample_format,
-                    packet_sender,
-                    samples_seen,
-                    packet_stats,
-                    levels,
-                    sequence,
-                )?;
-                Ok((stream, None))
+                let (stream, reader) = open_stream(device, &fallback, sample_format, None, links)?;
+                Ok(OpenedStream {
+                    stream,
+                    buffer_frames: None,
+                    reader,
+                })
             }
             None => Err(error),
         },
     }
 }
 
+/// Opens one stream whose callback feeds a fresh ring through a [CaptureWriter].
+///
+/// Every supported sample format goes through the same writer, which converts it to f32 (keeping
+/// 24-bit resolution), decimates high rates through the anti-alias filter and meters the result.
 fn open_stream(
     device: &Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
-    packet_sender: SyncSender<AudioPacket>,
-    samples_seen: Arc<AtomicU64>,
-    packet_stats: Arc<PacketStats>,
-    levels: Arc<LevelMeter>,
-    sequence: Arc<AtomicU64>,
-) -> Result<Stream, Box<dyn Error>> {
-    let channels = config.channels as u8;
-    let sample_rate = config.sample_rate;
-    let decimator = Decimator::new(sample_rate, channels)?;
-    let error_callback = |error| eprintln!("Audio input error: {error}");
+    buffer_frames: Option<u32>,
+    links: &CaptureLinks,
+) -> Result<(Stream, SourceReader), Box<dyn Error>> {
+    let ratio = sample_rate_reduction_ratio(config.sample_rate)?;
+    let format = SourceFormat {
+        channels: usize::from(config.channels),
+        block_frames: block_frames(buffer_frames, ratio),
+    };
+    let (writer, reader) = CaptureWriter::new(config.sample_rate, format, links.clone())?;
 
     let stream = match sample_format {
-        SampleFormat::F32 => device.build_input_stream(
-            config.clone(),
-            {
-                let mut decimator = decimator;
-                move |data: &[f32], _info: &InputCallbackInfo| {
-                    enqueue_packet(
-                        &packet_sender,
-                        &packet_stats,
-                        &sequence,
-                        decimator
-                            .process(&data.iter().copied().map(f32_to_i16).collect::<Vec<_>>()),
-                        channels,
-                        &samples_seen,
-                        &levels,
-                    );
-                }
-            },
-            error_callback,
-            None,
-        ),
-        SampleFormat::I16 => device.build_input_stream(
-            config.clone(),
-            {
-                let mut decimator = decimator;
-                move |data: &[i16], _info: &InputCallbackInfo| {
-                    enqueue_packet(
-                        &packet_sender,
-                        &packet_stats,
-                        &sequence,
-                        decimator.process(data),
-                        channels,
-                        &samples_seen,
-                        &levels,
-                    );
-                }
-            },
-            error_callback,
-            None,
-        ),
-        SampleFormat::U16 => device.build_input_stream(
-            config.clone(),
-            {
-                let mut decimator = decimator;
-                move |data: &[u16], _info: &InputCallbackInfo| {
-                    enqueue_packet(
-                        &packet_sender,
-                        &packet_stats,
-                        &sequence,
-                        decimator
-                            .process(&data.iter().copied().map(u16_to_i16).collect::<Vec<_>>()),
-                        channels,
-                        &samples_seen,
-                        &levels,
-                    );
-                }
-            },
-            error_callback,
-            None,
-        ),
-        // ASIO drivers hand over 32-bit integers; the top 16 bits are the audio.
-        SampleFormat::I32 => device.build_input_stream(
-            config.clone(),
-            {
-                let mut decimator = decimator;
-                move |data: &[i32], _info: &InputCallbackInfo| {
-                    enqueue_packet(
-                        &packet_sender,
-                        &packet_stats,
-                        &sequence,
-                        decimator
-                            .process(&data.iter().copied().map(i32_to_i16).collect::<Vec<_>>()),
-                        channels,
-                        &samples_seen,
-                        &levels,
-                    );
-                }
-            },
-            error_callback,
-            None,
-        ),
+        SampleFormat::F32 => open_typed::<f32>(device, config, writer),
+        SampleFormat::I16 => open_typed::<i16>(device, config, writer),
+        SampleFormat::U16 => open_typed::<u16>(device, config, writer),
+        // ASIO drivers hand over 32-bit integers, 24-bit audio left-justified in each word.
+        SampleFormat::I32 => open_typed::<i32>(device, config, writer),
         format => {
             return Err(
                 format!("the selected input uses unsupported sample format {format:?}").into(),
             )
         }
-    };
-
-    stream.map_err(|error| format!("could not open PCM input stream: {error}").into())
+    }?;
+    Ok((stream, reader))
 }
 
-fn enqueue_packet(
-    packet_sender: &SyncSender<AudioPacket>,
-    packet_stats: &PacketStats,
-    sequence: &AtomicU64,
-    samples: Vec<i16>,
-    channels: u8,
-    samples_seen: &AtomicU64,
-    levels: &LevelMeter,
-) {
-    samples_seen.fetch_add(samples.len() as u64, Ordering::Relaxed);
-    // Measure the source channels before mixing, so the meter describes the input. The scan is a
-    // single allocation-free pass over the decimated buffer; see [LevelMeter::observe].
-    levels.observe(&samples, usize::from(channels));
-    if samples.len() > MAX_SAMPLES_PER_PACKET {
-        packet_stats.discarded.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    let packet = AudioPacket {
-        channels,
-        sample_rate: TARGET_SAMPLE_RATE,
-        sequence: sequence.fetch_add(1, Ordering::Relaxed),
-        samples,
-    };
-
-    match packet_sender.try_send(packet) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-            packet_stats.discarded.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-struct Decimator {
-    channels: usize,
-    ratio: usize,
-    next_frame: usize,
-}
-
-impl Decimator {
-    fn new(source_sample_rate: u32, channels: u8) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            channels: usize::from(channels),
-            ratio: sample_rate_reduction_ratio(source_sample_rate)?,
-            next_frame: 0,
-        })
-    }
-
-    fn process(&mut self, samples: &[i16]) -> Vec<i16> {
-        decimate_frames(samples, self.channels, self.ratio, &mut self.next_frame)
-            .expect("decimator configuration must match the input stream")
-    }
-}
-
-fn sample_rate_reduction_ratio(source_sample_rate: u32) -> Result<usize, String> {
-    if source_sample_rate < TARGET_SAMPLE_RATE || source_sample_rate % TARGET_SAMPLE_RATE != 0 {
-        return Err(format!(
-            "source sample rate {source_sample_rate} Hz cannot be reduced exactly to {TARGET_SAMPLE_RATE} Hz; only 48000 Hz and integer multiples are supported"
-        ));
-    }
-
-    Ok((source_sample_rate / TARGET_SAMPLE_RATE) as usize)
-}
-
-fn decimate_frames(
-    samples: &[i16],
-    channels: usize,
-    ratio: usize,
-    next_frame: &mut usize,
-) -> Result<Vec<i16>, String> {
-    if channels == 0 {
-        return Err("cannot decimate PCM without channels".to_owned());
-    }
-    if ratio == 0 {
-        return Err("decimation ratio must be greater than zero".to_owned());
-    }
-    if samples.len() % channels != 0 {
-        return Err("PCM sample data must contain complete frames".to_owned());
-    }
-
-    let frame_count = samples.len() / channels;
-    let selected_frames = (frame_count + ratio - 1) / ratio;
-    let mut output = Vec::with_capacity(selected_frames * channels);
-    for frame in samples.chunks_exact(channels) {
-        if *next_frame == 0 {
-            output.extend_from_slice(frame);
-        }
-        *next_frame = (*next_frame + 1) % ratio;
-    }
-    Ok(output)
-}
-
-fn f32_to_i16(sample: f32) -> i16 {
-    (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16
-}
-
-fn u16_to_i16(sample: u16) -> i16 {
-    (i32::from(sample) - 32768) as i16
-}
-
-/// Converts a 32-bit sample to 16-bit by keeping the top half.
-///
-/// ASIO's `ASIOSTInt32LSB` is a full-scale 32-bit integer (and a left-justified 24-bit value in the
-/// same word), so the top 16 bits are the audio and the rest is the fraction the PCM16 wire drops.
-fn i32_to_i16(sample: i32) -> i16 {
-    (sample >> 16) as i16
+fn open_typed<T: SizedSample + CaptureSample>(
+    device: &Device,
+    config: &StreamConfig,
+    mut writer: CaptureWriter,
+) -> Result<Stream, Box<dyn Error>> {
+    device
+        .build_input_stream(
+            *config,
+            move |data: &[T], _info: &InputCallbackInfo| writer.write(data),
+            |error| eprintln!("Audio input error: {error}"),
+            None,
+        )
+        .map_err(|error| format!("could not open PCM input stream: {error}").into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::sync_channel;
-
-    #[test]
-    fn converts_supported_sample_formats_to_pcm16() {
-        assert_eq!(f32_to_i16(-1.0), -32767);
-        assert_eq!(f32_to_i16(1.0), 32767);
-        assert_eq!(f32_to_i16(0.5), 16384);
-        assert_eq!(u16_to_i16(0), -32768);
-        assert_eq!(u16_to_i16(32768), 0);
-        assert_eq!(u16_to_i16(u16::MAX), 32767);
-        assert_eq!(i32_to_i16(0), 0);
-        assert_eq!(i32_to_i16(i32::MAX), 32767);
-        assert_eq!(i32_to_i16(i32::MIN), -32768);
-    }
 
     #[test]
     fn accepts_target_sample_rate_inside_supported_range() {
@@ -694,49 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn decimates_192_khz_to_48_khz_by_complete_frames() {
-        let mut next_frame = 0;
-        let samples = [
-            10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 60, 61, 70, 71, 80, 81,
-        ];
-
-        assert_eq!(
-            decimate_frames(
-                &samples,
-                2,
-                sample_rate_reduction_ratio(192_000).unwrap(),
-                &mut next_frame,
-            )
-            .unwrap(),
-            vec![10, 11, 50, 51]
-        );
-    }
-
-    #[test]
-    fn leaves_48_khz_samples_unchanged() {
-        let mut next_frame = 0;
-        let samples = [10, 11, 20, 21];
-
-        assert_eq!(
-            decimate_frames(
-                &samples,
-                2,
-                sample_rate_reduction_ratio(48_000).unwrap(),
-                &mut next_frame,
-            )
-            .unwrap(),
-            samples
-        );
-    }
-
-    #[test]
-    fn rejects_non_integer_reduction_ratio() {
-        let error = sample_rate_reduction_ratio(44_100).unwrap_err();
-
-        assert!(error.contains("cannot be reduced exactly"));
-    }
-
-    #[test]
     fn describe_input_device_reports_the_selected_channel_count() {
         assert_eq!(
             describe_input_device("Interface".to_owned(), Ok(4)),
@@ -755,40 +522,6 @@ mod tests {
 
         assert_eq!(device.channels, 0);
         assert_eq!(device.name, "Broken");
-    }
-
-    #[test]
-    fn reusing_the_sequence_counter_continues_it_across_stream_rebuilds() {
-        let (sender, receiver) = sync_channel(4);
-        let stats = PacketStats {
-            sent: AtomicU64::new(0),
-            discarded: AtomicU64::new(0),
-        };
-        let sequence = Arc::new(AtomicU64::new(0));
-        let samples_seen = AtomicU64::new(0);
-        let levels = LevelMeter::new();
-
-        enqueue_packet(
-            &sender,
-            &stats,
-            &sequence,
-            vec![0, 0],
-            2,
-            &samples_seen,
-            &levels,
-        );
-        enqueue_packet(
-            &sender,
-            &stats,
-            &sequence,
-            vec![0, 0],
-            2,
-            &samples_seen,
-            &levels,
-        );
-
-        assert_eq!(receiver.recv().unwrap().sequence, 0);
-        assert_eq!(receiver.recv().unwrap().sequence, 1);
     }
 
     #[test]

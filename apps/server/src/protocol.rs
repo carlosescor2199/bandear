@@ -330,6 +330,13 @@ struct ControlError {
     seq: Option<u64>,
 }
 
+/// The PCM16 value the phones are sent for a float sample: scaled by 32768, rounded half away from
+/// zero, saturated to the 16-bit range. A sample that came from 16-bit capture converts back to
+/// itself exactly; NaN is silence.
+pub(crate) fn to_pcm16(sample: f32) -> i16 {
+    (sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16
+}
+
 // Packet layout: magic[4], version[1], channels[1], sample_rate[4 LE],
 // sequence[8 LE], sample_count[2 LE], then sample_count PCM16 samples in LE.
 pub(crate) fn serialize_packet(packet: &AudioPacket) -> Vec<u8> {

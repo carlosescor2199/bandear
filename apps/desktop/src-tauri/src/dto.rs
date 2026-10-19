@@ -12,8 +12,9 @@ use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
     LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin,
     MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer,
-    RecordingState, RecordingStatus, SampleFormat, SoundcheckClock, SoundcheckState,
+    RecordingState, RecordingStatus, Redundancy, SampleFormat, SoundcheckClock, SoundcheckState,
     SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack, CAPABILITY_PLAYBACK_BUFFER,
+    CAPABILITY_REDUNDANCY_RECOVERED,
 };
 
 use crate::session::{
@@ -243,6 +244,59 @@ pub struct MusicianDto {
     /// target, which the window shows as "needs a newer app". The cushion it plays is
     /// `linkLatest.cushionMs`.
     pub buffer_supported: bool,
+    /// Whether the musician's audio is sent twice (see [crate::commands::redundancy]): `{ on:
+    /// false }` or `{ on: true, delayBlocks }`. Every phone takes it.
+    pub redundancy: RedundancyDto,
+    /// Copies of packets sent again while redundancy is on; not in `packetsSent`.
+    pub duplicates_sent: u64,
+    /// The packets the phone reported a redundant copy recovered, over this engine's run.
+    pub recovered: u64,
+    /// Whether the musician's phone reports the packets a copy recovered (it announced
+    /// [personal_monitoring::CAPABILITY_REDUNDANCY_RECOVERED]). Redundancy works without it: an
+    /// older phone drops the copies as duplicates and recovers nothing.
+    pub redundancy_supported: bool,
+}
+
+/// A musician's redundancy as the window reads and sets it: `on`, and the `delayBlocks` of the
+/// copies when on (absent when off).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedundancyDto {
+    pub on: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_blocks: Option<u8>,
+}
+
+impl From<Redundancy> for RedundancyDto {
+    fn from(redundancy: Redundancy) -> Self {
+        Self {
+            on: redundancy != Redundancy::Off,
+            delay_blocks: redundancy.delay_blocks(),
+        }
+    }
+}
+
+/// What [crate::commands::redundancy::set_musician_redundancy] did, for the window.
+///
+/// `outcome` is `set` (the engine sends this musician's audio as `redundancy` says from the next
+/// block) or `invalid` (a delay outside `minDelayBlocks`-`maxDelayBlocks`; nothing changed, and
+/// `redundancy` is absent). `bandwidthFactor` is what this musician's link now carries against
+/// once (2 with redundancy on, 1 off). `saved` says whether the session keeps it for the next start;
+/// a save that failed is in `saveError`, the engine having it all the same. `message` says the
+/// outcome in words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedundancySetDto {
+    pub musician_key: String,
+    pub outcome: &'static str,
+    pub redundancy: Option<RedundancyDto>,
+    pub bandwidth_factor: u8,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    pub message: String,
+    pub min_delay_blocks: u8,
+    pub max_delay_blocks: u8,
+    pub default_delay_blocks: u8,
 }
 
 /// A musician's playback buffer as the window reads and sets it: `mode` `auto` or `fixed`, and the
@@ -903,6 +957,13 @@ impl From<&MusicianStatus> for MusicianDto {
                 .capabilities
                 .iter()
                 .any(|name| name == CAPABILITY_PLAYBACK_BUFFER),
+            redundancy: RedundancyDto::from(musician.redundancy),
+            duplicates_sent: musician.counters.duplicates_sent,
+            recovered: musician.counters.recovered,
+            redundancy_supported: musician
+                .capabilities
+                .iter()
+                .any(|name| name == CAPABILITY_REDUNDANCY_RECOVERED),
         }
     }
 }
@@ -1795,6 +1856,30 @@ mod tests {
         assert_eq!(phone["bufferSupported"], true);
         assert_eq!(older["buffer"], serde_json::json!({ "mode": "auto" }));
         assert_eq!(older["bufferSupported"], false, "an older phone");
+    }
+
+    #[test]
+    fn a_rows_redundancy_its_counts_and_whether_its_phone_reports_recoveries_reach_the_window() {
+        let mut phone = musician_with_link(LinkStatus::default());
+        phone.capabilities = vec!["stats.v2".to_owned(), "redundancy.recovered".to_owned()];
+        phone.redundancy = Redundancy::On { delay_blocks: 2 };
+        phone.counters.duplicates_sent = 1_200;
+        phone.counters.recovered = 7;
+        let older = musician_with_link(LinkStatus::default());
+
+        let phone = serde_json::to_value(MusicianDto::from(&phone)).expect("serializes");
+        let older = serde_json::to_value(MusicianDto::from(&older)).expect("serializes");
+
+        assert_eq!(
+            phone["redundancy"],
+            serde_json::json!({ "on": true, "delayBlocks": 2 })
+        );
+        assert_eq!(phone["duplicatesSent"], 1_200);
+        assert_eq!(phone["recovered"], 7);
+        assert_eq!(phone["redundancySupported"], true);
+        assert_eq!(older["redundancy"], serde_json::json!({ "on": false }));
+        assert_eq!(older["duplicatesSent"], 0);
+        assert_eq!(older["redundancySupported"], false, "an older phone");
     }
 
     #[test]

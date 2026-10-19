@@ -12,7 +12,8 @@
 //!     "client:0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b": {
 //!       "label": "Ana",
 //!       "engineer": { "limitPercent": 60, "lockedChannels": [1, 2] },
-//!       "buffer": { "mode": "fixed", "ms": 40 }
+//!       "buffer": { "mode": "fixed", "ms": 40 },
+//!       "redundancy": { "delayBlocks": 2 }
 //!     },
 //!     "address:192.168.1.40:50000": {
 //!       "label": "Rack A",
@@ -89,6 +90,11 @@
 //!   the desk starts and taken from a loaded session (see [crate::commands::playback_buffer]), and
 //!   the engine sends it to the phone whenever it registers. A mode this build does not know is kept
 //!   as written and the phone stays on Auto; one that cannot be read costs only itself.
+//!   An entry's `redundancy` (added the same way) says the musician's audio is sent twice, each
+//!   packet again `delayBlocks` blocks later (absent when off, the default): it is given to every
+//!   engine the desk starts and taken from a loaded session (see [crate::commands::redundancy]). A
+//!   delay this build cannot use is kept as written and the musician's audio is sent once; one that
+//!   cannot be read costs only itself.
 //! - `groups` holds the engineer's groups in their order: each with the stable id every musician's
 //!   group level follows, a name and 1-based channel numbers (as the engineer numbers them). They are
 //!   applied to every engine the desk starts (see [crate::commands::start_engine]) and replaced by
@@ -276,6 +282,15 @@ impl Session {
             .filter_map(|(key, entry)| Some((key.clone(), entry.buffer.clone()?)))
             .collect()
     }
+
+    /// Every redundancy setting the session keeps, each with its musician's key ([client_key] or
+    /// [address_key]), in key order.
+    pub fn redundancies(&self) -> Vec<(String, SessionRedundancy)> {
+        self.musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.redundancy.clone()?)))
+            .collect()
+    }
 }
 
 /// The audio input the desk last ran with, as the window starts every engine from it.
@@ -415,6 +430,13 @@ pub struct MusicianEntry {
         deserialize_with = "lenient_buffer"
     )]
     pub buffer: Option<SessionBuffer>,
+    /// Whether this musician's audio is sent twice; `None` when it is not, the default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_redundancy"
+    )]
+    pub redundancy: Option<SessionRedundancy>,
 }
 
 /// The playback buffer the desk set for one musician's phone (see
@@ -435,6 +457,25 @@ where
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value.and_then(|value| SessionBuffer::deserialize(value).ok()))
+}
+
+/// The redundancy the desk set for one musician (see [crate::commands::redundancy]): on, with the
+/// copies `delayBlocks` blocks late. Kept as written, so a delay this build cannot use survives a
+/// save; one it cannot use is skipped when an engine starts (and logged), and the audio goes once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRedundancy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_blocks: Option<u32>,
+}
+
+/// Reads an entry's `redundancy` without ever failing the entry, as [lenient_engineer] does.
+fn lenient_redundancy<'de, D>(deserializer: D) -> Result<Option<SessionRedundancy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| SessionRedundancy::deserialize(value).ok()))
 }
 
 /// A mirror as the desk keeps it for its follower (see [crate::commands::set_mirror]).
@@ -858,6 +899,40 @@ impl SessionStore {
             });
         }
         update_entry(&mut session, key.to_owned(), |entry| entry.buffer = buffer);
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
+    /// Every redundancy setting the session keeps, each with its musician's key, in key order.
+    pub fn redundancies(&self) -> Vec<(String, SessionRedundancy)> {
+        self.lock().session.redundancies()
+    }
+
+    /// Keeps the redundancy of the musician `key` names ([client_key] or [address_key], the key the
+    /// engine kept it under), or drops it with `None` (off), as [Self::set_buffer] keeps a buffer: a
+    /// setting kept for a phone's key also drops any kept for `address`. The file is written before
+    /// success is reported; a save that fails, or is refused over a session this build must not
+    /// replace, changes nothing.
+    pub fn set_redundancy(
+        &self,
+        key: &str,
+        address: &str,
+        redundancy: Option<SessionRedundancy>,
+    ) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let mut session = loaded.session.clone();
+        if key.starts_with("client:") {
+            update_entry(&mut session, address_key(address), |entry| {
+                entry.redundancy = None
+            });
+        }
+        update_entry(&mut session, key.to_owned(), |entry| {
+            entry.redundancy = redundancy
+        });
         write_atomically(&self.path, &session)?;
         loaded.session = session;
         Ok(())
@@ -2144,6 +2219,78 @@ mod tests {
         assert_eq!(
             read_json(&directory.join(SESSION_FILE))["musicians"],
             serde_json::json!({ format!("client:{PHONE}"): { "label": "Ana" } })
+        );
+    }
+
+    #[test]
+    fn redundancy_is_kept_for_the_phone_beside_its_label_survives_a_reload_and_off_drops_it() {
+        let directory = test_directory("redundancy-reload");
+        let session = SessionStore::open(&directory);
+        let on = |delay_blocks: u32| SessionRedundancy {
+            delay_blocks: Some(delay_blocks),
+        };
+        session
+            .set_label(Some(PHONE), ADDRESS, "Ana")
+            .expect("saved");
+        session
+            .set_redundancy(&address_key(ADDRESS), ADDRESS, Some(on(1)))
+            .expect("saved");
+
+        session
+            .set_redundancy(&client_key(PHONE), ADDRESS, Some(on(2)))
+            .expect("saved");
+
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["musicians"],
+            serde_json::json!({
+                format!("client:{PHONE}"): {
+                    "label": "Ana",
+                    "redundancy": { "delayBlocks": 2 }
+                }
+            }),
+            "the address's setting went with the phone's"
+        );
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(
+            reloaded.redundancies(),
+            vec![(format!("client:{PHONE}"), on(2))]
+        );
+
+        reloaded
+            .set_redundancy(&client_key(PHONE), ADDRESS, None)
+            .expect("saved");
+        assert_eq!(reloaded.redundancies(), Vec::new());
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["musicians"],
+            serde_json::json!({ format!("client:{PHONE}"): { "label": "Ana" } })
+        );
+    }
+
+    #[test]
+    fn an_unreadable_redundancy_costs_only_itself_and_an_unknown_delay_is_kept_as_written() {
+        let directory = test_directory("redundancy-unreadable");
+        fs::write(
+            directory.join(SESSION_FILE),
+            format!(
+                r#"{{"version":1,"musicians":{{"client:{PHONE}":{{"label":"Ana","redundancy":"twice"}},"address:{ADDRESS}":{{"redundancy":{{"delayBlocks":9}}}}}}}}"#
+            ),
+        )
+        .expect("write");
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(session.notice(), None, "the file loads as it is");
+        assert_eq!(
+            session.label_for(Some(PHONE), ADDRESS),
+            Some("Ana".to_owned())
+        );
+        assert_eq!(
+            session.redundancies(),
+            vec![(
+                address_key(ADDRESS),
+                SessionRedundancy {
+                    delay_blocks: Some(9)
+                }
+            )]
         );
     }
 

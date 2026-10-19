@@ -515,8 +515,66 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     the whole-path message and kept in the field, `D:\Takes` kept and listed, Default folder back;
     no console errors.
   - Commits: b680c6c (finding 1, 88 lines). Commit: this commit (finding 2).
-- [ ] T6 (virtual soundcheck): the playback source in place of capture and its UI. Route:
-  delegated writer.
+- [x] T6a (virtual soundcheck, engine): a take played back into the mixer in place of the live
+  inputs, with its transport. Route: delegated writer (writer and 2+ non-trivial files triggers).
+  - Design (`soundcheck.rs`): a disk thread ("soundcheck") reads the take's input tracks with
+    `WavReader` (take.json v1: `input` mono, `pair` stereo, 1-based channels; `local` never
+    opened) and lays them into frames of the device's inputs (unrecorded inputs silent, float
+    samples clamped, NaN silent) in a 2 s `rtrb` ring allocated at start on the engine's side. The
+    engine thread (`PipelineCommand::Playback`/`Live`, `Pipeline::pump_at`) takes blocks of the
+    capture's layout from it when the clock makes them due and meters them as capture does, so
+    phones, local output and meters behave as live. The capture stream stays open, set aside
+    (`CaptureStats::suspended`: the callback neither meters, counts nor queues); going live drops
+    what it left in its ring, between two blocks, with no device opened or listed.
+  - Clock: the local output's callback when one plays (`OutputPlayer` ticks `PlaybackClock` with
+    the frames each callback played and wakes the engine thread), else the engine thread's timer
+    (frames counted exactly from when it took over; it also takes over when the output's callbacks
+    stop for 250 ms). Playback starts once 250 ms are queued (or the rest of the take); later
+    shortfalls are padded with silence and counted as `underrun_frames`, never waited for. The
+    engine thread frees nothing: the disk thread holds its end of the ring until it sees the
+    engine let go.
+  - Refusals (`SoundcheckError`, typed, downcastable from the `Box<dyn Error>`): `Layout` (an input
+    past the device, an input in two tracks, a pair not linked now, a lone input that is a side of
+    a linked pair now: the tracks must be the ones a take of the device would have now),
+    `TakeUnreadable` (take.json missing, not JSON, not version 1, unknown kind, a file name that is
+    not a plain file of the folder), `TrackUnreadable` (missing or unreadable file, channels not
+    the track's), `SampleRate` (take or file not at 48 kHz), `Empty`, `PastEnd`, `Recording`
+    (start while a take records), `RecordingRefused`, `SwitchRefused` (recording or a device switch
+    during a soundcheck), `AlreadyPlaying`, `NotPlaying`, `Failed` (transport after a read error),
+    `EngineStopping`, `Unavailable`. Rate decision: takes are recorded after decimation, so every
+    take of this engine is 48 kHz whatever the device's rate (a 96 kHz device's take plays as is);
+    any other rate is refused, there is no resampler. The take's device name is not checked.
+  - Transport: at the end of a take that does not loop it pauses at its end (resume starts it
+    again from 0) or, looping, wraps within the block. Pause plays silence with the clock running.
+    A seek is a handshake (engine's side asks, disk moves and stops queueing, engine drops what was
+    queued and plays on from the disk's frame after a new preroll, then the disk queues again), so
+    no frame from the old position is ever played; the status shows the new frame at once.
+  - API for T6b: `start_soundcheck(SoundcheckRequest { take_folder, start_frame, looping }) ->
+    SoundcheckStatus`, `pause_soundcheck()`, `resume_soundcheck()`, `seek_soundcheck(frame)`,
+    `set_soundcheck_loop(bool)`, `stop_soundcheck()` (all `-> Result<SoundcheckStatus, Box<dyn
+    Error>>`; transport takes `&self`, start and stop `&mut self`), `soundcheck() ->
+    SoundcheckStatus { state: Off | Playing | Paused | Failed { reason }, take_folder, take_name,
+    position_frames, length_frames, looping, underrun_frames, clock: Timer | Output }`, also
+    `EngineStatus::soundcheck`; `EngineEvent::SoundcheckChanged` for every change made through the
+    handle (the take's own end or a read error show in the status only). Re-exported from the
+    crate root with `SoundcheckError`, `SoundcheckClock`, `SoundcheckState`.
+  - Desktop: `cargo build -p mixlink-desktop` is clean; its test targets need
+    `soundcheck: Default::default()` in three `EngineStatus` literals (`commands.rs:5975`,
+    `dto.rs:1228`, `examples/name_precedence_probe.rs:39`), left to T6b.
+  - RED: 16 of 421 failed against stubs (take loading, disk thread, clock and fill returning
+    nothing; the engine refusing to start; the capture not set aside): routing, layout, rate,
+    missing file, nothing to play, end of take, loop, underrun, timer, output clock, capture set
+    aside, allocation-free path, and the engine's live switch, timer, refusals and unfit take. Then
+    5 of 426 against transport stubs (pause, seek, loop off then seek, loop on late, the engine's
+    transport).
+  - GREEN: server unit tests 405 -> 421 (3e276c7) -> 426, on 3 full runs and 10 runs of the
+    soundcheck tests; the engine thread's playback path makes (0, 0) allocations and frees over
+    1000 blocks and the switch back to live, with the disk thread running; clippy reports nothing
+    new (its 7 findings are older).
+  - Commits: 3e276c7 (playback, 2,249 lines: over the guide, kept whole since the loader alone
+    would be dead code). Commit: this commit (transport).
+- [ ] T6b (virtual soundcheck, desktop): Tauri commands over the T6a API, the takes' Play and
+  Soundcheck, and the virtual soundcheck card. Route: delegated writer.
 - [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
 
 ## Progress
@@ -569,7 +627,12 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 - Review lineage review-087ed4936a1744f6 over c4ba1a7..2067f08 (T4b-fix and T5) approved and
   acknowledged; its two findings (quick arm presses dropping one, the Record screen's container
   logic untested) are fixed by T5-fix (b680c6c and its test commit). Next review base: 2067f08.
+- Review lineage review-66125d92f9e473fb over 2067f08..491f8ee (T5-fix) approved and acknowledged
+  with two SUGGESTIONs: a same-row double arm press sends `on: true` twice; the record
+  controller's `onChange` is not called when a request rejects (an unhandled promise). Next review
+  base: 491f8ee.
+- T6 split into T6a (engine, done in 3e276c7 and the transport commit) and T6b (desktop).
 
 ## Next step
 
-T6.
+T6b.

@@ -24,14 +24,17 @@ use crate::mix::{
 use crate::network::{NetworkSink, PacketStats};
 use crate::output::{
     check_request, local_output_sink, offered_outputs, open_output, output_channels,
-    system_output_device, system_output_devices, LocalOutputRequest, LocalOutputStatus,
-    OpenedOutput, OutputControl, OutputDevice, OutputShared,
+    system_output_device, system_output_devices, LocalOutputRequest, LocalOutputState,
+    LocalOutputStatus, OpenedOutput, OutputControl, OutputDevice, OutputShared,
 };
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
 use crate::recorder::{
     free_space, minutes_left, open_take, plan_tracks, recorder_sink, take_bytes_per_second,
     DiskEstimate, FileOpener, RecordRequest, Recorder, RecordingStatus, TakeEnd, TakeMarker,
     TakeOptions, TakeSummary, TrackOpener, STOP_WAIT,
+};
+use crate::soundcheck::{
+    PlaybackClock, Soundcheck, SoundcheckError, SoundcheckRequest, SoundcheckStatus,
 };
 use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
@@ -75,6 +78,11 @@ pub enum EngineEvent {
     /// [Self::GroupsChanged] or [Self::ChannelsChanged]). Read it with [EngineHandle::local_mix].
     /// It is no musician's mix, so it names no address and no phone is ever sent it.
     LocalMixChanged,
+    /// The soundcheck changed through the engine: a take started or stopped playing in place of
+    /// the inputs, or was paused, resumed, moved or set to loop. Read it with
+    /// [EngineHandle::soundcheck]. What the take does on its own (reaching its end, a read error)
+    /// shows in the status only: the engine thread never touches the event bus.
+    SoundcheckChanged,
 }
 
 /// Where a mix change came from.
@@ -360,6 +368,8 @@ pub struct EngineStatus {
     pub local_output: LocalOutputStatus,
     /// The take being recorded, if any, and the last one (see [EngineHandle::recording]).
     pub recording: RecordingStatus,
+    /// The take playing in place of the inputs, if any (see [EngineHandle::soundcheck]).
+    pub soundcheck: SoundcheckStatus,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -1362,6 +1372,10 @@ pub struct EngineHandle {
     block_frames: usize,
     /// The recorder: the lines to its sink on the engine thread, and the take being recorded.
     recorder: Recorder,
+    /// The clock a take played back follows: the local output's callbacks, else the timer.
+    playback_clock: Arc<PlaybackClock>,
+    /// The take playing in place of the inputs, if any.
+    soundcheck: Soundcheck,
     /// The running capture stream. Dropping it stops its callback, the only producer of its ring.
     stream: Option<cpal::Stream>,
     /// The engine thread: it reads the current stream's ring and feeds the sinks, and keeps the
@@ -1512,6 +1526,7 @@ impl EngineHandle {
             local_mix: self.local_mix.current(),
             local_output: self.local_output(),
             recording: self.recording(),
+            soundcheck: self.soundcheck(),
         }
     }
 
@@ -1549,12 +1564,14 @@ impl EngineHandle {
     /// `config` when any of it changed.
     ///
     /// A switch is refused while a take records ([Self::start_recording]): a take never mixes two
-    /// devices, so the take is stopped first.
+    /// devices, so the take is stopped first. It is refused too while a take plays in place of the
+    /// inputs ([Self::start_soundcheck]), which was checked against this device's inputs.
     pub fn switch_device(&mut self, filter: Option<&str>) -> Result<CaptureFormat, Box<dyn Error>> {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
         self.recorder.refuse_source_change()?;
+        self.soundcheck.refuse_source_change()?;
         let device = {
             let host = input_host(self.host);
             let devices = host
@@ -1607,12 +1624,14 @@ impl EngineHandle {
     ///
     /// A plan that cannot be made (a capture whose format and frames disagree), or an engine
     /// thread that is no longer running, leaves everything as it was: the running capture keeps
-    /// feeding the engine and the new one is dropped. So does a take that records.
+    /// feeding the engine and the new one is dropped. So does a take that records, or one that
+    /// plays in place of the inputs.
     pub(crate) fn install_capture(
         &mut self,
         capture: OpenedCapture,
     ) -> Result<CaptureFormat, Box<dyn Error>> {
         self.recorder.refuse_source_change()?;
+        self.soundcheck.refuse_source_change()?;
         let plan = plan_switch_from_attempt(&self.group_definitions, capture.channels())?;
         let pipeline = self.pipeline.as_ref().ok_or("the engine is stopping")?;
 
@@ -1815,6 +1834,7 @@ impl EngineHandle {
             &request,
             self.buffer_frames,
             self.block_frames,
+            Arc::clone(&self.playback_clock),
         )?;
         self.install_output(Some(opened))?;
         Ok(self.local_output())
@@ -1823,11 +1843,12 @@ impl EngineHandle {
     /// Makes `output` the local output, or turns it off with `None`: the local output's sink takes
     /// the new feed before its next block, then the previous output's stream is dropped. The feed
     /// the sink lets go of comes back and is freed here, at a later call, never on the engine
-    /// thread.
+    /// thread. A take played back follows the new output's callbacks, or the timer without one.
     pub(crate) fn install_output(
         &mut self,
         output: Option<OpenedOutput>,
     ) -> Result<(), Box<dyn Error>> {
+        let follow = output.is_some();
         let (feed, active) = match output {
             Some(output) => (
                 Some(output.feed),
@@ -1845,6 +1866,7 @@ impl EngineHandle {
             .map_err(|_| "the local output's lines were poisoned")?
             .send(feed)?;
         self.local_output.active = active;
+        self.playback_clock.follow_output(follow);
         Ok(())
     }
 
@@ -1910,6 +1932,7 @@ impl EngineHandle {
         if self.is_stopped() || self.pipeline.is_none() {
             return Err("the engine is stopping".into());
         }
+        self.soundcheck.refuse_recording()?;
         self.recorder.check_idle()?;
         let source_channels = usize::from(self.source_channels);
         let tracks = plan_tracks(
@@ -1972,6 +1995,120 @@ impl EngineHandle {
             free_bytes,
             minutes_left: free_bytes.and_then(|free| minutes_left(free, bytes_per_second)),
         })
+    }
+
+    /// Plays the take in `request.take_folder` in place of the inputs (a virtual soundcheck), from
+    /// `request.start_frame`, looping or not, and returns the soundcheck's status.
+    ///
+    /// The take's input tracks feed the mixer as the capture device did, in the same blocks and
+    /// with the same channels: every phone's mix, the local mix and output and the meters behave
+    /// as live, and inputs the take did not record are silent. Its local-mix track is not played.
+    /// The capture device keeps running, set aside: its audio is neither heard nor metered until
+    /// [Self::stop_soundcheck] takes the engine back to it. The take follows the local output's
+    /// clock when one plays, else a timer (see [crate::soundcheck]).
+    ///
+    /// A [SoundcheckError], and nothing changed, when the engine is stopping, a take records, a
+    /// soundcheck already plays, `take.json` or a track's file is missing or unreadable, the take
+    /// or a file is not at 48 kHz, its inputs do not fit the device's inputs now (an input past
+    /// them, or a pair that is not a linked pair now, or a lone input that now is), it holds no
+    /// input audio, or the start is past its end. While it plays, recording and device switches
+    /// are refused.
+    pub fn start_soundcheck(
+        &mut self,
+        request: SoundcheckRequest,
+    ) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err(SoundcheckError::EngineStopping.into());
+        }
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return Err(SoundcheckError::EngineStopping.into());
+        };
+        if self.soundcheck.is_active() {
+            return Err(SoundcheckError::AlreadyPlaying.into());
+        }
+        if self.recorder.refuse_source_change().is_err() {
+            return Err(SoundcheckError::Recording.into());
+        }
+        let follow_output = self.local_output.active.as_ref().is_some_and(|active| {
+            active.shared.status(&active.request).state == LocalOutputState::Running
+        });
+        self.playback_clock.follow_output(follow_output);
+        let (reader, active) = crate::soundcheck::prepare(
+            &request,
+            &self.config_state.snapshot().channels,
+            usize::from(self.source_channels),
+            Arc::clone(&self.playback_clock),
+            Arc::clone(&self.capture_stats),
+        )?;
+        self.playback_clock.set_active(true);
+        if let Err(reason) = pipeline.play(reader) {
+            self.playback_clock.set_active(false);
+            active.end(std::time::Duration::ZERO);
+            return Err(SoundcheckError::Unavailable { reason }.into());
+        }
+        self.soundcheck.begin(active);
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Stops the take playing in place of the inputs and takes the engine back to the capture
+    /// device, which never stopped: from the next block the phones, the local output and the
+    /// meters hear the inputs again. No device is opened or listed. Returns the soundcheck's
+    /// status (off). A [SoundcheckError::NotPlaying] when no take plays.
+    pub fn stop_soundcheck(&mut self) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        let active = self.soundcheck.take().ok_or(SoundcheckError::NotPlaying)?;
+        self.playback_clock.set_active(false);
+        if let Some(pipeline) = &self.pipeline {
+            // An engine thread that has ended let go of the take with everything else.
+            let _ = pipeline.go_live();
+        }
+        active.end(crate::soundcheck::STOP_WAIT);
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// The take playing in place of the inputs: its state, folder, name, position and length in
+    /// frames, whether it loops, the frames the disk fell behind by and the clock it follows; the
+    /// default (off) when the inputs are live.
+    pub fn soundcheck(&self) -> SoundcheckStatus {
+        self.soundcheck.status()
+    }
+
+    /// Pauses the take: the phones, the local output and the meters hear silence, the position
+    /// holds, and the inputs stay set aside. Returns the soundcheck's status.
+    /// [SoundcheckError::NotPlaying] without a take, [SoundcheckError::Failed] after a read error.
+    pub fn pause_soundcheck(&self) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.pause();
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Plays the take on from where it was paused; a take stopped at its end starts again at its
+    /// first frame. Returns the soundcheck's status. Refused as [Self::pause_soundcheck] is.
+    pub fn resume_soundcheck(&self) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.resume();
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Moves the take to `frame` (from 0, the take's length at most), playing or paused; the
+    /// status reports the new position at once. What was queued from the old position is never
+    /// played: the take is silent until the new frames are read (a few milliseconds), which is no
+    /// underrun. Returns the soundcheck's status. [SoundcheckError::PastEnd] past the take's end,
+    /// else refused as [Self::pause_soundcheck] is.
+    pub fn seek_soundcheck(&self, frame: u64) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.seek(frame)?;
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
+    }
+
+    /// Whether the take starts again at its first frame when it reaches its end, rather than
+    /// stopping there; a take already stopped at its end stays there until it is resumed. Returns
+    /// the soundcheck's status. Refused as [Self::pause_soundcheck] is.
+    pub fn set_soundcheck_loop(&self, looping: bool) -> Result<SoundcheckStatus, Box<dyn Error>> {
+        self.soundcheck.playing()?.set_looping(looping);
+        self.events.emit(EngineEvent::SoundcheckChanged);
+        Ok(self.soundcheck())
     }
 
     /// The engineer's channel details the engine keeps, whole: the list last set with
@@ -2252,6 +2389,9 @@ impl EngineHandle {
         }
         // Nothing feeds the take any more: its files are finished and it ends as the engine's.
         self.recorder.engine_stopped();
+        // Nothing plays a take back any more: its disk thread ends.
+        self.playback_clock.set_active(false);
+        self.soundcheck.engine_stopped();
         // Nothing feeds the local output any more: close it, and free what the sink handed back.
         self.local_output.active = None;
         self.local_output.reap();
@@ -2362,6 +2502,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         vec![Box::new(network), Box::new(local), Box::new(recorder)],
         Arc::clone(&levels),
     ))?;
+    let playback_clock = Arc::new(PlaybackClock::new());
+    playback_clock.set_waker(pipeline.waker());
     let links = CaptureLinks {
         levels: Arc::clone(&levels),
         stats: Arc::clone(&capture_stats),
@@ -2404,6 +2546,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         capture_device: Some(device),
         block_frames,
         recorder: Recorder::new(recorder_lines),
+        playback_clock,
+        soundcheck: Soundcheck::default(),
         stream: Some(opened.stream),
         pipeline: Some(pipeline),
         control_thread: Some(control_thread),
@@ -4348,6 +4492,8 @@ mod tests {
             Arc::clone(&levels),
         ))
         .expect("the engine thread starts");
+        let playback_clock = Arc::new(PlaybackClock::new());
+        playback_clock.set_waker(pipeline.waker());
         let mut engine = EngineHandle {
             device_name: String::new(),
             capture_format: test_format(0),
@@ -4370,6 +4516,8 @@ mod tests {
             capture_device: None,
             block_frames: DEFAULT_BLOCK_FRAMES,
             recorder: Recorder::new(recorder_lines),
+            playback_clock,
+            soundcheck: Soundcheck::default(),
             stream: None,
             pipeline: Some(pipeline),
             control_thread: None,
@@ -5159,6 +5307,348 @@ mod tests {
             .record_estimate(&take_of(&parent, vec![]))
             .expect_err("nothing is armed");
         assert!(refused.to_string().contains("arm"), "{refused}");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A soundcheck of the take in `folder` from its start, not looping.
+    fn soundcheck_of(folder: &std::path::Path) -> SoundcheckRequest {
+        SoundcheckRequest {
+            take_folder: folder.to_owned(),
+            start_frame: 0,
+            looping: false,
+        }
+    }
+
+    /// The soundcheck refusal in `error`.
+    fn soundcheck_refusal<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a SoundcheckError> {
+        error.downcast_ref::<SoundcheckError>()
+    }
+
+    /// The take (CH 1 at 0.5) plays in place of the inputs, paced by the local output's
+    /// callbacks: the output plays the local mix of the take exactly as it would of the same live
+    /// input, the meters show the take, and live audio is neither heard nor metered. Stopping
+    /// takes the engine back to the same capture, which is heard again at once.
+    #[test]
+    fn a_take_plays_in_place_of_the_inputs_and_stopping_returns_to_live() {
+        let (mut engine, mut capture, phone) = local_engine();
+        let (mut player, opened) = test_output("Speakers", 2, 0);
+        player.set_clock(Arc::clone(&engine.playback_clock));
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        // Only the output's callbacks pace the take in this test.
+        engine
+            .playback_clock
+            .set_grace(std::time::Duration::from_secs(600));
+        let folder = crate::soundcheck::tests::constant_take("engine-plays", 4_800, 0.5);
+        let events = engine.subscribe();
+
+        let status = engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect("the take plays");
+
+        assert_eq!(status.state, crate::soundcheck::SoundcheckState::Playing);
+        assert_eq!(status.take_folder.as_deref(), Some(folder.as_path()));
+        assert_eq!(status.take_name.as_deref(), Some("Soundcheck"));
+        assert_eq!(status.length_frames, 4_800);
+        assert_eq!(status.position_frames, 0);
+        assert_eq!(status.clock, crate::soundcheck::SoundcheckClock::Output);
+        assert_eq!(engine.status().soundcheck, status);
+        assert_eq!(drain(&events), vec![EngineEvent::SoundcheckChanged]);
+        // The whole take is queued (it is shorter than the preroll) and the capture set aside.
+        assert!(until(|| engine.soundcheck.queued() == 4_800));
+        assert!(until(|| engine
+            .capture_stats
+            .suspended
+            .load(Ordering::Acquire)));
+        capture.write(&[1.0f32; 2 * 64]);
+
+        // Each callback plays 64 frames, and one block of the take follows it; the output plays
+        // once its ring holds its callback and two blocks.
+        let mut buffer = [9.0f32; 2 * 64];
+        for callback in 1..=3 {
+            player.fill(&mut buffer);
+            assert!(until(|| player.queued() == 64 * callback));
+        }
+        player.fill(&mut buffer);
+        assert!(until(|| engine.soundcheck().position_frames == 256));
+        let mut heard = [0.0f32; 2];
+        crate::mix::MixPlan::new(&engine.local_mix(), 2).mix_into(&[0.5, 0.0], &mut heard);
+        for frame in buffer.chunks_exact(2) {
+            assert_eq!(frame, &heard[..], "the output plays the take's local mix");
+        }
+        assert!(phone_hears(&phone), "the phones hear the take");
+        let levels = engine.meters().channel_levels;
+        assert!(levels[0] > 0 && levels[0] <= 50, "{levels:?}");
+        assert_eq!(levels[1], 0, "live audio is not metered");
+        // No callback, no audio: the timer stays out of it while the output plays.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(engine.soundcheck().position_frames, 256);
+
+        let off = engine.stop_soundcheck().expect("the soundcheck stops");
+
+        assert_eq!(off, SoundcheckStatus::default());
+        assert_eq!(engine.soundcheck(), SoundcheckStatus::default());
+        assert_eq!(drain(&events), vec![EngineEvent::SoundcheckChanged]);
+        assert!(!engine.capture_stats.suspended.load(Ordering::Acquire));
+        capture.write(&[-0.25f32; 2 * 64]);
+        assert!(until(|| engine.meters().channel_levels[1] > 0));
+        assert_eq!(engine.device_name(), "Test input (2)", "the same capture");
+        assert!(engine.stop_soundcheck().is_err(), "nothing plays now");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Without a local output the engine's timer paces the take: it never runs ahead of the time
+    /// that passed since it started, and the phones hear it.
+    #[test]
+    fn without_a_local_output_a_take_plays_on_the_timer() {
+        let (mut engine, _capture, phone) = local_engine();
+        let folder = crate::soundcheck::tests::constant_take("engine-timer", 48_000, 0.5);
+        let started = Instant::now();
+
+        engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect("the take plays");
+
+        assert!(until(|| engine.soundcheck().position_frames >= 4_800));
+        let position = engine.soundcheck().position_frames;
+        let elapsed = started.elapsed();
+        assert!(
+            position as usize <= crate::pipeline::frames_in(elapsed) + 64,
+            "the timer ran ahead: {position} frames after {elapsed:?}"
+        );
+        assert_eq!(
+            engine.soundcheck().clock,
+            crate::soundcheck::SoundcheckClock::Timer
+        );
+        assert!(phone_hears(&phone));
+        engine.stop().expect("the engine stops");
+        assert_eq!(engine.soundcheck(), SoundcheckStatus::default());
+    }
+
+    /// A take never records playback, and the device a take plays on cannot change: recording,
+    /// switches and a second soundcheck are refused while one plays, and a soundcheck while a
+    /// take records.
+    #[test]
+    fn recording_switches_and_a_second_take_wait_for_the_soundcheck() {
+        let parent = crate::recorder::tests::scratch_directory("engine-soundcheck-refusals");
+        let folder = crate::soundcheck::tests::constant_take("engine-refusals", 4_800, 0.5);
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .start_recording(take_of(&parent, vec![0]))
+            .expect("the take starts");
+
+        let refused = engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect_err("no soundcheck while recording");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::Recording)
+        );
+        engine.stop_recording().expect("the take stops");
+
+        engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect("the take plays");
+        let before = session(&engine);
+        let refused = engine
+            .start_recording(take_of(&parent, vec![0]))
+            .expect_err("no recording during a soundcheck");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::RecordingRefused)
+        );
+        assert_eq!(
+            std::fs::read_dir(&parent).unwrap().count(),
+            1,
+            "no take folder was made"
+        );
+        let refused = engine
+            .switch_device(None)
+            .expect_err("no switch during a soundcheck");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::SwitchRefused)
+        );
+        let (_mono, opened) = test_capture(&engine, 1);
+        let refused = engine
+            .install_capture(opened)
+            .expect_err("no switch during a soundcheck");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::SwitchRefused)
+        );
+        assert_eq!(session(&engine), before);
+        let refused = engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect_err("one take at a time");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::AlreadyPlaying)
+        );
+
+        engine.stop_soundcheck().expect("the soundcheck stops");
+        let refused = engine.stop_soundcheck().expect_err("nothing plays");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::NotPlaying)
+        );
+        engine
+            .start_recording(take_of(&parent, vec![0]))
+            .expect("after the soundcheck a take records");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Plays the output's callbacks, 64 frames each, until `done` holds for the soundcheck: at
+    /// most 200 of them, 2 ms apart.
+    fn callbacks_until(
+        engine: &EngineHandle,
+        player: &mut crate::output::OutputPlayer,
+        done: impl Fn(&SoundcheckStatus) -> bool,
+    ) -> bool {
+        let mut buffer = [0.0f32; 2 * 64];
+        for _ in 0..200 {
+            if done(&engine.soundcheck()) {
+                return true;
+            }
+            player.fill(&mut buffer);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        done(&engine.soundcheck())
+    }
+
+    /// The transport through the engine: a pause holds the position, a seek shows its frame at
+    /// once and plays on from it to the end, where the take stops; looping set there and a
+    /// resume start it again from its first frame. Each change is announced.
+    #[test]
+    fn the_soundcheck_pauses_seeks_and_loops_through_the_engine() {
+        use crate::soundcheck::SoundcheckState;
+        let (mut engine, _capture, _phone) = local_engine();
+        let (mut player, opened) = test_output("Speakers", 2, 0);
+        player.set_clock(Arc::clone(&engine.playback_clock));
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        engine
+            .playback_clock
+            .set_grace(std::time::Duration::from_secs(600));
+        let folder = crate::soundcheck::tests::constant_take("engine-transport", 4_800, 0.5);
+        engine
+            .start_soundcheck(soundcheck_of(&folder))
+            .expect("the take plays");
+        assert!(until(|| engine.soundcheck.queued() == 4_800));
+        let events = engine.subscribe();
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            status.position_frames >= 128
+        }));
+
+        let paused = engine.pause_soundcheck().expect("a take plays");
+        assert_eq!(paused.state, SoundcheckState::Paused);
+        // A block already being played when the pause came may still finish.
+        for _ in 0..3 {
+            player.fill(&mut [0.0f32; 2 * 64]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let held = engine.soundcheck().position_frames;
+        for _ in 0..10 {
+            player.fill(&mut [0.0f32; 2 * 64]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(engine.soundcheck().position_frames, held, "the pause holds");
+
+        let resumed = engine.resume_soundcheck().expect("a take plays");
+        assert_eq!(resumed.state, SoundcheckState::Playing);
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            status.position_frames > held
+        }));
+
+        let moved = engine.seek_soundcheck(4_700).expect("within the take");
+        assert_eq!(moved.position_frames, 4_700, "the new frame shows at once");
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            status.state == SoundcheckState::Paused && status.position_frames == 4_800
+        }));
+
+        let looped = engine.set_soundcheck_loop(true).expect("a take plays");
+        assert!(looped.looping);
+        assert_eq!(looped.state, SoundcheckState::Paused, "it stays at the end");
+        let again = engine.resume_soundcheck().expect("a take plays");
+        assert_eq!(again.state, SoundcheckState::Playing);
+        assert_eq!(
+            again.position_frames, 0,
+            "resumed at its end, it starts again"
+        );
+        assert!(callbacks_until(&engine, &mut player, |status| {
+            (64..4_700).contains(&status.position_frames)
+        }));
+
+        let refused = engine
+            .seek_soundcheck(4_801)
+            .expect_err("past the take's end");
+        assert_eq!(
+            soundcheck_refusal(&*refused),
+            Some(&SoundcheckError::PastEnd {
+                frame: 4_801,
+                length: 4_800
+            })
+        );
+        assert_eq!(
+            drain(&events),
+            vec![EngineEvent::SoundcheckChanged; 5],
+            "pause, resume, seek, loop and resume"
+        );
+
+        engine.stop_soundcheck().expect("the soundcheck stops");
+        for refused in [
+            engine.pause_soundcheck(),
+            engine.resume_soundcheck(),
+            engine.seek_soundcheck(0),
+            engine.set_soundcheck_loop(false),
+        ] {
+            let refused = refused.expect_err("nothing plays");
+            assert_eq!(
+                soundcheck_refusal(&*refused),
+                Some(&SoundcheckError::NotPlaying)
+            );
+        }
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A take that does not fit the device (here CH 3 on a stereo device) or cannot be read is
+    /// refused with its reason, and the inputs stay live.
+    #[test]
+    fn a_take_that_does_not_fit_is_refused_and_the_inputs_stay_live() {
+        let (mut engine, mut capture, _phone) = local_engine();
+        let wide = crate::soundcheck::tests::take_of_input("engine-wide", 3);
+
+        let refused = engine
+            .start_soundcheck(soundcheck_of(&wide))
+            .expect_err("CH 3 is past the device");
+        assert!(
+            matches!(
+                soundcheck_refusal(&*refused),
+                Some(SoundcheckError::Layout { .. })
+            ),
+            "{refused}"
+        );
+        let missing = engine
+            .start_soundcheck(soundcheck_of(&wide.join("no such take")))
+            .expect_err("no take there");
+        assert!(
+            matches!(
+                soundcheck_refusal(&*missing),
+                Some(SoundcheckError::TakeUnreadable { .. })
+            ),
+            "{missing}"
+        );
+
+        assert_eq!(engine.soundcheck(), SoundcheckStatus::default());
+        assert!(!engine.capture_stats.suspended.load(Ordering::Acquire));
+        capture.write(&[0.5f32; 2 * 64]);
+        assert!(engine
+            .meters()
+            .channel_levels
+            .iter()
+            .all(|level| *level > 0));
         engine.stop().expect("the engine stops");
     }
 }

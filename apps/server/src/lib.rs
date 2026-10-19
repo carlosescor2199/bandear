@@ -11,6 +11,7 @@ mod output;
 mod pipeline;
 mod protocol;
 mod recorder;
+mod soundcheck;
 mod targets;
 mod wav;
 
@@ -27,6 +28,9 @@ pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, Output
 pub use recorder::{
     free_space, minutes_left, DiskEstimate, RecordRequest, RecordingState, RecordingStatus,
     TakeEnd, TakeMarker, TakeSummary, TakeTrack, TrackKind,
+};
+pub use soundcheck::{
+    SoundcheckClock, SoundcheckError, SoundcheckRequest, SoundcheckState, SoundcheckStatus,
 };
 pub use targets::{MirrorStatus, MusicianKey};
 pub use wav::{SampleFormat, WavError, WavReader, WavSpec, WavTarget, WavWriter};

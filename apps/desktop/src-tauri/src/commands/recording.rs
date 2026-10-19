@@ -34,6 +34,8 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
+use personal_monitoring::log_info;
+
 use personal_monitoring::{
     free_space, DiskEstimate, EngineHandle, RecordRequest, RecordingState, RecordingStatus,
     SampleFormat, TakeMarker, TakeSummary, WavReader,
@@ -242,9 +244,13 @@ pub fn set_recording_settings(
     settings: RecordingSettingsRequest,
 ) -> Result<RecordingSettingsDto, String> {
     let answer = keep_settings(&state.session, places(state), settings)?;
-    println!(
-        "[mixlink-desktop] set_recording_settings: folder=\"{}\" format={} include_local={} armed={:?}",
-        answer.folder, answer.format, answer.include_local, answer.armed
+    log_info!(
+        "recording",
+        "set_recording_settings: folder=\"{}\" format={} include_local={} armed={:?}",
+        answer.folder,
+        answer.format,
+        answer.include_local,
+        answer.armed
     );
     Ok(answer)
 }
@@ -265,8 +271,9 @@ pub fn start_recording(
         &take_name,
         utc_offset_minutes,
     )?;
-    println!(
-        "[mixlink-desktop] start_recording: folder=\"{}\" armed={:?} skipped={:?} include_local={}",
+    log_info!(
+        "recording",
+        "start_recording: folder=\"{}\" armed={:?} skipped={:?} include_local={}",
         started.recording.take_folder.as_deref().unwrap_or_default(),
         started.armed,
         started.skipped,
@@ -284,11 +291,17 @@ pub fn start_recording(
 pub fn stop_recording(state: &DesktopState) -> Result<RecordingStoppedDto, String> {
     let stopped = stop_with(&state.engine)?;
     match &stopped.take {
-        Some(take) => println!(
-            "[mixlink-desktop] stop_recording: \"{}\" {} frames, ended {}",
-            take.folder, take.frames, take.ended
+        Some(take) => log_info!(
+            "recording",
+            "stop_recording: \"{}\" {} frames, ended {}",
+            take.folder,
+            take.frames,
+            take.ended
         ),
-        None => println!("[mixlink-desktop] stop_recording: the files are still being finished"),
+        None => log_info!(
+            "recording",
+            "stop_recording: the files are still being finished"
+        ),
     }
     Ok(stopped)
 }
@@ -835,7 +848,7 @@ fn open_with(
     folder: &str,
 ) -> Result<(), String> {
     let take = take_in_recordings(session, places, folder)?;
-    println!("[mixlink-desktop] open_take_folder: \"{}\"", take.display());
+    log_info!("recording", "open_take_folder: \"{}\"", take.display());
     opener.open(&take)
 }
 

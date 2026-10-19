@@ -19,6 +19,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use personal_monitoring::{log_error, log_warn};
+
 use crate::session::SessionMix;
 
 /// The most often the local mix is written while it keeps changing.
@@ -99,8 +101,9 @@ impl LocalMixSaver {
                 .name("mixlink-local-mix-saver".to_owned())
                 .spawn(move || inner.run())
                 .map_err(|error| {
-                    eprintln!(
-                        "[mixlink-desktop] the local mix saver did not start ({error}); the local \
+                    log_warn!(
+                        "local",
+                        "the local mix saver did not start ({error}); the local \
                          mix is kept when the engine stops"
                     )
                 })
@@ -154,7 +157,7 @@ impl Drop for LocalMixSaver {
         self.inner.wake.notify_all();
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
-                eprintln!("[mixlink-desktop] the local mix saver panicked");
+                log_error!("local", "the local mix saver panicked");
             }
         }
         self.inner.write_pending();

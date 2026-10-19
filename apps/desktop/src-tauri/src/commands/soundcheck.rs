@@ -20,6 +20,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use personal_monitoring::log_info;
+
 use personal_monitoring::{EngineHandle, SoundcheckError, SoundcheckRequest, SoundcheckStatus};
 
 use super::recording::{places, take_in_recordings, Places};
@@ -272,8 +274,9 @@ fn start_checked<E: SoundcheckEngine>(
     let status = engine
         .start_soundcheck(request.clone())
         .map_err(|refusal| refusal_words(&refusal))?;
-    println!(
-        "[mixlink-desktop] start_soundcheck: \"{}\" from frame {start_frame}, looping={looping}",
+    log_info!(
+        "soundcheck",
+        "start_soundcheck: \"{}\" from frame {start_frame}, looping={looping}",
         request.take_folder.display()
     );
     Ok(SoundcheckDto::from(&status))
@@ -291,7 +294,7 @@ fn transport_with<E: SoundcheckEngine>(
     let status = change
         .apply(engine)
         .map_err(|refusal| refusal_words(&refusal))?;
-    println!("[mixlink-desktop] soundcheck {change:?}");
+    log_info!("soundcheck", "soundcheck {change:?}");
     Ok(SoundcheckDto::from(&status))
 }
 
@@ -304,7 +307,7 @@ fn stop_with<E: SoundcheckEngine>(engine: &Mutex<Option<E>>) -> Result<Soundchec
     let status = engine
         .stop_soundcheck()
         .map_err(|refusal| refusal_words(&refusal))?;
-    println!("[mixlink-desktop] stop_soundcheck: back to the live inputs");
+    log_info!("soundcheck", "stop_soundcheck: back to the live inputs");
     Ok(SoundcheckDto::from(&status))
 }
 

@@ -18,9 +18,10 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use personal_monitoring::{
-    check_channels, check_groups, start, AudioHost, ChannelKind, ChannelMeta, EngineConfig,
-    EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition, MirrorOutcome,
-    MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus, PresetChannel,
+    check_channels, check_groups, log_info, log_warn, start, AudioHost, ChannelKind, ChannelMeta,
+    EngineConfig, EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition,
+    MirrorOutcome, MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
+    PresetChannel,
 };
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
@@ -100,7 +101,7 @@ impl DesktopState {
             let session = Arc::clone(&session);
             LocalMixSaver::start(
                 move |mix| session.set_local_mix(mix.clone()),
-                |line| eprintln!("[mixlink-desktop] {line}"),
+                |line| log_warn!("desk", "{line}"),
                 SAVE_INTERVAL,
             )
         };
@@ -284,8 +285,9 @@ fn controls_of(session: &Session) -> Vec<(MusicianKey, EngineerControls)> {
         .into_iter()
         .filter_map(|(key, kept)| {
             let Some(musician) = musician_key_of(&key) else {
-                eprintln!(
-                    "[mixlink-desktop] the engineer's controls kept for `{key}` are skipped: it names no phone or address"
+                log_warn!(
+                    "desk",
+                    "the engineer's controls kept for `{key}` are skipped: it names no phone or address"
                 );
                 return None;
             };
@@ -322,8 +324,9 @@ fn mirrors_of(session: &Session) -> Vec<(MusicianKey, MusicianKey, String)> {
             match (musician_key_of(&key), musician_key_of(&mirror.leader)) {
                 (Some(follower), Some(leader)) => Some((follower, leader, mirror.name)),
                 _ => {
-                    eprintln!(
-                        "[mixlink-desktop] the mirror kept for `{key}` on `{}` is skipped: it names no phone or address",
+                    log_warn!(
+                        "desk",
+                        "the mirror kept for `{key}` on `{}` is skipped: it names no phone or address",
                         mirror.leader
                     );
                     None
@@ -465,23 +468,24 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
             hand_session_layout(&mut handle, &state.session, saved_groups, saved_channels);
             for (key, controls) in saved_controls {
                 if let Err(error) = handle.keep_engineer_controls(&key, controls) {
-                    eprintln!(
-                        "[mixlink-desktop] start_engine: the saved controls for {key:?} were not applied: {error}"
+                    log_warn!(
+                        "desk",
+                        "start_engine: the saved controls for {key:?} were not applied: {error}"
                     );
                 }
             }
             for refused in hand_kept_mirrors(&handle, saved_mirrors) {
-                eprintln!("[mixlink-desktop] start_engine: {refused}");
+                log_warn!("desk", "start_engine: {refused}");
             }
             let local = saved_local.map(|kept| apply_kept_local(&mut handle, &kept));
             let notice = local.and_then(|applied| {
                 if let Some(refused) = applied.refused {
-                    eprintln!("[mixlink-desktop] start_engine: {refused}");
+                    log_warn!("desk", "start_engine: {refused}");
                 }
                 applied.notice
             });
             if let Some(notice) = &notice {
-                eprintln!("[mixlink-desktop] start_engine: {notice}");
+                log_warn!("desk", "start_engine: {notice}");
             }
             state.set_local_notice(notice);
             let summary = StartSummary {
@@ -489,8 +493,9 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                 device_name: handle.device_name().to_owned(),
                 capture_format: handle.capture_format().into(),
             };
-            println!(
-                "[mixlink-desktop] start_engine: device=\"{}\" capture_format={}",
+            log_info!(
+                "desk",
+                "start_engine: device=\"{}\" capture_format={}",
                 summary.device_name,
                 summary.capture_format.describe()
             );
@@ -522,9 +527,10 @@ fn hand_session_layout<E: GroupEngine + ChannelEngine>(
     if !groups.is_empty() {
         let count = groups.len();
         match engine.set_groups(groups) {
-            Ok(()) => println!("[mixlink-desktop] start_engine: {count} saved groups applied"),
-            Err(error) => eprintln!(
-                "[mixlink-desktop] start_engine: the saved groups were not applied: {error}"
+            Ok(()) => log_info!("desk", "start_engine: {count} saved groups applied"),
+            Err(error) => log_warn!(
+                "desk",
+                "start_engine: the saved groups were not applied: {error}"
             ),
         }
     }
@@ -532,11 +538,13 @@ fn hand_session_layout<E: GroupEngine + ChannelEngine>(
     if !details.is_empty() {
         let count = details.len();
         match engine.set_channels(details) {
-            Ok(()) => println!(
-                "[mixlink-desktop] start_engine: {count} saved channel details applied"
+            Ok(()) => log_info!(
+                "desk",
+                "start_engine: {count} saved channel details applied"
             ),
-            Err(error) => eprintln!(
-                "[mixlink-desktop] start_engine: the saved channel details were not applied: {error}"
+            Err(error) => log_warn!(
+                "desk",
+                "start_engine: the saved channel details were not applied: {error}"
             ),
         }
     }
@@ -674,7 +682,7 @@ pub fn add_target(state: &DesktopState, address: String) -> Result<String, Strin
     let added = handle
         .add_target(&address)
         .map_err(|error| error.to_string())?;
-    println!("[mixlink-desktop] add_target: {added}");
+    log_info!("desk", "add_target: {added}");
     Ok(added.to_string())
 }
 
@@ -694,7 +702,7 @@ pub fn remove_target(state: &DesktopState, address: String) -> Result<String, St
     let removed = handle
         .remove_target(&address)
         .map_err(|error| error.to_string())?;
-    println!("[mixlink-desktop] remove_target: {removed}");
+    log_info!("desk", "remove_target: {removed}");
     Ok(removed.to_string())
 }
 
@@ -758,8 +766,9 @@ pub fn set_engineer_controls(
         client_id.as_deref(),
         controls,
     )?;
-    println!(
-        "[mixlink-desktop] set_engineer_controls: {} limit={} locked={:?} kept_for={} applied={} saved={}",
+    log_info!(
+        "desk",
+        "set_engineer_controls: {} limit={} locked={:?} kept_for={} applied={} saved={}",
         outcome.address,
         outcome.limit_percent,
         outcome
@@ -1055,9 +1064,11 @@ pub fn save_preset(
 ) -> Result<PresetsDto, String> {
     let outcome = save_preset_with(&state.engine, &state.session, &address, &name)?;
     if let Some(preset) = &outcome.preset {
-        println!(
-            "[mixlink-desktop] save_preset: \"{}\" ({}) from {address}",
-            preset.name, preset.id
+        log_info!(
+            "desk",
+            "save_preset: \"{}\" ({}) from {address}",
+            preset.name,
+            preset.id
         );
     }
     Ok(outcome)
@@ -1095,10 +1106,7 @@ fn save_preset_with<E: MixesEngine>(
 /// nothing.
 pub fn rename_preset(state: &DesktopState, id: String, name: String) -> Result<PresetsDto, String> {
     let outcome = rename_kept_preset(&state.session, &id, &name)?;
-    println!(
-        "[mixlink-desktop] rename_preset: {id} -> \"{}\"",
-        name.trim()
-    );
+    log_info!("desk", "rename_preset: {id} -> \"{}\"", name.trim());
     Ok(outcome)
 }
 
@@ -1119,7 +1127,7 @@ fn rename_kept_preset(session: &SessionStore, id: &str, name: &str) -> Result<Pr
 /// fails, changes nothing.
 pub fn delete_preset(state: &DesktopState, id: String) -> Result<PresetsDto, String> {
     let outcome = delete_kept_preset(&state.session, &id)?;
-    println!("[mixlink-desktop] delete_preset: {id}");
+    log_info!("desk", "delete_preset: {id}");
     Ok(outcome)
 }
 
@@ -1147,7 +1155,7 @@ pub fn apply_preset(
     musicians: Vec<String>,
 ) -> Result<MixesSetDto, String> {
     let outcome = apply_preset_with(&state.engine, &state.session, &id, &musicians)?;
-    println!("[mixlink-desktop] apply_preset: {id} on {musicians:?}");
+    log_info!("desk", "apply_preset: {id} on {musicians:?}");
     Ok(outcome)
 }
 
@@ -1181,7 +1189,7 @@ pub fn copy_mix(
     to: Vec<String>,
 ) -> Result<MixesSetDto, String> {
     let outcome = copy_mix_with(&state.engine, &from, &to)?;
-    println!("[mixlink-desktop] copy_mix: {from} onto {to:?}");
+    log_info!("desk", "copy_mix: {from} onto {to:?}");
     Ok(outcome)
 }
 
@@ -1235,9 +1243,14 @@ pub fn set_mirror(
         client_id.as_deref(),
         leader,
     )?;
-    println!(
-        "[mixlink-desktop] set_mirror: {} follows {:?} kept_for={} applied={} saved={}",
-        outcome.address, outcome.leader, outcome.kept_for, outcome.applied, outcome.saved
+    log_info!(
+        "desk",
+        "set_mirror: {} follows {:?} kept_for={} applied={} saved={}",
+        outcome.address,
+        outcome.leader,
+        outcome.kept_for,
+        outcome.applied,
+        outcome.saved
     );
     Ok(outcome)
 }
@@ -1506,7 +1519,10 @@ fn label_musician(
     let client_id = client_id_at(musicians, address);
     session.set_label(client_id.as_deref(), address, name)?;
     let kept_for = client_id.map_or_else(|| "address".to_owned(), |id| format!("phone {id}"));
-    println!("[mixlink-desktop] set_musician_name: {address} ({kept_for}) -> \"{name}\"");
+    log_info!(
+        "desk",
+        "set_musician_name: {address} ({kept_for}) -> \"{name}\""
+    );
     Ok(())
 }
 
@@ -1530,8 +1546,9 @@ fn label_musician(
 /// two edits at once never leave the session and the engine with different groups.
 pub fn set_groups(state: &DesktopState, groups: Vec<GroupRequest>) -> Result<GroupsSetDto, String> {
     let outcome = edit_groups(&state.engine, &state.session, groups)?;
-    println!(
-        "[mixlink-desktop] set_groups: {} groups, applied={} saved={}",
+    log_info!(
+        "desk",
+        "set_groups: {} groups, applied={} saved={}",
         outcome.groups.len(),
         outcome.applied,
         outcome.saved
@@ -1624,8 +1641,9 @@ pub fn set_channels(
     channels: Vec<ChannelRequest>,
 ) -> Result<ChannelsSetDto, String> {
     let outcome = edit_channels(&state.engine, &state.session, channels)?;
-    println!(
-        "[mixlink-desktop] set_channels: {} channels, applied={} saved={}",
+    log_info!(
+        "desk",
+        "set_channels: {} channels, applied={} saved={}",
         outcome.channels.len(),
         outcome.applied,
         outcome.saved
@@ -1844,8 +1862,9 @@ pub fn switch_device(state: &DesktopState, device: String) -> Result<StartSummar
         .switch_device(Some(&device))
         .map_err(|error| error.to_string())?;
     let format = CaptureFormatDto::from(handle.capture_format());
-    println!(
-        "[mixlink-desktop] switch_device: device=\"{}\" capture_format={}",
+    log_info!(
+        "desk",
+        "switch_device: device=\"{}\" capture_format={}",
         handle.device_name(),
         format.describe()
     );
@@ -1877,9 +1896,13 @@ pub fn set_audio_settings(
     settings: AudioSettingsRequest,
 ) -> Result<SessionAudio, String> {
     let kept = keep_audio_settings(&state.engine, &state.session, settings)?;
-    println!(
-        "[mixlink-desktop] set_audio_settings: host={} device={:?} buffer={:?} asio_driver={:?}",
-        kept.host, kept.device, kept.buffer_frames, kept.asio_driver
+    log_info!(
+        "desk",
+        "set_audio_settings: host={} device={:?} buffer={:?} asio_driver={:?}",
+        kept.host,
+        kept.device,
+        kept.buffer_frames,
+        kept.asio_driver
     );
     Ok(kept)
 }
@@ -2060,9 +2083,12 @@ fn session_mix_of(mix: &MixValues, desk: &DeskView) -> SessionMix {
 /// nothing.
 pub fn save_session(state: &DesktopState, name: String) -> Result<SessionSavedDto, String> {
     let outcome = save_session_with(&state.engine, &state.session, &state.snapshots, &name)?;
-    println!(
-        "[mixlink-desktop] save_session: \"{}\" ({}) with {} mixes",
-        outcome.session.name, outcome.session.id, outcome.session.mixes
+    log_info!(
+        "desk",
+        "save_session: \"{}\" ({}) with {} mixes",
+        outcome.session.name,
+        outcome.session.id,
+        outcome.session.mixes
     );
     Ok(outcome)
 }
@@ -2108,10 +2134,7 @@ pub fn rename_session(
     name: String,
 ) -> Result<SnapshotSummary, String> {
     let renamed = state.snapshots.rename(&id, &name)?;
-    println!(
-        "[mixlink-desktop] rename_session: {id} -> \"{}\"",
-        renamed.name
-    );
+    log_info!("desk", "rename_session: {id} -> \"{}\"", renamed.name);
     Ok(renamed)
 }
 
@@ -2119,7 +2142,7 @@ pub fn rename_session(
 /// confirm first.
 pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
     state.snapshots.delete(&id)?;
-    println!("[mixlink-desktop] delete_session: {id}");
+    log_info!("desk", "delete_session: {id}");
     Ok(())
 }
 
@@ -2174,8 +2197,9 @@ pub fn load_session(state: &DesktopState, id: String) -> Result<SessionLoadedDto
         &state.local_notice,
         &id,
     )?;
-    println!(
-        "[mixlink-desktop] load_session: \"{}\" ({id}) applied={} saved={} pushed={} skipped={} refused={}",
+    log_info!(
+        "desk",
+        "load_session: \"{}\" ({id}) applied={} saved={} pushed={} skipped={} refused={}",
         outcome.session.name,
         outcome.applied,
         outcome.saved,
@@ -2184,7 +2208,7 @@ pub fn load_session(state: &DesktopState, id: String) -> Result<SessionLoadedDto
         outcome.refused.len()
     );
     for line in outcome.damaged.iter().chain(&outcome.refused) {
-        eprintln!("[mixlink-desktop] load_session: {line}");
+        log_warn!("desk", "load_session: {line}");
     }
     Ok(outcome)
 }

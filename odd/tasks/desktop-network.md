@@ -83,8 +83,39 @@ optional recovered-packet count), the Network and system screen, the PRD update 
 
 ## Tasks
 
-- [ ] T1 (log file): log sink in the server crate, file writer with rotation in the desktop,
-  existing `println!`/`eprintln!` routed through it. Route: delegated writer.
+- [x] T1 (log file): log sink in the server crate, file writer with rotation in the desktop,
+  existing `println!`/`eprintln!` routed through it. Route: delegated writer (trigger: 2+
+  non-trivial files, server facade plus desktop file sink and about 70 call sites).
+  - API: `personal_monitoring::logging` (`Level`, `LogSink`, `set_sink`, `flush`, `format_line`,
+    `set_max_level`) and the macros `log_error!/log_warn!/log_info!/log_debug!(area, ...)`. Line:
+    `2026-10-18T19:04:05.123Z WARN  [control] message` (UTC, RFC 3339 to the millisecond; line
+    breaks in a message written as `\n`). Stderr until a host installs a sink; debug lines dropped
+    in release builds.
+  - Desktop: `logfile.rs` installs `<app_log_dir>/mixlink.log` first thing in `setup`, rotated at
+    5 MB keeping `mixlink.log.1..5`, created lazily, one write per line with no own buffer (the
+    exit path in `on_run_event` also flushes), a failed line goes to stderr (explained once,
+    counted, retried on the next line), mirrored to stderr in debug builds. Startup line with app
+    version, OS/arch and log file; Tauri command `log_location` answers `{ directory, file }`.
+  - Routed: 25 server lines (capture 2, control 10, discovery 5, engine 8) and 47 desktop lines
+    (the `[mixlink-desktop]` prefix replaced by the areas `desk`, `session`, `app`, `events`,
+    `soundcheck`, `recording`, `local`).
+  - Left out on purpose: the UDP send error in `NetworkSink::process` (engine thread) is no longer
+    printed at all, the per-musician `discarded` counter already reports it; the cpal error
+    callback in `capture.rs` `open_typed` keeps its `eprintln!` (it may run on the driver's audio
+    thread); the CLI's two `main.rs` lines stay `println!` (its user interface); test-only prints
+    and the `examples/` probes are unchanged.
+  - Real-time check: test `logging::tests::nothing_logs_on_a_real_time_path` reads the production
+    source of `pipeline.rs`, `output.rs`, every `impl Sink for` in `network.rs` and `recorder.rs`,
+    and `capture.rs` `open_typed`, and fails on any log call (and on any print except the capture
+    error callback's).
+  - RED: server, with `format_line` stubbed to an empty string, 4 of 6 logging tests failed (the
+    three format tests and the real-time check, which caught `eprintln!` in the `NetworkSink`);
+    desktop, with `append` stubbed to write nothing, 7 of 7 logfile tests failed. GREEN below.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 440 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 257 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings.
+  - Commits: 72f857b `feat(engine): route diagnostics through a log sink`; this commit
+    `feat(desktop): write a rotating log file`.
 - [ ] T2 (mixes backup): debounced autosave of live mixes to a rolling backup, restore from the
   session panel. Route: delegated writer.
 - [ ] T3 (health history): capabilities on `register`, RTT from ping/pong, history ring per
@@ -112,6 +143,8 @@ per reviewed slice, only with the user's approval.
 - Exploration done (read-only map with file evidence); the user chose "Auto or fixed" for the
   buffer.
 
+- T1 done (log file), two commits.
+
 ## Next step
 
-T1 (log file).
+T2 (mixes backup).

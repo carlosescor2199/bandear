@@ -3,6 +3,8 @@
 // in node. The screen only reads elements, writes what this works out and forwards its events.
 //
 // - The transport: one command at a time; the buttons wait until it is answered (`local.busy`).
+//   Moving the take (Back to start, the seek slider) and its loop go through the same guard, so
+//   none of them goes out while Stop is on its way; moves do not wait for each other.
 // - The waveform lanes: while a take records, each armed track keeps a bounded history of its
 //   peaks (createPeakHistory), cleared when the next take folder appears.
 // - Arming: a press is a delta (armChange), so quick presses on several tracks all land, and a
@@ -62,13 +64,40 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
     return true;
   }
 
-  // A transport command whose answer the caller gets: null when another was on its way.
+  // A transport command whose answer the caller gets: null when another was on its way (the
+  // screen renders again, so a control the engineer changed shows what holds).
   async function answered(name, run) {
     let result = null;
-    await command(name, async () => {
+    const ran = await command(name, async () => {
       result = await run();
     });
+    if (!ran) {
+      onChange();
+    }
     return result;
+  }
+
+  // Moves of the take on their way: they share the transport's guard ("move"), so none goes out
+  // while another command is on its way (a move during Stop would be refused and its words would
+  // replace the stop's), but moves do not wait for each other: the console sends the latest.
+  let moving = 0;
+  async function move(run) {
+    if (local.busy !== null && local.busy !== "move") {
+      onChange();
+      return null;
+    }
+    moving += 1;
+    local.busy = "move";
+    onChange();
+    try {
+      return await run();
+    } finally {
+      moving -= 1;
+      if (moving === 0) {
+        local.busy = null;
+      }
+      onChange();
+    }
   }
 
   // Whether a take plays in place of the inputs now.
@@ -225,9 +254,7 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
      */
     async rewind() {
       if (soundchecking()) {
-        const result = await app.seekSoundcheck(0);
-        onChange();
-        return result;
+        return move(() => app.seekSoundcheck(0));
       }
       local.atStart = true;
       onChange();
@@ -246,24 +273,24 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
       onChange();
     },
 
-    /** The seek slider let go at `seconds`: the take moves there. */
+    /**
+     * The seek slider let go at `seconds`: the take moves there. Null, and nothing sent, while
+     * another transport command is on its way.
+     */
     async seekTo(seconds) {
       local.drag = null;
       const { lengthFrames } = soundcheckStatus(app.store.getState());
-      const result = await app.seekSoundcheck(frameAt(seconds, lengthFrames));
-      onChange();
-      return result;
+      return move(() => app.seekSoundcheck(frameAt(seconds, lengthFrames)));
     },
 
     /**
-     * The loop: the take playing starts again at its end (or not); with the inputs live, the
+     * The loop: the take playing starts again at its end (or not), through the transport's guard
+     * (null, and nothing sent, while another command is on its way); with the inputs live, the
      * choice is kept for the next start.
      */
     async setLoop(on) {
       if (soundchecking()) {
-        const result = await app.setSoundcheckLoop(on);
-        onChange();
-        return result;
+        return answered("loop", () => app.setSoundcheckLoop(on));
       }
       local.loopNext = Boolean(on);
       onChange();

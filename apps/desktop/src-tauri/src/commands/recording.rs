@@ -143,9 +143,7 @@ impl RecordEngine for EngineHandle {
     }
 
     fn start_recording(&mut self, request: RecordRequest) -> Result<RecordingStatus, String> {
-        // A soundcheck playing refuses a take; it is said as the soundcheck commands say it.
-        EngineHandle::start_recording(self, request)
-            .map_err(|error| super::soundcheck::words(&*error))
+        EngineHandle::start_recording(self, request).map_err(start_refusal)
     }
 
     fn stop_recording(&mut self) -> Result<TakeSummary, String> {
@@ -163,6 +161,13 @@ impl RecordEngine for EngineHandle {
     fn record_estimate(&self, request: &RecordRequest) -> Result<DiskEstimate, String> {
         EngineHandle::record_estimate(self, request).map_err(|error| error.to_string())
     }
+}
+
+/// The words for the engine's refusal of a take, as [EngineHandle::start_recording] boxes it: a
+/// soundcheck playing ([personal_monitoring::SoundcheckError::RecordingRefused]) is said as the
+/// soundcheck commands say it, anything else as it is.
+fn start_refusal(error: Box<dyn std::error::Error>) -> String {
+    super::soundcheck::words(&*error)
 }
 
 /// Opens a folder in the system's file manager: the system's in the app, a recorder in the tests,
@@ -1788,6 +1793,29 @@ mod tests {
             opener.opened.lock().expect("noted").len(),
             1,
             "nothing else was opened"
+        );
+    }
+
+    /// A take refused because a soundcheck plays reaches the window in the soundcheck's words,
+    /// downcast from the box the engine returns it in (its `?` on the refusal), not as the
+    /// refusal's own Display; another engine error is said as it is.
+    #[test]
+    fn a_take_refused_during_a_soundcheck_is_said_in_the_soundchecks_words() {
+        use personal_monitoring::SoundcheckError;
+        fn engine_start(refusal: SoundcheckError) -> Result<(), Box<dyn std::error::Error>> {
+            Err(refusal)?;
+            Ok(())
+        }
+
+        let error = engine_start(SoundcheckError::RecordingRefused).expect_err("refused");
+        assert_eq!(
+            start_refusal(error),
+            "a soundcheck is playing a take: go back to the live inputs before recording (a take \
+             never records playback)"
+        );
+        assert_eq!(
+            start_refusal("the engine is stopping".into()),
+            "the engine is stopping"
         );
     }
 }

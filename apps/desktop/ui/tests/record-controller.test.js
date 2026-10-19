@@ -306,6 +306,66 @@ test("Back to start and the slider move the take, and a loop chosen before the s
   app.dispose();
 });
 
+/** Delivers the fake's held answers until every one of `pending` is settled; their results. */
+async function released(fake, pending) {
+  let settled = false;
+  const all = Promise.all(pending).finally(() => (settled = true));
+  for (let turn = 0; turn < 50 && !settled; turn += 1) {
+    fake.releaseAnswers();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return all;
+}
+
+const sentOf = (fake, name) => fake.calls.filter(({ command }) => command === name).length;
+
+test("a move or loop pressed while Stop goes back live is not sent, so the stop's words stay", async () => {
+  const { fake, app, first } = await withTake();
+  const controller = createRecordController(app);
+  await controller.soundcheckTake(first.folder);
+  for (const name of ["stop_soundcheck", "seek_soundcheck", "set_soundcheck_loop"]) {
+    fake.holdAnswers(name);
+  }
+
+  const stopping = controller.stop();
+  assert.equal(controller.local.busy, "stop");
+  const pressed = [controller.seekTo(1), controller.rewind(), controller.setLoop(true)];
+  const [stopped, ...answers] = await released(fake, [stopping, ...pressed]);
+
+  assert.deepEqual(answers, [null, null, null], "each was pressed while Stop was on its way");
+  assert.equal(sentOf(fake, "seek_soundcheck"), 0, "no move went out");
+  assert.equal(sentOf(fake, "set_soundcheck_loop"), 0, "nor the loop");
+  assert.equal(stopped.ok, true, stopped.message);
+  assert.deepEqual(app.store.getState().recordingOutcome, {
+    action: "soundcheck",
+    ok: true,
+    message: "Back to the live inputs.",
+  });
+  assert.equal(soundcheckOf(app).state, "off");
+  assert.equal(controller.local.busy, null);
+  app.dispose();
+});
+
+test("moves on their way hold the other transport commands but not each other", async () => {
+  const { fake, app, first } = await withTake();
+  const controller = createRecordController(app);
+  await controller.soundcheckTake(first.folder);
+  fake.holdAnswers("seek_soundcheck");
+
+  const moves = [controller.seekTo(0.5), controller.seekTo(1)];
+  assert.equal(controller.local.busy, "move");
+  assert.equal(await controller.stop(), null, "Stop waits for the moves");
+  assert.equal(await controller.setLoop(true), null, "and so does the loop");
+  const answers = await released(fake, moves);
+
+  assert.ok(answers.every((answer) => answer.ok), "both moves were answered");
+  assert.equal(soundcheckOf(app).positionFrames, 48_000, "the latest move wins");
+  assert.equal(soundcheckOf(app).state, "playing", "nothing stopped it");
+  assert.equal(sentOf(fake, "set_soundcheck_loop"), 0);
+  assert.equal(controller.local.busy, null, "the buttons are free once both are answered");
+  app.dispose();
+});
+
 test("the REC chip strip shows while a take records, is finished or failed, hidden otherwise", () => {
   const app = storeApp();
   const chip = { data: undefined };

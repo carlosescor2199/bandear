@@ -203,6 +203,41 @@ test("a take plays in place of the inputs from its start, moves, pauses, loops a
   app.dispose();
 });
 
+test("a seek plays a take stopped at its end and keeps a paused one paused, as the engine does", async () => {
+  const { fake, time, app, take } = await withTake();
+  await app.startSoundcheck(take.folder);
+  time.now += 4_000;
+  let soundcheck = await statusNow(app, fake);
+  assert.equal(soundcheck.state, "paused", "stopped at its end");
+  assert.equal(soundcheck.positionFrames, 144_000);
+
+  const fromEnd = await app.seekSoundcheck(48_000);
+  assert.equal(fromEnd.soundcheck.state, "playing", "a seek from the end plays at once");
+  assert.equal(fromEnd.soundcheck.positionFrames, 48_000);
+  time.now += 1_000;
+  soundcheck = await statusNow(app, fake);
+  assert.equal(soundcheck.state, "playing");
+  assert.equal(soundcheck.positionFrames, 96_000, "and plays on from the new frame");
+
+  await app.pauseSoundcheck();
+  const whilePaused = await app.seekSoundcheck(24_000);
+  assert.equal(whilePaused.soundcheck.state, "paused", "a take the engineer paused stays paused");
+  time.now += 1_000;
+  soundcheck = await statusNow(app, fake);
+  assert.equal(soundcheck.state, "paused");
+  assert.equal(soundcheck.positionFrames, 24_000, "held at the new frame");
+
+  const toEnd = await app.seekSoundcheck(144_000);
+  assert.equal(toEnd.soundcheck.state, "paused", "moved to its end while paused, it stays paused");
+  const again = await app.resumeSoundcheck();
+  assert.equal(again.message, "Soundcheck playing from 0:00.", "played on from its end, it starts again");
+  time.now += 1_000;
+  soundcheck = await statusNow(app, fake);
+  assert.equal(soundcheck.state, "playing");
+  assert.equal(soundcheck.positionFrames, 48_000);
+  app.dispose();
+});
+
 test("a soundcheck can start from a frame, looping, and plays on the local output's clock", async () => {
   const { fake, app, take } = await withTake();
   const output = await app.setLocalOutput({ device: "Speakers (Realtek Audio)", firstChannel: 0 });

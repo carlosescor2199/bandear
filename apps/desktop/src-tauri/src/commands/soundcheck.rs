@@ -17,6 +17,7 @@
 //! engine's status carries too.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use personal_monitoring::{EngineHandle, SoundcheckError, SoundcheckRequest, SoundcheckStatus};
@@ -185,12 +186,14 @@ pub fn pause_soundcheck(state: &DesktopState) -> Result<SoundcheckDto, String> {
     transport_with(&state.engine, Transport::Pause)
 }
 
-/// Plays on; a take stopped at its end starts again from its first frame.
+/// Plays on; a take at its end (stopped there, or paused and moved there) starts again from its
+/// first frame.
 pub fn resume_soundcheck(state: &DesktopState) -> Result<SoundcheckDto, String> {
     transport_with(&state.engine, Transport::Resume)
 }
 
-/// Plays on from `frame` (the take's end at most), paused or not.
+/// Moves the take to `frame` (the take's end at most): a paused take stays paused there, a take
+/// that stopped at its end plays on from there.
 pub fn seek_soundcheck(state: &DesktopState, frame: u64) -> Result<SoundcheckDto, String> {
     transport_with(&state.engine, Transport::Seek(frame))
 }
@@ -234,12 +237,33 @@ fn start_with<E: SoundcheckEngine>(
     start_frame: u64,
     looping: bool,
 ) -> Result<SoundcheckDto, String> {
-    // The lock order every command that holds both follows: the engine's, then the session's.
+    start_checked(
+        engine,
+        || take_in_recordings(session, places, take_folder),
+        start_frame,
+        looping,
+    )
+}
+
+/// [start_with] with the take folder checked by `check`, which runs without the engine's lock.
+fn start_checked<E: SoundcheckEngine>(
+    engine: &Mutex<Option<E>>,
+    check: impl FnOnce() -> Result<PathBuf, String>,
+    start_frame: u64,
+    looping: bool,
+) -> Result<SoundcheckDto, String> {
+    const NOT_RUNNING: &str = "the engine is not running: start it to soundcheck a take";
+    if engine_lock(engine)?.is_none() {
+        return Err(NOT_RUNNING.to_owned());
+    }
+    // The folder is checked on the disk (and the session read) before the engine's lock is taken,
+    // so a slow disk never holds up the meters, the status or the transport. The engine's own load
+    // of the take (take.json and each file's header, `EngineHandle::start_soundcheck`) runs on this
+    // thread too, under the lock: it needs the engine's channel layout as it is when the take
+    // starts.
+    let take = check()?;
     let mut guard = engine_lock(engine)?;
-    let engine = guard
-        .as_mut()
-        .ok_or_else(|| "the engine is not running: start it to soundcheck a take".to_owned())?;
-    let take = take_in_recordings(session, places, take_folder)?;
+    let engine = guard.as_mut().ok_or_else(|| NOT_RUNNING.to_owned())?;
     let request = SoundcheckRequest {
         take_folder: take,
         start_frame,
@@ -562,6 +586,48 @@ mod tests {
             let error = error.expect_err("no engine");
             assert!(error.contains("the engine is not running"), "{error}");
         }
+    }
+
+    /// The take folder is checked on the disk with the engine's lock free (the meters, the status
+    /// and the transport go on meanwhile), and only then is the take started under it; a folder
+    /// refused leaves the engine untouched, and with no engine nothing is checked.
+    #[test]
+    fn the_take_folder_is_checked_without_holding_the_engine_lock() {
+        let engine = running(SoundcheckStandIn::default());
+        let folder = PathBuf::from(r"D:\Recordings\2026-10-16_190000_Show");
+        let lock_free = std::cell::Cell::new(None);
+
+        start_checked(
+            &engine,
+            || {
+                lock_free.set(Some(engine.try_lock().is_ok()));
+                Ok(folder.clone())
+            },
+            0,
+            false,
+        )
+        .expect("the take plays");
+
+        assert_eq!(lock_free.get(), Some(true), "the engine's lock was free");
+        assert_eq!(
+            requests_of(&engine),
+            vec![SoundcheckRequest {
+                take_folder: folder,
+                start_frame: 0,
+                looping: false,
+            }]
+        );
+
+        let untouched = running(SoundcheckStandIn::default());
+        let error = start_checked(&untouched, || Err("not a take folder".to_owned()), 0, false)
+            .expect_err("refused");
+        assert_eq!(error, "not a take folder");
+        assert!(requests_of(&untouched).is_empty());
+
+        let none: Mutex<Option<SoundcheckStandIn>> = Mutex::new(None);
+        let error =
+            start_checked(&none, || panic!("nothing is checked"), 0, false).expect_err("no engine");
+        assert!(error.contains("the engine is not running"), "{error}");
     }
 
     #[test]

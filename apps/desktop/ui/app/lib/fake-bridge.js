@@ -581,7 +581,8 @@ function withPort(address) {
  * soundcheck already playing, a take recording, a rate other than 48 kHz, tracks that do not fit
  * the device's inputs and linked pairs now, no input audio, a start past the end), each in the
  * desktop's words; its position advances with `clock`, a take that does not loop pauses at its end
- * (resume starts it again), a looping one starts again at its first frame. `pause_soundcheck`,
+ * (resume starts it again), a looping one starts again at its first frame; a seek keeps a paused
+ * take paused and plays one that stopped at its end. `pause_soundcheck`,
  * `resume_soundcheck`, `seek_soundcheck`, `set_soundcheck_loop` and `stop_soundcheck` answer the
  * soundcheck and send a status at once; the status carries `soundcheck` (paced by the local output
  * while it plays, else the timer). While a soundcheck plays, a take and a device switch are
@@ -2476,8 +2477,9 @@ export function createFakeBridge({
     resume_soundcheck() {
       playingCheck();
       settleCheck();
-      if (check.ended) {
-        // As the engine does: a take stopped at its end starts again from its first frame.
+      if (check.ended || check.base >= check.length) {
+        // As the engine does: a take at its end, stopped there or paused and moved there, starts
+        // again from its first frame.
         check.base = 0;
         check.ended = false;
       }
@@ -2491,6 +2493,8 @@ export function createFakeBridge({
         throw pastEnd(to, check.length);
       }
       settleCheck();
+      // As the engine does: a take the engineer paused stays paused at the new frame; one that
+      // stopped at its end (not paused) plays on from it.
       check.base = to;
       check.ended = false;
       return soundcheckChanged();

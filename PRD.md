@@ -1,4 +1,4 @@
-Versión 0.3 (agrega mezcla local, grabación multipista y soundcheck virtual), ajustada para una primera validación técnica realizada por una sola persona, con 1 a 3 horas de trabajo por noche.
+Versión 0.4 (agrega historial de salud del enlace, buffer del celular desde la consola, redundancia de paquetes, archivo de registro, fuente de demostración y respaldo automático de mezclas; la 0.3 agregó mezcla local, grabación multipista y soundcheck virtual), ajustada para una primera validación técnica realizada por una sola persona, con 1 a 3 horas de trabajo por noche.
 
 # PRD: Sistema de monitoreo personal inalámbrico (nombre provisional: _MixLink_)
 
@@ -35,7 +35,7 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 - RF2. Capturar hasta 32 canales de entrada.
 - RF3. Generar una mezcla estéreo independiente por músico.
 - RF4. Enviar el audio por UDP a cada cliente y recibir su control por un canal aparte.
-- RF5. Mostrar medidores, estado de conexión y pérdida de paquetes por cliente.
+- RF5. Mostrar medidores, estado de conexión y pérdida de paquetes por cliente, con un historial por músico de muestras de un segundo (los últimos 10 minutos) en un gráfico: pérdida, tiempo de ida y vuelta del canal de control, y el jitter y el colchón que informa el celular, con los segundos sin informe, las reconexiones, los cortes y los tiempos de espera marcados.
 - RF6. Descubrimiento automático (mDNS) y código QR para conectar.
 - RF7. Guardar y cargar presets de sesión y de mezcla.
 - RF12. Permitir al ingeniero bloquear canales y establecer límites de volumen por músico.
@@ -43,13 +43,17 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 - RF14. Grabación multipista mientras suena el show: cada entrada armada a su propio archivo WAV (un par enlazado en estéreo, y la mezcla local si se pide), en 24 bits enteros o 32 bits flotante a 48 kHz, RF64 por encima de 4 GB y cabeceras refrescadas para que un corte deje archivos legibles. Una carpeta por toma con su `take.json` (pistas, inicio, marcadores, muestras perdidas), marcadores durante la toma y estimación del tiempo de disco restante. No se cambia de dispositivo mientras se graba.
 - RF15. Soundcheck virtual: reproducir una toma dentro del mezclador en lugar de las entradas en vivo, con pausa, búsqueda, bucle y vuelta inmediata a las entradas. Solo tomas de 48 kHz cuyas pistas encajen en las entradas y pares actuales; mientras suena no se graba ni se cambia de dispositivo.
 - RF16. Pantalla de grabación en la app de escritorio: transporte, una pista por entrada con armado, medidor y forma de onda, lista de tomas, ajustes (carpeta, formato, mezcla local) y la tarjeta del soundcheck virtual.
+- RF17. Redundancia de paquetes por músico: cada paquete de audio se envía dos veces, duplicando el ancho de banda solo de ese músico. Por defecto la copia sale justo después del original (sin latencia añadida, la acepta cualquier celular, cubre pérdidas aisladas); opcionalmente sale 1 a 4 bloques después, para ráfagas de pérdida en el WiFi, solo para un celular que retiene los paquetes ese tiempo, a costa de esa latencia (unos 5,3 ms por bloque de 256 muestras a 48 kHz). El celular informa los paquetes recuperados por una copia diferida.
+- RF18. Archivo de registro: el motor y la app de escritorio escriben sus eventos en `mixlink.log`, en la carpeta de registros de la app, con hora UTC, nivel y área; rota a los 5 MB y conserva 5 archivos anteriores. Una versión sin consola sigue dejando diagnóstico.
+- RF19. Fuente de demostración: una señal generada (un loop de 8 canales a -18 dBFS, igual en cada ejecución) elegible como driver "Demo (no interface)", para correr el motor y transmitir a los celulares sin interfaz de audio. Nunca se elige sola; permite grabar, pero no el soundcheck virtual.
+- RF20. Respaldo automático de las mezclas de los músicos: unos segundos después de que dejan de cambiar (y al detener el motor o cerrar la app) se guardan en un respaldo rotativo de 10 copias, escrito de forma atómica. Restaurar es decisión del ingeniero desde el panel de sesión y solo alcanza a los músicos conectados; la mezcla propia de un celular que se reconecta no se reemplaza sola.
 
 **Apps móviles (Swift y Kotlin)**
 
 - RF8. Conectarse al servidor, elegir su perfil de músico y recibir el audio.
 - RF9. Faders, paneo, mute y solo por canal, con grupos (voces, batería, etc.).
 - RF10. Mezclas guardadas (bancos) y botón de "más de mí".
-- RF11. Indicador de estabilidad y ajuste del buffer.
+- RF11. Indicador de estabilidad y ajuste del buffer. El ingeniero elige por músico, desde la consola, "Auto" (el colchón adaptativo del celular) o un buffer fijo de 5 a 500 ms que el celular aplica sin adaptarlo; la consola muestra lo que el celular reproduce realmente. El celular informa su jitter, su colchón y el audio en cola.
 
 ## 6. Requerimientos no funcionales
 
@@ -61,7 +65,9 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 
 ## 7. Decisiones técnicas
 
-- **Transporte:** UDP unicast con números de secuencia y buffer anticipado adaptativo.
+- **Transporte:** UDP unicast con números de secuencia y buffer anticipado adaptativo, o fijo si el ingeniero lo pide. La redundancia reenvía el mismo datagrama sin cambiar su formato; las copias diferidas se guardan en memoria reservada fuera del hilo de audio, que nunca reserva memoria ni bloquea.
+- **Compatibilidad:** el celular anuncia en el registro una lista opcional de capacidades (estadísticas ampliadas, buffer desde la consola, retención para copias diferidas, paquetes recuperados). El servidor solo envía los mensajes nuevos a quien los anunció y la consola muestra "needs a newer app" en los demás; los celulares y servidores anteriores siguen funcionando, porque los campos desconocidos se ignoran.
+- **Tiempo de ida y vuelta:** se mide con el ping y pong del canal de control cada 2 s, suavizado como el SRTT de TCP, en cualquier celular.
 - **Códec:** PCM en v1; Opus con tramas de 2,5 a 5 ms como opción para redes saturadas.
 - **Audio interno:** flotante de 32 bits a 48 kHz desde la captura; la conversión a 16 bits ocurre solo al enviar a los celulares, así que la grabación conserva los 24 bits de la entrada. Las entradas a 96 o 192 kHz pasan por un filtro antialias antes de diezmar.
 - **Grabación:** escritor WAV/RF64 propio; el audio va a disco en un hilo aparte por un búfer sin bloqueos, y si el búfer se llena se descartan y cuentan muestras sin bloquear nunca el audio.

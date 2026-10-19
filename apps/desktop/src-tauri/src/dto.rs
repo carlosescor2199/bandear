@@ -813,6 +813,8 @@ mod tests {
             packets_sent: 0,
             packets_discarded: 0,
             musicians: Vec::new(),
+            local_mix: personal_monitoring::MixValues::default(),
+            local_output: Default::default(),
         }
     }
 
@@ -1264,6 +1266,7 @@ mod tests {
                     output_levels: [100, 50],
                 },
             ],
+            local_levels: [0, 0],
         };
 
         let json = serde_json::to_value(MetersDto::from(&meters)).expect("meters serialize");
@@ -1316,6 +1319,7 @@ mod tests {
         let mut meters = MetersDto::from(&EngineMeters {
             channel_levels: vec![0],
             musicians: Vec::new(),
+            local_levels: [0, 0],
         });
         meters.run = 3;
         let change = MixChangedDto::new(
@@ -1367,6 +1371,7 @@ mod tests {
         let meters = MetersDto::from(&EngineMeters {
             channel_levels: Vec::new(),
             musicians: Vec::new(),
+            local_levels: [0, 0],
         });
 
         assert_eq!(status.run, 0);

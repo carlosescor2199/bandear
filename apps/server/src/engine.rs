@@ -18,10 +18,15 @@ use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlP
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
 use crate::mix::{
-    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, MixPreset,
-    MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
+    group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
+    MixPreset, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
 };
 use crate::network::{NetworkSink, PacketStats};
+use crate::output::{
+    check_request, offered_outputs, open_output, output_channels, system_output_device,
+    system_output_devices, LocalOutputRequest, LocalOutputSink, LocalOutputStatus, OpenedOutput,
+    OutputDevice, OutputFeed, OutputShared,
+};
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
 use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
@@ -60,6 +65,11 @@ pub enum EngineEvent {
     /// ([EngineHandle::set_channels]), or a device switch changed which inputs they are shown for.
     /// It comes before the [Self::MixChanged] of every mix a new stereo pair panned apart.
     ChannelsChanged,
+    /// The engine's local mix changed: through [EngineHandle::set_local_mix], or because a group
+    /// edit, a device switch or new channel details moved its levels or pans (then after
+    /// [Self::GroupsChanged] or [Self::ChannelsChanged]). Read it with [EngineHandle::local_mix].
+    /// It is no musician's mix, so it names no address and no phone is ever sent it.
+    LocalMixChanged,
 }
 
 /// Where a mix change came from.
@@ -339,6 +349,10 @@ pub struct EngineStatus {
     pub packets_sent: u64,
     pub packets_discarded: u64,
     pub musicians: Vec<MusicianStatus>,
+    /// The engine's local mix (see [EngineHandle::local_mix]), with its revision.
+    pub local_mix: MixValues,
+    /// Where the local mix plays, and how (see [EngineHandle::set_local_output]).
+    pub local_output: LocalOutputStatus,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -932,6 +946,9 @@ pub struct EngineMeters {
     pub channel_levels: Vec<u8>,
     /// Each musician's output peak, in the order [EngineStatus::musicians] lists them.
     pub musicians: Vec<MusicianMeters>,
+    /// The 0-100 peak of the engine's local mix, left then right: metered whether or not a local
+    /// output plays it.
+    pub local_levels: [u8; 2],
 }
 
 /// One musician's output peak.
@@ -943,11 +960,12 @@ pub struct MusicianMeters {
     pub output_levels: [u8; 2],
 }
 
-/// Reads the input levels of `channels` source channels and every musician's output level. A pure
-/// read: it changes no meter.
+/// Reads the input levels of `channels` source channels, every musician's output level and the
+/// local mix's. A pure read: it changes no meter.
 pub(crate) fn read_meters(
     levels: &LevelMeter,
     channels: usize,
+    local: &OutputMeter,
     entries: &[TargetEntry],
 ) -> EngineMeters {
     EngineMeters {
@@ -959,16 +977,18 @@ pub(crate) fn read_meters(
                 output_levels: entry.output_meter.read(),
             })
             .collect(),
+        local_levels: local.read(),
     }
 }
 
-/// Returns every input and output meter to zero.
+/// Returns every input and output meter to zero, the local mix's included.
 ///
 /// A stopped capture delivers no more audio, so no audio time passes for the levels to fall by,
 /// and the send loop that would count the silence has ended too; the engine clears the meters
 /// instead, so a reader never sees the last level frozen.
-pub(crate) fn clear_meters(levels: &LevelMeter, entries: &[TargetEntry]) {
+pub(crate) fn clear_meters(levels: &LevelMeter, local: &OutputMeter, entries: &[TargetEntry]) {
     levels.clear();
+    local.clear();
     for entry in entries {
         entry.output_meter.clear();
     }
@@ -1264,6 +1284,34 @@ pub(crate) fn edit_groups(
     Ok(config.snapshot().groups.clone())
 }
 
+/// Moves the local mix from the configuration `previous` onto `live`, as [apply_groups] and
+/// [apply_channels] move every musician's mix, and returns whether its stored values moved (so it
+/// must be announced): group levels that followed their groups to new positions, or a pair that a
+/// new link panned apart. A configuration that did not change touches nothing.
+fn follow_configuration(
+    local: &MixState,
+    previous: &ConfigSnapshot,
+    live: &ConfigSnapshot,
+) -> bool {
+    if previous.generation == live.generation {
+        return false;
+    }
+    let mut moved = false;
+    if previous.layout.same_positions(&live.layout) {
+        local.set_group_layout(&live.layout);
+    } else {
+        local.regroup(&live.layout, &group_sources(&previous.layout, &live.layout));
+        moved = true;
+    }
+    if local
+        .set_channel_flags(channel_flags(&live.requested_channels))
+        .is_some()
+    {
+        moved = true;
+    }
+    moved
+}
+
 /// The live engine. Dropping it does not stop the engine; call [EngineHandle::stop].
 pub struct EngineHandle {
     device_name: String,
@@ -1292,6 +1340,19 @@ pub struct EngineHandle {
     /// what every phone is sent as `config`, and the membership a new musician's mix starts with.
     config_state: Arc<ConfigState>,
     events: EventBus,
+    /// The engine's own mix, for the engineer's local output: kept apart from the target table,
+    /// since it is no musician and no phone, but moved with every musician's mix when the groups
+    /// or the channel details change (see [follow_configuration]).
+    local_mix: Arc<MixState>,
+    /// The local mix's left and right peak, shared with the local output's sink.
+    local_meter: OutputMeter,
+    /// The local output: the line to its sink and the output that plays, if any.
+    local_output: LocalOutput,
+    /// The capture device, kept so an ASIO output can be opened on the driver the capture holds
+    /// without listing ASIO devices (which loads every driver). `None` for a test source.
+    capture_device: Option<cpal::Device>,
+    /// The engine block of the current capture, which sizes a new output's ring.
+    block_frames: usize,
     /// The running capture stream. Dropping it stops its callback, the only producer of its ring.
     stream: Option<cpal::Stream>,
     /// The engine thread: it reads the current stream's ring and feeds the sinks, and keeps the
@@ -1306,9 +1367,53 @@ pub struct EngineHandle {
 /// it drives itself, with no stream.
 pub(crate) struct OpenedCapture {
     pub(crate) stream: Option<cpal::Stream>,
+    /// The device the stream is open on; `None` for a test source.
+    pub(crate) device: Option<cpal::Device>,
     pub(crate) reader: SourceReader,
     pub(crate) device_name: String,
     pub(crate) format: CaptureFormat,
+}
+
+/// The engine's side of the local output: the line to its sink on the engine thread, and the
+/// output that plays.
+pub(crate) struct LocalOutput {
+    feeds: Sender<Option<OutputFeed>>,
+    active: Option<ActiveOutput>,
+}
+
+/// The output the local mix plays on.
+struct ActiveOutput {
+    /// The device stream; dropping it stops the output. `None` for a test output, and once a
+    /// switch to another ASIO driver stopped it.
+    stream: Option<cpal::Stream>,
+    request: LocalOutputRequest,
+    shared: Arc<OutputShared>,
+}
+
+impl LocalOutput {
+    /// No output yet, with `feeds` the line to the local output's sink.
+    pub(crate) fn new(feeds: Sender<Option<OutputFeed>>) -> Self {
+        Self {
+            feeds,
+            active: None,
+        }
+    }
+}
+
+impl OpenedCapture {
+    /// The channel count the session would switch to: the reported format's, which must be the
+    /// layout of the frames in the ring, or every block would be read with the wrong stride.
+    fn channels(&self) -> Result<u16, Box<dyn Error>> {
+        let ring = self.reader.format().channels;
+        if usize::from(self.format.channels) != ring {
+            return Err(format!(
+                "the capture reports {} channels but its frames carry {ring}",
+                self.format.channels
+            )
+            .into());
+        }
+        Ok(self.format.channels)
+    }
 }
 
 impl EngineHandle {
@@ -1387,6 +1492,8 @@ impl EngineHandle {
             musicians: join_musicians(
                 &targets, &connected, &counters, &mixes, &announced, &links, &mirrors,
             ),
+            local_mix: self.local_mix.current(),
+            local_output: self.local_output(),
         }
     }
 
@@ -1398,6 +1505,7 @@ impl EngineHandle {
         read_meters(
             &self.levels,
             usize::from(self.source_channels),
+            &self.local_meter,
             &self.targets.read(),
         )
     }
@@ -1449,6 +1557,7 @@ impl EngineHandle {
 
         self.install_capture(OpenedCapture {
             stream: Some(opened.stream),
+            device: Some(device.clone()),
             reader: opened.reader,
             device_name: device.to_string(),
             format: CaptureFormat {
@@ -1474,30 +1583,38 @@ impl EngineHandle {
     /// Makes an opened, running capture the engine's: the engine thread reads its ring from the
     /// next block on, the previous stream is dropped, and the session takes its channel count.
     ///
-    /// A plan that cannot be made leaves everything as it was (the new capture is dropped).
+    /// A plan that cannot be made (a capture whose format and frames disagree), or an engine
+    /// thread that is no longer running, leaves everything as it was: the running capture keeps
+    /// feeding the engine and the new one is dropped.
     pub(crate) fn install_capture(
         &mut self,
         capture: OpenedCapture,
     ) -> Result<CaptureFormat, Box<dyn Error>> {
-        let plan = plan_switch_from_attempt(&self.group_definitions, Ok(capture.format.channels))?;
+        let plan = plan_switch_from_attempt(&self.group_definitions, capture.channels())?;
         let pipeline = self.pipeline.as_ref().ok_or("the engine is stopping")?;
 
         // Commit: the engine thread moves to the new ring between two blocks, then the old stream,
         // the only producer of the old ring, is stopped.
+        let block_frames = capture.reader.format().block_frames;
         pipeline.set_source(capture.reader)?;
         self.stream = capture.stream;
+        self.capture_device = capture.device;
+        self.block_frames = block_frames;
         self.device_name = capture.device_name;
         self.capture_format = capture.format;
         self.source_channels = plan.source_channels;
+        self.keep_asio_output_on_the_capture_driver();
         // Every phone is sent the new `config` (channel count and groups) when it differs, and every
         // musician, connected now or registering later, mixes with the new membership.
-        apply_groups(
-            &self.targets,
-            &self.config_state,
-            &self.events,
-            plan.source_channels,
-            plan.groups,
-        );
+        self.publish(|| {
+            apply_groups(
+                &self.targets,
+                &self.config_state,
+                &self.events,
+                plan.source_channels,
+                plan.groups,
+            )
+        });
         // The old device's levels describe a stream that is gone, and channels the new device lacks
         // would keep theirs frozen until a switch back; the new stream raises its own at once.
         self.levels.clear();
@@ -1526,13 +1643,15 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        let groups = edit_groups(
-            &self.targets,
-            &self.config_state,
-            &self.events,
-            self.source_channels,
-            &definitions,
-        )?;
+        let groups = self.publish(|| {
+            edit_groups(
+                &self.targets,
+                &self.config_state,
+                &self.events,
+                self.source_channels,
+                &definitions,
+            )
+        })?;
         self.group_definitions = definitions;
         Ok(groups)
     }
@@ -1570,12 +1689,165 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        Ok(edit_channels(
-            &self.targets,
-            &self.config_state,
-            &self.events,
-            &channels,
+        Ok(self.publish(|| {
+            edit_channels(&self.targets, &self.config_state, &self.events, &channels)
+        })?)
+    }
+
+    /// Runs `change`, which may publish a new configuration (groups, channel details or a device's
+    /// channel count) and move every musician's mix onto it, then moves the local mix onto it too
+    /// and announces it when its values moved: after the change's own events.
+    fn publish<T>(&self, change: impl FnOnce() -> T) -> T {
+        let previous = self.config_state.snapshot();
+        let result = change();
+        let live = self.config_state.snapshot();
+        if follow_configuration(&self.local_mix, &previous, &live) {
+            self.events.emit(EngineEvent::LocalMixChanged);
+        }
+        result
+    }
+
+    /// The engine's local mix, with its revision: the engineer's own mix for the local output
+    /// (see [crate::EngineHandle::set_local_mix]).
+    pub fn local_mix(&self) -> MixValues {
+        self.local_mix.current()
+    }
+
+    /// Applies a partial update to the engine's local mix and returns the mix now stored.
+    ///
+    /// It is merged exactly as the desk merges a musician's ([Self::set_mix]): absent fields keep
+    /// their values, levels are clamped, a list longer than its table is refused, both sides of a
+    /// linked pair stay equal, a hidden input stays silent and the groups are the live ones. It has
+    /// no engineer's controls and follows nobody. Every stored change takes a new revision and is
+    /// announced as [EngineEvent::LocalMixChanged]; an update that cannot be applied is an error
+    /// naming the problem, and then nothing changes and nothing is announced.
+    pub fn set_local_mix(&self, update: &MixUpdate) -> Result<MixValues, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let applied = self.local_mix.apply(update)?;
+        self.events.emit(EngineEvent::LocalMixChanged);
+        Ok(applied)
+    }
+
+    /// The output devices the local mix can be played on, with their output channel counts.
+    ///
+    /// Under ASIO only the capture driver's own outputs are offered, read from the device the
+    /// capture holds: ASIO holds one driver at a time, and listing the others would load each of
+    /// them. Under the system host (the default; WASAPI on Windows) every output device is listed.
+    /// No ASIO driver is ever opened for this list.
+    pub fn output_devices(&self) -> Result<Vec<OutputDevice>, Box<dyn Error>> {
+        Ok(offered_outputs(
+            self.host,
+            self.capture_output(),
+            system_output_devices,
         )?)
+    }
+
+    /// The capture device as an output, when the capture runs on ASIO: its name and output
+    /// channels, from the metadata the driver gave when the capture opened it.
+    fn capture_output(&self) -> Option<OutputDevice> {
+        if self.host != AudioHost::Asio {
+            return None;
+        }
+        self.capture_device.as_ref().map(|device| OutputDevice {
+            name: device.to_string(),
+            channels: output_channels(device),
+        })
+    }
+
+    /// Plays the local mix on `request`'s device and stereo pair, or turns the local output off
+    /// with `None` (the default: the engine starts with no local output). Returns the local
+    /// output's status.
+    ///
+    /// The device is named exactly and must be one [Self::output_devices] offers (under ASIO, the
+    /// capture's own driver), with the pair within its outputs; it must run at 48 kHz, as there is
+    /// no resampler yet. The change is live: the new output is opened and started first, the
+    /// engine thread moves the local mix to it between two blocks, then the previous output is
+    /// closed. Capture and the phones never notice. A request that is refused or a device that
+    /// cannot be opened is an error, and the output in use keeps playing. A device that fails
+    /// later stops only the local output, which the status reports with the reason.
+    pub fn set_local_output(
+        &mut self,
+        request: Option<LocalOutputRequest>,
+    ) -> Result<LocalOutputStatus, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let Some(request) = request else {
+            self.install_output(None)?;
+            return Ok(self.local_output());
+        };
+        check_request(self.host, &self.output_devices()?, &request)?;
+        let device = match self.host {
+            AudioHost::Asio => self
+                .capture_device
+                .clone()
+                .ok_or("no ASIO driver is open for the local output")?,
+            AudioHost::Auto | AudioHost::Wasapi => system_output_device(&request.device)?,
+        };
+        let opened = open_output(
+            &device,
+            self.host,
+            &request,
+            self.buffer_frames,
+            self.block_frames,
+        )?;
+        self.install_output(Some(opened))?;
+        Ok(self.local_output())
+    }
+
+    /// Makes `output` the local output, or turns it off with `None`: the local output's sink takes
+    /// the new feed before its next block, then the previous output's stream is dropped.
+    pub(crate) fn install_output(
+        &mut self,
+        output: Option<OpenedOutput>,
+    ) -> Result<(), Box<dyn Error>> {
+        let (feed, active) = match output {
+            Some(output) => (
+                Some(output.feed),
+                Some(ActiveOutput {
+                    stream: output.stream,
+                    request: output.request,
+                    shared: output.shared,
+                }),
+            ),
+            None => (None, None),
+        };
+        self.local_output
+            .feeds
+            .send(feed)
+            .map_err(|_| "the engine thread has stopped")?;
+        self.local_output.active = active;
+        Ok(())
+    }
+
+    /// Where the local mix plays and how: off, running, or failed with the reason, and the frames
+    /// padded and dropped to hold its delay.
+    pub fn local_output(&self) -> LocalOutputStatus {
+        match &self.local_output.active {
+            Some(active) => active.shared.status(&active.request),
+            None => LocalOutputStatus::default(),
+        }
+    }
+
+    /// Under ASIO the local output must be on the driver the capture holds: after a switch to
+    /// another driver it is stopped and reported as failed, with the reason, until the engineer
+    /// chooses an output of the new driver.
+    fn keep_asio_output_on_the_capture_driver(&mut self) {
+        if self.host != AudioHost::Asio {
+            return;
+        }
+        let Some(active) = &mut self.local_output.active else {
+            return;
+        };
+        if active.request.device != self.device_name {
+            active.stream = None;
+            active.shared.fail(format!(
+                "the capture moved to the ASIO driver \"{}\"; an ASIO output plays only on the capture's driver",
+                self.device_name
+            ));
+        }
     }
 
     /// The engineer's channel details the engine keeps, whole: the list last set with
@@ -1854,8 +2126,10 @@ impl EngineHandle {
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.stop()?;
         }
+        // Nothing feeds the local output any more: close it.
+        self.local_output.active = None;
         // Capture and the engine thread have ended, so nothing would ever lower the last levels.
-        clear_meters(&self.levels, &self.targets.read());
+        clear_meters(&self.levels, &self.local_meter, &self.targets.read());
         if let Some(thread) = self.control_thread.take() {
             thread
                 .join()
@@ -1931,6 +2205,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         group_layout,
     ));
     let events = EventBus::default();
+    let local_mix = Arc::new(config_state.new_mix());
 
     let control_thread = spawn_control_thread(
         config.control_port,
@@ -1953,14 +2228,20 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let levels = Arc::new(LevelMeter::new());
     let capture_stats = Arc::new(CaptureStats::default());
     let network = NetworkSink::new(Arc::clone(&target_registry), Arc::clone(&packet_stats))?;
-    let pipeline =
-        PipelineHandle::spawn(Pipeline::new(vec![Box::new(network)], Arc::clone(&levels)))?;
+    let (feeds, outputs) = std::sync::mpsc::channel();
+    let local_meter = OutputMeter::default();
+    let local = LocalOutputSink::new(Arc::clone(&local_mix), local_meter.clone(), outputs);
+    let pipeline = PipelineHandle::spawn(Pipeline::new(
+        vec![Box::new(network), Box::new(local)],
+        Arc::clone(&levels),
+    ))?;
     let links = CaptureLinks {
         levels: Arc::clone(&levels),
         stats: Arc::clone(&capture_stats),
         wake: Some(pipeline.waker()),
     };
     let opened = build_input_stream(&device, &supported_config, buffer_frames, &links)?;
+    let block_frames = opened.reader.format().block_frames;
     pipeline.set_source(opened.reader)?;
     opened
         .stream
@@ -1990,6 +2271,11 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         peers,
         config_state,
         events,
+        local_mix,
+        local_meter,
+        local_output: LocalOutput::new(feeds),
+        capture_device: Some(device),
+        block_frames,
         stream: Some(opened.stream),
         pipeline: Some(pipeline),
         control_thread: Some(control_thread),
@@ -2001,6 +2287,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
 mod tests {
     use super::*;
     use crate::cli::GroupDefinition;
+    use crate::output::LocalOutputState;
+    use crate::pipeline::DEFAULT_BLOCK_FRAMES;
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("test IP should parse")
@@ -2703,17 +2991,20 @@ mod tests {
             .observe(&pcm(&[32_767, 16_384]));
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[32_767, 16_384]), 2);
+        let local = OutputMeter::default();
+        local.observe(&pcm(&[16_384, 16_384]));
 
-        clear_meters(&inputs, &registry.read());
+        clear_meters(&inputs, &local, &registry.read());
 
         assert_eq!(
-            read_meters(&inputs, 2, &registry.read()),
+            read_meters(&inputs, 2, &local, &registry.read()),
             EngineMeters {
                 channel_levels: vec![0, 0],
                 musicians: vec![MusicianMeters {
                     address,
                     output_levels: [0, 0],
                 }],
+                local_levels: [0, 0],
             }
         );
     }
@@ -2729,8 +3020,10 @@ mod tests {
             .observe(&pcm(&[32_767, -16_384]));
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[16_384, 0, -32_767, 0]), 2);
+        let local = OutputMeter::default();
+        local.observe(&pcm(&[8_192, 32_767]));
 
-        let meters = read_meters(&inputs, 2, &registry.read());
+        let meters = read_meters(&inputs, 2, &local, &registry.read());
 
         assert_eq!(
             meters,
@@ -2746,10 +3039,11 @@ mod tests {
                         output_levels: [0, 0],
                     },
                 ],
+                local_levels: [25, 100],
             }
         );
         assert_eq!(
-            read_meters(&inputs, 2, &registry.read()),
+            read_meters(&inputs, 2, &local, &registry.read()),
             meters,
             "a read changes nothing"
         );
@@ -3892,6 +4186,7 @@ mod tests {
         .expect("a 48 kHz source builds");
         let opened = OpenedCapture {
             stream: None,
+            device: None,
             reader,
             device_name: format!("Test input ({channels})"),
             format: test_format(channels),
@@ -3899,8 +4194,10 @@ mod tests {
         (writer, opened)
     }
 
-    /// A running engine with no audio device: the engine thread and the network sink run as in a
-    /// session, with one phone at `phone`, and the capture is a stereo source the test drives.
+    /// A running engine with no audio device: the engine thread, the network sink and the local
+    /// output's sink run as in a session, with one phone at `phone`, and the capture is a stereo
+    /// source the test drives. One group spans both inputs, so a switch to a mono device would
+    /// invalidate it.
     fn engine_without_device(phone: SocketAddr) -> (EngineHandle, crate::pipeline::CaptureWriter) {
         let targets = Arc::new(
             TargetRegistry::new(&[phone], &GroupLayout::default()).expect("registry should build"),
@@ -3912,9 +4209,16 @@ mod tests {
         });
         let network = NetworkSink::new(Arc::clone(&targets), Arc::clone(&packet_stats))
             .expect("the sink binds");
-        let pipeline =
-            PipelineHandle::spawn(Pipeline::new(vec![Box::new(network)], Arc::clone(&levels)))
-                .expect("the engine thread starts");
+        let config_state = Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default()));
+        let local_mix = Arc::new(config_state.new_mix());
+        let local_meter = OutputMeter::default();
+        let (feeds, outputs) = std::sync::mpsc::channel();
+        let local = LocalOutputSink::new(Arc::clone(&local_mix), local_meter.clone(), outputs);
+        let pipeline = PipelineHandle::spawn(Pipeline::new(
+            vec![Box::new(network), Box::new(local)],
+            Arc::clone(&levels),
+        ))
+        .expect("the engine thread starts");
         let mut engine = EngineHandle {
             device_name: String::new(),
             capture_format: test_format(0),
@@ -3922,15 +4226,20 @@ mod tests {
             buffer_frames: Some(64),
             host: AudioHost::Auto,
             source_channels: 0,
-            group_definitions: Vec::new(),
+            group_definitions: vec![definition("pair", "Pair", &[1, 2])],
             levels,
             targets,
             stopped: Arc::new(AtomicBool::new(false)),
             capture_stats: Arc::new(CaptureStats::default()),
             packet_stats,
             peers: Arc::new(Mutex::new(HashMap::new())),
-            config_state: Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default())),
+            config_state: Arc::clone(&config_state),
             events: EventBus::default(),
+            local_mix,
+            local_meter,
+            local_output: LocalOutput::new(feeds),
+            capture_device: None,
+            block_frames: DEFAULT_BLOCK_FRAMES,
             stream: None,
             pipeline: Some(pipeline),
             control_thread: None,
@@ -3986,6 +4295,7 @@ mod tests {
                     address,
                     output_levels: [0, 0],
                 }],
+                local_levels: [0, 0],
             }
         );
     }
@@ -4018,6 +4328,473 @@ mod tests {
             "{raised:?}"
         );
 
+        engine.stop().expect("the engine stops");
+    }
+
+    /// What a switch would change: the device, its format, the channel count and the groups.
+    fn session(engine: &EngineHandle) -> (String, CaptureFormat, u8, Vec<GroupStatus>) {
+        (
+            engine.device_name().to_owned(),
+            engine.capture_format().clone(),
+            engine.source_channels,
+            engine.config_state.snapshot().groups.clone(),
+        )
+    }
+
+    /// A switch whose plan is refused (here a capture whose format reports one channel while its
+    /// frames carry two) changes nothing: the device, format, channel count and groups stay, the
+    /// running capture keeps feeding the phones, and the refused capture's audio goes nowhere. A
+    /// stopped engine then refuses `switch_device` before it touches any audio device.
+    #[test]
+    fn a_refused_switch_leaves_the_running_capture_untouched() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        phone
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout should set");
+        let (mut engine, mut running) = engine_without_device(phone.local_addr().expect("address"));
+        let before = session(&engine);
+        assert_eq!(before.2, 2);
+        assert!(before.3.iter().all(|group| !group.invalid));
+        let (mut refused, mut opened) = test_capture(&engine, 2);
+        opened.format = test_format(1);
+
+        let error = engine
+            .install_capture(opened)
+            .expect_err("a capture whose format and frames disagree is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reports 1 channels but its frames carry 2"),
+            "{error}"
+        );
+        assert_eq!(session(&engine), before);
+        refused.write(&[-0.25f32; 2 * 64]);
+        running.write(&[0.5f32; 2 * 64]);
+        let mut packet = [0u8; 1_024];
+        phone
+            .recv(&mut packet)
+            .expect("the running capture still reaches the phone");
+        assert_eq!(i16::from_le_bytes([packet[20], packet[21]]), 16_384);
+
+        engine.stop().expect("the engine stops");
+        let error = engine
+            .switch_device(None)
+            .expect_err("a stopped engine does not switch");
+        assert!(error.to_string().contains("stopping"), "{error}");
+        assert_eq!(session(&engine), before);
+    }
+
+    /// A sink that fails on its first block, which ends the engine thread.
+    struct Failing;
+
+    impl crate::pipeline::Sink for Failing {
+        fn process(&mut self, _block: &crate::pipeline::Block<'_>) {
+            panic!("a sink failed (expected by this test)");
+        }
+    }
+
+    /// When the engine thread is no longer running (here a sink panicked and ended it), a switch
+    /// fails without committing anything: the device, format, channel count and groups stay, so a
+    /// mono device that would invalidate the stereo group leaves it valid.
+    #[test]
+    fn a_switch_fails_without_committing_when_the_engine_thread_has_ended() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (mut engine, _running) = engine_without_device(phone.local_addr().expect("address"));
+        let failing = PipelineHandle::spawn(Pipeline::new(
+            vec![Box::new(Failing)],
+            Arc::clone(&engine.levels),
+        ))
+        .expect("the engine thread starts");
+        engine
+            .pipeline
+            .replace(failing)
+            .expect("the engine was running")
+            .stop()
+            .expect("the first engine thread stops");
+        let (mut doomed, opened) = test_capture(&engine, 2);
+        let pipeline = engine.pipeline.as_ref().expect("the failing engine thread");
+        pipeline
+            .set_source(opened.reader)
+            .expect("the failing thread takes a source");
+        doomed.write(&[0.1f32; 2 * 64]);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !pipeline.has_ended() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            pipeline.has_ended(),
+            "the failing sink ended the engine thread"
+        );
+        let before = session(&engine);
+
+        let (_mono, mono) = test_capture(&engine, 1);
+        let error = engine
+            .install_capture(mono)
+            .expect_err("no engine thread takes the new capture");
+
+        assert!(error.to_string().contains("has stopped"), "{error}");
+        assert_eq!(session(&engine), before);
+        assert!(session(&engine).3.iter().all(|group| !group.invalid));
+    }
+
+    /// [engine_without_device] with its phone socket kept, so the musician stays at that address.
+    fn local_engine() -> (
+        EngineHandle,
+        crate::pipeline::CaptureWriter,
+        std::net::UdpSocket,
+    ) {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (engine, capture) = engine_without_device(phone.local_addr().expect("address"));
+        (engine, capture, phone)
+    }
+
+    /// Everything on the bus so far.
+    fn drain(events: &Receiver<EngineEvent>) -> Vec<EngineEvent> {
+        events.try_iter().collect()
+    }
+
+    /// The local mix and the musician's agree on what is server configuration: the group each
+    /// channel feeds and the hidden channels.
+    fn assert_same_configuration(engine: &EngineHandle) {
+        let local = engine.local_mix();
+        let musician = engine.status().musicians[0].mix;
+        assert_eq!(local.channel_group, musician.channel_group);
+        assert_eq!(local.hidden_channels, musician.hidden_channels);
+    }
+
+    #[test]
+    fn the_local_mix_starts_neutral_on_the_live_groups_and_is_no_musician() {
+        let (mut engine, _capture, _phone) = local_engine();
+
+        let local = engine.local_mix();
+
+        assert_eq!(local.channel_gains, MixValues::default().channel_gains);
+        assert_eq!(local.volume_percent, 100);
+        assert_eq!(
+            &local.channel_group[..2],
+            &[Some(0), Some(0)],
+            "the stereo group"
+        );
+        assert!(local.revision > 0);
+        let status = engine.status();
+        assert_eq!(status.local_mix, local);
+        assert_eq!(status.musicians.len(), 1, "the local mix is no musician");
+        assert_same_configuration(&engine);
+        engine.stop().expect("the engine stops");
+    }
+
+    /// The desk's path, as for a musician: a partial update merged and stored under a new
+    /// revision, announced as the local mix's own event, and no musician touched. An update that
+    /// cannot be applied changes and announces nothing.
+    #[test]
+    fn setting_the_local_mix_changes_only_it_and_announces_it() {
+        let (mut engine, _capture, _phone) = local_engine();
+        let events = engine.subscribe();
+        let musician = engine.status().musicians[0].mix;
+        let before = engine.local_mix();
+
+        let applied = engine
+            .set_local_mix(&MixUpdate {
+                volume_percent: Some(40),
+                channel_gains: Some(vec![80]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+
+        assert_eq!(applied.volume_percent, 40);
+        assert_eq!(&applied.channel_gains[..2], &[80, 100]);
+        assert!(applied.revision > before.revision);
+        assert_eq!(engine.local_mix(), applied);
+        assert_eq!(drain(&events), vec![EngineEvent::LocalMixChanged]);
+        assert_eq!(engine.status().musicians[0].mix, musician);
+
+        let refused = engine
+            .set_local_mix(&MixUpdate {
+                channel_gains: Some(vec![100; 33]),
+                ..MixUpdate::default()
+            })
+            .expect_err("an oversized list is refused");
+        assert!(refused.to_string().contains("at most 32"), "{refused}");
+        assert_eq!(engine.local_mix(), applied);
+        assert!(drain(&events).is_empty());
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Linking a pair reaches the local mix as it reaches every musician's: the pair is panned
+    /// apart and its second side takes the first side's level under a new revision, announced
+    /// after the channel details. A hidden input is silent in it.
+    #[test]
+    fn channel_details_move_the_local_mix_like_a_musicians() {
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .set_local_mix(&MixUpdate {
+                channel_gains: Some(vec![30, 70]),
+                pans: Some(vec![40, 60]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let events = engine.subscribe();
+
+        engine
+            .set_channels(vec![
+                linked(channel("Keys L", ChannelKind::Keys)),
+                channel("Keys R", ChannelKind::Keys),
+            ])
+            .expect("valid details");
+
+        let local = engine.local_mix();
+        assert_eq!(&local.pans[..2], &[0, 100]);
+        assert_eq!(&local.channel_gains[..2], &[30, 30]);
+        let announced = drain(&events);
+        assert_eq!(announced.first(), Some(&EngineEvent::ChannelsChanged));
+        assert_eq!(announced.last(), Some(&EngineEvent::LocalMixChanged));
+        assert_same_configuration(&engine);
+
+        engine
+            .set_channels(vec![
+                hidden(channel("Spare", ChannelKind::Other)),
+                channel("Voice", ChannelKind::Voice),
+            ])
+            .expect("valid details");
+        assert_eq!(engine.local_mix().hidden_channels, 1);
+        assert_same_configuration(&engine);
+        let mut heard = [0.0; 2];
+        crate::mix::MixPlan::new(&engine.local_mix(), 2).mix_into(&[0.5, 0.0], &mut heard);
+        assert_eq!(
+            heard,
+            [0.0, 0.0],
+            "the hidden input is silent in the local mix"
+        );
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A group edit moves the local mix's group levels by group id, as every musician's, and a
+    /// device switch points it at the groups the new device can feed.
+    #[test]
+    fn groups_move_the_local_mix_like_a_musicians() {
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .set_local_mix(&MixUpdate {
+                group_levels: Some(vec![40]),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update applies");
+        let events = engine.subscribe();
+
+        engine
+            .set_groups(vec![
+                definition("keys", "Keys", &[1]),
+                definition("pair", "Pair", &[2]),
+            ])
+            .expect("valid groups");
+
+        assert_eq!(&engine.local_mix().group_levels[..2], &[100, 40]);
+        let announced = drain(&events);
+        assert_eq!(announced.first(), Some(&EngineEvent::GroupsChanged));
+        assert_eq!(announced.last(), Some(&EngineEvent::LocalMixChanged));
+        assert_same_configuration(&engine);
+
+        let (_mono, opened) = test_capture(&engine, 1);
+        engine.install_capture(opened).expect("the switch commits");
+        assert_eq!(engine.local_mix().channel_group[1], None, "input 2 is gone");
+        assert_eq!(engine.local_mix().group_levels[1], 40, "its level is kept");
+        assert_same_configuration(&engine);
+        engine.stop().expect("the engine stops");
+    }
+
+    /// An output the test plays itself: the device callback's end of the ring and the output to
+    /// install, named `device`, with `channels` outputs and the pair at `first`.
+    fn test_output(
+        device: &str,
+        channels: usize,
+        first: u16,
+    ) -> (crate::output::OutputPlayer, crate::output::OpenedOutput) {
+        let (feed, player, shared) = crate::output::output_link(channels, usize::from(first), 64);
+        let opened = crate::output::OpenedOutput {
+            stream: None,
+            request: LocalOutputRequest {
+                device: device.to_owned(),
+                first_channel: first,
+            },
+            feed,
+            shared,
+        };
+        (player, opened)
+    }
+
+    /// Waits until `done` holds, for at most five seconds.
+    fn until(done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        done()
+    }
+
+    /// One packet at the phone, within two seconds.
+    fn phone_hears(phone: &std::net::UdpSocket) -> bool {
+        phone
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout should set");
+        let mut packet = [0u8; 1_024];
+        phone.recv(&mut packet).is_ok()
+    }
+
+    #[test]
+    fn the_local_output_is_off_by_default_and_the_local_mix_is_metered() {
+        let (mut engine, mut capture, _phone) = local_engine();
+
+        assert_eq!(engine.local_output(), LocalOutputStatus::default());
+        assert_eq!(engine.status().local_output.state, LocalOutputState::Off);
+        capture.write(&[0.5f32; 2 * 64]);
+        assert!(until(|| engine
+            .meters()
+            .local_levels
+            .iter()
+            .all(|level| *level > 0)));
+
+        engine.stop().expect("the engine stops");
+        assert_eq!(engine.meters().local_levels, [0, 0]);
+    }
+
+    /// The local mix (here at half volume) plays on the chosen pair; another output takes over
+    /// live and the first is fed no more; turning it off stops it. The phone hears every block
+    /// throughout: neither capture nor the phones notice.
+    #[test]
+    fn the_local_output_plays_the_local_mix_and_changes_live_without_touching_the_phones() {
+        let (mut engine, mut capture, phone) = local_engine();
+        engine
+            .set_local_mix(&MixUpdate {
+                volume_percent: Some(50),
+                ..MixUpdate::default()
+            })
+            .expect("a valid update");
+        let (mut first, opened) = test_output("Speakers", 4, 2);
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        let status = engine.local_output();
+        assert_eq!(status.state, LocalOutputState::Running);
+        assert_eq!(status.output.map(|output| output.first_channel), Some(2));
+
+        for _ in 0..4 {
+            capture.write(&[0.5f32; 2 * 64]);
+        }
+        assert!(until(|| first.queued() == 4 * 64));
+        assert!(phone_hears(&phone));
+        let mut buffer = [9.0f32; 4 * 64];
+        first.fill(&mut buffer);
+        for frame in buffer.chunks_exact(4) {
+            // Outputs 1-2 silent; 3-4 the half-volume mix (within the pan law's float residue).
+            assert_eq!(&frame[..2], &[0.0, 0.0]);
+            assert!((frame[2] - 0.25).abs() < 1e-6 && (frame[3] - 0.25).abs() < 1e-6);
+        }
+
+        let (second, opened) = test_output("Headphones", 2, 0);
+        engine
+            .install_output(Some(opened))
+            .expect("the output changes live");
+        for _ in 0..2 {
+            capture.write(&[0.5f32; 2 * 64]);
+        }
+        assert!(until(|| second.queued() == 2 * 64));
+        assert_eq!(first.queued(), 3 * 64, "the previous output is fed no more");
+        assert!(phone_hears(&phone));
+
+        let off = engine
+            .set_local_output(None)
+            .expect("turning the output off always works");
+        assert_eq!(off, LocalOutputStatus::default());
+        capture.write(&[0.5f32; 2 * 64]);
+        capture.write(&[0.5f32; 2 * 64]);
+        // The eighth packet means the engine thread has finished with the seventh block.
+        assert!(until(|| engine.status().packets_sent >= 8));
+        assert!(phone_hears(&phone));
+        assert_eq!(second.queued(), 2 * 64, "a removed output is fed no more");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A device failure (what the stream's error callback reports) stops only the local output:
+    /// it is reported with its reason and fed no more, and the phones keep hearing.
+    #[test]
+    fn a_failed_local_output_stops_only_itself_and_is_reported() {
+        let (mut engine, mut capture, phone) = local_engine();
+        let (player, opened) = test_output("Speakers", 2, 0);
+        let shared = Arc::clone(&opened.shared);
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+        capture.write(&[0.5f32; 2 * 64]);
+        assert!(until(|| player.queued() == 64));
+
+        shared.fail("the output device failed: unplugged".to_owned());
+        capture.write(&[0.5f32; 2 * 64]);
+        capture.write(&[0.5f32; 2 * 64]);
+
+        // The phone hears all three blocks; the third one's packet means the engine thread has
+        // finished with the second block, the first after the failure.
+        for _ in 0..3 {
+            assert!(phone_hears(&phone));
+        }
+        assert_eq!(player.queued(), 64);
+        assert_eq!(
+            engine.status().local_output.state,
+            LocalOutputState::Failed {
+                reason: "the output device failed: unplugged".to_owned()
+            }
+        );
+        engine.stop().expect("the engine stops");
+    }
+
+    /// Under ASIO the only output offered is the capture driver's own, read from the device the
+    /// capture already holds (here none, as no driver is open): nothing is listed and another
+    /// driver is refused before anything is opened.
+    #[test]
+    fn under_asio_no_other_driver_is_offered_or_opened() {
+        let (mut engine, _capture, _phone) = local_engine();
+        engine.host = AudioHost::Asio;
+
+        assert!(engine.output_devices().expect("listing works").is_empty());
+        let refused = engine
+            .set_local_output(Some(LocalOutputRequest {
+                device: "Realtek ASIO".to_owned(),
+                first_channel: 0,
+            }))
+            .expect_err("another driver is refused");
+        assert!(
+            refused.to_string().contains("only the capture driver"),
+            "{refused}"
+        );
+        assert_eq!(engine.local_output(), LocalOutputStatus::default());
+        engine.stop().expect("the engine stops");
+    }
+
+    /// An ASIO output lives on the capture driver: a switch to the same driver keeps it, a switch
+    /// to another driver stops it (reported with the reason), since ASIO holds one driver.
+    #[test]
+    fn under_asio_a_switch_to_another_driver_stops_the_local_output() {
+        let (mut engine, _capture, _phone) = local_engine();
+        engine.host = AudioHost::Asio;
+        let driver = engine.device_name().to_owned();
+        let (_player, opened) = test_output(&driver, 2, 0);
+        engine
+            .install_output(Some(opened))
+            .expect("the output installs");
+
+        let (_same, opened) = test_capture(&engine, 2);
+        engine.install_capture(opened).expect("the switch commits");
+        assert_eq!(engine.local_output().state, LocalOutputState::Running);
+
+        let (_other, opened) = test_capture(&engine, 1);
+        engine.install_capture(opened).expect("the switch commits");
+        let LocalOutputState::Failed { reason } = engine.local_output().state else {
+            panic!("the output on the previous driver should have stopped");
+        };
+        assert!(reason.contains("ASIO driver"), "{reason}");
         engine.stop().expect("the engine stops");
     }
 }

@@ -290,7 +290,7 @@ fn supported_reduction_sample_rate(range: &SupportedStreamConfigRange) -> Option
         })
 }
 
-fn sample_format_rank(sample_format: SampleFormat) -> u8 {
+pub(crate) fn sample_format_rank(sample_format: SampleFormat) -> u8 {
     match sample_format {
         SampleFormat::I16 => 0,
         SampleFormat::F32 => 1,
@@ -304,7 +304,7 @@ fn supports_sample_rate(min_sample_rate: u32, max_sample_rate: u32, sample_rate:
     min_sample_rate <= sample_rate && sample_rate <= max_sample_rate
 }
 
-fn is_supported_sample_format(sample_format: SampleFormat) -> bool {
+pub(crate) fn is_supported_sample_format(sample_format: SampleFormat) -> bool {
     matches!(
         sample_format,
         SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I32 | SampleFormat::U16
@@ -317,7 +317,10 @@ fn is_supported_sample_format(sample_format: SampleFormat) -> bool {
 /// the phones are sent, is one callback long (see [block_frames]), so the callback size is also the
 /// packet interval. Kept pure and separate from stream construction so the mapping is testable
 /// without an audio host.
-fn with_buffer_size(mut config: StreamConfig, buffer_frames: Option<u32>) -> StreamConfig {
+pub(crate) fn with_buffer_size(
+    mut config: StreamConfig,
+    buffer_frames: Option<u32>,
+) -> StreamConfig {
     if let Some(frames) = buffer_frames {
         config.buffer_size = BufferSize::Fixed(frames);
     }
@@ -329,7 +332,7 @@ fn with_buffer_size(mut config: StreamConfig, buffer_frames: Option<u32>) -> Str
 /// Some drivers only accept one buffer size (a Realtek ASIO driver reports `1024..=1024`, the Volt's
 /// accepts a range). Requesting outside that range fails the stream open, so clamping here turns a
 /// failed session into the size the driver actually allows.
-fn clamp_buffer_frames(requested: u32, supported: &SupportedBufferSize) -> u32 {
+pub(crate) fn clamp_buffer_frames(requested: u32, supported: &SupportedBufferSize) -> u32 {
     match supported {
         SupportedBufferSize::Range { min, max } => requested.clamp(*min, *max),
         SupportedBufferSize::Unknown => requested,

@@ -189,6 +189,23 @@ mod tests {
         UdpSocket::bind(value).expect("test socket should bind")
     }
 
+    /// A phone on loopback address `127.0.0.{host}`, or `None` when the machine has no such
+    /// address. The engine keys musicians by IP, so a test with several musicians needs several
+    /// loopback addresses; Linux and Windows answer on all of 127/8, but macOS only configures
+    /// 127.0.0.1 unless told otherwise (`sudo ifconfig lo0 alias 127.0.0.2`). A test that needs
+    /// the address skips itself, saying so, rather than failing.
+    fn musician_phone(host: u8) -> Option<UdpSocket> {
+        match UdpSocket::bind(format!("127.0.0.{host}:0")) {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                eprintln!(
+                    "skipped: 127.0.0.{host} cannot be bound ({error}); a second musician needs a second loopback address"
+                );
+                None
+            }
+        }
+    }
+
     fn packet() -> AudioPacket {
         AudioPacket {
             channels: 2,
@@ -227,7 +244,9 @@ mod tests {
     #[test]
     fn a_removed_target_stops_receiving_while_the_others_keep_streaming() {
         let removed = bind("127.0.0.1:0");
-        let kept = bind("127.0.0.2:0");
+        let Some(kept) = musician_phone(2) else {
+            return;
+        };
         let targets = registry(&[
             removed.local_addr().expect("removed address"),
             kept.local_addr().expect("kept address"),
@@ -341,7 +360,9 @@ mod tests {
     #[test]
     fn an_added_target_starts_receiving_without_restarting_the_network_thread() {
         let first = bind("127.0.0.1:0");
-        let second = bind("127.0.0.2:0");
+        let Some(second) = musician_phone(2) else {
+            return;
+        };
         let targets = registry(&[first.local_addr().expect("first address")]);
         let (sender, receiver) = sync_channel(4);
         let thread = spawn_network_thread(receiver, Arc::clone(&targets), stats(), inputs())
@@ -447,7 +468,9 @@ mod tests {
     #[test]
     fn a_target_can_be_removed_while_a_block_is_being_sent() {
         let first = bind("127.0.0.1:0");
-        let second = bind("127.0.0.2:0");
+        let Some(second) = musician_phone(2) else {
+            return;
+        };
         let second_address = second.local_addr().expect("second address");
         let targets = registry(&[first.local_addr().expect("first address"), second_address]);
         let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
@@ -476,20 +499,22 @@ mod tests {
 
     /// The whole per-block path after warm-up, as it runs live: a 24-bit, 96 kHz stereo callback
     /// converted, filtered, decimated and metered into the ring, then each block mixed for three
-    /// phones, metered, encoded and sent. Not one heap allocation or free on the way.
+    /// phones, metered, encoded and sent. Not one heap allocation or free on the way. Where only
+    /// 127.0.0.1 can be bound (macOS by default) it runs with that one phone rather than not at all.
     #[test]
     fn the_capture_to_phone_path_never_allocates() {
         use crate::pipeline::tests::allocations;
 
-        let phones: Vec<UdpSocket> = (1..=3)
-            .map(|host| bind(&format!("127.0.0.{host}:0")))
-            .collect();
+        let phones: Vec<UdpSocket> = (1..=3).filter_map(musician_phone).collect();
         let addresses: Vec<SocketAddr> = phones
             .iter()
             .map(|phone| phone.local_addr().expect("phone address"))
             .collect();
         let targets = registry(&addresses);
-        targets.read()[1]
+        targets
+            .read()
+            .last()
+            .expect("127.0.0.1 always binds")
             .mix_state
             .apply(&MixUpdate {
                 pans: Some(vec![50, 50]),

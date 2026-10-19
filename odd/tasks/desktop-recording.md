@@ -143,10 +143,51 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     one block when the driver's callback length differs from the block (WASAPI), plus 0.32 ms of
     filter delay at 96/192 kHz only. Documented in the `pipeline.rs` module comment.
   - Earlier commits: cdb5d84 (capture, ring, decimator, engine thread), ebadce2 (float network
-    sink). Commit: this commit (meter fixes R3-001..R3-003).
-- [ ] T2 (local mix and output): the engine-owned local mix, the cpal output sink with drift
-  handling and the ASIO rules, session persistence, Tauri commands, the Local mix tab and the
-  "Local mix out" select. Route: delegated writer.
+    sink). Commit: f4ffdbe (meter fixes R3-001..R3-003).
+  - [x] T1-fix (review findings): device switches driven through `EngineHandle` with the
+    `CaptureWriter` seam; a capture whose format and frames disagree is now refused by the plan;
+    the two timing-bound pipeline tests wait on conditions; tests that need several musician IPs
+    skip with a message when 127.0.0.2/3 cannot be bound (macOS), and the allocation test runs
+    with the phones that bind. RED (by mutation: the plan fed the format unchecked, and the commit
+    made before the engine thread took the source):
+    `a_refused_switch_leaves_the_running_capture_untouched` accepted the mismatched capture, and
+    `a_switch_fails_without_committing_when_the_engine_thread_has_ended` committed
+    ("Test input (1)", 1 channel) on a dead engine thread. GREEN: server unit tests 327 -> 329,
+    passing on 3 runs. The timing and loopback changes have no RED: they remove dependence on the
+    machine (timer granularity, loopback aliases) and pass the same here. Commit: 2b5ac1d.
+- [x] T2a (local mix and output, engine): the engine-owned local mix and the cpal output sink with
+  drift handling and the ASIO rules. Route: delegated writer (writer and 2+ non-trivial files
+  triggers).
+  - Local mix: one `Arc<MixState>` outside the target table, changed with
+    `EngineHandle::set_local_mix(&MixUpdate)` on the desk's path, read with `local_mix()`,
+    announced as `EngineEvent::LocalMixChanged` (no address), moved with every musician's mix on
+    group edits, device switches and channel details, reported in `EngineStatus::local_mix`.
+  - Local output (`output.rs`): a `LocalOutputSink` mixes the local mix with `MixPlan` each block,
+    meters it (`EngineMeters::local_levels`) and pushes it into an `rtrb` ring read by the cpal
+    output callback (`OutputPlayer`), which writes the pair into the chosen channels, silence
+    elsewhere, in the device's sample format. Target fill one device callback + 2 blocks; under
+    it the player pads with silence (counted as underrun frames) and primes again; 2 blocks above
+    it frames are dropped back to the target (counted). Worst-case delay one callback + 4 blocks
+    (31.3 ms at a 480-frame WASAPI period with 256-frame blocks, 26.7 ms at ASIO 256). Changing or
+    removing the output is live (the sink takes the new feed between blocks); a device error marks
+    only the output failed, with its reason. Off by default; under ASIO only the capture driver's
+    own outputs are offered (from the device the capture holds, nothing listed) and a switch to
+    another ASIO driver stops the output; under WASAPI every output device. 48 kHz only.
+  - API for T2b: `output_devices()`, `set_local_output(Option<LocalOutputRequest>)`,
+    `local_output()`, `EngineStatus::local_output` (`LocalOutputStatus { output, state:
+    Off | Running | Failed { reason }, underrun_frames, dropped_frames }`).
+  - RED: the local mix tests did not compile (no `local_mix`, `set_local_mix`,
+    `LocalMixChanged`); 9 of 12 output tests failed against stubs (player that only played
+    silence, sink that did nothing, rules that offered nothing and refused nothing); the engine
+    output tests did not compile (26 errors: no `install_output`, `set_local_output`,
+    `local_output`, `output_devices`, `local_levels`).
+  - GREEN: server unit tests 329 -> 333 -> 350; the output callback makes zero allocations and
+    frees over 2000 callbacks; desktop `cargo check --all-targets` clean (status and meters
+    literals gained the new fields).
+  - Commits: 1a0223f (local mix), and this commit (local output).
+- [ ] T2b (local mix and output, desktop): session persistence of the local mix and the output
+  choice, Tauri commands over the T2a API, the Local mix tab and the "Local mix out" select.
+  Route: delegated writer.
 - [ ] T3 (WAV/RF64 writer): pure, heavily tested writer for 24-bit and 32-bit float, mono and
   stereo, RF64 upgrade, crash-safe headers; and a reader for playback. Route: delegated writer.
 - [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
@@ -162,10 +203,17 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 
 - Branch `feat/desktop-recording` from main 0bb278b (phases 1 and 2 merged as PRs #17-#38).
 - The user approved adding the `rtrb` crate (a download from crates.io); `rtrb` 0.3.5 is in.
-- T1 done in three work units: cdb5d84, ebadce2 and the meter-fix commit. T2 plugs the local
-  output in as a `Sink` (fed by `process`, sized in `source_changed`) and T4 the recorder the same
-  way; neither touches the capture path.
+- T1 done in three work units: cdb5d84, ebadce2 and f4ffdbe. T2 plugs the local output in as a
+  `Sink` (fed by `process`, sized in `source_changed`) and T4 the recorder the same way; neither
+  touches the capture path.
+- T1 was reviewed in two parts because of the lens context budget, both approved and
+  acknowledged: review-bd3440d2b6f6bfc9 (0bb278b..cdb5d84) and review-4f74b5710abf87fc
+  (cdb5d84..f4ffdbe). Part 1's R3-001 (the network sink still allocating) was resolved by
+  ebadce2; the rest (part 1 R3-002 and R3-003, part 2 R3-001) by T1-fix. Next review base: f4ffdbe.
+- T2 split into T2a (engine, done in 1a0223f and the local-output commit) and T2b (desktop).
+  Live checks still owed for T7: an ASIO output on the Volt next to its capture (cpal opens both
+  directions on one driver), and drift over a long WASAPI run.
 
 ## Next step
 
-T2.
+T2b.

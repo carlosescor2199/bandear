@@ -12,7 +12,8 @@ use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
     LinkHealth, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin, MixUpdate, MixValues,
     MusicianKey, MusicianStatus, OutputDevice, RecordingState, RecordingStatus, SampleFormat,
-    TakeEnd, TakeMarker, TakeSummary, TakeTrack,
+    SoundcheckClock, SoundcheckState, SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary,
+    TakeTrack,
 };
 
 use crate::session::{
@@ -871,6 +872,8 @@ pub struct EngineStatusDto {
     pub recording: RecordingDto,
     /// The most recent take that ended while this engine ran, however it ended; null before one.
     pub last_take: Option<TakeSummaryDto>,
+    /// The take played back in place of the inputs, if any (see [crate::commands::soundcheck]).
+    pub soundcheck: SoundcheckDto,
 }
 
 impl From<&EngineStatus> for EngineStatusDto {
@@ -930,6 +933,65 @@ impl From<&EngineStatus> for EngineStatusDto {
                 .last_take
                 .as_ref()
                 .map(TakeSummaryDto::from),
+            soundcheck: SoundcheckDto::from(&status.soundcheck),
+        }
+    }
+}
+
+/// The virtual soundcheck on the status (`soundcheck`) and in every soundcheck command's answer:
+/// whether a take plays in place of the inputs, where it is and what paces it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoundcheckDto {
+    /// "off" (the inputs are live), "playing", "paused" (by the engineer, or stopped at the end of
+    /// a take that does not loop) or "failed" (reading the take failed; only stopping is left).
+    pub state: &'static str,
+    /// Why it failed; null unless `state` is "failed".
+    pub reason: Option<String>,
+    /// The take's folder, whole, while a take plays (or is paused or failed); null when off.
+    pub take_folder: Option<String>,
+    /// The take's name from its `take.json`; null when off.
+    pub take_name: Option<String>,
+    /// The next frame of the take to play, from 0, and the same in seconds.
+    pub position_frames: u64,
+    pub position_seconds: f64,
+    /// The frames the take plays for, and the same in seconds.
+    pub length_frames: u64,
+    pub length_seconds: f64,
+    pub looping: bool,
+    /// Frames of silence played because the disk fell behind.
+    pub underrun_frames: u64,
+    /// What paces the take: "output" (the local output's device) or "timer" (no output plays).
+    pub clock: &'static str,
+}
+
+impl From<&SoundcheckStatus> for SoundcheckDto {
+    fn from(status: &SoundcheckStatus) -> Self {
+        let (state, reason) = match &status.state {
+            SoundcheckState::Off => ("off", None),
+            SoundcheckState::Playing => ("playing", None),
+            SoundcheckState::Paused => ("paused", None),
+            SoundcheckState::Failed { reason } => ("failed", Some(reason.clone())),
+        };
+        Self {
+            state,
+            reason,
+            take_folder: status
+                .take_folder
+                .as_ref()
+                .map(|folder| folder.display().to_string()),
+            take_name: status.take_name.clone(),
+            position_frames: status.position_frames,
+            // Every take plays at the engine's rate, whatever the device's.
+            position_seconds: seconds_of(status.position_frames, TAKE_SAMPLE_RATE),
+            length_frames: status.length_frames,
+            length_seconds: seconds_of(status.length_frames, TAKE_SAMPLE_RATE),
+            looping: status.looping,
+            underrun_frames: status.underrun_frames,
+            clock: match status.clock {
+                SoundcheckClock::Timer => "timer",
+                SoundcheckClock::Output => "output",
+            },
         }
     }
 }
@@ -2208,6 +2270,67 @@ mod tests {
         });
         assert_eq!(failed.state, "failed");
         assert_eq!(failed.reason.as_deref(), Some("the disk is full"));
+    }
+
+    #[test]
+    fn the_status_carries_the_soundcheck_and_where_the_take_is() {
+        let mut status = status_with(Vec::new(), vec![0, 0]);
+        status.soundcheck = SoundcheckStatus {
+            state: SoundcheckState::Playing,
+            take_folder: Some(std::path::PathBuf::from(
+                "D:\\Takes\\2026-10-16_191000_Show",
+            )),
+            take_name: Some("Show".to_owned()),
+            position_frames: 72_000,
+            length_frames: 480_000,
+            looping: true,
+            underrun_frames: 256,
+            clock: SoundcheckClock::Output,
+        };
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+
+        assert_eq!(
+            json["soundcheck"],
+            serde_json::json!({
+                "state": "playing",
+                "reason": null,
+                "takeFolder": "D:\\Takes\\2026-10-16_191000_Show",
+                "takeName": "Show",
+                "positionFrames": 72_000,
+                "positionSeconds": 1.5,
+                "lengthFrames": 480_000,
+                "lengthSeconds": 10.0,
+                "looping": true,
+                "underrunFrames": 256,
+                "clock": "output"
+            })
+        );
+    }
+
+    #[test]
+    fn a_soundcheck_off_paused_or_failed_is_said_with_its_reason() {
+        let off = SoundcheckDto::from(&SoundcheckStatus::default());
+        assert_eq!((off.state, off.clock), ("off", "timer"));
+        assert_eq!(off.take_folder, None);
+
+        let paused = SoundcheckDto::from(&SoundcheckStatus {
+            state: SoundcheckState::Paused,
+            ..SoundcheckStatus::default()
+        });
+        assert_eq!(paused.state, "paused");
+
+        let failed = SoundcheckDto::from(&SoundcheckStatus {
+            state: SoundcheckState::Failed {
+                reason: "reading \"01 Kick.wav\" failed".to_owned(),
+            },
+            ..SoundcheckStatus::default()
+        });
+        assert_eq!(failed.state, "failed");
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("reading \"01 Kick.wav\" failed")
+        );
     }
 
     #[test]

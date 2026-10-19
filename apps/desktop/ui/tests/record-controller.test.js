@@ -133,6 +133,75 @@ test("two quick arm presses on two tracks both land", async () => {
   app.dispose();
 });
 
+test("a second press on the same row before the first is answered toggles it back", async () => {
+  const { fake, app } = await connected();
+  const controller = createRecordController(app);
+  const asked = () =>
+    fake.calls
+      .filter(({ command }) => command === "set_recording_settings")
+      .map(({ args }) => args.settings);
+
+  const [on, off] = await Promise.all([controller.arm("in-1"), controller.arm("in-1")]);
+  assert.equal(on.ok, true, on.message);
+  assert.equal(off.ok, true, off.message);
+  assert.deepEqual(
+    asked().map((settings) => settings.armed),
+    [[1], []],
+    "the second press disarms what the first armed",
+  );
+  assert.deepEqual(app.store.getState().recordingSettings.armed, []);
+
+  // Once answered, a press toggles from what the desk keeps again.
+  const again = await controller.arm("in-1");
+  assert.equal(again.ok, true, again.message);
+  assert.deepEqual(app.store.getState().recordingSettings.armed, [1]);
+
+  // The local mix toggles from its pending intent the same way.
+  await Promise.all([controller.arm("local"), controller.arm("local")]);
+  assert.deepEqual(
+    asked()
+      .slice(-2)
+      .map((settings) => settings.includeLocal),
+    [true, false],
+  );
+  assert.equal(app.store.getState().recordingSettings.includeLocal, false);
+  app.dispose();
+});
+
+test("a settings request or listing that fails still renders again and says why", async () => {
+  const app = storeApp();
+  app.store.dispatch(actions.status(sampleStatus()));
+  app.store.dispatch(actions.recordingSettings(SETTINGS));
+  app.setRecordingSettings = () => Promise.reject(new Error("the bridge went away"));
+  app.refreshTakes = () => Promise.reject(new Error("no listing"));
+  let changes = 0;
+  const controller = createRecordController(app, { onChange: () => (changes += 1) });
+
+  const armed = await controller.arm("in-2");
+  assert.equal(armed.ok, false);
+  assert.match(armed.message, /the bridge went away/);
+  assert.equal(changes, 1, "rendered again after the failure");
+  assert.equal(app.store.getState().recordingOutcome.ok, false);
+  assert.match(app.store.getState().recordingOutcome.message, /the bridge went away/);
+
+  const folder = await controller.useFolder("D:\\Takes");
+  assert.equal(folder.ok, false);
+  assert.equal(changes, 2);
+  const byDefault = await controller.useDefaultFolder();
+  assert.equal(byDefault.ok, false);
+  assert.equal(changes, 3);
+  const format = await controller.changeSettings({ format: "float32" });
+  assert.equal(format.ok, false);
+  assert.equal(changes, 4);
+
+  // A kept folder whose listing fails is still said kept, and the screen renders again.
+  app.setRecordingSettings = () => Promise.resolve({ ok: true, message: "Saved." });
+  const kept = await controller.useFolder("D:\\Takes");
+  assert.equal(kept.ok, true);
+  assert.equal(changes, 5);
+  assert.match(app.store.getState().takes.error, /no listing/);
+});
+
 test("a refused folder stays in the field to be corrected, a kept one shows as the desk has it", async () => {
   const { fake, app } = await connected();
   const controller = createRecordController(app);

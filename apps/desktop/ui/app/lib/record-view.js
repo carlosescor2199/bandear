@@ -112,12 +112,13 @@ export function localTrackRow(state) {
  * The settings change pressing a row's arm button asks for: the row armed or disarmed (a pair as
  * one, see armedAfter), or the local mix on or off. The arming is a delta (`arm`, see
  * settingsRequest) applied when the request is built, so two quick presses on two rows both land.
+ * `armedNow` is what the press toggles: the row as shown, or what a press still on its way asked.
  */
-export function armChange(state, row) {
+export function armChange(state, row, armedNow = row.armed) {
   if (row.local) {
-    return { includeLocal: !row.armed };
+    return { includeLocal: !armedNow };
   }
-  return { arm: { input: row.input, on: !row.armed, channels: deviceChannels(state) } };
+  return { arm: { input: row.input, on: !armedNow, channels: deviceChannels(state) } };
 }
 
 /**

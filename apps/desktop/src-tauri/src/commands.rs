@@ -3,10 +3,12 @@
 //! They live apart from the `#[tauri::command]` wrappers in the crate root so that an example
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return. The engineer's local mix and its output have their own module,
-//! [local], and so does recording takes, [recording].
+//! [local], and so do recording takes, [recording], and playing one back in place of the inputs,
+//! [soundcheck].
 
 pub mod local;
 pub mod recording;
+pub mod soundcheck;
 
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
@@ -2575,6 +2577,9 @@ mod tests {
                 &personal_monitoring::RecordingStatus::default(),
             ),
             last_take: None,
+            soundcheck: crate::dto::SoundcheckDto::from(
+                &personal_monitoring::SoundcheckStatus::default(),
+            ),
         }
     }
 

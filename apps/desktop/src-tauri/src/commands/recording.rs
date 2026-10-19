@@ -143,7 +143,9 @@ impl RecordEngine for EngineHandle {
     }
 
     fn start_recording(&mut self, request: RecordRequest) -> Result<RecordingStatus, String> {
-        EngineHandle::start_recording(self, request).map_err(|error| error.to_string())
+        // A soundcheck playing refuses a take; it is said as the soundcheck commands say it.
+        EngineHandle::start_recording(self, request)
+            .map_err(|error| super::soundcheck::words(&*error))
     }
 
     fn stop_recording(&mut self) -> Result<TakeSummary, String> {
@@ -210,7 +212,7 @@ fn file_manager(folder: &Path) -> std::process::Command {
     command
 }
 
-fn places(state: &DesktopState) -> Places<'_> {
+pub(super) fn places(state: &DesktopState) -> Places<'_> {
     Places {
         default: &state.recordings,
         config: state.session.directory(),
@@ -827,10 +829,20 @@ fn open_with(
     opener: &dyn FolderOpener,
     folder: &str,
 ) -> Result<(), String> {
-    let recordings = folder_of(&session.recording().unwrap_or_default(), places.default);
-    let take = take_folder_in(&recordings, Path::new(folder.trim()))?;
+    let take = take_in_recordings(session, places, folder)?;
     println!("[mixlink-desktop] open_take_folder: \"{}\"", take.display());
     opener.open(&take)
+}
+
+/// The take folder `folder` names in the kept (or default) recordings folder, checked on the disk
+/// as [take_folder_in] does: what `open_take_folder` opens and a soundcheck plays.
+pub(super) fn take_in_recordings(
+    session: &SessionStore,
+    places: Places<'_>,
+    folder: &str,
+) -> Result<PathBuf, String> {
+    let recordings = folder_of(&session.recording().unwrap_or_default(), places.default);
+    take_folder_in(&recordings, Path::new(folder.trim()))
 }
 
 /// The take folder `folder` names, as `recordings` joined with its name: only a folder holding a

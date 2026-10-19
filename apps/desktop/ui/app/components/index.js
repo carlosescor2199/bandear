@@ -24,3 +24,4 @@ import "./group-cards.js";
 // Organisms of the Network and system screen.
 import "./musicians-table.js";
 import "./audio-setup.js";
+import "./link-health.js";

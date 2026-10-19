@@ -1,12 +1,14 @@
 // <ml-musicians-table>: the musicians the engine sends to, with their names, links and counts, a
 // guarded Remove, and a form to add a phone by address.
 //
-// Property: `data` = { rows, addError, tableError }: rows from musicianRows (network-view.js);
-//   the two errors are sentences to show, or null.
+// Property: `data` = { rows, addError, tableError, selected }: rows from musicianRows
+//   (network-view.js); the two errors are sentences to show, or null; `selected` the address of the
+//   musician whose link history is open, or null.
 // Method: `clearAddress()` empties the address field after a phone was added.
 // Events (bubbling, composed): `musician-rename` { address, name } when an editable name is
 //   committed, `musician-remove` { address } when a removal is confirmed, `musician-add`
-//   { address } when the form is sent.
+//   { address } when the form is sent, `musician-select` { address } when a musician's History is
+//   pressed or their row is clicked outside its fields and buttons (again on the open one closes it).
 //
 // A name commits on Enter or when the field loses focus; Escape puts the saved name back. A name
 // the phone announced is the phone's, so its field is read-only; a local label is marked as such,
@@ -65,6 +67,26 @@ const styles = sheet(`
     padding: 10px 8px;
     border-top: 1px solid var(--ml-border-subtle);
     vertical-align: middle;
+  }
+  tr[data-selected] td {
+    background: var(--ml-surface-raised);
+  }
+  tbody tr {
+    cursor: pointer;
+  }
+  .link-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .history {
+    min-height: 26px;
+    padding: 0 8px;
+    font-size: var(--ml-text-xs);
+  }
+  .history[aria-pressed="true"] {
+    border-color: var(--ml-accent);
+    color: var(--ml-accent);
   }
   .num {
     font-family: var(--ml-font-mono);
@@ -207,7 +229,7 @@ const styles = sheet(`
 `);
 
 class MlMusiciansTable extends HTMLElement {
-  #data = { rows: [], addError: null, tableError: null };
+  #data = { rows: [], addError: null, tableError: null, selected: null };
   #parts;
   #rows = new Map();
   #armed = null;
@@ -319,7 +341,13 @@ class MlMusiciansTable extends HTMLElement {
         <div class="address"></div>
       </td>
       <td class="control"><span class="dot" aria-hidden="true"></span><span class="control-word"></span></td>
-      <td><ml-link-state></ml-link-state><div class="detail"></div></td>
+      <td>
+        <div class="link-line">
+          <ml-link-state></ml-link-state>
+          <button type="button" class="history" aria-pressed="false">History</button>
+        </div>
+        <div class="detail"></div>
+      </td>
       <td class="mix"></td>
       <td class="num sent"></td>
       <td class="num discarded"></td>
@@ -334,6 +362,7 @@ class MlMusiciansTable extends HTMLElement {
       dot: row.querySelector(".dot"),
       control: row.querySelector(".control-word"),
       link: row.querySelector("ml-link-state"),
+      history: row.querySelector(".history"),
       detail: row.querySelector(".detail"),
       mix: row.querySelector(".mix"),
       sent: row.querySelector(".sent"),
@@ -355,6 +384,14 @@ class MlMusiciansTable extends HTMLElement {
       // A field turned read-only (the phone announced a name meanwhile) commits nothing.
       if (!view.name.disabled && view.name.value.trim() !== view.saved) {
         emit(this, "musician-rename", { address, name: view.name.value.trim() });
+      }
+    });
+    view.history.addEventListener("click", () => emit(this, "musician-select", { address }));
+    row.addEventListener("click", (event) => {
+      // A click on the row's own fields and buttons does what they do; anywhere else opens the
+      // musician's link history, as History does.
+      if (!event.composedPath().some((node) => node.matches?.("input, button, a"))) {
+        emit(this, "musician-select", { address });
       }
     });
     row.addEventListener("keydown", (event) => {
@@ -392,6 +429,10 @@ class MlMusiciansTable extends HTMLElement {
     setText(view.loss, row.loss);
     view.loss.classList.toggle("warn", row.lossHigh);
     view.label = row.name || row.address;
+    const selected = this.#data.selected === row.address;
+    reflect(view.row, "data-selected", selected);
+    reflect(view.history, "aria-pressed", selected ? "true" : "false");
+    reflect(view.history, "aria-label", `Link history of ${view.label}`);
     this.#renderActions(view);
   }
 

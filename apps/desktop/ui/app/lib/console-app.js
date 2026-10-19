@@ -1318,6 +1318,12 @@ export function createConsoleApp({
     /** Reads the backups of the musicians' mixes again; answers `{ ok, message }`. */
     loadMixBackups,
     /**
+     * One musician's link history, `musicianKey` naming them as the desk does: the samples
+     * numbered after `sinceSeq`, or all of them (see linkHistory in bridge.js). Rejects when no
+     * engine runs or the key names nobody.
+     */
+    linkHistory: (musicianKey, sinceSeq = null) => api.linkHistory(musicianKey, sinceSeq),
+    /**
      * Puts the mix backup `stamp` back on the musicians who are connected now; answers `{ ok,
      * message }` (formatMixRestored).
      */

@@ -20,6 +20,56 @@ object PlaybackLatency {
     /** Clean adjustment intervals required before the cushion may shrink by one packet. */
     private const val CLEAN_INTERVALS_BEFORE_SHRINK = 3
 
+    /** The desk's buffer when it leaves the cushion to the phone (Auto); any other is fixed, in ms. */
+    const val DESK_BUFFER_AUTO = 0
+
+    /** The fixed buffer lengths the desk may set, in milliseconds (the server checks the same). */
+    const val MIN_FIXED_BUFFER_MS = 5
+    const val MAX_FIXED_BUFFER_MS = 500
+
+    /** How much audio is played between two adjustments of the adaptive cushion: one second. */
+    const val ADJUST_INTERVAL_MS = 1_000
+
+    /**
+     * The capacity to open the track with, in frames: the longest fixed buffer
+     * ([MAX_FIXED_BUFFER_MS]) at [sampleRate], in whole packets of [packetFrames] so its last packet
+     * fits too (just the frames when the packet size is unknown). The capacity is only the most the
+     * buffer may be set to; what the track keeps queued is what [targetBufferFrames] asks of it, so
+     * a large capacity costs memory (about 94 KB at 48 kHz), not latency. This is the platform's
+     * documented way to tune latency: open with room, then set the buffer size down.
+     */
+    fun trackCapacityFrames(sampleRate: Int, packetFrames: Int): Int {
+        val frames = ceilDiv(MAX_FIXED_BUFFER_MS.toLong() * sampleRate.coerceAtLeast(0), 1_000L)
+        if (packetFrames <= 0) return frames.toInt()
+        return (ceilDiv(frames, packetFrames.toLong()) * packetFrames).toInt()
+    }
+
+    /**
+     * The cushion, in packets, for the desk's fixed buffer of [fixedMs] milliseconds: the length at
+     * [sampleRate] rounded up to whole packets of [packetFrames] (so the phone never plays less than
+     * the engineer set), at least one packet, and at most the whole packets the track holds
+     * ([capacityFrames], the track's capacity). Before a packet sized anything it is one packet.
+     */
+    fun fixedCushionPackets(fixedMs: Int, packetFrames: Int, sampleRate: Int, capacityFrames: Int): Int {
+        if (packetFrames <= 0 || sampleRate <= 0) return 1
+        val packets = ceilDiv(fixedMs.coerceAtLeast(0).toLong() * sampleRate, 1_000L * packetFrames)
+        val most = (capacityFrames / packetFrames).coerceAtLeast(1)
+        return packets.coerceIn(1L, most.toLong()).toInt()
+    }
+
+    /**
+     * The audio played between two adjustments, in frames: [ADJUST_INTERVAL_MS] at [sampleRate]
+     * (48 kHz when the rate cannot be used), so the controller judges the same span of time whatever
+     * the block size the server sends (256-frame blocks are about 187 packets a second, 480-frame
+     * ones 100).
+     */
+    fun adjustIntervalFrames(sampleRate: Int): Int {
+        val rate = if (sampleRate > 0) sampleRate else 48_000
+        return (rate.toLong() * ADJUST_INTERVAL_MS / 1_000L).toInt().coerceAtLeast(1)
+    }
+
+    private fun ceilDiv(value: Long, divisor: Long): Long = (value + divisor - 1) / divisor
+
     /**
      * Frames written to the track but not presented yet.
      *

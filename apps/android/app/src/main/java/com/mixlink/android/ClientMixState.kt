@@ -100,6 +100,13 @@ internal class ClientMixState {
     @Volatile var volumePercent = 100
     @Volatile var maxLevelPercent = 100
     @Volatile var muted = false
+
+    /**
+     * The playback buffer the desk set (`playback`): a fixed length in milliseconds, or
+     * [PlaybackLatency.DESK_BUFFER_AUTO]. The control thread writes it, the receive loop follows it.
+     * It is never stored: a session starts on Auto and the server sends it again on registering.
+     */
+    @Volatile var deskBufferMs = PlaybackLatency.DESK_BUFFER_AUTO
 }
 
 /**

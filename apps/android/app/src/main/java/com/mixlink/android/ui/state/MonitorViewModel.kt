@@ -13,6 +13,7 @@ import com.mixlink.android.EngineerControls
 import com.mixlink.android.GroupInfo
 import com.mixlink.android.LinkStatsReport
 import com.mixlink.android.MixReport
+import com.mixlink.android.PlaybackLatency
 import com.mixlink.android.PmonPlayer
 import com.mixlink.android.ServerDiscovery
 import com.mixlink.android.ui.components.MainTab
@@ -172,6 +173,11 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
         override fun onMixAnswered(seq: Long, applied: MixReport?) =
             serverMixReported(MixAnswered(seq, applied?.mix, applied?.engineer ?: EngineerControls()))
 
+        // Handed to the receive thread as is: it follows the desk's buffer at its next packet.
+        override fun onPlaybackBuffer(fixedMs: Int) {
+            playerMix.deskBufferMs = fixedMs
+        }
+
         override fun onClosed() = publishControlState()
 
         override fun onControlError(message: String) {
@@ -239,6 +245,9 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             running.set(true)
             control.controlState = ControlState.CONNECTING
             control.clearMixOwnership()
+            // Every session starts on Auto: the phone keeps nothing of a buffer an earlier server set,
+            // and a server that takes it from the desk sends it again on registering.
+            playerMix.deskBufferMs = PlaybackLatency.DESK_BUFFER_AUTO
             // The name and the UDP port travel in the registration, so the server adds this musician
             // as a target with no address typed; the client id keeps their row when the IP changes.
             control.connect(host, controlPort, audioPort, _state.value.musicianName, clientId())

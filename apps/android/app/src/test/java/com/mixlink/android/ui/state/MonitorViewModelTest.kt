@@ -7,6 +7,7 @@ import com.mixlink.android.DiscoveredServer
 import com.mixlink.android.LinkStatsReport
 import com.mixlink.android.MixBank
 import com.mixlink.android.MixSnapshot
+import com.mixlink.android.PlaybackLatency
 import com.mixlink.android.ui.components.LinkHealth
 import com.mixlink.android.ui.components.MainTab
 import com.mixlink.android.ui.components.PillKind
@@ -1154,6 +1155,24 @@ class MonitorViewModelTest {
         assertTrue(scheduler.shutDown)
         assertTrue(transport.shutDown)
         assertEquals(1, scanner.shutdowns)
+    }
+
+    @Test
+    fun theDesksBufferReachesTheReceiveThreadAndANewSessionStartsOnAuto() {
+        connected()
+        assertEquals(PlaybackLatency.DESK_BUFFER_AUTO, receiver.mixState.deskBufferMs)
+
+        socket().receive("""{"type":"playback","buffer":{"mode":"fixed","ms":40}}""")
+        assertEquals(40, receiver.mixState.deskBufferMs)
+
+        viewModel.disconnect()
+        receiver.finishStopping()
+        viewModel.connect(SERVER)
+        assertEquals(
+            "the phone keeps nothing: the server sends it again",
+            PlaybackLatency.DESK_BUFFER_AUTO,
+            receiver.mixState.deskBufferMs,
+        )
     }
 
     private companion object {

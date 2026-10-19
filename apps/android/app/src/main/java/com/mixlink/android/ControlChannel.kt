@@ -76,6 +76,13 @@ internal class ControlChannel(
          */
         fun onMixAnswered(seq: Long, applied: MixReport?) = Unit
 
+        /**
+         * The desk set this musician's playback buffer (`playback`): [fixedMs] is a fixed length in
+         * milliseconds, or [PlaybackLatency.DESK_BUFFER_AUTO] for Auto. The channel sends nothing back:
+         * the cushion played says it in the next `stats`. A message the phone cannot use is ignored.
+         */
+        fun onPlaybackBuffer(fixedMs: Int) = Unit
+
         fun onClosed()
         fun onControlError(message: String)
     }
@@ -161,6 +168,7 @@ internal class ControlChannel(
                         }
                     }
                     "mix_state" -> listener.onMixPushed(parseMixReport(message))
+                    "playback" -> parsePlaybackBuffer(message)?.let(listener::onPlaybackBuffer)
                 }
             } catch (error: Exception) {
                 listener.onControlError("Invalid control response: ${error.message ?: "unknown error"}")
@@ -490,14 +498,18 @@ internal class ControlChannel(
 /** The phone's `stats` carry `jitter_ms`, `cushion_ms` and `backlog_ms` ([LinkStatsReport]). */
 internal const val CAPABILITY_STATS_V2 = "stats.v2"
 
+/** The phone plays the buffer the desk sets: the `playback` message ([parsePlaybackBuffer]). */
+internal const val CAPABILITY_PLAYBACK_BUFFER = "playback.buffer"
+
 /**
  * What this build of the app implements, announced in every registration so the server only sends
  * a phone the messages it understands. A feature adds its name here, one line, once the phone
- * implements it: `playback.buffer` (the buffer set from the desk) and `redundancy.recovered` (the
- * packets a redundant copy brought) are still to come. Names are 1-32 of `[a-z0-9._-]`, at most 16.
+ * implements it: `redundancy.recovered` (the packets a redundant copy brought) is still to come.
+ * Names are 1-32 of `[a-z0-9._-]`, at most 16.
  */
 internal val CLIENT_CAPABILITIES: List<String> = listOf(
     CAPABILITY_STATS_V2,
+    CAPABILITY_PLAYBACK_BUFFER,
 )
 
 /**
@@ -639,5 +651,25 @@ internal fun parseChannelDetails(value: Any?, count: Int): List<ChannelInfo>? {
             hidden = entry.opt("hidden") == true,
             link = entry.opt("link") == true,
         )
+    }
+}
+
+/**
+ * The desk's buffer a `playback` message carries (`{"type":"playback","buffer":{"mode":"auto"}}` or
+ * `{"mode":"fixed","ms":40}`): [PlaybackLatency.DESK_BUFFER_AUTO] for Auto, else the fixed length
+ * in milliseconds. Null for anything the phone cannot use (no buffer, another mode, a length that is
+ * not a whole number from [PlaybackLatency.MIN_FIXED_BUFFER_MS] to
+ * [PlaybackLatency.MAX_FIXED_BUFFER_MS]), which is then ignored; fields it does not know are too.
+ */
+internal fun parsePlaybackBuffer(message: JSONObject): Int? {
+    val buffer = message.optJSONObject("buffer") ?: return null
+    return when (buffer.optString("mode")) {
+        "auto" -> PlaybackLatency.DESK_BUFFER_AUTO
+        "fixed" -> (buffer.opt("ms") as? Number)
+            ?.takeIf { it is Int || it is Long }
+            ?.toLong()
+            ?.takeIf { it in PlaybackLatency.MIN_FIXED_BUFFER_MS..PlaybackLatency.MAX_FIXED_BUFFER_MS }
+            ?.toInt()
+        else -> null
     }
 }

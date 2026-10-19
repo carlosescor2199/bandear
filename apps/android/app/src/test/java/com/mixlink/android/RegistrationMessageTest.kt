@@ -66,9 +66,9 @@ class RegistrationMessageTest {
     fun announcesWhatThisBuildImplements() {
         val announced = JSONObject(buildRegisterMessage("Ana", 50000)).getJSONArray("capabilities")
 
-        // `playback.buffer` and `redundancy.recovered` join the list with the features that use them.
-        assertEquals(listOf("stats.v2"), List(announced.length()) { announced.getString(it) })
-        assertEquals(listOf(CAPABILITY_STATS_V2), CLIENT_CAPABILITIES)
+        // `redundancy.recovered` joins the list with the feature that uses it.
+        assertEquals(listOf("stats.v2", "playback.buffer"), List(announced.length()) { announced.getString(it) })
+        assertEquals(listOf(CAPABILITY_STATS_V2, CAPABILITY_PLAYBACK_BUFFER), CLIENT_CAPABILITIES)
     }
 
     /** The server keeps 1-32 characters of `[a-z0-9._-]`, at most 16 names, each once. */

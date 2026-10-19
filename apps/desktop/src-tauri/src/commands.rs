@@ -3,9 +3,10 @@
 //! They live apart from the `#[tauri::command]` wrappers in the crate root so that an example
 //! binary can drive exactly the same code path without a window. The window is only a rendering of
 //! what these functions return. The engineer's local mix and its output have their own module,
-//! [local].
+//! [local], and so does recording takes, [recording].
 
 pub mod local;
+pub mod recording;
 
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
@@ -22,6 +23,7 @@ use personal_monitoring::{
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
 use self::local::{apply_kept_local, kept_local, with_pending, LocalEngine};
+use self::recording::{FolderOpener, RecordingsFolder, SystemFileManager};
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
@@ -73,11 +75,19 @@ pub struct DesktopState {
     /// Keeps the local mix in the session off the engine lock (see [local::saver]). Paused inside
     /// the engine lock by a start and a load; it writes taking only the session's lock.
     local_saver: LocalMixSaver,
+    /// The desk's default recordings folder (see [recording]).
+    recordings: RecordingsFolder,
+    /// Opens a take folder in the system's file manager (see [recording::open_take_folder]).
+    folder_opener: Box<dyn FolderOpener>,
 }
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
+    /// Takes go to a `Recordings` folder beside the session until [Self::with_recordings_folder]
+    /// names the desk's default.
     pub fn new(session: SessionStore) -> Self {
+        let recordings =
+            recording::default_recordings_folder(None, Some(session.directory().to_path_buf()));
         let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
         let session = Arc::new(session);
         let local_saver = {
@@ -97,7 +107,16 @@ impl DesktopState {
             snapshots,
             local_notice: Mutex::new(None),
             local_saver,
+            recordings,
+            folder_opener: Box::new(SystemFileManager),
         }
+    }
+
+    /// Makes `recordings` the desk's default recordings folder (see
+    /// [recording::default_recordings_folder]).
+    pub fn with_recordings_folder(mut self, recordings: RecordingsFolder) -> Self {
+        self.recordings = recordings;
+        self
     }
 
     /// Keeps `notice` as what the status says about the kept local output, or clears it.
@@ -2057,6 +2076,8 @@ fn save_session_with<E: DeskReader>(
     let desk = guard.as_ref().map(DeskReader::desk);
     let mixes = desk.as_ref().map(saved_mixes).unwrap_or_default();
     let mut current = session.current();
+    // How this desk records belongs to the desk, not to a show.
+    current.recording = None;
     if let Some(desk) = &desk {
         // The local mix the engine plays: an edit whose save failed, or levels a group or channel
         // change moved, are the engine's, not yet the session's.
@@ -2258,6 +2279,8 @@ fn load_session_with<E: SessionEngine>(
         local: saved_local
             .clone()
             .or_else(|| with_pending(previous.local, paused.pending())),
+        // How this desk records is the desk's own, whatever the saved session says.
+        recording: previous.recording,
         ..snapshot.session.clone()
     };
     let live = match guard.as_mut() {
@@ -2542,6 +2565,10 @@ mod tests {
             local_output: crate::dto::LocalOutputDto::from(
                 &personal_monitoring::LocalOutputStatus::default(),
             ),
+            recording: crate::dto::RecordingDto::from(
+                &personal_monitoring::RecordingStatus::default(),
+            ),
+            last_take: None,
         }
     }
 
@@ -5824,6 +5851,41 @@ mod tests {
             "the groups apply at the next start"
         );
         assert_eq!(outcome.session.name, "Show");
+    }
+
+    #[test]
+    fn the_recording_settings_stay_the_desks_own_through_a_save_and_a_load() {
+        let test = "session-recording";
+        let (session, snapshots, engine) = desk(test, None);
+        working_session(&session);
+        let desks = crate::session::SessionRecording {
+            folder: Some("D:\\Takes".to_owned()),
+            armed: vec![1, 2],
+            ..crate::session::SessionRecording::default()
+        };
+        session.set_recording(desks.clone()).expect("kept");
+
+        let saved = save_session_with(&engine, &session, &snapshots, "Show").expect("saved");
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(
+            read.snapshot.session.recording, None,
+            "a named session never carries this desk's recording settings"
+        );
+
+        let mut other = layout_session(&[], 0);
+        other.recording = Some(crate::session::SessionRecording {
+            folder: Some("E:\\Elsewhere".to_owned()),
+            include_local: true,
+            ..crate::session::SessionRecording::default()
+        });
+        saved_session(test, "other", &snapshot(other, &[]));
+        load_into(&engine, &session, &snapshots, "other").expect("loaded");
+
+        assert_eq!(
+            session.recording(),
+            Some(desks),
+            "a load keeps the desk's own recording settings"
+        );
     }
 
     /// [load_session_with] with no local mix waiting to be kept and the notice set aside.

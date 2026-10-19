@@ -12,10 +12,12 @@ pub mod sessions;
 
 use commands::DesktopState;
 use dto::{
-    AudioSettingsRequest, ChannelRequest, ChannelsSetDto, EngineStateDto, EngineerControlsRequest,
-    EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto, LocalOutputRequestDto,
-    LocalOutputSetDto, MirrorRequest, MirrorSetDto, MixDto, MixUpdateRequest, MixesSetDto,
-    OutputDeviceDto, PresetsDto, SessionLoadedDto, SessionSavedDto, StartRequest, StartSummary,
+    AudioSettingsRequest, ChannelRequest, ChannelsSetDto, DiskEstimateDto, EngineStateDto,
+    EngineerControlsRequest, EngineerControlsSetDto, GroupRequest, GroupsSetDto, InputDeviceDto,
+    LocalOutputRequestDto, LocalOutputSetDto, MirrorRequest, MirrorSetDto, MixDto,
+    MixUpdateRequest, MixesSetDto, OutputDeviceDto, PresetsDto, RecordingSettingsDto,
+    RecordingSettingsRequest, RecordingStartedDto, RecordingStoppedDto, SessionLoadedDto,
+    SessionSavedDto, StartRequest, StartSummary, TakeMarkerDto, TakesDto,
 };
 use events::EventPump;
 use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
@@ -302,6 +304,73 @@ async fn load_session(
     commands::load_session(state.inner(), id)
 }
 
+/// How this desk records takes: `{ folder, defaultFolder, folderIsDefault, format, includeLocal,
+/// armed, notice }` (see [commands::recording::recording_settings]).
+#[tauri::command]
+async fn recording_settings(
+    state: State<'_, DesktopState>,
+) -> Result<RecordingSettingsDto, String> {
+    commands::recording::recording_settings(state.inner())
+}
+
+/// Keeps `settings` (`{ folder, format, includeLocal, armed }`, the folder null for the default and
+/// the inputs 1-based) and answers them as kept (see [commands::recording::set_recording_settings]).
+#[tauri::command]
+async fn set_recording_settings(
+    state: State<'_, DesktopState>,
+    settings: RecordingSettingsRequest,
+) -> Result<RecordingSettingsDto, String> {
+    commands::recording::set_recording_settings(state.inner(), settings)
+}
+
+/// Starts recording a take called `takeName` with the kept settings (`utcOffsetMinutes`, the
+/// window's offset from UTC, names its folder in local time) and answers `{ recording, folder,
+/// armed, skipped, includeLocal, format }` (see [commands::recording::start_recording]).
+#[tauri::command]
+async fn start_recording(
+    state: State<'_, DesktopState>,
+    take_name: String,
+    utc_offset_minutes: Option<i32>,
+) -> Result<RecordingStartedDto, String> {
+    commands::recording::start_recording(state.inner(), take_name, utc_offset_minutes)
+}
+
+/// Stops the take and answers `{ finishing, take, message }`: the finished take, or `finishing`
+/// while its files are still being finished (ask again; see
+/// [commands::recording::stop_recording]).
+#[tauri::command]
+async fn stop_recording(state: State<'_, DesktopState>) -> Result<RecordingStoppedDto, String> {
+    commands::recording::stop_recording(state.inner())
+}
+
+/// Marks the take being recorded with `name` and answers `{ frame, seconds, name }` (see
+/// [commands::recording::add_marker]).
+#[tauri::command]
+async fn add_marker(state: State<'_, DesktopState>, name: String) -> Result<TakeMarkerDto, String> {
+    commands::recording::add_marker(state.inner(), name)
+}
+
+/// What a take with the kept settings would take on the disk: `{ folder, bytesPerSecond, freeBytes,
+/// minutesLeft, problem }` (see [commands::recording::record_estimate]).
+#[tauri::command]
+async fn record_estimate(state: State<'_, DesktopState>) -> Result<DiskEstimateDto, String> {
+    commands::recording::record_estimate(state.inner())
+}
+
+/// The takes in the recordings folder, the newest first: `{ folder, takes, unreadable, missing }`
+/// (see [commands::recording::list_takes]).
+#[tauri::command]
+async fn list_takes(state: State<'_, DesktopState>) -> Result<TakesDto, String> {
+    commands::recording::list_takes(state.inner())
+}
+
+/// Opens the take folder `folder` in the system's file manager; only a take folder inside the
+/// recordings folder (see [commands::recording::open_take_folder]).
+#[tauri::command]
+async fn open_take_folder(state: State<'_, DesktopState>, folder: String) -> Result<(), String> {
+    commands::recording::open_take_folder(state.inner(), folder)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -312,15 +381,24 @@ pub fn run() {
             // engine or any client protocol. Opening it never fails: a damaged file is set aside
             // and logged. The engineer's named sessions live beside it, in `sessions`.
             let directory = app.path().app_config_dir()?;
+            // Takes go to the user's Music folder + MixLink\Recordings by default; when it cannot
+            // be found, to the app's own data folder, and the recording settings say so.
+            let recordings = commands::recording::default_recordings_folder(
+                app.path().audio_dir().ok(),
+                app.path().app_local_data_dir().ok(),
+            );
+            if let Some(notice) = &recordings.notice {
+                eprintln!("[mixlink-desktop] {notice}");
+            }
             // Every engine the window starts streams its meters, status and mix changes as events
             // (see [events]); the app handle is both where the pump reads and where it emits.
             let handle = app.handle().clone();
             app.manage(
-                DesktopState::new(SessionStore::open(&directory)).with_event_pump(
-                    move |events, run| {
+                DesktopState::new(SessionStore::open(&directory))
+                    .with_recordings_folder(recordings)
+                    .with_event_pump(move |events, run| {
                         EventPump::start(events, run, handle.clone(), handle.clone())
-                    },
-                ),
+                    }),
             );
             Ok(())
         })
@@ -355,7 +433,15 @@ pub fn run() {
             save_session,
             rename_session,
             delete_session,
-            load_session
+            load_session,
+            recording_settings,
+            set_recording_settings,
+            start_recording,
+            stop_recording,
+            add_marker,
+            record_estimate,
+            list_takes,
+            open_take_folder
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")

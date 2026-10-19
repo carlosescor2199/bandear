@@ -103,6 +103,10 @@ pub struct TakeTrack {
     pub name: String,
     /// What the input carries when the take started; `None` for the local mix.
     pub instrument: Option<ChannelKind>,
+    /// The frames the file holds once the take ended (what a reader of it finds); 0 while the
+    /// take records. After a disk error the files may differ: the one that failed keeps the
+    /// frames of its last refresh.
+    pub frames: u64,
 }
 
 /// How a take ended.
@@ -147,8 +151,10 @@ pub struct TakeSummary {
     pub format: SampleFormat,
     /// The input device the take was recorded from.
     pub device: String,
+    /// Each with the frames its file holds.
     pub tracks: Vec<TakeTrack>,
-    /// The frames in every file.
+    /// The frames every file holds: the fewest of the tracks' frames. All files hold the same
+    /// unless a disk error stopped the take part-way through writing them.
     pub frames: u64,
     pub markers: Vec<TakeMarker>,
     /// Frames the disk could not keep up with, left out of every file.
@@ -361,6 +367,7 @@ pub(crate) fn plan_tracks(
                     .collect(),
                 name,
                 instrument: Some(meta.kind),
+                frames: 0,
             },
             sources,
         });
@@ -373,6 +380,7 @@ pub(crate) fn plan_tracks(
                 channels: Vec::new(),
                 name: "Local mix".to_owned(),
                 instrument: None,
+                frames: 0,
             },
             sources: Vec::new(),
         });
@@ -524,7 +532,8 @@ pub(crate) fn create_take_folder(
 /// What a take shares between the sink, the disk thread and the engine.
 #[derive(Default)]
 pub(crate) struct TakeShared {
-    /// Frames the sink put in the ring: the take's length so far.
+    /// Frames the sink put in the ring: the take's length so far. Dropped blocks are not in it,
+    /// as they are in no file, so it is the file position of the next frame (and of a marker).
     frames: AtomicU64,
     /// Frames the ring had no room for.
     dropped: AtomicU64,
@@ -541,15 +550,36 @@ pub(crate) struct TakeShared {
     /// How the engine ended the take. Never locked on the engine thread.
     end: Mutex<Option<TakeEnd>>,
     /// The take's markers, in the order added. Never locked on the engine thread.
-    markers: Mutex<Vec<TakeMarker>>,
+    markers: Mutex<MarkerBook>,
+}
+
+/// A take's markers, and whether it still takes new ones.
+#[derive(Default)]
+struct MarkerBook {
+    list: Vec<TakeMarker>,
+    /// The disk thread has taken the list for the take's end: no marker joins it any more, so
+    /// what the status shows is what `take.json` lists.
+    sealed: bool,
 }
 
 impl TakeShared {
-    fn markers(&self) -> Vec<TakeMarker> {
+    /// The markers' lock, taken back from a thread that panicked holding it: the list itself is
+    /// never left half-changed (a push is the only change).
+    fn marker_book(&self) -> std::sync::MutexGuard<'_, MarkerBook> {
         self.markers
             .lock()
-            .map(|markers| markers.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn markers(&self) -> Vec<TakeMarker> {
+        self.marker_book().list.clone()
+    }
+
+    /// The markers for the take's end, after which no marker is added.
+    fn seal_markers(&self) -> Vec<TakeMarker> {
+        let mut book = self.marker_book();
+        book.sealed = true;
+        book.list.clone()
     }
 
     /// No frame follows: the disk thread finishes the take.
@@ -861,9 +891,25 @@ struct TakeInfo {
 }
 
 impl TakeInfo {
-    /// The take of `frames` frames that ended as `ended`, with the markers and dropped frames
-    /// `shared` holds.
-    fn summary(&self, shared: &TakeShared, frames: u64, ended: TakeEnd) -> TakeSummary {
+    /// The take whose files hold `track_frames` (one count per track, in order), with `markers`
+    /// and the dropped frames `shared` counted, that ended as `ended`. Its frames are the frames
+    /// every file holds.
+    fn summary(
+        &self,
+        shared: &TakeShared,
+        track_frames: &[u64],
+        markers: Vec<TakeMarker>,
+        ended: TakeEnd,
+    ) -> TakeSummary {
+        let tracks: Vec<TakeTrack> = self
+            .tracks
+            .iter()
+            .zip(track_frames.iter().copied().chain(std::iter::repeat(0)))
+            .map(|(track, frames)| TakeTrack {
+                frames,
+                ..track.clone()
+            })
+            .collect();
         TakeSummary {
             folder: self.folder.clone(),
             name: self.name.clone(),
@@ -871,9 +917,9 @@ impl TakeInfo {
             sample_rate: TARGET_SAMPLE_RATE,
             format: self.format,
             device: self.device.clone(),
-            tracks: self.tracks.clone(),
-            frames,
-            markers: shared.markers(),
+            frames: tracks.iter().map(|track| track.frames).min().unwrap_or(0),
+            tracks,
+            markers,
             dropped_frames: shared.dropped.load(Ordering::Relaxed),
             ended,
         }
@@ -913,6 +959,7 @@ struct TrackJson<'a> {
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     instrument: Option<&'static str>,
+    frames: u64,
 }
 
 #[derive(Serialize)]
@@ -951,6 +998,7 @@ fn write_take_file(summary: &TakeSummary, recording: bool) -> io::Result<()> {
                 channels: &track.channels,
                 name: &track.name,
                 instrument: track.instrument.map(ChannelKind::name),
+                frames: track.frames,
             })
             .collect(),
         frames: summary.frames,
@@ -987,6 +1035,8 @@ struct TrackFile<T: WavTarget> {
     width: usize,
     /// Its samples of the frames being written.
     buffer: Vec<f32>,
+    /// The frames its header counts (its last refresh, or its finish): what a reader finds.
+    held: u64,
 }
 
 impl<T: WavTarget> TrackFile<T> {
@@ -1069,9 +1119,14 @@ fn run_disk<T: WavTarget>(
         .store(files.iter().map(TrackFile::bytes).sum(), Ordering::Relaxed);
     for file in &mut files {
         if let Some(writer) = file.writer.take() {
-            if let Err(error) = writer.finish() {
-                failure
-                    .get_or_insert_with(|| format!("could not finish \"{}\": {error}", file.file));
+            let frames = writer.frames();
+            match writer.finish() {
+                Ok(_) => file.held = frames,
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        format!("could not finish \"{}\": {error}", file.file)
+                    });
+                }
             }
         }
     }
@@ -1085,7 +1140,10 @@ fn run_disk<T: WavTarget>(
             .and_then(|end| end.clone())
             .unwrap_or(TakeEnd::Stopped),
     };
-    let mut summary = info.summary(&shared, written, ended);
+    let track_frames: Vec<u64> = files.iter().map(|file| file.held).collect();
+    // From here no marker joins the take, so take.json lists every marker the status showed.
+    let markers = shared.seal_markers();
+    let mut summary = info.summary(&shared, &track_frames, markers, ended);
     if let Err(error) = write_take_file(&summary, false) {
         if !matches!(summary.ended, TakeEnd::DiskError { .. }) {
             summary.ended = TakeEnd::DiskError {
@@ -1154,6 +1212,9 @@ fn keep_files<T: WavTarget>(files: &mut [TrackFile<T>], sync: bool) -> Result<()
             file.writer = None;
             return result;
         }
+        if let Some(writer) = &file.writer {
+            file.held = writer.frames();
+        }
     }
     Ok(())
 }
@@ -1182,12 +1243,14 @@ impl RunningTake {
 
     /// Waits for the disk thread and returns the take it finished.
     fn join(mut self) -> TakeSummary {
-        let frames = self.shared.written.load(Ordering::Acquire);
         match self.disk.take().map(JoinHandle::join) {
             Some(Ok(summary)) => summary,
+            // The disk thread ended without saying what its files hold: their last refresh
+            // covered at least the frames it reported written.
             _ => self.info.summary(
                 &self.shared,
-                frames,
+                &vec![self.shared.written.load(Ordering::Acquire); self.info.tracks.len()],
+                self.shared.seal_markers(),
                 TakeEnd::DiskError {
                     reason: "the recorder's disk thread failed".to_owned(),
                 },
@@ -1238,6 +1301,7 @@ pub(crate) fn open_take<O: TrackOpener>(
                 file: planned.track.file.clone(),
                 width: planned.width(),
                 buffer: Vec::with_capacity(CHUNK_FRAMES * planned.width()),
+                held: 0,
             }),
             Err(error) => {
                 drop(files);
@@ -1250,7 +1314,8 @@ pub(crate) fn open_take<O: TrackOpener>(
         }
     }
     let fresh = TakeShared::default();
-    if let Err(error) = write_take_file(&info.summary(&fresh, 0, TakeEnd::Stopped), true) {
+    let opening = info.summary(&fresh, &[], Vec::new(), TakeEnd::Stopped);
+    if let Err(error) = write_take_file(&opening, true) {
         drop(files);
         let _ = fs::remove_dir_all(&folder);
         return Err(format!("could not write {TAKE_FILE}: {error}"));
@@ -1431,34 +1496,47 @@ impl Recorder {
         }
     }
 
-    /// Marks the frame being recorded with `name` (`Marker n` when blank, at most
-    /// [MAX_MARKER_CHARS] characters): the first frame of the block the sink records next, so a
-    /// marker is accurate to the block. An error when no take records.
+    /// Marks the frame being recorded with `name` (at most [MAX_MARKER_CHARS] characters; when
+    /// blank, the first `Marker n` from the marker count on that no marker has): the first frame
+    /// of the block the sink records next, a position in the files (dropped blocks are in no
+    /// file), so a marker is accurate to the block. An error when no take records, or once the
+    /// take stopped taking markers (asked to stop, failed, or ended).
     pub(crate) fn add_marker(&self, name: &str) -> Result<TakeMarker, String> {
         let Some(take) = self.take.as_ref().filter(|take| !take.stopping) else {
             return Err("no take is recording".to_owned());
         };
-        let mut markers = take
-            .shared
-            .markers
-            .lock()
-            .map_err(|_| "the take's markers were poisoned".to_owned())?;
-        // Checked under the lock the disk thread reads the markers with, after it stops a take, so
-        // a marker is never added to a take whose take.json is already written.
+        // Checked under the lock the disk thread seals the markers with when it builds the take's
+        // end, and after a failure is stored, so a marker the status shows is always in take.json.
+        let mut book = take.shared.marker_book();
+        if book.sealed {
+            return Err("the take is no longer recording".to_owned());
+        }
         if let Some(reason) = take.shared.failure() {
             return Err(format!("the take stopped recording: {reason}"));
         }
         let trimmed = name.trim();
+        let name = if trimmed.is_empty() {
+            (book.list.len() + 1..)
+                .map(|number| format!("Marker {number}"))
+                .find(|candidate| book.list.iter().all(|marker| marker.name != *candidate))
+                .unwrap_or_else(|| "Marker".to_owned())
+        } else {
+            trimmed.chars().take(MAX_MARKER_CHARS).collect()
+        };
         let marker = TakeMarker {
             frame: take.shared.frames.load(Ordering::Acquire),
-            name: if trimmed.is_empty() {
-                format!("Marker {}", markers.len() + 1)
-            } else {
-                trimmed.chars().take(MAX_MARKER_CHARS).collect()
-            },
+            name,
         };
-        markers.push(marker.clone());
+        book.list.push(marker.clone());
         Ok(marker)
+    }
+
+    /// The frames the disk thread has written to every file and refreshed.
+    #[cfg(test)]
+    pub(crate) fn written(&self) -> u64 {
+        self.take
+            .as_ref()
+            .map_or(0, |take| take.shared.written.load(Ordering::Acquire))
     }
 }
 
@@ -1706,10 +1784,19 @@ pub(crate) mod tests {
 
     impl Bench {
         fn start<O: TrackOpener>(&mut self, request: &RecordRequest, opener: O) -> PathBuf {
+            self.start_with(request, opener, eager())
+        }
+
+        fn start_with<O: TrackOpener>(
+            &mut self,
+            request: &RecordRequest,
+            opener: O,
+            options: TakeOptions,
+        ) -> PathBuf {
             let tracks = plan_tracks(&four_inputs(), 4, &request.armed, request.include_local)
                 .expect("a valid plan");
             let (feed, take) =
-                open_take(request, "Test input", tracks, 4, started(), opener, eager())
+                open_take(request, "Test input", tracks, 4, started(), opener, options)
                     .expect("the take opens");
             let folder = take.info.folder.clone();
             self.recorder.start(feed, take).expect("the sink listens");
@@ -1785,12 +1872,14 @@ pub(crate) mod tests {
             json["tracks"],
             serde_json::json!([
                 { "file": "01 Vocal.wav", "kind": "input", "channels": [1], "name": "Vocal",
-                  "instrument": "voice" },
+                  "instrument": "voice", "frames": 192 },
                 { "file": "03-04 Keys.wav", "kind": "pair", "channels": [3, 4], "name": "Keys",
-                  "instrument": "keys" },
-                { "file": "Local mix.wav", "kind": "local", "channels": [], "name": "Local mix" },
+                  "instrument": "keys", "frames": 192 },
+                { "file": "Local mix.wav", "kind": "local", "channels": [], "name": "Local mix",
+                  "frames": 192 },
             ])
         );
+        assert!(summary.tracks.iter().all(|track| track.frames == 192));
         assert!(
             !folder.join("take.json.tmp").exists(),
             "written through a temporary file"
@@ -1940,7 +2029,8 @@ pub(crate) mod tests {
 
     /// A write that fails stops only the take: it reports the reason, the sink feeds it no more,
     /// the failed file keeps the audio of its last refresh, the other file is finished, and
-    /// `take.json` says the disk ended it.
+    /// `take.json` says the disk ended it. The second file fails, so the first may already hold
+    /// the frames the failing pass wrote: every count the take reports is what its files hold.
     #[test]
     fn a_failed_write_stops_the_take_and_keeps_what_was_refreshed() {
         let parent = scratch_directory("failed");
@@ -1949,7 +2039,7 @@ pub(crate) mod tests {
         let folder = bench.start(
             &request(&parent, vec![0, 1], SampleFormat::Float32),
             FailingOpener {
-                failing: "01",
+                failing: "02",
                 fail: Arc::clone(&fail),
             },
         );
@@ -1968,7 +2058,7 @@ pub(crate) mod tests {
         let RecordingState::Failed { reason } = bench.recorder.status().state else {
             unreachable!("checked above");
         };
-        assert!(reason.contains("01 Vocal.wav"), "{reason}");
+        assert!(reason.contains("02 CH 2.wav"), "{reason}");
         assert!(reason.contains("no space left"), "{reason}");
         bench.sink.process(&block(&input, 4));
         assert_eq!(
@@ -1979,13 +2069,19 @@ pub(crate) mod tests {
 
         let summary = bench.stop();
         assert_eq!(summary.ended, TakeEnd::DiskError { reason });
-        assert_eq!(read_wav(&folder.join("01 Vocal.wav")).1.len(), 128);
-        // The failing refresh may come before or after the third block is written: the other
-        // file is finished with every frame the take wrote either way.
-        let other = read_wav(&folder.join("02 CH 2.wav")).1.len();
-        assert!(other == 128 || other == 192, "{other}");
-        assert_eq!(other as u64, summary.frames);
+        let failed = read_wav(&folder.join("02 CH 2.wav")).1.len() as u64;
+        assert_eq!(failed, 128, "the failed file keeps its last refresh");
+        // The failing refresh may come before or after the third block is written, so the first
+        // file holds 128 or 192 frames: the take reports exactly what each file holds.
+        let first = read_wav(&folder.join("01 Vocal.wav")).1.len() as u64;
+        assert!(first == 128 || first == 192, "{first}");
+        let held: Vec<u64> = summary.tracks.iter().map(|track| track.frames).collect();
+        assert_eq!(held, vec![first, failed]);
+        assert_eq!(summary.frames, 128, "the frames every file holds");
         let json = read_json(&folder.join(TAKE_FILE));
+        assert_eq!(json["frames"], 128);
+        assert_eq!(json["tracks"][0]["frames"], first);
+        assert_eq!(json["tracks"][1]["frames"], failed);
         assert_eq!(json["ended"]["how"], "diskError");
         assert!(json["ended"]["reason"]
             .as_str()
@@ -2041,6 +2137,151 @@ pub(crate) mod tests {
             .add_marker("Late")
             .expect_err("no take records");
         assert!(refused.contains("recording"), "{refused}");
+    }
+
+    /// A take's frames are the frames every file holds, and each track says what its file holds,
+    /// even when a disk error left them apart.
+    #[test]
+    fn the_take_counts_the_frames_every_file_holds() {
+        let tracks = plan_tracks(&four_inputs(), 4, &[0, 1, 2], false).expect("a valid plan");
+        let info = TakeInfo {
+            folder: PathBuf::from("take"),
+            name: "Take".to_owned(),
+            started: rfc3339_utc(started()),
+            format: SampleFormat::Int24,
+            device: "Test input".to_owned(),
+            tracks: tracks.into_iter().map(|planned| planned.track).collect(),
+        };
+
+        let summary = info.summary(
+            &TakeShared::default(),
+            &[192, 128, 192],
+            Vec::new(),
+            TakeEnd::Stopped,
+        );
+
+        assert_eq!(summary.frames, 128);
+        assert_eq!(
+            summary
+                .tracks
+                .iter()
+                .map(|track| track.frames)
+                .collect::<Vec<_>>(),
+            vec![192, 128, 192]
+        );
+    }
+
+    /// Dropped blocks are in no file, so a marker after them still lands on its frame in the
+    /// files: the disk thread does not look at the ring until the take stops, so most blocks
+    /// overflow it, and the marker is where the files end.
+    #[test]
+    fn a_marker_after_dropped_blocks_lands_on_its_frame_in_the_files() {
+        let parent = scratch_directory("dropped-marker");
+        let mut bench = bench();
+        let folder = bench.start_with(
+            &request(&parent, vec![0], SampleFormat::Float32),
+            FileOpener,
+            TakeOptions {
+                ring_frames: 128,
+                timings: DiskTimings {
+                    refresh: Duration::from_secs(60),
+                    sync: Duration::from_secs(60),
+                    poll: Duration::from_secs(60),
+                },
+            },
+        );
+        let input = numbered(0, 64, 4);
+        for _ in 0..10 {
+            bench.sink.process(&block(&input, 4));
+        }
+
+        let marker = bench
+            .recorder
+            .add_marker("After the drops")
+            .expect("a take");
+        let summary = bench.stop();
+
+        assert!(summary.dropped_frames > 0, "the ring overflowed");
+        assert_eq!(marker.frame + summary.dropped_frames, 10 * 64);
+        assert_eq!(
+            read_wav(&folder.join("01 Vocal.wav")).1.len() as u64,
+            marker.frame
+        );
+        assert_eq!(summary.frames, marker.frame);
+    }
+
+    /// Once the disk thread has built the take's end (here the engine thread is gone, so the take
+    /// closes without being asked to stop), no marker is taken: the status shows exactly the
+    /// markers `take.json` lists.
+    #[test]
+    fn a_take_that_ended_takes_no_more_markers() {
+        let parent = scratch_directory("sealed");
+        let mut bench = bench();
+        let folder = bench.start(&request(&parent, vec![0], SampleFormat::Int24), FileOpener);
+        bench.sink.process(&block(&numbered(0, 64, 4), 4));
+        let intro = bench.recorder.add_marker("Intro").expect("a take records");
+        let take = bench.recorder.take.as_ref().expect("a take");
+        take.shared.close();
+        take.wake();
+        assert!(until(|| bench
+            .recorder
+            .take
+            .as_ref()
+            .is_some_and(RunningTake::disk_finished)));
+
+        let late = bench
+            .recorder
+            .add_marker("Late")
+            .expect_err("the take ended");
+
+        assert!(late.contains("no longer recording"), "{late}");
+        assert_eq!(bench.recorder.status().markers, vec![intro.clone()]);
+        let json = read_json(&folder.join(TAKE_FILE));
+        assert_eq!(
+            json["markers"],
+            serde_json::json!([{ "frame": 64, "name": "Intro" }])
+        );
+        assert_eq!(bench.stop().markers, vec![intro]);
+    }
+
+    /// A blank name takes the first "Marker n" from the marker count on that no marker has.
+    #[test]
+    fn default_marker_names_never_repeat() {
+        let parent = scratch_directory("marker-names");
+        let mut bench = bench();
+        bench.start(&request(&parent, vec![0], SampleFormat::Int24), FileOpener);
+
+        let names: Vec<String> = ["Marker 2", "", "", "Marker 5", ""]
+            .iter()
+            .map(|name| bench.recorder.add_marker(name).expect("a take").name)
+            .collect();
+
+        assert_eq!(
+            names,
+            ["Marker 2", "Marker 3", "Marker 4", "Marker 5", "Marker 6"]
+        );
+        bench.stop();
+    }
+
+    /// A thread that panicked holding the markers' lock loses none of them.
+    #[test]
+    fn markers_survive_a_poisoned_lock() {
+        let shared = Arc::new(TakeShared::default());
+        shared.marker_book().list.push(TakeMarker {
+            frame: 64,
+            name: "Verse".to_owned(),
+        });
+        let holder = Arc::clone(&shared);
+        let panicked = thread::spawn(move || {
+            let _book = holder.marker_book();
+            panic!("a thread failed holding the markers (expected by this test)");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(shared.markers.is_poisoned());
+
+        assert_eq!(shared.markers().len(), 1);
+        assert_eq!(shared.seal_markers()[0].name, "Verse");
     }
 
     /// The minutes left are the free space over the bytes per second of every armed track.

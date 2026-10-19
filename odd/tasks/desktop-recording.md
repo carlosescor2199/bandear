@@ -361,7 +361,24 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     frees idle, on the block that starts a take, over 500 recorded blocks and on the block that
     stops it; clippy reports nothing new (its 7 warnings are older); desktop `cargo check
     --all-targets` clean (three status literals gained `recording`).
-  - Commits: baa4676 (recording, 2,096 lines). Commit: this commit (markers and disk estimate).
+  - Commits: baa4676 (recording, 2,096 lines), a4d4bf1 (markers and disk estimate).
+  - [x] T4a-fix (review findings of review-df4473db63140231 and review-82387e9cddd5d953): every
+    count a take reports is what its files hold. Each `TakeTrack` (and its `take.json` entry) has
+    `frames`, the frames its header counts (its finish, or the last refresh of a file that
+    failed), and the take's `frames` is the fewest of them, the frames every file holds (part 1
+    R3-001). The disk-error engine test waits for the block to be written and refreshed, not for
+    headers (R3-002). A marker after dropped blocks is proven to land on its frame in the files:
+    the counter never included dropped blocks (part 2 R3-001). The disk thread seals the markers
+    under their lock when it builds the take's end, and `add_marker` refuses a sealed or failed
+    take under that lock, so the status never shows a marker `take.json` lacks (R3-002). A
+    poisoned markers lock gives back its list (R3-003). A blank marker name takes the first free
+    "Marker n" (R3-004). RED by mutation in one build (frames as the most instead of the fewest,
+    no sealed check, "Marker n" from the count alone, an empty list on a poisoned lock): 5 of 405
+    failed (`the_take_counts_the_frames_every_file_holds`, the failed-write test,
+    `a_take_that_ended_takes_no_more_markers`, `default_marker_names_never_repeat`,
+    `markers_survive_a_poisoned_lock`). The dropped-blocks marker test has no RED (already
+    correct, now proven); the engine test's wait has no RED. GREEN: server unit tests 400 -> 405
+    on 3 runs, and 15 repeated runs of the recording tests. Commit: this commit.
 - [ ] T4b (recorder and takes, desktop): Tauri commands and settings over the T4a API (folder,
   format, include local mix, arming), status and events. Route: delegated writer.
 - [ ] T5 (Record screen): the Record section per the design, the REC chip, takes table and
@@ -400,7 +417,11 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   acknowledged; both findings (R3-001 the exit test racing the saver's interval, R3-002 an empty
   data chunk read as audio) are fixed by T3-fix. Next review base: b9e1073.
 - T3-fix (f0950d7) is pending review in the slice from b9e1073.
-- T4 split into T4a (engine, done in baa4676 and the markers and disk estimate commit) and T4b
+- T3-fix and T4a were reviewed in two parts because of the reviewer's budget, both approved and
+  acknowledged: review-df4473db63140231 (b9e1073..baa4676) and review-82387e9cddd5d953
+  (baa4676..a4d4bf1). Their findings (part 1 R3-001 and R3-002, part 2 R3-001 to R3-004) are
+  fixed by T4a-fix. Next review base: a4d4bf1.
+- T4 split into T4a (engine, done in baa4676 and a4d4bf1) and T4b
   (desktop).
 
 ## Next step

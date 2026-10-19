@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
-    LinkHealth, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin, MixUpdate, MixValues,
-    MusicianKey, MusicianStatus, OutputDevice, RecordingState, RecordingStatus, SampleFormat,
-    SoundcheckClock, SoundcheckState, SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary,
-    TakeTrack,
+    LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin,
+    MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, RecordingState,
+    RecordingStatus, SampleFormat, SoundcheckClock, SoundcheckState, SoundcheckStatus, TakeEnd,
+    TakeMarker, TakeSummary, TakeTrack,
 };
 
 use crate::session::{
@@ -223,6 +223,14 @@ pub struct MusicianDto {
     /// What the musician's phone announced it supports (for example "stats.v2"), in the order
     /// sent; empty for a configured target and for a phone that predates capabilities.
     pub capabilities: Vec<String>,
+    /// The control channel's round trip in milliseconds, smoothed, and the last one measured; null
+    /// until its first pong. It does not come from the phone's reports, so an older phone has one
+    /// too.
+    pub rtt_ms: Option<f64>,
+    pub rtt_last_ms: Option<f64>,
+    /// The newest second of the musician's link history (a gap included); null before their
+    /// phone's first report. The history itself is read with `link_history`, never carried here.
+    pub link_latest: Option<LinkSampleDto>,
     /// Whose mix this musician's follows (see [crate::commands::set_mirror]); null when it
     /// follows nobody.
     pub mirror: Option<MirrorDto>,
@@ -832,9 +840,73 @@ impl From<&MusicianStatus> for MusicianDto {
             loss_percent: musician.link.loss_percent,
             receive_timeouts_per_second: musician.link.receive_timeouts_per_second,
             capabilities: musician.capabilities.clone(),
+            rtt_ms: musician.link.round_trip.smoothed_ms,
+            rtt_last_ms: musician.link.round_trip.last_ms,
+            link_latest: musician.link.latest.as_ref().map(LinkSampleDto::from),
             mirror: musician.mirror.as_ref().map(MirrorDto::from),
         }
     }
+}
+
+/// One second of a musician's link history, for the window (see
+/// [personal_monitoring::LinkSample]). Every number is null in a gap, the round trip excepted, and
+/// the phone's own numbers (jitter, cushion, backlog, recovered) are null when it does not report
+/// them.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkSampleDto {
+    /// When, in Unix milliseconds (UTC).
+    pub at_ms: u64,
+    /// No report arrived for this second while the phone was connected.
+    pub gap: bool,
+    /// The first sample after the phone reconnected.
+    pub reconnected: bool,
+    /// "unknown" (a gap), "good", "warning" or "bad".
+    pub health: &'static str,
+    pub interval_ms: Option<u32>,
+    pub packets_received: Option<u64>,
+    pub packets_lost: Option<u64>,
+    pub loss_percent: Option<f64>,
+    pub underruns: Option<u64>,
+    pub receive_timeouts: Option<u64>,
+    pub rtt_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub cushion_ms: Option<f64>,
+    pub backlog_ms: Option<f64>,
+    pub recovered: Option<u64>,
+}
+
+impl From<&LinkSample> for LinkSampleDto {
+    fn from(sample: &LinkSample) -> Self {
+        Self {
+            at_ms: sample.at_ms,
+            gap: sample.gap,
+            reconnected: sample.reconnected,
+            health: link_health_name(sample.health),
+            interval_ms: sample.interval_ms,
+            packets_received: sample.packets_received,
+            packets_lost: sample.packets_lost,
+            loss_percent: sample.loss_percent,
+            underruns: sample.underruns,
+            receive_timeouts: sample.receive_timeouts,
+            rtt_ms: sample.rtt_ms,
+            jitter_ms: sample.jitter_ms,
+            cushion_ms: sample.cushion_ms,
+            backlog_ms: sample.backlog_ms,
+            recovered: sample.recovered,
+        }
+    }
+}
+
+/// What `link_history` answers: the musician's key as asked, their samples after `sinceMs` (all of
+/// them without it), the oldest first, and how many a history keeps and how far apart they are.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkHistoryDto {
+    pub musician_key: String,
+    pub samples: Vec<LinkSampleDto>,
+    pub max_samples: usize,
+    pub period_ms: u64,
 }
 
 /// The name of a link health level, in the lowercase the window matches on.
@@ -1670,6 +1742,52 @@ mod tests {
         ] {
             assert!(older.get(field).is_some(), "{field} is still on the row");
         }
+    }
+
+    #[test]
+    fn a_row_carries_the_round_trip_and_the_newest_sample_but_never_the_history() {
+        let latest = LinkSample {
+            at_ms: 5_000,
+            gap: false,
+            reconnected: false,
+            health: LinkHealth::Warning,
+            interval_ms: Some(1_000),
+            packets_received: Some(199),
+            packets_lost: Some(1),
+            loss_percent: Some(0.5),
+            underruns: Some(0),
+            receive_timeouts: Some(0),
+            rtt_ms: Some(7.0),
+            jitter_ms: None,
+            cushion_ms: Some(40.0),
+            backlog_ms: None,
+            recovered: None,
+        };
+        let phone = musician_with_link(LinkStatus {
+            round_trip: personal_monitoring::RoundTrip {
+                last_ms: Some(7.0),
+                smoothed_ms: Some(6.5),
+            },
+            latest: Some(latest),
+            ..LinkStatus::default()
+        });
+
+        let row = serde_json::to_value(MusicianDto::from(&phone)).expect("serializes");
+        let never = serde_json::to_value(MusicianDto::from(&musician_with_link(
+            LinkStatus::default(),
+        )))
+        .expect("serializes");
+
+        assert_eq!(row["rttMs"], 6.5, "smoothed");
+        assert_eq!(row["rttLastMs"], 7.0);
+        assert_eq!(row["linkLatest"]["atMs"], 5_000);
+        assert_eq!(row["linkLatest"]["health"], "warning");
+        assert_eq!(row["linkLatest"]["cushionMs"], 40.0);
+        assert!(row["linkLatest"]["jitterMs"].is_null());
+        assert!(row.get("linkHistory").is_none() && row.get("samples").is_none());
+        assert!(never["rttMs"].is_null());
+        assert!(never["rttLastMs"].is_null());
+        assert!(never["linkLatest"].is_null());
     }
 
     #[test]

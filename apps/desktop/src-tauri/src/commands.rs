@@ -7,6 +7,7 @@
 //! [soundcheck].
 
 pub mod backups;
+pub mod link_history;
 pub mod local;
 pub mod recording;
 pub mod soundcheck;
@@ -2608,6 +2609,9 @@ mod tests {
                     loss_percent: None,
                     receive_timeouts_per_second: None,
                     capabilities: Vec::new(),
+                    rtt_ms: None,
+                    rtt_last_ms: None,
+                    link_latest: None,
                     mirror: None,
                 })
                 .collect(),

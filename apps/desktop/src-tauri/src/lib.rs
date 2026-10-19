@@ -453,6 +453,18 @@ async fn restore_mix_backup(
     commands::backups::restore_mix_backup(state.inner(), stamp)
 }
 
+/// The link history of the musician `musicianKey` names (`client:<id>` or `address:<ip:port>`):
+/// `{ musicianKey, samples, maxSamples, periodMs }`, the samples after `sinceMs` (Unix
+/// milliseconds) or all of them, the oldest first (see [commands::link_history]).
+#[tauri::command]
+async fn link_history(
+    state: State<'_, DesktopState>,
+    musician_key: String,
+    since_ms: Option<u64>,
+) -> Result<dto::LinkHistoryDto, String> {
+    commands::link_history::link_history(state.inner(), &musician_key, since_ms)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -550,7 +562,8 @@ pub fn run() {
             stop_soundcheck,
             log_location,
             list_mix_backups,
-            restore_mix_backup
+            restore_mix_backup,
+            link_history
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")

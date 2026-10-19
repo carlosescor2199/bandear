@@ -225,6 +225,10 @@ function musicianRow(address, identity, link, mixChanges = {}) {
     clientId: null,
     name: null,
     nameIsLocal: false,
+    capabilities: [],
+    rttMs: null,
+    rttLastMs: null,
+    linkLatest: null,
     ...identity,
     ...mergeMixUpdate(defaultMix(), mixChanges),
     revision: 1,
@@ -351,6 +355,7 @@ export function sampleStatus() {
           clientName: "Lead vocal",
           clientId: "5f0c2a8e-1b7d-4c3a-9e6f-2d8b4a7c1e90",
           name: "Lead vocal",
+          capabilities: ["stats.v2", "playback.buffer"],
         },
         GOOD,
         {
@@ -362,7 +367,12 @@ export function sampleStatus() {
       ),
       musicianRow(
         "192.168.1.12:50000",
-        { clientName: "Bass", clientId: "a3d9e7b1-6c2f-4e8a-b5d0-7f1c9e3a2b64", name: "Bass" },
+        {
+          clientName: "Bass",
+          clientId: "a3d9e7b1-6c2f-4e8a-b5d0-7f1c9e3a2b64",
+          name: "Bass",
+          capabilities: ["stats.v2"],
+        },
         WARNING,
       ),
       musicianRow(
@@ -471,6 +481,164 @@ export function syntheticMeters(status, time) {
     ? heardLevels(status.localMix, hidden, channels)
     : { left: 0, right: 0 };
   return { run: status.run, channels, musicians, local };
+}
+
+/** How many one-second samples a link history keeps, as the desktop's does: ten minutes. */
+export const LINK_HISTORY_SAMPLES = 600;
+
+/** The time one link history sample stands for, in milliseconds. */
+export const LINK_SAMPLE_PERIOD_MS = 1000;
+
+// A stable number in [0, 1) for `text` and `index`: the same musician and second give the same one.
+function noise(text, index) {
+  let hash = (2166136261 ^ index) >>> 0;
+  for (const char of String(text)) {
+    hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  }
+  hash = Math.imul(hash ^ (hash >>> 15), 2246822507);
+  hash ^= hash >>> 13;
+  return (hash >>> 0) / 4294967296;
+}
+
+// How each fake link behaves, by the row's level: the mean loss in percent, an underrun every so
+// many seconds (0 for none), the round trip and jitter ranges in milliseconds, the phone's
+// cushion, the second of every ten minutes it reconnected at (null for never) and how many of the newest seconds
+// are gaps (its reports stopped). A phone that never reported only has a round trip.
+const LINK_PROFILES = Object.freeze({
+  good: {
+    loss: 0.05,
+    underrunEvery: 0,
+    rtt: [3, 6],
+    jitter: [0.5, 2],
+    cushion: 40,
+    reconnectedAt: null,
+    silentFor: 0,
+  },
+  warning: {
+    loss: 1.2,
+    underrunEvery: 9,
+    rtt: [8, 25],
+    jitter: [3, 9],
+    cushion: 60,
+    reconnectedAt: 360,
+    silentFor: 0,
+  },
+  bad: {
+    loss: 0.4,
+    underrunEvery: 0,
+    rtt: [12, 40],
+    jitter: [2, 6],
+    cushion: 40,
+    reconnectedAt: null,
+    silentFor: 20,
+  },
+  unknown: { rtt: [4, 9] },
+});
+
+const round1 = (value) => Math.round(value * 10) / 10;
+
+// The control channel's round trip of `row` in the second `second`; null for a row not connected.
+function fakeRoundTrip(row, second) {
+  if (!row.controlConnected) {
+    return null;
+  }
+  const [low, high] = (LINK_PROFILES[row.linkHealth] ?? LINK_PROFILES.unknown).rtt;
+  return round1(low + (high - low) * noise(row.clientId ?? row.address, second * 5 + 1));
+}
+
+// The level a second's numbers reach, on the desktop's thresholds (see health.rs).
+function sampleHealth(lost, expected, underruns) {
+  if (lost * 10000 >= 200 * expected || underruns >= 2) {
+    return "bad";
+  }
+  return underruns > 0 || lost * 10000 >= 50 * expected ? "warning" : "good";
+}
+
+/**
+ * The link history of `row` (a status row) up to `time` milliseconds, as `link_history` answers
+ * its samples: one a second, the oldest first, the newest `count` of at most LINK_HISTORY_SAMPLES.
+ * The same row and time give the same samples. A row that never reported (`linkHealth` "unknown")
+ * or is not connected has none; a "warning" link reconnects once every ten minutes; a lost ("bad")
+ * link's newest 20 seconds are gaps; a phone that does not announce "stats.v2" reports no jitter,
+ * cushion or backlog, and only one that announces "redundancy.recovered" reports recovered packets.
+ */
+export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES) {
+  const profile = LINK_PROFILES[row.linkHealth];
+  if (!profile || row.linkHealth === "unknown" || !row.controlConnected) {
+    return [];
+  }
+  const capabilities = row.capabilities ?? [];
+  const extras = capabilities.includes("stats.v2");
+  const recovering = capabilities.includes("redundancy.recovered");
+  const key = row.clientId ?? row.address;
+  const newest = Math.floor(time / LINK_SAMPLE_PERIOD_MS);
+  const samples = [];
+  for (let back = Math.min(count, LINK_HISTORY_SAMPLES) - 1; back >= 0; back -= 1) {
+    const second = newest - back;
+    const atMs = second * LINK_SAMPLE_PERIOD_MS;
+    const rttMs = fakeRoundTrip(row, second);
+    const reconnected = profile.reconnectedAt === second % LINK_HISTORY_SAMPLES;
+    if (back < profile.silentFor) {
+      samples.push({
+        atMs,
+        gap: true,
+        reconnected,
+        health: "unknown",
+        intervalMs: null,
+        packetsReceived: null,
+        packetsLost: null,
+        lossPercent: null,
+        underruns: null,
+        receiveTimeouts: null,
+        rttMs,
+        jitterMs: null,
+        cushionMs: null,
+        backlogMs: null,
+        recovered: null,
+      });
+      continue;
+    }
+    const expected = 200;
+    const lost = Math.round(noise(key, second * 5 + 2) * 2 * expected * (profile.loss / 100));
+    const underruns = profile.underrunEvery && second % profile.underrunEvery === 0 ? 1 : 0;
+    const [low, high] = profile.jitter;
+    samples.push({
+      atMs,
+      gap: false,
+      reconnected,
+      health: sampleHealth(lost, expected, underruns),
+      intervalMs: LINK_SAMPLE_PERIOD_MS,
+      packetsReceived: expected - lost,
+      packetsLost: lost,
+      lossPercent: (lost * 100) / expected,
+      underruns,
+      receiveTimeouts: 0,
+      rttMs,
+      jitterMs: extras ? round1(low + (high - low) * noise(key, second * 5 + 3)) : null,
+      cushionMs: extras ? profile.cushion : null,
+      backlogMs: extras ? round1(profile.cushion - 10 * noise(key, second * 5 + 4)) : null,
+      recovered: recovering ? Math.min(lost, 1) : null,
+    });
+  }
+  return samples;
+}
+
+/**
+ * The round trip a status row shows for `row` at `time` milliseconds: `{ rttMs, rttLastMs }`, the
+ * smoothed one (the mean of the last eight seconds) and the last; both null for a row not
+ * connected. A phone that never reported has one too: it comes from the control channel.
+ */
+export function syntheticRoundTrip(row, time) {
+  const newest = Math.floor(time / LINK_SAMPLE_PERIOD_MS);
+  const last = fakeRoundTrip(row, newest);
+  if (last === null) {
+    return { rttMs: null, rttLastMs: null };
+  }
+  let sum = 0;
+  for (let back = 0; back < 8; back += 1) {
+    sum += fakeRoundTrip(row, newest - back);
+  }
+  return { rttMs: round1(sum / 8), rttLastMs: last };
 }
 
 function hostOf(address) {
@@ -605,7 +773,10 @@ function backupStamp(at) {
  * newest first (`mixBackups` seeds them, one with a `problem` cannot be restored), and
  * `restore_mix_backup` pushes each backed-up mix to the musician here under its key as a load does
  * (a phone not connected and a musician not here are skipped), refusing a stamp that names no
- * backup and a restore with the engine stopped; `mixBackups()` reads them.
+ * backup and a restore with the engine stopped; `mixBackups()` reads them. Link histories too:
+ * every connected row carries a round trip (`rttMs`, `rttLastMs`) and its newest second
+ * (`linkLatest`), and `link_history` answers a musician's ten minutes of generated seconds (see
+ * syntheticLinkHistory) by their key, newer than `sinceMs` when given, as the desktop does.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -814,10 +985,20 @@ export function createFakeBridge({
   // recorded as it stands now and the last take that ended.
   function statusNow() {
     showMirrors();
+    showLinks();
     engine.recording = recordingNow();
     engine.lastTake = lastTake ? clone(lastTake) : null;
     engine.soundcheck = soundcheckNow();
     return clone(engine);
+  }
+
+  // Each row's round trip and newest link history sample now, as the engine reports them.
+  function showLinks() {
+    const now = clock();
+    for (const row of engine.musicians) {
+      Object.assign(row, syntheticRoundTrip(row, now));
+      row.linkLatest = syntheticLinkHistory(row, now, 1)[0] ?? null;
+    }
   }
 
   // ---- Recording takes, with the desktop's rules (see recording.js and commands/recording.rs).
@@ -2334,6 +2515,29 @@ export function createFakeBridge({
         localLoaded,
         localMix,
         localOutputNotice,
+      };
+    },
+    link_history({ musicianKey, sinceMs = null } = {}) {
+      // As the desktop answers: a key of the desk's forms, then a running engine, then a musician.
+      const key = String(musicianKey ?? "");
+      if (!key.startsWith("client:") && !key.startsWith("address:")) {
+        throw `\`${key}\` names no phone or address`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const row = rowForKey(key);
+      if (!row) {
+        throw `\`${key}\` names no musician`;
+      }
+      const samples = syntheticLinkHistory(row, clock()).filter(
+        (sample) => sinceMs === null || sample.atMs > sinceMs,
+      );
+      return {
+        musicianKey: key,
+        samples,
+        maxSamples: LINK_HISTORY_SAMPLES,
+        periodMs: LINK_SAMPLE_PERIOD_MS,
       };
     },
     list_mix_backups() {

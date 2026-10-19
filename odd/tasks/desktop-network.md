@@ -163,9 +163,67 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     `node --test apps/desktop/ui/tests`: 470 passed.
   - Commits: 67fba08 `feat(desktop): back up the musicians' mixes as they change` (+1380/-3);
     this commit `feat(desktop-ui): restore a mix backup from the session panel`.
-- [ ] T3 (health history): capabilities on `register`, RTT from ping/pong, history ring per
+- [x] T2-fix (review-8872f9deff0e3f2d WARNING): a backup whose old copies could not be pruned was
+  reported as failed, so the writer never recorded it and rewrote every identical backup while
+  pruning kept failing. `BackupStore::write` now answers `Written { stamp, prune_problem }`: the
+  backup counts as written, the writer warns once per problem (info when pruning works again) and
+  the next write drops the surplus. Seam: an injected remover (`with_remover`). Route: delegated
+  writer (with T3).
+  - RED: 2 of 16 backup tests failed (store returned the prune error; the writer rewrote the same
+    backup: 4 files instead of 2). GREEN: 16 of 16, desktop 279 passed.
+  - Commit: 6bd3e86 `fix(desktop): count a backup as written when pruning fails` (+163/-15).
+- [x] T3 (health history): capabilities on `register`, RTT from ping/pong, history ring per
   musician, phone stats extras (jitter, cushion) parsed when present, DTO and events. Route:
-  delegated writer.
+  delegated writer (trigger: 2+ non-trivial files across protocol, registry, control server,
+  engine status, desktop DTOs, a new command and the fake bridge).
+  - Protocol (for T5, documented in `protocol.rs`): `register` takes an optional
+    `capabilities: [string]`; names kept are 1-32 of `[a-z0-9._-]`, at most 16, each once,
+    unknown names kept, anything unreadable dropped (never an error). Constants
+    `CAPABILITY_STATS_V2 = "stats.v2"` (stats carry the extras), `CAPABILITY_PLAYBACK_BUFFER =
+    "playback.buffer"` (T6), `CAPABILITY_REDUNDANCY_RECOVERED = "redundancy.recovered"` (T7). Each
+    registration replaces the musician's list. `stats` takes optional `jitter_ms` (interarrival
+    jitter over the interval), `cushion_ms` (the cushion it aims for, in milliseconds, not
+    packets, so phones with different block sizes read on one scale), `backlog_ms` (audio queued at
+    the end of the interval) and `recovered` (packets only a redundant copy brought in time; they
+    count in `packets_received`, not in `packets_lost`); a value out of range (a duration outside
+    0-60000 ms, a count that is not an unsigned integer) is read as absent.
+  - RTT: each heartbeat ping (every 2 s) carries an 8-byte number (`PingClock`); the pong that
+    echoes it gives the round trip, kept as the last value and an EWMA (weight 1/8, as TCP's
+    SRTT); a pong for an older ping measures nothing. Any phone has one (WebSocket libraries answer
+    pings themselves). Never on the audio paths.
+  - History (`apps/server/src/link_history.rs`): per musician a `VecDeque` of 600 one-second samples
+    allocated once (`HISTORY_SAMPLES`). Sample: `at_ms` (Unix ms, UTC), `gap`, `reconnected`,
+    `health`, `interval_ms`, `packets_received`, `packets_lost`, `loss_percent`, `underruns`,
+    `receive_timeouts`, `rtt_ms`, `jitter_ms`, `cushion_ms`, `backlog_ms`, `recovered`. A second
+    with no report while the session runs becomes a gap sample once the next report is 2 s late
+    (the control accept loop's tick, about 10 a second, or the late report itself); no gaps before
+    a session's first report or after its last connection closed, so a phone that never reports
+    has no history. A reconnect keeps the history and marks the next sample `reconnected`: within
+    the grace period, from a new IP with the client id, and after the grace period by client id
+    (up to 32 departed phones kept). A different phone taking a row over gets its own. An engine
+    restart starts every history empty.
+  - Status: `LinkStatus` gains `round_trip` and `latest` (newest sample); the musician DTO gains
+    `capabilities`, `rttMs` (smoothed), `rttLastMs` and `linkLatest`; existing fields unchanged.
+    `EngineHandle::link_history(key, since_ms)`.
+  - Desktop: command `link_history(musicianKey, sinceMs?)` (`client:<id>` / `address:<ip:port>`)
+    answers `{ musicianKey, samples: [LinkSampleDto], maxSamples: 600, periodMs: 1000 }`, samples
+    after `sinceMs`, oldest first; an unreadable key, nobody and no engine are errors. Bridge
+    `linkHistory(musicianKey, sinceMs = null)`; the fake bridge generates deterministic histories
+    (`syntheticLinkHistory`, `syntheticRoundTrip`): good, warning with one reconnect every ten
+    minutes, lost with the last 20 s as gaps, none for a phone that never reported; Lead vocal and
+    Bass announce `stats.v2`.
+  - RED: protocol and control 6 of 450 failed with stub readers (capabilities, extras); link
+    history 12 of 12 failed with stub bodies; the wiring tests 3 of 5 failed with the status copy,
+    the client-id return and the pong recording disabled; desktop 4 of 4 failed with the command and
+    the row fields stubbed; UI link-history suite 3 of 7 failed on its first run (row defaults
+    overrode the capabilities, the reconnect marker moved with the clock), fixed. GREEN below.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 467 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 284 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 477 passed.
+  - Commits: 46876b9 `feat(server): keep the capabilities a phone announces` (+311/-1); 01aed61
+    `feat(server): keep a link history with round-trip time` (+1181/-7); this commit
+    `feat(desktop): serve a musician's link history`.
 - [ ] T4 (health chart): chart on the Network and system screen. Route: delegated writer.
 - [ ] T5 (Android): announce capabilities, report jitter and cushion in `stats`. Route: delegated
   writer.
@@ -194,7 +252,11 @@ per reviewed slice, only with the user's approval.
   re-armed and the failure count not exposed (SUGGESTION), and the discarded UDP send error
   (SUGGESTION); all fixed in T1-fix. Next review base d787a05.
 - T1-fix and T2 done (mixes backup), four commits.
+- review-8872f9deff0e3f2d (d787a05..81155c8, T1-fix and T2) approved and acknowledged, with one
+  WARNING: a prune failure counted the backup as failed, so identical backups piled up (fixed in
+  T2-fix). Next review base 81155c8.
+- T2-fix and T3 done (health history), four commits.
 
 ## Next step
 
-T3 (health history).
+T4 (health chart).

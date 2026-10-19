@@ -2652,6 +2652,7 @@ mod tests {
             link: Default::default(),
             capabilities: Vec::new(),
             mirror: None,
+            playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
         }
     }
 

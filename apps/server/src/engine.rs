@@ -29,6 +29,7 @@ use crate::output::{
     LocalOutputStatus, OpenedOutput, OutputControl, OutputDevice, OutputShared,
 };
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
+use crate::playback::{BufferOutcome, BufferSetting, PlaybackBuffer};
 use crate::recorder::{
     free_space, minutes_left, open_take, plan_tracks, recorder_sink, take_bytes_per_second,
     DiskEstimate, FileOpener, RecordRequest, Recorder, RecordingStatus, TakeEnd, TakeMarker,
@@ -37,7 +38,7 @@ use crate::recorder::{
 use crate::soundcheck::{
     PlaybackClock, Soundcheck, SoundcheckError, SoundcheckRequest, SoundcheckStatus,
 };
-use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
+use crate::targets::{BufferSet, MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
 /// The capture buffer the engine requests when the caller did not choose one.
 ///
@@ -84,6 +85,10 @@ pub enum EngineEvent {
     /// [EngineHandle::soundcheck]. What the take does on its own (reaching its end, a read error)
     /// shows in the status only: the engine thread never touches the event bus.
     SoundcheckChanged,
+    /// The playback buffer the engine keeps for the musician at this address's IP changed (see
+    /// [EngineHandle::set_playback_buffer]); their phone is sent it when it takes one. The status
+    /// reports it ([MusicianStatus::playback_buffer]).
+    PlaybackBufferChanged { address: SocketAddr },
 }
 
 /// Where a mix change came from.
@@ -157,6 +162,10 @@ pub struct MusicianStatus {
     /// Whose mix this musician's follows, when the engineer made it follow one (see
     /// [EngineHandle::set_mirror]); `None` when it follows nobody.
     pub mirror: Option<MirrorStatus>,
+    /// The playback buffer the engine keeps for this musician (see
+    /// [EngineHandle::set_playback_buffer]); Auto when the desk set none. Only a phone that
+    /// announced [crate::CAPABILITY_PLAYBACK_BUFFER] plays it.
+    pub playback_buffer: PlaybackBuffer,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -656,6 +665,42 @@ pub(crate) fn set_target_controls(
     Ok((key, applied))
 }
 
+/// Sets the playback buffer of the musician `key` names, as [EngineHandle::set_playback_buffer]
+/// does: kept and announced when their phone takes one, `peers` telling whether that phone's control
+/// channel is connected now.
+pub(crate) fn set_target_buffer(
+    targets: &TargetRegistry,
+    peers: &ControlPeers,
+    events: &EventBus,
+    key: &MusicianKey,
+    buffer: PlaybackBuffer,
+) -> Result<BufferSetting, String> {
+    match targets.set_playback_buffer(key, buffer)? {
+        BufferSet::Unsupported { address } => Ok(BufferSetting {
+            kept_for: key.clone(),
+            address,
+            outcome: BufferOutcome::Unsupported,
+        }),
+        BufferSet::Kept { key, address } => {
+            events.emit(EngineEvent::PlaybackBufferChanged { address });
+            let connected = peers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&address.ip());
+            let outcome = if connected {
+                BufferOutcome::Sent
+            } else {
+                BufferOutcome::NotConnected
+            };
+            Ok(BufferSetting {
+                kept_for: key,
+                address,
+                outcome,
+            })
+        }
+    }
+}
+
 /// Keeps `controls` for the musician `key` names and puts them in force if they are here, as
 /// [EngineHandle::keep_engineer_controls] does; each mix that changed is announced as a change made
 /// through the engine.
@@ -728,6 +773,7 @@ pub(crate) fn join_musicians(
     announced: &HashMap<IpAddr, Announced>,
     links: &HashMap<IpAddr, LinkStatus>,
     mirrors: &HashMap<IpAddr, MirrorStatus>,
+    buffers: &HashMap<IpAddr, PlaybackBuffer>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -744,6 +790,7 @@ pub(crate) fn join_musicians(
                 link: links.get(&ip).copied().unwrap_or_default(),
                 capabilities: announced.capabilities,
                 mirror: mirrors.get(&ip).cloned(),
+                playback_buffer: buffers.get(&ip).copied().unwrap_or_default(),
             }
         })
         .collect()
@@ -1541,6 +1588,7 @@ impl EngineHandle {
         let announced = announced_identities(&entries);
         let links = link_statuses(&entries, &connected, Instant::now());
         let mirrors = self.targets.mirror_statuses(&entries);
+        let buffers = self.targets.playback_buffers(&entries);
         let config = self.config_state.snapshot();
         EngineStatus {
             device_name: self.device_name.clone(),
@@ -1558,7 +1606,7 @@ impl EngineHandle {
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed)
                 + self.capture_stats.dropped_blocks.load(Ordering::Relaxed),
             musicians: join_musicians(
-                &targets, &connected, &counters, &mixes, &announced, &links, &mirrors,
+                &targets, &connected, &counters, &mixes, &announced, &links, &mirrors, &buffers,
             ),
             local_mix: self.local_mix.current(),
             local_output: self.local_output(),
@@ -2434,6 +2482,49 @@ impl EngineHandle {
         ))
     }
 
+    /// Sets the playback buffer of the musician `key` names (their phone's client id, or an address
+    /// by IP): Auto, their phone's own adaptive cushion, or a fixed length (see [crate::playback]).
+    ///
+    /// The engine keeps it for the musician (under their phone's client id when it announced one,
+    /// else their address: the key it returns) for as long as it runs, and their phone is sent it
+    /// now when its control channel is connected ([BufferOutcome::Sent]), and again each time it
+    /// registers, so the choice survives a reconnect ([BufferOutcome::NotConnected] when it is not
+    /// connected now). A phone that did not announce [crate::CAPABILITY_PLAYBACK_BUFFER] is left as
+    /// it is and nothing is kept ([BufferOutcome::Unsupported]). The change is announced as
+    /// [EngineEvent::PlaybackBufferChanged].
+    ///
+    /// An engine that is stopping, or a key that names nobody here, is an error, and nothing
+    /// changes.
+    pub fn set_playback_buffer(
+        &self,
+        key: &MusicianKey,
+        buffer: PlaybackBuffer,
+    ) -> Result<BufferSetting, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        set_target_buffer(&self.targets, &self.peers, &self.events, key, buffer)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Replaces every playback buffer the engine keeps with `kept` (keys as
+    /// [Self::set_playback_buffer] keeps them), as a desk does when it starts an engine or loads a
+    /// saved session: one not in `kept` is forgotten (Auto), also for a musician who is not here.
+    /// Each phone here that takes a buffer and whose buffer changed is sent it.
+    pub fn replace_playback_buffers(
+        &self,
+        kept: &[(MusicianKey, PlaybackBuffer)],
+    ) -> Result<(), Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        for address in self.targets.replace_playback_buffers(kept) {
+            self.events
+                .emit(EngineEvent::PlaybackBufferChanged { address });
+        }
+        Ok(())
+    }
+
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
@@ -2698,6 +2789,7 @@ mod tests {
             &announced_identities(&entries),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(musicians.len(), 1, "the row moved instead of doubling");
@@ -2770,6 +2862,7 @@ mod tests {
             &mixes,
             &announced,
             &links,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -3084,6 +3177,101 @@ mod tests {
                 origin: MixOrigin::Engine,
             })
         );
+    }
+
+    #[test]
+    fn a_buffer_is_sent_to_a_connected_phone_kept_for_one_away_and_never_set_on_an_older_one() {
+        let layout = GroupLayout::default();
+        let registry = TargetRegistry::new(&["192.168.1.3:50000".parse().unwrap()], &layout)
+            .expect("registry should build");
+        registry.register(ip("192.168.1.4"), 50000, None, Some(PHONE_ID), &layout);
+        registry.set_capabilities(
+            ip("192.168.1.4"),
+            vec![crate::CAPABILITY_PLAYBACK_BUFFER.to_owned()],
+        );
+        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let phone = MusicianKey::Client(PHONE_ID.to_owned());
+        let forty = PlaybackBuffer::Fixed { ms: 40 };
+
+        let away = set_target_buffer(&registry, &peers, &events, &phone, forty)
+            .expect("the phone is listed");
+        peers.lock().unwrap().insert(ip("192.168.1.4"), 1);
+        let connected = set_target_buffer(
+            &registry,
+            &peers,
+            &events,
+            &MusicianKey::Address("192.168.1.4:50000".parse().unwrap()),
+            forty,
+        )
+        .expect("named by its address too");
+        let rack = set_target_buffer(
+            &registry,
+            &peers,
+            &events,
+            &MusicianKey::Address("192.168.1.3:50000".parse().unwrap()),
+            forty,
+        )
+        .expect("the rack is listed");
+        let nobody = set_target_buffer(
+            &registry,
+            &peers,
+            &events,
+            &MusicianKey::Client("someone-else".to_owned()),
+            forty,
+        )
+        .expect_err("nobody");
+
+        let phone_row: SocketAddr = "192.168.1.4:50000".parse().unwrap();
+        assert_eq!(
+            away,
+            BufferSetting {
+                kept_for: phone.clone(),
+                address: phone_row,
+                outcome: BufferOutcome::NotConnected,
+            }
+        );
+        assert_eq!(
+            connected,
+            BufferSetting {
+                kept_for: phone,
+                address: phone_row,
+                outcome: BufferOutcome::Sent,
+            },
+            "kept for the phone"
+        );
+        assert_eq!(rack.outcome, BufferOutcome::Unsupported);
+        assert_eq!(
+            rack.address,
+            "192.168.1.3:50000".parse::<SocketAddr>().unwrap()
+        );
+        assert!(nobody.contains("is not here"), "{nobody}");
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            vec![
+                EngineEvent::PlaybackBufferChanged {
+                    address: "192.168.1.4:50000".parse().unwrap()
+                };
+                2
+            ],
+            "only the phone that takes it is announced"
+        );
+        let musicians = join_musicians(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+            ],
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &registry.playback_buffers(&registry.read()),
+        );
+        assert_eq!(musicians[0].playback_buffer, PlaybackBuffer::Auto);
+        assert_eq!(musicians[1].playback_buffer, forty);
     }
 
     #[test]

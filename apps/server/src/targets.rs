@@ -8,7 +8,8 @@ use crate::health::{LatestLinkReport, LinkReport};
 use crate::link_history::{LinkHistory, LinkHistoryRead, LinkMoment, SharedLinkHistory};
 use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixState, MixValues};
 use crate::network::TargetCounters;
-use crate::protocol::StatsCommand;
+use crate::playback::PlaybackBuffer;
+use crate::protocol::{StatsCommand, CAPABILITY_PLAYBACK_BUFFER};
 
 /// Whom the engineer's controls for a musician are kept for: the stable client id their phone
 /// announced, or, for a configured target and a phone that announced none, their address (joined
@@ -267,6 +268,28 @@ pub(crate) struct Registration {
     pub(crate) followed: bool,
 }
 
+/// What [TargetRegistry::set_playback_buffer] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BufferSet {
+    /// The buffer is kept for the musician under `key` (their phone's client id, else their
+    /// address), whose row is at `address`.
+    Kept {
+        key: MusicianKey,
+        address: SocketAddr,
+    },
+    /// The musician at `address` has no phone that takes a buffer; nothing changed.
+    Unsupported { address: SocketAddr },
+}
+
+/// Whether the phone of `entry` announced it plays the buffer the desk sets.
+fn supports_buffer(entry: &TargetEntry) -> bool {
+    entry
+        .origin
+        .capabilities()
+        .iter()
+        .any(|name| name == CAPABILITY_PLAYBACK_BUFFER)
+}
+
 /// One configured musician destination: the UDP address plus the state that belongs to it.
 ///
 /// The three values travel together on purpose. The network thread needs exactly this triple for
@@ -318,6 +341,10 @@ pub(crate) struct TargetRegistry {
     entries: RwLock<Vec<TargetEntry>>,
     controls: Mutex<HashMap<BookKey, EngineerControls>>,
     mirrors: Mutex<HashMap<BookKey, Mirror>>,
+    /// The playback buffer the desk set per musician (see [crate::playback]), by their phone's
+    /// client id, else their IP; a musician with none kept is on Auto. Kept for as long as the
+    /// engine runs, whether or not the musician is here, and never held with another book's lock.
+    buffers: Mutex<HashMap<BookKey, PlaybackBuffer>>,
     propagation: Mutex<()>,
     /// The link histories of phones whose rows were removed (the grace period ran out, or the
     /// engineer removed them), by client id, the most recent last; at most
@@ -363,6 +390,7 @@ impl TargetRegistry {
             entries: RwLock::new(entries),
             controls: Mutex::new(HashMap::new()),
             mirrors: Mutex::new(HashMap::new()),
+            buffers: Mutex::new(HashMap::new()),
             propagation: Mutex::new(()),
             departed_histories: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1085,6 +1113,116 @@ impl TargetRegistry {
         {
             *capabilities = announced;
         }
+    }
+
+    fn buffer_book(&self) -> MutexGuard<'_, HashMap<BookKey, PlaybackBuffer>> {
+        self.buffers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The buffer kept for the musician with this client id at this IP: the one kept for their
+    /// phone first, then the one kept for their IP; Auto when none is.
+    fn kept_buffer(
+        book: &HashMap<BookKey, PlaybackBuffer>,
+        client_id: Option<&str>,
+        ip: IpAddr,
+    ) -> PlaybackBuffer {
+        client_id
+            .and_then(|id| book.get(&BookKey::Client(id.to_owned())).copied())
+            .or_else(|| book.get(&BookKey::Ip(ip)).copied())
+            .unwrap_or_default()
+    }
+
+    /// The buffer a control connection from `ip` tells its phone: the one kept for the musician
+    /// there (see [Self::kept_buffer]), when their phone announced [CAPABILITY_PLAYBACK_BUFFER];
+    /// `None` for an older phone, a configured target and an IP with no target, which are never
+    /// sent one.
+    pub(crate) fn playback_buffer_for_phone(&self, ip: IpAddr) -> Option<PlaybackBuffer> {
+        let entries = self.read();
+        let entry = entries.iter().find(|entry| entry.address.ip() == ip)?;
+        supports_buffer(entry)
+            .then(|| Self::kept_buffer(&self.buffer_book(), entry.origin.client_id(), ip))
+    }
+
+    /// The buffer kept for each musician here, by IP, as the status reports it.
+    pub(crate) fn playback_buffers(
+        &self,
+        entries: &[TargetEntry],
+    ) -> HashMap<IpAddr, PlaybackBuffer> {
+        let book = self.buffer_book();
+        entries
+            .iter()
+            .map(|entry| {
+                let ip = entry.address.ip();
+                (ip, Self::kept_buffer(&book, entry.origin.client_id(), ip))
+            })
+            .collect()
+    }
+
+    /// Sets the playback buffer of the musician `key` names (by their phone's client id, or an
+    /// address by IP) and keeps it for them: under their phone's client id when it announced one,
+    /// which also drops any kept for their IP, else under their IP. Auto is kept as nothing kept.
+    ///
+    /// A musician whose phone did not announce [CAPABILITY_PLAYBACK_BUFFER] changes nothing
+    /// ([BufferSet::Unsupported]); a key that names nobody here is an error.
+    pub(crate) fn set_playback_buffer(
+        &self,
+        key: &MusicianKey,
+        buffer: PlaybackBuffer,
+    ) -> Result<BufferSet, String> {
+        let entries = self.read();
+        let entry = entries
+            .iter()
+            .find(|entry| names(key, entry))
+            .ok_or_else(|| format!("{} is not here", describe_key(key)))?;
+        if !supports_buffer(entry) {
+            return Ok(BufferSet::Unsupported {
+                address: entry.address,
+            });
+        }
+        let kept_for = musician_key(entry);
+        let mut book = self.buffer_book();
+        if matches!(kept_for, MusicianKey::Client(_)) {
+            book.remove(&BookKey::Ip(entry.address.ip()));
+        }
+        match buffer {
+            PlaybackBuffer::Auto => book.remove(&BookKey::from(&kept_for)),
+            fixed => book.insert(BookKey::from(&kept_for), fixed),
+        };
+        Ok(BufferSet::Kept {
+            key: kept_for,
+            address: entry.address,
+        })
+    }
+
+    /// Replaces every buffer kept with `kept`, as a desk starting an engine or loading a session
+    /// does: buffers kept before and not in `kept` are forgotten, also for a musician who is not
+    /// here. Answers the addresses of the musicians here whose phone takes a buffer and whose buffer
+    /// changed, so they can be told.
+    pub(crate) fn replace_playback_buffers(
+        &self,
+        kept: &[(MusicianKey, PlaybackBuffer)],
+    ) -> Vec<SocketAddr> {
+        let entries = self.read();
+        let before = self.playback_buffers(&entries);
+        {
+            let mut book = self.buffer_book();
+            book.clear();
+            for (key, buffer) in kept {
+                if *buffer != PlaybackBuffer::Auto {
+                    book.insert(BookKey::from(key), *buffer);
+                }
+            }
+        }
+        let after = self.playback_buffers(&entries);
+        entries
+            .iter()
+            .filter(|entry| supports_buffer(entry))
+            .filter(|entry| {
+                let ip = entry.address.ip();
+                before.get(&ip) != after.get(&ip)
+            })
+            .map(|entry| entry.address)
+            .collect()
     }
 
     /// The link history of the target at `ip`, if there is one.
@@ -2769,5 +2907,215 @@ mod tests {
             "a phone away is put on the loaded mirror when it registers"
         );
         assert_eq!(gains_at(&registry, "192.168.1.31:50000", 2), [30, 40]);
+    }
+
+    /// Registers `client_id`'s phone from `peer` announcing the capabilities `capabilities`, as the
+    /// control channel does.
+    fn register_with(
+        registry: &TargetRegistry,
+        peer: &str,
+        client_id: &str,
+        capabilities: &[&str],
+    ) {
+        register_phone(registry, peer, 50000, "Ana", Some(client_id));
+        registry.set_capabilities(
+            ip(peer),
+            capabilities.iter().map(|name| (*name).to_owned()).collect(),
+        );
+    }
+
+    const FORTY: PlaybackBuffer = PlaybackBuffer::Fixed { ms: 40 };
+
+    #[test]
+    fn a_buffer_is_kept_for_the_phone_and_follows_it_to_a_new_ip_and_back_after_it_left() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_with(
+            &registry,
+            "192.168.1.10",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.10")),
+            Some(PlaybackBuffer::Auto),
+            "a phone that takes a buffer is on Auto until the desk sets one"
+        );
+
+        let set = registry
+            .set_playback_buffer(&MusicianKey::Client(PHONE_A.to_owned()), FORTY)
+            .expect("Ana is here");
+        assert_eq!(
+            set,
+            BufferSet::Kept {
+                key: MusicianKey::Client(PHONE_A.to_owned()),
+                address: address("192.168.1.10:50000"),
+            }
+        );
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.10")),
+            Some(FORTY)
+        );
+
+        // DHCP gives the phone another IP: the buffer goes with its client id.
+        register_with(
+            &registry,
+            "192.168.1.3",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.3")),
+            Some(FORTY)
+        );
+
+        // The row goes after the grace period; the phone comes back and still has its buffer.
+        registry.remove("192.168.1.3:50000").expect("removed");
+        register_with(
+            &registry,
+            "192.168.1.20",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.20")),
+            Some(FORTY)
+        );
+        let statuses = registry.playback_buffers(&registry.read());
+        assert_eq!(statuses.get(&ip("192.168.1.20")), Some(&FORTY));
+    }
+
+    #[test]
+    fn an_older_phone_and_a_configured_target_are_never_sent_a_buffer_and_keep_none() {
+        let registry =
+            TargetRegistry::new(&[address("192.168.1.40:50000")], &GroupLayout::default())
+                .expect("registry");
+        register_with(&registry, "192.168.1.10", PHONE_A, &["stats.v2"]);
+
+        assert_eq!(registry.playback_buffer_for_phone(ip("192.168.1.10")), None);
+        assert_eq!(registry.playback_buffer_for_phone(ip("192.168.1.40")), None);
+        assert_eq!(registry.playback_buffer_for_phone(ip("192.168.1.99")), None);
+        assert_eq!(
+            registry
+                .set_playback_buffer(&MusicianKey::Client(PHONE_A.to_owned()), FORTY)
+                .expect("Ana is here"),
+            BufferSet::Unsupported {
+                address: address("192.168.1.10:50000")
+            }
+        );
+        assert_eq!(
+            registry
+                .set_playback_buffer(&MusicianKey::Address(address("192.168.1.40:50000")), FORTY)
+                .expect("the rack is here"),
+            BufferSet::Unsupported {
+                address: address("192.168.1.40:50000")
+            }
+        );
+
+        // Updated to a build that takes one, the phone finds nothing kept from before.
+        register_with(
+            &registry,
+            "192.168.1.10",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.10")),
+            Some(PlaybackBuffer::Auto)
+        );
+    }
+
+    #[test]
+    fn auto_forgets_the_fixed_buffer_and_nobody_here_is_an_error() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_with(
+            &registry,
+            "192.168.1.10",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        let ana = MusicianKey::Client(PHONE_A.to_owned());
+        registry.set_playback_buffer(&ana, FORTY).expect("set");
+
+        registry
+            .set_playback_buffer(
+                &MusicianKey::Address(address("192.168.1.10:50000")),
+                PlaybackBuffer::Auto,
+            )
+            .expect("Ana is named by her address too");
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.10")),
+            Some(PlaybackBuffer::Auto)
+        );
+        assert!(registry.buffer_book().is_empty(), "Auto keeps nothing");
+
+        let error = registry
+            .set_playback_buffer(&MusicianKey::Client(PHONE_B.to_owned()), FORTY)
+            .expect_err("nobody");
+        assert!(error.contains("is not here"), "{error}");
+    }
+
+    #[test]
+    fn a_buffer_kept_for_the_phone_wins_over_one_kept_for_its_ip() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_with(
+            &registry,
+            "192.168.1.10",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        registry.replace_playback_buffers(&[
+            (
+                MusicianKey::Address(address("192.168.1.10:50000")),
+                PlaybackBuffer::Fixed { ms: 100 },
+            ),
+            (MusicianKey::Client(PHONE_A.to_owned()), FORTY),
+        ]);
+        assert_eq!(
+            registry.playback_buffer_for_phone(ip("192.168.1.10")),
+            Some(FORTY)
+        );
+    }
+
+    #[test]
+    fn replacing_the_buffers_names_the_phones_here_whose_buffer_changed() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_with(
+            &registry,
+            "192.168.1.10",
+            PHONE_A,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        register_with(
+            &registry,
+            "192.168.1.11",
+            PHONE_B,
+            &[CAPABILITY_PLAYBACK_BUFFER],
+        );
+        register_with(&registry, "192.168.1.12", "older-phone", &[]);
+        let ana = MusicianKey::Client(PHONE_A.to_owned());
+        let eva = MusicianKey::Client(PHONE_B.to_owned());
+
+        let changed = registry.replace_playback_buffers(&[
+            (ana.clone(), FORTY),
+            (MusicianKey::Client("older-phone".to_owned()), FORTY),
+            (MusicianKey::Client("away".to_owned()), FORTY),
+        ]);
+        assert_eq!(changed, vec![address("192.168.1.10:50000")]);
+
+        let changed = registry
+            .replace_playback_buffers(&[(ana, FORTY), (eva, PlaybackBuffer::Fixed { ms: 60 })]);
+        assert_eq!(
+            changed,
+            vec![address("192.168.1.11:50000")],
+            "Ana kept 40 ms; only Eva's changed"
+        );
+
+        let changed = registry.replace_playback_buffers(&[]);
+        assert_eq!(
+            changed,
+            vec![address("192.168.1.10:50000"), address("192.168.1.11:50000")],
+            "both are back on Auto"
+        );
+        assert!(registry.buffer_book().is_empty());
     }
 }

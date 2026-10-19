@@ -20,8 +20,8 @@ use crate::link_history::{LinkMoment, PingClock};
 use crate::mix::{GroupLayout, Membership, MixState};
 use crate::protocol::{
     control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
-    parse_mix_update, parse_register_command, parse_stats_command, registered_name, ChannelConfig,
-    ControlConfig, GroupConfig,
+    parse_mix_update, parse_register_command, parse_stats_command, playback_message,
+    registered_name, ChannelConfig, ControlConfig, GroupConfig,
 };
 use crate::targets::TargetRegistry;
 
@@ -501,23 +501,53 @@ fn should_push_mix(event: &EngineEvent, peer: SocketAddr) -> bool {
     }
 }
 
-/// One connection's view of the live event bus: it only ever answers "push the mix now".
+/// Whether a connection with `peer` should be sent its musician's playback buffer because of
+/// `event`: a change of the buffer kept for the musician at the same IP. Whether the phone takes
+/// one at all is checked when it is sent ([TargetRegistry::playback_buffer_for_phone]).
+fn should_push_buffer(event: &EngineEvent, peer: SocketAddr) -> bool {
+    matches!(event, EngineEvent::PlaybackBufferChanged { address } if address.ip() == peer.ip())
+}
+
+/// What a connection's phone must be sent now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Push {
+    /// The musician's whole mix (`mix_state`).
+    Mix,
+    /// The musician's playback buffer (`playback`).
+    Buffer,
+    /// Both, after the feed missed events and cannot tell which of them were for this phone.
+    Everything,
+}
+
+impl Push {
+    fn mix(self) -> bool {
+        matches!(self, Push::Mix | Push::Everything)
+    }
+
+    fn buffer(self) -> bool {
+        matches!(self, Push::Buffer | Push::Everything)
+    }
+}
+
+/// One connection's view of the live event bus: it only ever answers what to push now (see
+/// [Push]).
 ///
 /// It owns the recovery rules, so the connection loop has a single branch for them:
 ///
-/// - A change of this musician's mix that this connection did not make asks for a push.
-/// - A feed that lagged behind the bus asks for a push too: an event for this musician may be
-///   among the missed ones, and the push carries the whole mix, so sending it is always correct.
+/// - A change of this musician's mix that this connection did not make asks for the mix.
+/// - A change of this musician's playback buffer asks for the buffer.
+/// - A feed that lagged behind the bus asks for both: an event for this musician may be among the
+///   missed ones, and each push carries the whole value, so sending it is always correct.
 /// - A closed bus turns the feed off for good. The connection carries on without it, and the feed
 ///   parks instead of resolving at once on every poll, so the loop cannot spin on it. The
 ///   connection holds a sender of the bus itself, so today this can only follow a refactor.
-struct MixPushFeed {
+struct PushFeed {
     events: broadcast::Receiver<EngineEvent>,
     peer: SocketAddr,
     open: bool,
 }
 
-impl MixPushFeed {
+impl PushFeed {
     fn new(events: broadcast::Receiver<EngineEvent>, peer: SocketAddr) -> Self {
         Self {
             events,
@@ -526,21 +556,22 @@ impl MixPushFeed {
         }
     }
 
-    /// Resolves when this connection's phone must be sent its musician's whole mix.
+    /// Resolves with what this connection's phone must be sent now.
     ///
     /// Cancel-safe, as a `select!` branch must be: it only awaits the broadcast's own cancel-safe
     /// `recv`, and it returns as soon as an event asks for a push, so dropping it loses nothing that
     /// mattered.
-    async fn next_push(&mut self) {
+    async fn next_push(&mut self) -> Push {
         while self.open {
             match self.events.recv().await {
-                Ok(event) if should_push_mix(&event, self.peer) => return,
+                Ok(event) if should_push_mix(&event, self.peer) => return Push::Mix,
+                Ok(event) if should_push_buffer(&event, self.peer) => return Push::Buffer,
                 Ok(_) => {}
-                Err(RecvError::Lagged(_)) => return,
+                Err(RecvError::Lagged(_)) => return Push::Everything,
                 Err(RecvError::Closed) => self.open = false,
             }
         }
-        std::future::pending::<()>().await;
+        std::future::pending::<Push>().await
     }
 }
 
@@ -616,7 +647,7 @@ async fn handle_control_connection(
     let _peer = register_peer(&peers, &events, &targets, peer);
     // Subscribed before `config` goes out, so a client that has seen `config` cannot miss a mix
     // change made after it.
-    let mut mix_pushes = MixPushFeed::new(events.subscribe_live(), peer);
+    let mut pushes = PushFeed::new(events.subscribe_live(), peer);
     let (writer, mut reader) = websocket.split();
 
     // The sink is shared between the read loop and the config watcher through an async mutex. The
@@ -676,25 +707,43 @@ async fn handle_control_connection(
                 break;
             }
             // The feed applies the recovery rules (a lagged feed pushes, a closed one parks).
-            _ = mix_pushes.next_push() => {
-                // A peer whose target is gone has no mix to follow; it keeps its channel as before.
-                let Some(mix_state) = targets.mix_state(peer.ip()) else {
-                    continue;
-                };
-                // Read under the mix's writer lock and before the configuration check in the send,
-                // so levels moved by an edit of the groups follow the new `config` (see
-                // [send_with_config]), with the name of the musician it follows, if any.
-                let (values, following) = mix_state.report();
-                let message = mix_state_message(values, following.as_deref())?;
-                // Bounded like the ping: a push that cannot be written in time means a dead peer.
-                match send_by(&writer, &config, Message::Text(message.into()), dead_at).await {
-                    BoundedSend::Sent => continue,
-                    BoundedSend::Failed => break,
-                    BoundedSend::TimedOut => {
-                        log_missed_heartbeat(peer, heartbeat.dead_after);
-                        break;
+            push = pushes.next_push() => {
+                let mut outgoing: Vec<String> = Vec::with_capacity(2);
+                // Only a phone that takes a buffer is sent one; an older phone never sees the
+                // message, and a peer whose target is gone has nothing to follow.
+                if push.buffer() {
+                    if let Some(buffer) = targets.playback_buffer_for_phone(peer.ip()) {
+                        outgoing.push(playback_message(buffer)?);
                     }
                 }
+                // A peer whose target is gone has no mix to follow; it keeps its channel as before.
+                if let Some(mix_state) = push.mix().then(|| targets.mix_state(peer.ip())).flatten() {
+                    // Read under the mix's writer lock and before the configuration check in the
+                    // send, so levels moved by an edit of the groups follow the new `config` (see
+                    // [send_with_config]), with the name of the musician it follows, if any.
+                    let (values, following) = mix_state.report();
+                    outgoing.push(mix_state_message(values, following.as_deref())?);
+                }
+                // Bounded like the ping: a push that cannot be written in time means a dead peer.
+                let mut gone = false;
+                for message in outgoing {
+                    match send_by(&writer, &config, Message::Text(message.into()), dead_at).await {
+                        BoundedSend::Sent => {}
+                        BoundedSend::Failed => {
+                            gone = true;
+                            break;
+                        }
+                        BoundedSend::TimedOut => {
+                            log_missed_heartbeat(peer, heartbeat.dead_after);
+                            gone = true;
+                            break;
+                        }
+                    }
+                }
+                if gone {
+                    break;
+                }
+                continue;
             }
             _ = ping_timer.tick() => {
                 // A ping that cannot be sent in time is as good as no answer.
@@ -782,7 +831,14 @@ async fn handle_control_connection(
                                     "control registration from {peer}: {address} (unnamed){moved}"
                                 ),
                             }
-                            None
+                            // A phone that takes a playback buffer is told the one the desk keeps for
+                            // it on every registration, Auto included: the engineer's choice survives
+                            // a reconnect, and a phone never keeps one an earlier server set. Any
+                            // other phone is answered with nothing, as before.
+                            targets
+                                .playback_buffer_for_phone(peer.ip())
+                                .map(playback_message)
+                                .transpose()?
                         }
                         Err(error) => Some(control_error(error)?),
                     }
@@ -3284,6 +3340,105 @@ mod tests {
         stop_server(address, &stopped, server).await;
     }
 
+    const BUFFER_PHONE_ID: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
+    const REGISTER_WITH_BUFFER: &str = r#"{"type":"register","name":"Ana","udp_port":50123,"client_id":"0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b","capabilities":["stats.v2","playback.buffer"]}"#;
+
+    /// A phone that takes a buffer hears the one the desk keeps for it when it registers (Auto
+    /// until the desk sets one), when the desk changes it, and again on its next connection.
+    #[tokio::test]
+    async fn a_phone_that_takes_a_buffer_is_told_it_on_registering_on_a_change_and_after_a_reconnect(
+    ) {
+        use crate::playback::{BufferOutcome, PlaybackBuffer};
+
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::clone(&peers),
+            Heartbeat::default(),
+            events.clone(),
+        );
+
+        let mut phone = connect_client(address).await;
+        send_text(&mut phone, REGISTER_WITH_BUFFER).await;
+        let first = read_message_of_type(&mut phone, "playback")
+            .await
+            .expect("told on registering");
+        assert_eq!(
+            first,
+            serde_json::json!({"type": "playback", "buffer": {"mode": "auto"}})
+        );
+
+        let set = crate::engine::set_target_buffer(
+            &targets,
+            &peers,
+            &events,
+            &crate::targets::MusicianKey::Client(BUFFER_PHONE_ID.to_owned()),
+            PlaybackBuffer::Fixed { ms: 40 },
+        )
+        .expect("the phone is here");
+        assert_eq!(set.outcome, BufferOutcome::Sent);
+        assert_eq!(
+            set.kept_for,
+            crate::targets::MusicianKey::Client(BUFFER_PHONE_ID.to_owned())
+        );
+        let changed = read_message_of_type(&mut phone, "playback")
+            .await
+            .expect("told of the change");
+        assert_eq!(
+            changed["buffer"],
+            serde_json::json!({"mode": "fixed", "ms": 40})
+        );
+
+        phone.close(None).await.expect("the phone should close");
+        drop(phone);
+        let mut back = connect_client(address).await;
+        send_text(&mut back, REGISTER_WITH_BUFFER).await;
+        let again = read_message_of_type(&mut back, "playback")
+            .await
+            .expect("told again on its next connection");
+        assert_eq!(
+            again["buffer"],
+            serde_json::json!({"mode": "fixed", "ms": 40})
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// An older phone never sees the message: not on registering, and not when a change of the
+    /// buffer kept for its IP is announced.
+    #[tokio::test]
+    async fn an_older_phone_is_never_sent_a_buffer() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+        );
+
+        let mut phone = connect_client(address).await;
+        send_text(&mut phone, REGISTER_ANA).await;
+        events.emit(EngineEvent::PlaybackBufferChanged {
+            address: "127.0.0.1:50123".parse().unwrap(),
+        });
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        send_text(&mut phone, mix).await;
+        let next = read_next_reply(&mut phone)
+            .await
+            .expect("the mix is answered");
+        assert_eq!(
+            next["type"], "mix_ack",
+            "nothing came before the answer to the mix: {next}"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
     const PHONE: &str = "192.168.1.3:41000";
 
     fn engine_change(address: &str) -> EngineEvent {
@@ -3298,7 +3453,7 @@ mod tests {
     #[tokio::test]
     async fn a_feed_that_lagged_asks_for_the_whole_mix() {
         let (bus, receiver) = broadcast::channel(1);
-        let mut feed = MixPushFeed::new(receiver, PHONE.parse().unwrap());
+        let mut feed = PushFeed::new(receiver, PHONE.parse().unwrap());
         for other in [
             "192.168.1.4:50000",
             "192.168.1.5:50000",
@@ -3308,10 +3463,10 @@ mod tests {
                 .expect("the feed is subscribed");
         }
 
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), feed.next_push())
-                .await
-                .is_ok(),
+        // Either push may be among the missed events, so both are asked for.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), feed.next_push()).await,
+            Ok(Push::Everything),
             "none of the events was for this phone, but some were missed"
         );
     }
@@ -3322,7 +3477,7 @@ mod tests {
     async fn a_feed_waits_through_events_that_are_not_for_its_phone() {
         let phone: SocketAddr = PHONE.parse().unwrap();
         let (bus, receiver) = broadcast::channel(16);
-        let mut feed = MixPushFeed::new(receiver, phone);
+        let mut feed = PushFeed::new(receiver, phone);
         bus.send(EngineEvent::ClientConnected { address: phone })
             .expect("the feed is subscribed");
         bus.send(EngineEvent::MixChanged {
@@ -3342,10 +3497,22 @@ mod tests {
 
         bus.send(engine_change("192.168.1.3:50000"))
             .expect("the feed is subscribed");
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), feed.next_push())
-                .await
-                .is_ok()
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), feed.next_push()).await,
+            Ok(Push::Mix)
+        );
+        bus.send(EngineEvent::PlaybackBufferChanged {
+            address: "192.168.1.4:50000".parse().unwrap(),
+        })
+        .expect("the feed is subscribed");
+        bus.send(EngineEvent::PlaybackBufferChanged {
+            address: "192.168.1.3:50000".parse().unwrap(),
+        })
+        .expect("the feed is subscribed");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), feed.next_push()).await,
+            Ok(Push::Buffer),
+            "another musician's buffer is passed over, this one's is pushed"
         );
     }
 
@@ -3368,7 +3535,7 @@ mod tests {
         use std::future::Future;
 
         let (bus, receiver) = broadcast::channel::<EngineEvent>(16);
-        let mut feed = MixPushFeed::new(receiver, PHONE.parse().unwrap());
+        let mut feed = PushFeed::new(receiver, PHONE.parse().unwrap());
         drop(bus);
         let wakes = Arc::new(WakeCounter(std::sync::atomic::AtomicUsize::new(0)));
         let waker = std::task::Waker::from(Arc::clone(&wakes));

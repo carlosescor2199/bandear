@@ -11,6 +11,7 @@ mod mix;
 mod network;
 mod output;
 mod pipeline;
+mod playback;
 mod protocol;
 mod recorder;
 mod soundcheck;
@@ -28,6 +29,9 @@ pub use health::{LinkHealth, LinkStatus};
 pub use link_history::{LinkHistoryRead, LinkSample, RoundTrip, HISTORY_SAMPLES};
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
+pub use playback::{
+    BufferOutcome, BufferSetting, PlaybackBuffer, MAX_FIXED_BUFFER_MS, MIN_FIXED_BUFFER_MS,
+};
 pub use protocol::{
     CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_RECOVERED, CAPABILITY_STATS_V2,
     KNOWN_CAPABILITIES,

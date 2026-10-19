@@ -6,6 +6,7 @@
 //! [local], and so do recording takes, [recording], and playing one back in place of the inputs,
 //! [soundcheck].
 
+pub mod backups;
 pub mod local;
 pub mod recording;
 pub mod soundcheck;
@@ -27,6 +28,7 @@ use personal_monitoring::{
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
 use self::local::{apply_kept_local, kept_local, with_pending, LocalEngine};
 use self::recording::{FolderOpener, RecordingsFolder, SystemFileManager};
+use crate::backups::{BackupStore, BACKUPS_DIRECTORY, KEPT_BACKUPS};
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
@@ -82,6 +84,9 @@ pub struct DesktopState {
     recordings: RecordingsFolder,
     /// Opens a take folder in the system's file manager (see [recording::open_take_folder]).
     folder_opener: Box<dyn FolderOpener>,
+    /// The musicians' mixes, backed up as they change in the `backups` folder beside the session
+    /// file (see [backups]). Read under the engine lock, written off it.
+    mix_backups: backups::MixBackups,
 }
 
 impl DesktopState {
@@ -96,6 +101,10 @@ impl DesktopState {
             session.directory(),
         );
         let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
+        let mix_backups = backups::MixBackups::start(BackupStore::new(
+            session.directory().join(BACKUPS_DIRECTORY),
+            KEPT_BACKUPS,
+        ));
         let session = Arc::new(session);
         let local_saver = {
             let session = Arc::clone(&session);
@@ -116,6 +125,7 @@ impl DesktopState {
             local_saver,
             recordings,
             folder_opener: Box::new(SystemFileManager),
+            mix_backups,
         }
     }
 
@@ -1819,7 +1829,8 @@ fn edit_channels<E: ChannelEngine>(
 }
 
 /// Stops the engine's event pump, then the engine, and joins their threads; then, with the engine
-/// lock released, writes the local mix still waiting to be kept (see [local::saver]). Stopping
+/// lock released, writes the local mix still waiting to be kept (see [local::saver]) and hands a
+/// backup of the musicians' mixes as the engine left them to its writer (see [backups]). Stopping
 /// when idle is a no-op.
 pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
     let mut pump = state
@@ -1831,12 +1842,17 @@ pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
         .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    // The musicians' mixes as the engine leaves them, backed up once the lock is released.
+    let desk = guard.as_ref().map(DeskReader::desk);
     let stopped = match guard.take() {
         Some(mut handle) => handle.stop().map_err(|error| error.to_string()),
         None => Ok(()),
     };
     drop(guard);
     state.local_saver.flush();
+    if let Some(desk) = &desk {
+        backups::back_up_desk(state, desk);
+    }
     stopped
 }
 
@@ -5998,6 +6014,166 @@ mod tests {
     ) -> Result<SessionLoadedDto, String> {
         let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
         load_session_with(engine, session, snapshots, &saver, &Mutex::new(None), id)
+    }
+
+    #[test]
+    fn a_backup_keeps_every_musicians_mix_name_and_controls_by_their_key() {
+        let (session, _, engine) = desk(
+            "backup-of",
+            Some(StandInEngine {
+                inputs: 2,
+                live_groups: vec!["kit".to_owned(), "vox".to_owned()],
+                here: Mutex::new(vec![
+                    MusicianStatus {
+                        name: Some("Ana's phone".to_owned()),
+                        ..here(
+                            ANA,
+                            Some(PHONE),
+                            true,
+                            mix_of(&[80, 40, 7], &[70, 30], 85, false, 90),
+                        )
+                    },
+                    here(
+                        RACK,
+                        None,
+                        false,
+                        mix_of(&[100, 90], &[100, 55], 60, true, 100),
+                    ),
+                ]),
+                ..StandInEngine::default()
+            }),
+        );
+        working_session(&session);
+        session.set_label(None, RACK, "Rack A").expect("saved");
+        let desk_now = engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .map(DeskReader::desk)
+            .expect("running");
+
+        let backup = backups::backup_of(&desk_now, &session, 5).expect("two musicians");
+
+        assert_eq!(
+            backup,
+            crate::backups::MixBackup {
+                version: crate::backups::BACKUP_VERSION,
+                saved_at: 5,
+                musicians: vec![
+                    crate::backups::BackedUpMusician {
+                        key: client_key(PHONE),
+                        name: Some("Ana's phone".to_owned()),
+                        client_id: Some(PHONE.to_owned()),
+                        address: Some(ANA.to_owned()),
+                        engineer: Some(kept_controls(60, &[1])),
+                        mix: saved_mix(&[80, 40], &[("kit", 70), ("vox", 30)], 85, false),
+                    },
+                    crate::backups::BackedUpMusician {
+                        key: address_key(RACK),
+                        name: Some("Rack A".to_owned()),
+                        client_id: None,
+                        address: Some(RACK.to_owned()),
+                        engineer: None,
+                        mix: saved_mix(&[100, 90], &[("kit", 100), ("vox", 55)], 60, true),
+                    },
+                ],
+            },
+            "the phone's own name first, else the engineer's label; never the phone's level cap"
+        );
+        let nobody = DeskView {
+            musicians: Vec::new(),
+            ..desk_now
+        };
+        assert_eq!(
+            backups::backup_of(&nobody, &session, 5),
+            None,
+            "nobody to back up"
+        );
+    }
+
+    #[test]
+    fn a_restore_puts_each_mix_back_on_the_musicians_connected_and_skips_the_others() {
+        let (session, _, engine) = desk(
+            "backup-restore",
+            Some(StandInEngine {
+                inputs: 2,
+                live_groups: vec!["kit".to_owned()],
+                here: Mutex::new(vec![
+                    here(ANA, Some(PHONE), true, MixValues::default()),
+                    here(BASS_AT, Some(AWAY_PHONE), false, MixValues::default()),
+                    here(RACK, None, false, MixValues::default()),
+                ]),
+                ..StandInEngine::default()
+            }),
+        );
+        let musician = |key: String, name: &str, volume: u8| crate::backups::BackedUpMusician {
+            key,
+            name: Some(name.to_owned()),
+            client_id: None,
+            address: None,
+            engineer: None,
+            mix: saved_mix(&[11, 22], &[("kit", 33)], volume, false),
+        };
+        let backup = crate::backups::MixBackup {
+            version: crate::backups::BACKUP_VERSION,
+            saved_at: 7,
+            musicians: vec![
+                musician(client_key(PHONE), "Ana", 81),
+                musician(client_key(AWAY_PHONE), "Bass", 82),
+                musician(address_key(RACK), "Rack", 83),
+                musician(client_key(GONE_PHONE), "Gone", 84),
+            ],
+        };
+
+        let outcome = backups::restore_with(
+            &engine,
+            &session.current(),
+            "19700101T000000007Z",
+            backup.clone(),
+        )
+        .expect("restored");
+
+        let restored: Vec<&str> = outcome
+            .restored
+            .iter()
+            .map(|mix| mix.address.as_str())
+            .collect();
+        assert_eq!(
+            restored,
+            vec![ANA, RACK],
+            "a configured target with no phone plays it"
+        );
+        let pushed: Vec<(String, Option<i32>)> = pushed_to(&engine)
+            .into_iter()
+            .map(|(address, update)| (address, update.volume_percent))
+            .collect();
+        assert_eq!(
+            pushed,
+            vec![(ANA.to_owned(), Some(81)), (RACK.to_owned(), Some(83))],
+            "through the desk's path, so each phone is sent its mix"
+        );
+        let skipped: Vec<(&str, Option<&str>, &str)> = outcome
+            .skipped
+            .iter()
+            .map(|mix| (mix.key.as_str(), mix.label.as_deref(), mix.reason))
+            .collect();
+        let away = client_key(AWAY_PHONE);
+        let gone = client_key(GONE_PHONE);
+        assert_eq!(
+            skipped,
+            vec![
+                (away.as_str(), Some("Bass"), "notConnected"),
+                (gone.as_str(), Some("Gone"), "notHere"),
+            ],
+            "skipped and named, never queued"
+        );
+        assert_eq!(outcome.backup.stamp, "19700101T000000007Z");
+        assert_eq!(outcome.backup.musicians, 4);
+
+        let idle: Mutex<Option<StandInEngine>> = Mutex::new(None);
+        let refused =
+            backups::restore_with(&idle, &session.current(), "x", backup).expect_err("no engine");
+        assert!(refused.contains("not running"), "{refused}");
     }
 
     /// A status of the engine with no musicians and no local output.

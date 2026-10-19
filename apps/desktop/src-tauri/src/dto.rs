@@ -393,6 +393,17 @@ pub struct LoadedMixDto {
     pub mix: MixDto,
 }
 
+/// What restoring a mix backup did (see [crate::commands::backups::restore_mix_backup]): the
+/// backup as listed, the mixes put back on the musicians who are connected, and the backed-up
+/// mixes that went to nobody, with why (`notConnected`, `notHere` or `refused`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixRestoredDto {
+    pub backup: crate::backups::MixBackupSummary,
+    pub restored: Vec<LoadedMixDto>,
+    pub skipped: Vec<SkippedMixDto>,
+}
+
 /// A saved mix a loaded session pushed to nobody.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

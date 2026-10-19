@@ -172,6 +172,9 @@ pub trait PumpSource: Send + 'static {
     fn musician_mix(&self, address: SocketAddr) -> Option<(SocketAddr, MixValues)>;
     /// The engine's local mix now (see [local_mix_changed]).
     fn local_mix(&self) -> Option<MixValues>;
+    /// The mix backups' turn on each pass ([commands::backups::tick]): `changed` says whether a
+    /// musician's mix change was just announced. Nothing by default.
+    fn mix_backup(&self, _changed: bool) {}
 }
 
 /// Where the pump sends its events: the window in the app, a recorder in tests.
@@ -257,6 +260,7 @@ fn pump(
         }
         // Waiting on the bus is also the pump's sleep: a change goes out at once, and a stop is
         // noticed within one meter interval.
+        let mut mix_announced = false;
         match events.recv_timeout(schedule.wait(Instant::now())) {
             Ok(event) if status_at_once(&event) => {
                 if let Some(status) = source.status() {
@@ -272,12 +276,16 @@ fn pump(
                 let lookup = |address| source.musician_mix(address);
                 if let Some(change) = mix_changed(&event, run, lookup) {
                     sink.emit(MIX_CHANGED_EVENT, change);
+                    mix_announced = true;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             // The engine and its bus are gone: there is nothing left to stream.
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        // A musician's mix change is noted for the backups, and a backup due is taken (read here,
+        // written by the backups' own thread).
+        source.mix_backup(mix_announced);
     }
 }
 
@@ -298,6 +306,12 @@ impl<R: Runtime> PumpSource for AppHandle<R> {
 
     fn local_mix(&self) -> Option<MixValues> {
         commands::local_mix(self.try_state::<DesktopState>()?.inner())
+    }
+
+    fn mix_backup(&self, changed: bool) {
+        if let Some(state) = self.try_state::<DesktopState>() {
+            commands::backups::tick(state.inner(), changed, Instant::now());
+        }
     }
 }
 
@@ -604,6 +618,66 @@ mod tests {
                 ..MixValues::default()
             })
         }
+    }
+
+    /// The engine of [FakeEngine], counting the mix backups' turns: every pass, and those that
+    /// followed a musician's mix change.
+    #[derive(Clone, Default)]
+    struct BackupTurns {
+        passes: Arc<std::sync::atomic::AtomicUsize>,
+        changes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PumpSource for BackupTurns {
+        fn meters(&self) -> Option<MetersDto> {
+            None
+        }
+
+        fn status(&self) -> Option<EngineStatusDto> {
+            None
+        }
+
+        fn musician_mix(&self, address: SocketAddr) -> Option<(SocketAddr, MixValues)> {
+            one_musician(address)
+        }
+
+        fn local_mix(&self) -> Option<MixValues> {
+            Some(MixValues::default())
+        }
+
+        fn mix_backup(&self, changed: bool) {
+            self.passes.fetch_add(1, Ordering::SeqCst);
+            if changed {
+                self.changes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn the_pump_gives_the_backups_a_turn_each_pass_and_says_when_a_musicians_mix_changed() {
+        let (bus, events) = channel();
+        let turns = BackupTurns::default();
+        let pump = EventPump::start(events, 1, turns.clone(), Recorder::default());
+        assert!(wait_until(|| turns.passes.load(Ordering::SeqCst) >= 3));
+        assert_eq!(turns.changes.load(Ordering::SeqCst), 0, "no change yet");
+
+        bus.send(EngineEvent::LocalMixChanged).expect("sent");
+        bus.send(EngineEvent::ClientConnected {
+            address: address("192.168.1.3:50001"),
+        })
+        .expect("sent");
+        bus.send(EngineEvent::MixChanged {
+            address: address("192.168.1.3:50001"),
+            origin: MixOrigin::Engine,
+        })
+        .expect("sent");
+        assert!(wait_until(|| turns.changes.load(Ordering::SeqCst) == 1));
+        pump.stop();
+        assert_eq!(
+            turns.changes.load(Ordering::SeqCst),
+            1,
+            "only the musician's mix change counts, not the local mix or a connection"
+        );
     }
 
     /// Polls `done` for up to three seconds.

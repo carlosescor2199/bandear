@@ -4,6 +4,7 @@
 //! engine call to [commands]. The engine lives in `personal-monitoring` and knows nothing of Tauri,
 //! so the headless binary does not inherit this dependency stack.
 
+pub mod backups;
 pub mod commands;
 pub mod dto;
 pub mod events;
@@ -433,6 +434,25 @@ async fn log_location() -> Result<LogLocation, String> {
     logfile::location().ok_or_else(|| "the log file is not set up: lines go to stderr".to_owned())
 }
 
+/// The backups of the musicians' mixes, the newest first: `[{ stamp, savedAt, musicians, names,
+/// problem }]` (see [backups]); `problem` says why one cannot be restored.
+#[tauri::command]
+async fn list_mix_backups(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<backups::MixBackupSummary>, String> {
+    commands::backups::list_mix_backups(state.inner())
+}
+
+/// Puts the mixes of the backup `stamp` back on the musicians who are connected now, each phone
+/// sent its mix at once; answers who got theirs and who was skipped and why.
+#[tauri::command]
+async fn restore_mix_backup(
+    state: State<'_, DesktopState>,
+    stamp: String,
+) -> Result<dto::MixRestoredDto, String> {
+    commands::backups::restore_mix_backup(state.inner(), stamp)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -528,7 +548,9 @@ pub fn run() {
             seek_soundcheck,
             set_soundcheck_loop,
             stop_soundcheck,
-            log_location
+            log_location,
+            list_mix_backups,
+            restore_mix_backup
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")
@@ -540,11 +562,13 @@ pub fn run() {
 
 /// What the app does as it runs, given its state once managed: on exit, the local mix still
 /// waiting to be kept (it is kept off the engine lock, a few times a second at most) is written
-/// before the app goes, and then the log is flushed so its last lines stay.
+/// before the app goes, so is a backup of the musicians' mixes as the engine has them, and then
+/// the log is flushed so its last lines stay.
 fn on_run_event(state: Option<&DesktopState>, event: &tauri::RunEvent) {
     if let tauri::RunEvent::Exit = event {
         if let Some(state) = state {
             commands::local::flush_local_mix(state);
+            commands::backups::flush_mix_backup(state);
         }
         log_info!("app", "exiting");
         personal_monitoring::logging::flush();

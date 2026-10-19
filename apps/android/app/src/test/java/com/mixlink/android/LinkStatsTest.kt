@@ -187,6 +187,54 @@ class LinkStatsTest {
     }
 
     @Test
+    fun theJitterIsTheMeanArrivalDeviationOverTheInterval() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+        stats.onPacket(lostBefore = 0, nowMs = 0)
+        stats.onArrivalDeviation(1.0)
+        stats.onArrivalDeviation(-3.0)
+        stats.onArrivalDeviation(2.0)
+
+        // An early packet varies the arrival as much as a late one.
+        assertEquals(2.0, stats.poll(1_000, cumulativeUnderruns = 0)!!.jitterMs, 1e-9)
+    }
+
+    @Test
+    fun theJitterStartsAgainAfterAReportAndIsNotMeasuredWithoutArrivals() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+        stats.onPacket(lostBefore = 0, nowMs = 0)
+        stats.onArrivalDeviation(8.0)
+        stats.poll(1_000, cumulativeUnderruns = 0)
+
+        // No two packets arrived in this interval: there is no spacing to measure.
+        assertTrue(stats.poll(2_000, cumulativeUnderruns = 0)!!.jitterMs.isNaN())
+
+        stats.onArrivalDeviation(0.5)
+        assertEquals(0.5, stats.poll(3_000, cumulativeUnderruns = 0)!!.jitterMs, 1e-9)
+    }
+
+    @Test
+    fun theCushionAndTheBacklogAreTheValuesAtTheIntervalsEnd() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+        stats.onPacket(lostBefore = 0, nowMs = 0)
+
+        val report = stats.poll(1_000, cumulativeUnderruns = 0, cushionMs = 10.0, backlogMs = 37.5)!!
+
+        assertEquals(10.0, report.cushionMs, 0.0)
+        assertEquals(37.5, report.backlogMs, 0.0)
+    }
+
+    @Test
+    fun aReportWithoutTheExtrasMarksThemNotMeasured() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+
+        val report = stats.poll(LINK_STATS_STARTUP_GRACE_MS, cumulativeUnderruns = 0)!!
+
+        assertTrue(report.jitterMs.isNaN())
+        assertTrue(report.cushionMs.isNaN())
+        assertTrue(report.backlogMs.isNaN())
+    }
+
+    @Test
     fun theIntervalIsClampedToWhatTheServerAccepts() {
         val stats = LinkStatsAccumulator(startedAtMs = 0)
 

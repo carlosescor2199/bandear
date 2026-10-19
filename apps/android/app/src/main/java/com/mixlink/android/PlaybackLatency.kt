@@ -49,6 +49,18 @@ object PlaybackLatency {
     fun targetBufferFrames(packetFrames: Int, cushionPackets: Int): Int =
         (packetFrames.coerceAtLeast(0) * cushionPackets.coerceAtLeast(1)).coerceAtLeast(1)
 
+    /**
+     * The cushion the phone aims for, in milliseconds: the buffer [targetBufferFrames] asks the track
+     * for, at the track's [sampleRate]. Milliseconds, so phones with different packet sizes read on
+     * one scale. `NaN` (not measured) before the first packet sized it or at an unusable rate.
+     */
+    fun cushionMs(packetFrames: Int, cushionPackets: Int, sampleRate: Int): Double =
+        if (packetFrames <= 0 || sampleRate <= 0) {
+            Double.NaN
+        } else {
+            targetBufferFrames(packetFrames, cushionPackets) * 1000.0 / sampleRate
+        }
+
     /** One adjustment outcome: the cushion to use next, and the clean-interval count to carry. */
     data class CushionDecision(val cushion: Int, val cleanIntervals: Int)
 

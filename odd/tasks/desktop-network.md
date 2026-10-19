@@ -295,8 +295,69 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     `feat(desktop-ui): link health chart on the network screen`.
   - Not built from the design board: the phone buffer and redundancy columns (T6, T7), demo mode
     (T8), log viewer and export/restore of mixes from a file.
-- [ ] T5 (Android): announce capabilities, report jitter and cushion in `stats`. Route: delegated
-  writer.
+- [x] T4-fix (review-e6137cfb0b4da4c8 findings). Route: delegated writer (trigger: findings across
+  the network screen, the link health logic and the control server tests; done with T5).
+  - WARNING fixed: the screen's link health wiring moved into a DOM-free controller,
+    `lib/link-health-controller.js` (`createLinkHealthController({ read, onChange, schedule, cancel
+    })`: `select(musicians, address)`, `view(musicians)` answering `{ selected, data }`, `setRange`,
+    `showTable`, `close`, `dispose`); the screen only forwards events and draws. Node tests: picking
+    the open musician again closes the panel and stops the follower, another one is followed
+    instead, the panel closes and the follower stops when the musician leaves the list or the
+    engine stops (nobody listed), a failed read reaches the panel and the next good read clears it,
+    range and table, unmounting stops the follower and drops a late answer.
+  - SUGGESTION fixed: `followedMusician(musicians, key, address)` (link-health-view.js): when an
+    `address:` key is gone, the row at the same address that now has a client id is the same phone,
+    so a phone that registers keeps its panel open and is followed by its client id (the history
+    held stays shown until the new key's read); a phone that already had a client id is never
+    followed to another at its old address.
+  - SUGGESTION fixed: `a_closed_connection_stops_the_gaps` drives the tick by hand
+    (`fill_link_gaps` with a moment seconds ahead): the same tick keeps gaps while connected and none
+    a minute ahead once the connection closed; no fixed sleep (the test went from about 3 s to
+    0.01 s).
+  - RED: UI suite failed to load (controller module missing); with the guard's `end_link_session`
+    disabled, the server test failed (60 samples, 55 of them gaps, against 5). GREEN below.
+  - Browser check (`desktop-ui`, `?fake#/network`): History opened Bass (600 samples), History again
+    closed the panel and unpressed it, Drums opened, 1 min set the range, Close closed it; no console
+    errors.
+  - Commits: 769ea43 `fix(desktop-ui): test the link health wiring and follow a musician who
+    registers` (+359/-61); 90b9cfc `test(server): prove gaps stop after a close without a fixed
+    sleep` (+25/-4).
+- [x] T5 (Android): announce capabilities, report jitter, cushion and backlog in `stats`. Route:
+  delegated writer (trigger: 2+ non-trivial files, the control channel, the link stats, the player
+  and their tests).
+  - Capabilities: `CLIENT_CAPABILITIES = listOf(CAPABILITY_STATS_V2)` in `ControlChannel.kt`, sent
+    as `capabilities` in every registration (first open, reconnect, rename); T6 and T7 add their
+    name by one line. An empty list puts no key.
+  - Stats extras (`stats.v2`), measured on the receive thread over each report interval:
+    `jitter_ms` the mean of each packet's spacing distance from the smoothed spacing (the deviation
+    the local jitter already smooths, `LinkStatsAccumulator.onArrivalDeviation`), absent with no two
+    packets in the interval; `cushion_ms` the buffer asked of the track
+    (`PlaybackLatency.cushionMs`: cushion packets times packet frames at the track's rate), absent
+    before the first packet; `backlog_ms` the audio queued when the interval ends (track timestamp
+    read at the poll). Hand-off: the existing once-a-second `LinkStatsReport` carries them as
+    primitive doubles (`NaN` = not measured, nothing boxed) to `ControlChannel.sendLinkStats`, which
+    builds the JSON on the control scheduler; per packet only two primitive fields change, no
+    allocation or lock. `recovered` is left for T7.
+  - Wire: extras rounded to 0.01 ms; a value not measured or outside 0-60 000 ms is left out.
+  - Old servers: main before phase 4 (4f2ae0c) has no `deny_unknown_fields` in `protocol.rs`, and its
+    tests `an_address_in_a_registration_is_ignored_because_there_is_no_such_field` and
+    `parses_a_stats_report_with_its_interval_and_counts` (an unknown `battery`) prove unknown fields
+    in `register` and `stats` are ignored.
+  - RED (stub API: no capabilities, extras not measured or sent, cushion 0):
+    `gradle -p apps/android :app:testDebugUnitTest --max-workers=2 --no-daemon`: 467 tests, 11
+    failed (2 stats message, 3 link stats, 2 cushion, 4 registration); the 3 that passed (no extras
+    without measures, names valid, an empty list) are kept as guards. GREEN below.
+  - Build: no Gradle wrapper; Gradle 9.6.0 from `~/.gradle/wrapper/dists` with `JAVA_HOME` set to
+    Android Studio's JBR and `ANDROID_HOME` to the local SDK, `--max-workers=2 --no-daemon` (the user
+    approved Android builds with this limit); no Java process left after.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 474 passed;
+    `node --test apps/desktop/ui/tests`: 512 passed;
+    `gradle -p apps/android :app:testDebugUnitTest --max-workers=2 --no-daemon`: 467 tests, 0
+    failures (456 before, 11 new); `gradle -p apps/android :app:assembleDebug --max-workers=2
+    --no-daemon`: BUILD SUCCESSFUL, APK `apps/android/app/build/outputs/apk/debug/app-debug.apk`
+    (not installed).
+  - Commit: this commit `feat(android): announce capabilities and report jitter, cushion and
+    backlog`.
 - [ ] T6 (buffer from the desk): server message, desk control per musician, Android applies Auto
   or fixed. Route: delegated writer.
 - [ ] T7 (redundancy): delayed duplicate send per musician, desk toggle, recovered count. Route:
@@ -332,7 +393,14 @@ per reviewed slice, only with the user's approval.
   tests for the tick's gaps and a closed connection (SUGGESTION); all fixed in T3-fix. Next review
   base 0d689e1.
 - T3-fix and T4 done (health chart), three commits.
+- review-e6137cfb0b4da4c8 (0d689e1..e26e4f3, T3-fix and T4) approved and acknowledged, with three
+  findings: the screen's link health wiring untested (WARNING), a phone listed by address that
+  registers closing its panel (SUGGESTION), and the closed-connection test's fixed 3 s sleep
+  (SUGGESTION); all fixed in T4-fix. Next review base e26e4f3.
+- The user approved Android builds with `--max-workers=2`.
+- T4-fix and T5 done (Android capabilities and stats extras), three commits.
 
 ## Next step
 
-T5 (Android: announce capabilities, report jitter and cushion).
+T6 (buffer from the desk: server message, desk control per musician, Android applies Auto or
+fixed).

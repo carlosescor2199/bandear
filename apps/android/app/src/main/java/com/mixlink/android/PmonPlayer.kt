@@ -163,7 +163,21 @@ internal class PmonPlayer(
                     // track's underrun count is read only when one is due.
                     val nowMs = System.nanoTime() / NANOS_PER_MILLISECOND
                     if (linkStats.isDue(nowMs)) {
-                        linkStats.poll(nowMs, audioTrack?.underrunCount ?: 0)?.let { report ->
+                        // The cushion aimed for and the audio queued right now end the interval; the
+                        // report holds them as primitives and is handed over as it always was.
+                        val track = audioTrack
+                        val rate = playbackRate ?: 0
+                        val backlogNowMs = if (track != null && track.getTimestamp(audioTimestamp)) {
+                            PlaybackLatency.backlogMs(framesWritten, audioTimestamp.framePosition, rate)
+                        } else {
+                            Double.NaN
+                        }
+                        linkStats.poll(
+                            nowMs,
+                            track?.underrunCount ?: 0,
+                            cushionMs = PlaybackLatency.cushionMs(packetFrames, cushionPackets, rate),
+                            backlogMs = backlogNowMs,
+                        )?.let { report ->
                             listener.onLinkStats(report)
                         }
                     }
@@ -202,6 +216,7 @@ internal class PmonPlayer(
                                 interArrivalMs += 0.1 * (intervalMs - interArrivalMs)
                             }
                             jitterMs += 0.1 * (kotlin.math.abs(intervalMs - interArrivalMs) - jitterMs)
+                            linkStats.onArrivalDeviation(intervalMs - interArrivalMs)
                         }
                         previousPacketAtNanos = packetReceivedAtNanos
                         val elapsedSeconds = (packetReceivedAtNanos - metricsStartedAtNanos) / 1_000_000_000.0

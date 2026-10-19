@@ -24,6 +24,7 @@ import "./sessions.test.js";
 import "./session-console.test.js";
 import "./mix-backups.test.js";
 import "./link-history.test.js";
+import "./link-health-view.test.js";
 import "./channels-screen.test.js";
 import "./local-mix.test.js";
 import "./recording.test.js";

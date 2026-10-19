@@ -23,7 +23,9 @@
 //! as it plays and never drifts. Without a local output (or when its callbacks stop for
 //! [OUTPUT_GRACE], a device that failed) the engine thread's own timer is the clock: frames fall due
 //! with the time that passes, counted exactly from when the timer took over, and the thread wakes
-//! for each block. The timer runs on the system's wait granularity, so on a coarse system timer
+//! for each block. Which clock is decided on the engine thread at every block, from the callbacks
+//! themselves: an installed output's callbacks take over from the timer as soon as they come, so an
+//! output that starts playing after the take did is followed from then on. The timer runs on the system's wait granularity, so on a coarse system timer
 //! blocks may go out a few at a time, at the same average rate.
 //!
 //! Real time. The engine thread never allocates, frees, locks, waits or panics for the take. Only
@@ -33,8 +35,8 @@
 //! underrun. When the ring runs short later, the block is padded with silence, the padded frames
 //! are counted as underrun and the ring fills to the preroll again: the engine thread never waits
 //! for the disk. Nothing the engine thread holds is freed there: when it lets the take go, the disk
-//! thread still holds the other end of the ring (it ends only once it sees the engine let go) and
-//! the engine's side holds the shared state.
+//! thread still holds the other end of the ring and the shared state (it ends only once it sees
+//! the engine let go, even when a stop gave up waiting for that), and frees them.
 //!
 //! What plays. `take.json` (version 1, see [crate::recorder]) lists the tracks: an `input` track
 //! is a mono file of one input, a `pair` track a stereo file of a linked pair, a `local` track the
@@ -97,7 +99,8 @@ pub(crate) const OUTPUT_GRACE: Duration = Duration::from_millis(250);
 /// skips the rest rather than bursting it out.
 const MAX_DUE_FRAMES: usize = TARGET_SAMPLE_RATE as usize / 4;
 
-/// How long [crate::EngineHandle::stop_soundcheck] waits for the disk thread to end.
+/// How long [crate::EngineHandle::stop_soundcheck] waits for the disk thread to end; past it, the
+/// disk thread ends on its own once the engine thread lets go of the take.
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// The take's description in its folder.
@@ -263,7 +266,8 @@ impl std::error::Error for SoundcheckError {}
 pub(crate) struct PlaybackClock {
     /// Frames the local output has played, every callback included.
     output_frames: AtomicU64,
-    /// A local output plays, so the take follows its callbacks rather than the timer.
+    /// A local output is installed: its callbacks are the take's clock whenever they come. Only
+    /// [crate::EngineHandle]'s output changes set it, never a soundcheck's start.
     follow_output: AtomicBool,
     /// A take plays: each callback wakes the engine thread.
     active: AtomicBool,
@@ -299,7 +303,7 @@ impl PlaybackClock {
         }
     }
 
-    /// Whether a local output plays, so that its callbacks are the clock.
+    /// Whether a local output is installed, so that its callbacks are the clock once they come.
     pub(crate) fn follow_output(&self, follow: bool) {
         self.follow_output.store(follow, Ordering::Relaxed);
     }
@@ -317,6 +321,12 @@ impl PlaybackClock {
     pub(crate) fn set_grace(&self, grace: Duration) {
         self.grace_micros
             .store(grace.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Whether a take would follow the local output's callbacks.
+    #[cfg(test)]
+    pub(crate) fn follows_output(&self) -> bool {
+        self.follow_output.load(Ordering::Relaxed)
     }
 }
 
@@ -573,7 +583,7 @@ pub(crate) struct PlaybackShared {
     /// The take follows the local output's callbacks (else the timer), as the engine thread last
     /// found.
     output_clock: AtomicBool,
-    /// The engine's side gave up on the take: the disk thread ends.
+    /// No engine thread holds the take's reader ([ActiveSoundcheck::close]): the disk thread ends.
     closed: AtomicBool,
     failed: AtomicBool,
     /// Why reading failed, written once by the disk thread; never read on the engine thread.
@@ -861,10 +871,20 @@ impl PlaybackReader {
         &self.capture
     }
 
+    /// Starts the take on the timer: the local output installed, if any, does not play now. Its
+    /// callbacks still take over as the clock as soon as they come (see [Self::due]).
+    pub(crate) fn start_on_timer(&mut self) {
+        self.timer = Some((Instant::now(), 0));
+        self.shared.output_clock.store(false, Ordering::Relaxed);
+    }
+
     /// The whole blocks of `block_frames` the clock has made due by `now`.
     ///
-    /// The local output's callbacks are the clock while one plays and has played within the
-    /// grace; otherwise the timer, which counts the frames in the time since it took over.
+    /// The installed local output's callbacks are the clock whenever they come, from the start or
+    /// later (they take over from the timer at once); the timer is the clock without an output,
+    /// once the output's callbacks have stopped for the grace, or from the start when the output
+    /// did not play then ([Self::start_on_timer]). The timer counts the frames in the time since
+    /// it took over.
     pub(crate) fn due(&mut self, now: Instant, block_frames: usize) -> usize {
         let block_frames = block_frames.max(1);
         let ticks = self.clock.output_frames.load(Ordering::Relaxed);
@@ -876,7 +896,10 @@ impl PlaybackReader {
             self.last_tick = now;
             self.timer = None;
             self.shared.output_clock.store(true, Ordering::Relaxed);
-        } else if !follow || now.saturating_duration_since(self.last_tick) >= self.clock.grace() {
+        } else if !follow
+            || self.timer.is_some()
+            || now.saturating_duration_since(self.last_tick) >= self.clock.grace()
+        {
             let (origin, counted) = self.timer.get_or_insert((now, 0));
             let total = frames_in(now.saturating_duration_since(*origin)) as u64;
             self.credit = self
@@ -971,6 +994,24 @@ impl PlaybackReader {
         shared.position.store(self.position, Ordering::Relaxed);
         shared.seek_done.store(requested, Ordering::Release);
         false
+    }
+
+    /// Lets go of the take on the engine thread, freeing nothing there. The disk thread ends only
+    /// once it sees the ring let go of, so it still holds the shared state when this thread lets
+    /// go of its share, and the ring's other end when this thread lets go of its own: it frees
+    /// both. The order matters, so it is spelled out rather than left to the fields' order.
+    pub(crate) fn release(self) {
+        let Self {
+            consumer,
+            shared,
+            clock,
+            capture,
+            ..
+        } = self;
+        drop(shared);
+        drop(clock);
+        drop(capture);
+        drop(consumer);
     }
 
     /// Whether the ring holds enough to play: the preroll, or everything the disk will queue.
@@ -1079,17 +1120,14 @@ pub(crate) struct ActiveSoundcheck {
     length: u64,
 }
 
-/// Loads the take of `request` for the device's `source_channels` inputs whose details are
-/// `details`, and starts its disk thread: the reader for the engine thread, and the take on the
-/// engine's side.
-pub(crate) fn prepare(
+/// Starts the disk thread of `take` (loaded with [load_take]) from `request`'s frame, looping as
+/// it asks: the reader for the engine thread, and the take on the engine's side.
+pub(crate) fn prepare<R: Read + Seek + Send + 'static>(
+    take: LoadedTake<R>,
     request: &SoundcheckRequest,
-    details: &[ChannelMeta],
-    source_channels: usize,
     clock: Arc<PlaybackClock>,
     capture: Arc<CaptureStats>,
 ) -> Result<(PlaybackReader, ActiveSoundcheck), SoundcheckError> {
-    let take = load_take(&request.take_folder, details, source_channels)?;
     let folder = take.folder.clone();
     let name = take.name.clone();
     let length = take.length;
@@ -1120,8 +1158,10 @@ pub(crate) fn prepare(
 }
 
 impl ActiveSoundcheck {
-    /// Waits up to `wait` for the disk thread to end once the engine thread has let go of the
-    /// take, then ends it in any case and joins it.
+    /// Waits up to `wait` for the disk thread to end once the engine thread has been asked to let
+    /// go of the take, and joins it. When the wait runs out (the engine thread is held up and
+    /// still plays from the ring), the disk thread is left to end on its own: it ends once it sees
+    /// the engine thread let go, and frees the ring then, so the engine thread never does.
     pub(crate) fn end(mut self, wait: Duration) {
         let Some(disk) = self.disk.take() else {
             return;
@@ -1131,6 +1171,17 @@ impl ActiveSoundcheck {
             disk.thread().unpark();
             thread::sleep(Duration::from_millis(1));
         }
+        if disk.is_finished() {
+            let _ = disk.join();
+        }
+    }
+
+    /// Ends the disk thread and joins it, when no engine thread holds the take's reader: the
+    /// engine thread has ended, or never got the take.
+    pub(crate) fn close(mut self) {
+        let Some(disk) = self.disk.take() else {
+            return;
+        };
         self.shared.closed.store(true, Ordering::Release);
         disk.thread().unpark();
         let _ = disk.join();
@@ -1266,7 +1317,7 @@ impl Soundcheck {
     /// Ends the take after the engine thread has ended: nothing plays it any more.
     pub(crate) fn engine_stopped(&mut self) {
         if let Some(active) = self.active.take() {
-            active.end(Duration::ZERO);
+            active.close();
         }
     }
 
@@ -1406,6 +1457,79 @@ pub(crate) mod tests {
         folder
     }
 
+    /// What makes the files of a [flaky] take fail, as a disk can: every read once
+    /// [Faults::fail_reads] is called, every seek once [Faults::fail_seeks] is.
+    pub(crate) struct Faults {
+        reads: AtomicBool,
+        seeks: AtomicBool,
+    }
+
+    impl Faults {
+        pub(crate) fn fail_reads(&self) {
+            self.reads.store(true, Ordering::Release);
+        }
+
+        pub(crate) fn fail_seeks(&self) {
+            self.seeks.store(true, Ordering::Release);
+        }
+    }
+
+    /// A track file held in memory that fails when its [Faults] say so.
+    pub(crate) struct FlakyFile {
+        bytes: std::io::Cursor<Vec<u8>>,
+        faults: Arc<Faults>,
+    }
+
+    impl Read for FlakyFile {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.faults.reads.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("the disk stopped answering"));
+            }
+            self.bytes.read(buffer)
+        }
+    }
+
+    impl Seek for FlakyFile {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            if self.faults.seeks.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("the disk stopped answering"));
+            }
+            self.bytes.seek(to)
+        }
+    }
+
+    /// `take` with every file read into memory, failing when the returned [Faults] say so.
+    pub(crate) fn flaky(take: LoadedTake) -> (LoadedTake<FlakyFile>, Arc<Faults>) {
+        let faults = Arc::new(Faults {
+            reads: AtomicBool::new(false),
+            seeks: AtomicBool::new(false),
+        });
+        let tracks = take
+            .tracks
+            .into_iter()
+            .map(|track| {
+                let bytes = fs::read(take.folder.join(&track.file)).expect("the file reads");
+                let file = FlakyFile {
+                    bytes: std::io::Cursor::new(bytes),
+                    faults: Arc::clone(&faults),
+                };
+                TrackSource {
+                    reader: WavReader::new(file).expect("the file is a WAV file"),
+                    file: track.file,
+                    inputs: track.inputs,
+                }
+            })
+            .collect();
+        let take = LoadedTake {
+            folder: take.folder,
+            name: take.name,
+            length: take.length,
+            channels: take.channels,
+            tracks,
+        };
+        (take, faults)
+    }
+
     fn meta(name: &str, kind: ChannelKind) -> ChannelMeta {
         ChannelMeta {
             name: name.to_owned(),
@@ -1472,7 +1596,7 @@ pub(crate) mod tests {
     }
 
     /// Steps the disk until it has nothing more to do.
-    fn fill_ring(disk: &mut DiskPlayer) {
+    fn fill_ring<R: Read + Seek>(disk: &mut DiskPlayer<R>) {
         while let DiskStep::Queued(_) = disk.step() {}
     }
 
@@ -1983,5 +2107,144 @@ pub(crate) mod tests {
         assert_eq!(&wrapped[40..], heard_range(0..24).as_slice());
         assert!(!run.shared.ended.load(Ordering::Relaxed));
         assert_eq!(run.shared.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// A seek the disk cannot make fails the take as a read error does: the reason names the
+    /// file, the engine thread plays silence from then on (what was queued included), the disk
+    /// queues nothing more, every change is refused with the reason, and the disk thread ends once
+    /// the engine thread lets go.
+    #[test]
+    fn a_seek_the_disk_cannot_make_fails_the_take() {
+        let take =
+            load_take(&take_folder("seek-fails"), &four_inputs(), 4).expect("the take loads");
+        let (take, faults) = flaky(take);
+        let (mut disk, mut reader, shared) = playback_link(
+            take,
+            0,
+            false,
+            Arc::new(PlaybackClock::new()),
+            Arc::new(CaptureStats::default()),
+            small(),
+        )
+        .expect("the take links");
+        fill_ring(&mut disk);
+        assert_eq!(next(&mut reader, 64), heard_range(0..64));
+
+        faults.fail_seeks();
+        shared.request_seek(500);
+
+        assert_eq!(disk.step(), DiskStep::Idle);
+        let reason = shared.failure().expect("the take failed");
+        assert!(
+            reason.contains("seeking in \"01 Vocal.wav\" failed"),
+            "{reason}"
+        );
+        assert!(silent(&next(&mut reader, 64)));
+        assert!(silent(&next(&mut reader, 64)));
+        let queued = shared.queued.load(Ordering::Acquire);
+        assert_eq!(disk.step(), DiskStep::Idle);
+        assert_eq!(shared.queued.load(Ordering::Acquire), queued);
+        let soundcheck = Soundcheck {
+            active: Some(ActiveSoundcheck {
+                shared: Arc::clone(&shared),
+                disk: None,
+                folder: PathBuf::from("take"),
+                name: "Soundcheck".to_owned(),
+                length: LENGTH,
+            }),
+        };
+        assert_eq!(
+            soundcheck.status().state,
+            SoundcheckState::Failed {
+                reason: reason.clone()
+            }
+        );
+        assert_eq!(
+            soundcheck.playing().err(),
+            Some(SoundcheckError::Failed { reason })
+        );
+
+        drop(reader);
+        assert_eq!(disk.step(), DiskStep::Exit);
+    }
+
+    /// A read error in the middle of the take fails it the same way: silence from the next block,
+    /// nothing more queued.
+    #[test]
+    fn a_read_error_in_the_middle_of_the_take_fails_it() {
+        let take =
+            load_take(&take_folder("read-fails"), &four_inputs(), 4).expect("the take loads");
+        let (take, faults) = flaky(take);
+        let (mut disk, mut reader, shared) = playback_link(
+            take,
+            0,
+            true,
+            Arc::new(PlaybackClock::new()),
+            Arc::new(CaptureStats::default()),
+            small(),
+        )
+        .expect("the take links");
+        fill_ring(&mut disk);
+        for block in 0..8 {
+            assert_eq!(
+                next(&mut reader, 64),
+                heard_range(64 * block..64 * (block + 1))
+            );
+        }
+
+        faults.fail_reads();
+        // The ring has room for a chunk again once the engine thread took enough of it.
+        let mut steps = 0;
+        while shared.failure().is_none() && steps < 100 {
+            next(&mut reader, 64);
+            disk.step();
+            steps += 1;
+        }
+
+        let reason = shared.failure().expect("the take failed");
+        assert!(
+            reason.contains("reading \"01 Vocal.wav\" failed"),
+            "{reason}"
+        );
+        let queued = shared.queued.load(Ordering::Acquire);
+        assert!(silent(&next(&mut reader, 64)));
+        assert_eq!(disk.step(), DiskStep::Idle);
+        assert_eq!(shared.queued.load(Ordering::Acquire), queued);
+    }
+
+    /// A stop that gives up waiting for the disk thread (the engine thread was held up and has not
+    /// let go of the take yet) leaves the disk thread holding its end of the ring until the engine
+    /// thread lets go: then nothing is freed on the engine thread, and the disk thread frees the
+    /// ring and the shared state when it ends.
+    #[test]
+    fn a_stop_that_gives_up_waiting_frees_nothing_on_the_engine_thread() {
+        let links = links();
+        let (_writer, live) = source(4, 64, links.clone());
+        let mut pipeline = Pipeline::new(Vec::new(), Arc::clone(&links.levels));
+        pipeline.set_source(live);
+        let request = SoundcheckRequest {
+            take_folder: take_folder("stop-gives-up"),
+            start_frame: 0,
+            looping: true,
+        };
+        let take = load_take(&request.take_folder, &four_inputs(), 4).expect("the take loads");
+        // The engine's side holds the clock for as long as the engine runs.
+        let clock = Arc::new(PlaybackClock::new());
+        let (playback, active) =
+            prepare(take, &request, Arc::clone(&clock), Arc::clone(&links.stats))
+                .expect("the take starts");
+        let shared = Arc::downgrade(&active.shared);
+        pipeline.play(playback);
+
+        // This thread is the engine thread, held up: the stop's wait runs out first.
+        active.end(Duration::from_millis(20));
+        let (_, frees) = allocations::count(|| pipeline.go_live());
+
+        assert_eq!(frees, 0, "the engine thread freed the take");
+        assert!(
+            crate::recorder::tests::until(|| shared.upgrade().is_none()),
+            "the disk thread ends and frees the take"
+        );
+        assert!(!links.stats.suspended.load(Ordering::Relaxed));
     }
 }

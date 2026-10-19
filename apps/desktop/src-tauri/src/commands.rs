@@ -5994,6 +5994,7 @@ mod tests {
             local_mix: MixValues::default(),
             local_output: personal_monitoring::LocalOutputStatus::default(),
             recording: personal_monitoring::RecordingStatus::default(),
+            soundcheck: Default::default(),
         }
     }
 

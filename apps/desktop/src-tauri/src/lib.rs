@@ -425,8 +425,9 @@ async fn stop_soundcheck(state: State<'_, DesktopState>) -> Result<SoundcheckDto
     commands::soundcheck::stop_soundcheck(state.inner())
 }
 
-/// Where the log is: `{ directory, file }`, the folder and the current `mixlink.log` (see
-/// [logfile]); an error when the app could not set its log file up and logs to stderr only.
+/// Where the log is: `{ directory, file, failedLines }`, the folder, the current `mixlink.log` and
+/// the lines it could not take since the start (see [logfile]); an error when the app could not
+/// set its log file up and logs to stderr only.
 #[tauri::command]
 async fn log_location() -> Result<LogLocation, String> {
     logfile::location().ok_or_else(|| "the log file is not set up: lines go to stderr".to_owned())

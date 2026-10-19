@@ -319,9 +319,51 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     test fail with `Some(20)` on `Ready`; the new test passed with the same pauses.
     GREEN: server unit tests 379 -> 381; desktop 205 -> 206 on 3 runs (the saver guard test
     added, the exit test replaced); clippy reports nothing in `wav.rs`. Commit: this commit.
-- [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
-  `take.json`, markers, dropped-frame accounting, refusing device switches while recording, disk
-  estimate, Tauri commands. Route: delegated writer.
+- [x] T4a (recorder and takes, engine): the recorder sink and disk thread, arming, take folders
+  and `take.json`, markers, dropped-frame accounting, refusing device switches while recording,
+  disk estimate. Route: delegated writer (writer and 2+ non-trivial files triggers).
+  - Design (`recorder.rs`): `RecorderSink` (a fourth sink after the network and local ones) copies
+    each block's armed channels, plus the local mix through its own `MixPlan` when asked, into the
+    take's `rtrb` ring (4 s, allocated on the engine's side at start); a ring without room drops
+    the block whole and counts it. Takes reach the sink through a 4-slot command ring and come back
+    through a return ring that `start`/`stop` reap, so nothing is allocated or freed on the engine
+    thread. A disk thread ("recorder") splits frames into a mono file per armed input, one stereo
+    file per armed linked pair (either side arms it) and `Local mix.wav`, writes them with
+    `WavWriter` (Int24 default, Float32), refreshes headers every 1 s and syncs every 5 s, and on
+    the end finishes every file and writes `take.json` (version 1; also written at the start with
+    `ended: null`) through a temporary file and a rename. Folder
+    `<YYYY-MM-DD_HHMMSS>_<take name>` (local time by `utc_offset_minutes`, ` (2)`... never an
+    existing folder); files `01 Vocal.wav`, `03-04 Keys.wav`, `Local mix.wav`; RFC 3339 UTC start
+    time formatted by hand. A failed write stops only the take (the failed file keeps its last
+    refresh, the others are finished, `ended: diskError` with the reason); the sink stops feeding
+    it. Free space: a `#[cfg(windows)]` binding to `GetDiskFreeSpaceExW` (nearest existing
+    parent; `None` elsewhere); minutes left = free bytes / sum of the tracks' bytes per second.
+  - API for T4b/T5: `start_recording(RecordRequest { folder, take_name, format, armed (0-based),
+    include_local, utc_offset_minutes }) -> RecordingStatus`, `stop_recording() -> TakeSummary`
+    (waits up to 10 s for the files, else an error with the state `Stopping`), `add_marker(name)
+    -> TakeMarker { frame, name }`, `recording() -> RecordingStatus { state: Idle | Recording |
+    Stopping | Failed { reason }, take_folder, frames, dropped_frames, bytes_written, tracks,
+    markers, free_bytes, minutes_left, last_take }` (also `EngineStatus::recording`),
+    `record_estimate(&RecordRequest) -> DiskEstimate { bytes_per_second, free_bytes,
+    minutes_left }`, and `free_space`, `minutes_left`. `TakeSummary { folder, name, started,
+    sample_rate, format, device, tracks: [TakeTrack { file, kind: Input | Pair | Local, channels
+    (1-based), name, instrument }], frames, markers, dropped_frames, ended: Stopped |
+    EngineStopped | DiskError { reason } }`. `switch_device` and `install_capture` are refused
+    while a take records; `stop()` ends the take as `EngineStopped` and leaves it in `last_take`.
+  - RED: 14 of 14 new tests failed against stubs (unit: track planning, refusals, names, RFC 3339,
+    folders, splitting and `take.json`, the start file, ring overflow, allocation-free sink, failed
+    write; engine: a take while the phones hear, refused switch, engine stop, disk error); then 5
+    of 5 (markers unit and engine, minutes, free space, estimate). Run 3 once showed a race in the
+    failed-write test's own assertion (a refresh failing before the third block was drained); the
+    test now asserts the healthy file holds every frame the take wrote, and 20 repeated runs of
+    the recording tests passed.
+  - GREEN: server unit tests 381 -> 395 -> 400 on 3 runs; the sink makes (0, 0) allocations and
+    frees idle, on the block that starts a take, over 500 recorded blocks and on the block that
+    stops it; clippy reports nothing new (its 7 warnings are older); desktop `cargo check
+    --all-targets` clean (three status literals gained `recording`).
+  - Commits: baa4676 (recording, 2,096 lines). Commit: this commit (markers and disk estimate).
+- [ ] T4b (recorder and takes, desktop): Tauri commands and settings over the T4a API (folder,
+  format, include local mix, arming), status and events. Route: delegated writer.
 - [ ] T5 (Record screen): the Record section per the design, the REC chip, takes table and
   settings. Route: delegated writer.
 - [ ] T6 (virtual soundcheck): the playback source in place of capture and its UI. Route:
@@ -357,7 +399,10 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 - Review lineage review-c02182433a1b692a over 9ce6711..b9e1073 (T2b-fix2 and T3) approved and
   acknowledged; both findings (R3-001 the exit test racing the saver's interval, R3-002 an empty
   data chunk read as audio) are fixed by T3-fix. Next review base: b9e1073.
+- T3-fix (f0950d7) is pending review in the slice from b9e1073.
+- T4 split into T4a (engine, done in baa4676 and the markers and disk estimate commit) and T4b
+  (desktop).
 
 ## Next step
 
-T4.
+T4b.

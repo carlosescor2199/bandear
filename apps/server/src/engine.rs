@@ -29,8 +29,9 @@ use crate::output::{
 };
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
 use crate::recorder::{
-    open_take, plan_tracks, recorder_sink, FileOpener, RecordRequest, Recorder, RecordingStatus,
-    TakeEnd, TakeOptions, TakeSummary, TrackOpener, STOP_WAIT,
+    free_space, minutes_left, open_take, plan_tracks, recorder_sink, take_bytes_per_second,
+    DiskEstimate, FileOpener, RecordRequest, Recorder, RecordingStatus, TakeEnd, TakeMarker,
+    TakeOptions, TakeSummary, TrackOpener, STOP_WAIT,
 };
 use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
@@ -1939,10 +1940,38 @@ impl EngineHandle {
         Ok(self.recorder.wait(STOP_WAIT)?)
     }
 
-    /// The take being recorded: its state, folder, frames, dropped frames, bytes and tracks, and
-    /// the last take that ended.
+    /// The take being recorded: its state, folder, frames, dropped frames, bytes, tracks and
+    /// markers, the free space on its disk and the minutes of it that space holds, and the last
+    /// take that ended.
     pub fn recording(&self) -> RecordingStatus {
         self.recorder.status()
+    }
+
+    /// Marks the take being recorded with `name` (`Marker n` when blank, at most 64 characters)
+    /// at the first frame of the block being recorded, and returns the marker. `take.json` lists
+    /// the markers when the take ends. An error when no take records.
+    pub fn add_marker(&self, name: &str) -> Result<TakeMarker, Box<dyn Error>> {
+        Ok(self.recorder.add_marker(name)?)
+    }
+
+    /// What a take of `request` would take on the disk: its bytes per second (the armed tracks
+    /// as [Self::start_recording] would lay them out), the free space on `request.folder`'s disk
+    /// and the minutes it holds. An error when the request could not start a take (nothing
+    /// armed, an input the device lacks).
+    pub fn record_estimate(&self, request: &RecordRequest) -> Result<DiskEstimate, Box<dyn Error>> {
+        let tracks = plan_tracks(
+            &self.config_state.snapshot().channels,
+            usize::from(self.source_channels),
+            &request.armed,
+            request.include_local,
+        )?;
+        let bytes_per_second = take_bytes_per_second(&tracks, request.format);
+        let free_bytes = free_space(&request.folder);
+        Ok(DiskEstimate {
+            bytes_per_second,
+            free_bytes,
+            minutes_left: free_bytes.and_then(|free| minutes_left(free, bytes_per_second)),
+        })
     }
 
     /// The engineer's channel details the engine keeps, whole: the list last set with
@@ -5063,6 +5092,72 @@ mod tests {
             panic!("the disk ended the take: {:?}", summary.ended);
         };
         assert!(reason.contains("no space left"), "{reason}");
+        engine.stop().expect("the engine stops");
+    }
+
+    /// A marker added through the engine lands on the first frame of the block being recorded:
+    /// after three blocks of 64, frame 192.
+    #[test]
+    fn a_marker_lands_on_the_block_being_recorded() {
+        let parent = crate::recorder::tests::scratch_directory("engine-marker");
+        let (mut engine, mut capture, _phone) = local_engine();
+        assert!(engine.add_marker("Early").is_err(), "no take records");
+        engine
+            .start_recording(take_of(&parent, vec![0]))
+            .expect("the take starts");
+        for _ in 0..3 {
+            capture.write(&[0.5f32; 2 * 64]);
+        }
+        assert!(until(|| engine.recording().frames == 192));
+
+        let marker = engine.add_marker("Chorus").expect("a take records");
+
+        assert_eq!(marker.frame, 192);
+        assert_eq!(engine.recording().markers, vec![marker.clone()]);
+        let summary = engine.stop_recording().expect("the take stops");
+        assert_eq!(summary.markers, vec![marker]);
+        engine.stop().expect("the engine stops");
+    }
+
+    /// The estimate lays out the tracks as a take would (a linked pair is one stereo file) and
+    /// reads the folder's disk; a request that could not start a take is refused.
+    #[test]
+    fn the_disk_estimate_follows_the_armed_tracks() {
+        let parent = crate::recorder::tests::scratch_directory("engine-estimate");
+        let (mut engine, _capture, _phone) = local_engine();
+        engine
+            .set_channels(vec![
+                ChannelMeta {
+                    linked_to_next: true,
+                    ..channel("Keys", ChannelKind::Keys)
+                },
+                channel("", ChannelKind::Keys),
+            ])
+            .expect("valid details");
+
+        let estimate = engine
+            .record_estimate(&RecordRequest {
+                include_local: true,
+                ..take_of(&parent, vec![0])
+            })
+            .expect("a take could start");
+
+        assert_eq!(
+            estimate.bytes_per_second,
+            4 * 3 * 48_000,
+            "the pair and the mix"
+        );
+        assert_eq!(estimate.free_bytes.is_some(), cfg!(windows));
+        assert_eq!(
+            estimate.minutes_left,
+            estimate
+                .free_bytes
+                .and_then(|bytes| minutes_left(bytes, estimate.bytes_per_second))
+        );
+        let refused = engine
+            .record_estimate(&take_of(&parent, vec![]))
+            .expect_err("nothing is armed");
+        assert!(refused.to_string().contains("arm"), "{refused}");
         engine.stop().expect("the engine stops");
     }
 }

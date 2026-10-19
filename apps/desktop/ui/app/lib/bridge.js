@@ -228,6 +228,17 @@ export function createEngineApi(bridge) {
     linkHistory: (musicianKey, sinceSeq = null) =>
       bridge.invoke("link_history", { musicianKey, sinceSeq }),
     /**
+     * Sets the playback buffer of the musician `musicianKey` names: `mode` "auto", or "fixed" with
+     * `ms` whole milliseconds (5-500). Resolves to `{ musicianKey, outcome, buffer, saved,
+     * saveError, message, minMs, maxMs }`, `outcome` "sent", "notConnected" (kept, the phone gets
+     * it when it is back), "unsupported" (the phone needs a newer app; nothing changed) or
+     * "invalid" (no such buffer; nothing changed), `buffer` `{ mode, ms? }` what the musician has
+     * now (null when nothing changed); see formatBufferSet in playback-buffer.js. A key that names
+     * nobody, or no engine, rejects. Status rows carry `buffer` and `bufferSupported`.
+     */
+    setMusicianBuffer: (musicianKey, mode, ms = null) =>
+      bridge.invoke("set_musician_buffer", { musicianKey, mode, ms }),
+    /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
      */

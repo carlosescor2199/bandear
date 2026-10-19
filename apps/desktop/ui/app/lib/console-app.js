@@ -57,6 +57,10 @@
 //   `restoreMixBackup(stamp)`, which puts one back on the musicians who are connected now, in turn
 //   with the desk edits and loads. Both answer `{ ok, message }`; a restore reads the status and the
 //   backups after it.
+// - A phone's playback buffer (the Network and system screen; see playback-buffer.js):
+//   `setMusicianBuffer(musicianKey, mode, ms)` sets Auto or a fixed length, in turn with the desk
+//   edits and loads (a load replaces the buffers), answers `{ ok, message }` (formatBufferSet) and
+//   reads the status after it.
 // - Recording takes (the Record screen; see recording.js): the recording settings (read once
 //   connected, `loadRecordingSettings` again) change with `setRecordingSettings(change)`, one change
 //   at a time and each built on the one before it, so two quick toggles both land; a refusal leaves
@@ -123,6 +127,7 @@ import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
+import { formatBufferSet, nameForKey } from "./playback-buffer.js";
 import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
 
@@ -884,6 +889,21 @@ export function createConsoleApp({
     });
   }
 
+  // Sets the playback buffer of the musician `musicianKey` names once every desk edit and load
+  // asked for before it was answered (a load replaces the buffers). Answers `{ ok, message }`
+  // (formatBufferSet) and reads the status after an answer.
+  function setMusicianBuffer(musicianKey, mode, ms = null) {
+    return inTurn(async () => {
+      try {
+        const answer = await api.setMusicianBuffer(musicianKey, mode, ms);
+        await readStatus();
+        return formatBufferSet(answer, nameForKey(store.getState().musicians, musicianKey));
+      } catch (error) {
+        return { ok: false, message: sentenceWithReason("The buffer was not set", message(error)) };
+      }
+    });
+  }
+
   // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
   function sendWaiting() {
     for (const [address, edits] of Object.entries(store.getState().pending)) {
@@ -1323,6 +1343,11 @@ export function createConsoleApp({
      * engine runs or the key names nobody.
      */
     linkHistory: (musicianKey, sinceSeq = null) => api.linkHistory(musicianKey, sinceSeq),
+    /**
+     * Sets the playback buffer of the musician `musicianKey` names: `mode` "auto", or "fixed" with
+     * `ms` (see setMusicianBuffer in bridge.js); answers `{ ok, message }` (formatBufferSet).
+     */
+    setMusicianBuffer,
     /**
      * Puts the mix backup `stamp` back on the musicians who are connected now; answers `{ ok,
      * message }` (formatMixRestored).

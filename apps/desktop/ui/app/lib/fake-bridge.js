@@ -229,7 +229,9 @@ function musicianRow(address, identity, link, mixChanges = {}) {
     rttMs: null,
     rttLastMs: null,
     linkLatest: null,
+    buffer: { mode: "auto" },
     ...identity,
+    bufferSupported: (identity.capabilities ?? []).includes("playback.buffer"),
     ...mergeMixUpdate(defaultMix(), mixChanges),
     revision: 1,
     packetsSent: 0,
@@ -554,6 +556,18 @@ function sampleHealth(lost, expected, underruns) {
   return underruns > 0 || lost * 10000 >= 50 * expected ? "warning" : "good";
 }
 
+// A 256-frame packet at 48 kHz, the blocks the demo interface sends, in milliseconds.
+const FAKE_PACKET_MS = (256 * 1000) / 48000;
+
+/**
+ * The cushion a phone plays for a fixed buffer of `ms` milliseconds, as it reports it: the length
+ * rounded up to whole packets of the demo's blocks, to the hundredth.
+ */
+export function fixedCushionMs(ms) {
+  const packets = Math.ceil(ms / FAKE_PACKET_MS - 1e-9);
+  return Math.round(packets * FAKE_PACKET_MS * 100) / 100;
+}
+
 /**
  * The link history of `row` (a status row) up to `time` milliseconds, as `link_history` answers
  * its samples: one a second, the oldest first, the newest `count` of at most LINK_HISTORY_SAMPLES,
@@ -562,8 +576,10 @@ function sampleHealth(lost, expected, underruns) {
  * or is not connected has none; a "warning" link reconnects once every ten minutes; a lost ("bad")
  * link's newest 20 seconds are gaps; a phone that does not announce "stats.v2" reports no jitter,
  * cushion or backlog, and only one that announces "redundancy.recovered" reports recovered packets.
+ * `fixed`, `{ ms, since }`, is a fixed buffer the desk set at the second `since`: from that second on
+ * the phone reports the cushion it plays for it (fixedCushionMs) instead of its own.
  */
-export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES) {
+export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES, fixed = null) {
   const profile = LINK_PROFILES[row.linkHealth];
   if (!profile || row.linkHealth === "unknown" || !row.controlConnected) {
     return [];
@@ -605,6 +621,7 @@ export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES) {
     const lost = Math.round(noise(key, second * 5 + 2) * 2 * expected * (profile.loss / 100));
     const underruns = profile.underrunEvery && second % profile.underrunEvery === 0 ? 1 : 0;
     const [low, high] = profile.jitter;
+    const cushion = fixed && second >= fixed.since ? fixedCushionMs(fixed.ms) : profile.cushion;
     samples.push({
       seq: second,
       monoMs: atMs,
@@ -620,8 +637,8 @@ export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES) {
       receiveTimeouts: 0,
       rttMs,
       jitterMs: extras ? round1(low + (high - low) * noise(key, second * 5 + 3)) : null,
-      cushionMs: extras ? profile.cushion : null,
-      backlogMs: extras ? round1(profile.cushion - 10 * noise(key, second * 5 + 4)) : null,
+      cushionMs: extras ? cushion : null,
+      backlogMs: extras ? round1(cushion - 10 * noise(key, second * 5 + 4)) : null,
       recovered: recovering ? Math.min(lost, 1) : null,
     });
   }
@@ -782,7 +799,12 @@ function backupStamp(at) {
  * every connected row carries a round trip (`rttMs`, `rttLastMs`) and its newest second
  * (`linkLatest`), and `link_history` answers a musician's ten minutes of generated seconds (see
  * syntheticLinkHistory) by their key, numbered after `sinceSeq` when given, as the desktop does,
- * with a `historyId` per musician that a new engine start replaces.
+ * with a `historyId` per musician that a new engine start replaces. Playback buffers too (see
+ * playback-buffer.js): `set_musician_buffer` keeps Auto or a fixed length for a phone that
+ * announces "playback.buffer" (Lead vocal), as the desktop's session does, for the phone's client
+ * id else its address, across engine starts and in named sessions; every row says its `buffer` and
+ * `bufferSupported`, and from the second it was set the phone's reported cushion is the fixed
+ * length rounded up to whole packets (fixedCushionMs). Any other phone answers "unsupported".
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -849,6 +871,11 @@ export function createFakeBridge({
   // The engineer's controls as the desk's session keeps them, `{ engineerLimitPercent,
   // lockedChannels }` by labelKey: for the phone's client id when it has one, else the address.
   const engineerBook = new Map();
+  // The playback buffers as the desk's session keeps them, `{ mode: "fixed", ms }` by labelKey (Auto
+  // is kept as nothing), and the second each was set at, so a phone's reported cushion follows it
+  // from then on.
+  const bufferBook = new Map();
+  const bufferSince = new Map();
   // The audio input as the desk's session keeps it, `{ host, device, bufferFrames, asioDriver }`,
   // or null before any was kept.
   let keptAudio = savedAudio ? clone(savedAudio) : null;
@@ -995,6 +1022,7 @@ export function createFakeBridge({
   // recorded as it stands now and the last take that ended.
   function statusNow() {
     showMirrors();
+    showBuffers();
     showLinks();
     engine.recording = recordingNow();
     engine.lastTake = lastTake ? clone(lastTake) : null;
@@ -1007,7 +1035,32 @@ export function createFakeBridge({
     const now = clock();
     for (const row of engine.musicians) {
       Object.assign(row, syntheticRoundTrip(row, now));
-      row.linkLatest = syntheticLinkHistory(row, now, 1)[0] ?? null;
+      row.linkLatest = syntheticLinkHistory(row, now, 1, fixedOf(row))[0] ?? null;
+    }
+  }
+
+  // The fixed buffer kept for `row`'s musician (for their phone first, then their address) when
+  // their phone takes one, else null.
+  function keptBuffer(row) {
+    if (!(row.capabilities ?? []).includes("playback.buffer")) {
+      return null;
+    }
+    const key = keysOf(row).find((candidate) => bufferBook.has(candidate));
+    return key ? { key, buffer: bufferBook.get(key) } : null;
+  }
+
+  // What a phone's reports follow: the fixed buffer kept for it, `{ ms, since }`, or null.
+  function fixedOf(row) {
+    const kept = keptBuffer(row);
+    return kept ? { ms: kept.buffer.ms, since: bufferSince.get(kept.key) ?? 0 } : null;
+  }
+
+  // Each row's buffer as the engine reports it: the one kept for it, else Auto, and whether its
+  // phone takes one.
+  function showBuffers() {
+    for (const row of engine.musicians) {
+      row.bufferSupported = (row.capabilities ?? []).includes("playback.buffer");
+      row.buffer = clone(keptBuffer(row)?.buffer ?? { mode: "auto" });
     }
   }
 
@@ -1492,6 +1545,7 @@ export function createFakeBridge({
       groups: savedGroups,
       channels: savedChannels,
       engineer: [...engineerBook.entries()],
+      buffers: [...bufferBook.entries()],
       mirrors: [...mirrorBook.entries()],
       presets: keptPresets,
       audio: keptAudio,
@@ -2477,6 +2531,13 @@ export function createFakeBridge({
       for (const [key, mirror] of session.mirrors ?? []) {
         mirrorBook.set(key, mirror);
       }
+      // As the desktop does: the loaded buffers replace the kept ones, so a phone on a fixed buffer
+      // the loaded session does not keep goes back to Auto.
+      bufferBook.clear();
+      for (const [key, buffer] of session.buffers ?? []) {
+        bufferBook.set(key, buffer);
+        bufferSince.set(key, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
+      }
       keptPresets = session.presets ?? [];
       keptAudio = audio.audio;
       // As the desktop does: a saved session from before the local mix leaves the desk's own.
@@ -2541,7 +2602,7 @@ export function createFakeBridge({
       if (!row) {
         throw `\`${key}\` names no musician`;
       }
-      const samples = syntheticLinkHistory(row, clock()).filter(
+      const samples = syntheticLinkHistory(row, clock(), LINK_HISTORY_SAMPLES, fixedOf(row)).filter(
         (sample) => sinceSeq === null || sample.seq > sinceSeq,
       );
       if (!historyIds.has(key)) {
@@ -2555,6 +2616,71 @@ export function createFakeBridge({
         maxSamples: LINK_HISTORY_SAMPLES,
         periodMs: LINK_SAMPLE_PERIOD_MS,
       };
+    },
+    set_musician_buffer({ musicianKey, mode, ms = null } = {}) {
+      // As the desktop answers: a key of the desk's forms, then the buffer asked for, then a
+      // running engine, then a musician here whose phone takes one.
+      const key = String(musicianKey ?? "");
+      if (!key.startsWith("client:") && !key.startsWith("address:")) {
+        throw `\`${key}\` names no phone or address`;
+      }
+      const answer = (outcome, buffer, message) => ({
+        musicianKey: key,
+        outcome,
+        buffer,
+        saved: buffer !== null,
+        saveError: null,
+        message,
+        minMs: 5,
+        maxMs: 500,
+      });
+      let buffer;
+      if (mode === "auto") {
+        buffer = { mode: "auto" };
+      } else if (mode !== "fixed") {
+        return answer("invalid", null, `Not set: \`${mode}\` is no buffer mode: it is \`auto\` or \`fixed\`.`);
+      } else if (ms === null || ms === undefined) {
+        return answer("invalid", null, "Not set: a fixed buffer needs its length in ms.");
+      } else if (!Number.isInteger(ms) || ms < 5 || ms > 500) {
+        return answer(
+          "invalid",
+          null,
+          `Not set: a fixed buffer must be between 5 and 500 ms, got ${ms} ms.`,
+        );
+      } else {
+        buffer = { mode: "fixed", ms };
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const row = rowForKey(key);
+      if (!row) {
+        const named = key.startsWith("client:") ? `the phone ${key.slice(7)}` : key.slice(8);
+        throw `${named} is not here`;
+      }
+      if (!(row.capabilities ?? []).includes("playback.buffer")) {
+        return answer(
+          "unsupported",
+          null,
+          "This phone needs a newer app to take its buffer from the desk.",
+        );
+      }
+      // Kept for the phone when it has a client id (dropping one kept for its address), else for
+      // the address; Auto is kept as nothing.
+      const keptFor = labelKey(row);
+      if (row.clientId) {
+        bufferBook.delete(`address:${row.address}`);
+      }
+      if (buffer.mode === "fixed") {
+        bufferBook.set(keptFor, buffer);
+      } else {
+        bufferBook.delete(keptFor);
+      }
+      bufferSince.set(keptFor, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
+      const words = buffer.mode === "fixed" ? `a fixed ${buffer.ms} ms` : "Auto";
+      return row.controlConnected
+        ? answer("sent", buffer, `Sent to the phone: ${words}.`)
+        : answer("notConnected", buffer, `Kept: the phone gets ${words} when it is connected again.`);
     },
     list_mix_backups() {
       settleBackups();

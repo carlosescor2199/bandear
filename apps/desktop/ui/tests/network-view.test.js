@@ -50,7 +50,16 @@ test("a row per musician with the name, who owns it, the link and the counts", (
     discarded: "30",
     loss: "2.44%",
     lossHigh: true,
+    buffer: {
+      key: `client:${status.musicians[0].clientId}`,
+      supported: true,
+      mode: "auto",
+      ms: null,
+      playing: null,
+      note: null,
+    },
   });
+  assert.equal(rows[1].buffer.note, "needs a newer app", "Bass's phone takes no buffer");
   assert.equal(rows[3].name, "Drums");
   assert.equal(rows[3].editable, true, "no announced name: the desk may label it");
   assert.equal(rows[3].nameIsLocal, true);

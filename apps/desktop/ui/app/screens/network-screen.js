@@ -7,6 +7,8 @@
 // local-mix.js): the outputs are listed again for every engine run, since they depend on its
 // driver. Picking a musician in the table opens their link health (link-health-controller.js): the
 // panel follows their history once a second while it is open, with the range and the table its own.
+// Each row's Buffer sets that phone's playback buffer from the desk, Auto or Fixed
+// (playback-buffer.js), and says on the row what came of it.
 
 import "../components/audio-setup.js";
 import "../components/link-health.js";
@@ -24,6 +26,7 @@ import {
 } from "../lib/network-view.js";
 import { mixBackupsView } from "../lib/mix-backups-view.js";
 import { mixMessages } from "../lib/mix-view.js";
+import { bufferRequest } from "../lib/playback-buffer.js";
 import { sessionPanelCommands, sessionPanelView } from "../lib/sessions.js";
 
 const LAYOUT = `
@@ -74,6 +77,9 @@ export function mountNetworkScreen(main, app) {
     tableError: null,
     // The last change of the local mix's output, `{ ok, message }`, said until the next one.
     outputSaid: null,
+    // The last change of a musician's playback buffer, `{ address, ok, message }`, said on that
+    // row until the next one.
+    bufferSaid: null,
   };
   // The open musician's link health: which one, its range and table, and the follower.
   const health = createLinkHealthController({
@@ -96,6 +102,7 @@ export function mountNetworkScreen(main, app) {
       addError: local.addError,
       tableError: local.tableError,
       selected,
+      bufferSaid: local.bufferSaid,
     };
     parts.health.data = data;
     parts.audio.data = {
@@ -220,6 +227,18 @@ export function mountNetworkScreen(main, app) {
     update({ tableError: result.ok ? null : `Could not remove ${address}: ${result.message}` });
   }
 
+  // A Buffer chosen on a row: checked here (a fixed length in whole ms within range), then sent;
+  // what came of it is said on the row.
+  async function onMusicianBuffer({ detail: { address, key, mode, ms } }) {
+    const request = bufferRequest(mode, ms);
+    if (!request.ok) {
+      update({ bufferSaid: { address, ok: false, message: request.message } });
+      return;
+    }
+    const result = await app.setMusicianBuffer(key, request.mode, request.ms);
+    update({ bufferSaid: { address, ok: result.ok, message: result.message } });
+  }
+
   async function onRename({ detail: { address, name } }) {
     const result = await app.rename(address, name);
     update({ tableError: result.ok ? null : `Could not save the name: ${result.message}` });
@@ -245,6 +264,7 @@ export function mountNetworkScreen(main, app) {
   screen.addEventListener("musician-remove", onRemove);
   screen.addEventListener("musician-rename", onRename);
   screen.addEventListener("musician-select", onSelect);
+  screen.addEventListener("musician-buffer", onMusicianBuffer);
   screen.addEventListener("link-range", ({ detail: { rangeMs } }) => {
     health.setRange(rangeMs);
     render();

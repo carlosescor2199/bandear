@@ -33,3 +33,4 @@ import "./record-view.test.js";
 import "./record-controller.test.js";
 import "./soundcheck.test.js";
 import "./soundcheck-view.test.js";
+import "./playback-buffer.test.js";

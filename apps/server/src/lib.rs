@@ -10,6 +10,7 @@ mod network;
 mod output;
 mod pipeline;
 mod protocol;
+mod recorder;
 mod targets;
 mod wav;
 
@@ -23,5 +24,8 @@ pub use engine::{
 pub use health::{LinkHealth, LinkStatus};
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
+pub use recorder::{
+    RecordRequest, RecordingState, RecordingStatus, TakeEnd, TakeSummary, TakeTrack, TrackKind,
+};
 pub use targets::{MirrorStatus, MusicianKey};
 pub use wav::{SampleFormat, WavError, WavReader, WavSpec, WavTarget, WavWriter};

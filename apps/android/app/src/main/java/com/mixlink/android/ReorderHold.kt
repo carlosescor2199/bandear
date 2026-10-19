@@ -101,7 +101,8 @@ internal class ReorderHold<T : Any> {
     private var lastPlayed = 0L
     // Everything held is due (see [release]) until nothing is.
     private var releasing = false
-    // A packet that arrived too far ahead to be held with the others: held once they are played.
+    // A packet that arrived too far ahead to be held with the others: held once [head] is close
+    // enough, or once they are played, so [head] never passes it while it waits.
     private var waiting: Any? = null
     private var waitingSequence = 0L
 
@@ -155,13 +156,21 @@ internal class ReorderHold<T : Any> {
     @Suppress("UNCHECKED_CAST")
     fun next(): T? {
         while (started) {
+            val ahead = waiting
+            if (ahead != null && waitingSequence - head < HOLD_SLOTS) {
+                // The packet that arrived far ahead is now close enough to hold with the others, so
+                // the stream plays it in its place: nothing skips past it, or leaves it to rewind to.
+                waiting = null
+                store(waitingSequence, ahead, late = false)
+            }
             val slot = slotOf(head)
             val present = packets[slot] != null && sequences[slot] == head
             if (present) {
                 if (!releasing && newest - head < holdPackets) break
                 val packet = packets[slot] as T
                 packets[slot] = null
-                lostBefore = if (played) head - lastPlayed - 1 else 0L
+                // Never negative: head only moves forward past the last packet played.
+                lostBefore = if (played) (head - lastPlayed - 1).coerceAtLeast(0L) else 0L
                 lost += lostBefore
                 lastRecovered = arrivedLate[slot]
                 if (lastRecovered) recovered++

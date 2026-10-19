@@ -236,6 +236,44 @@ class ReorderHoldTest {
     }
 
     @Test
+    fun aPacketThatArrivedFarAheadDuringABurstIsPlayedInItsPlace() {
+        val hold = hold(4)
+        // The server sends each block, then the copy of the one four blocks before it. Originals 6
+        // and 7 are lost, so 8 arrives too far ahead of what is held to be held with it at once.
+        val arrivals = mutableListOf<Long>()
+        for (block in 0L..15L) {
+            if (block != 6L && block != 7L) arrivals += block
+            if (block >= 4L) arrivals += block - 4
+        }
+        val played = mutableListOf<Long>()
+        fun drainChecked() {
+            while (true) {
+                played += hold.next() ?: break
+                assertTrue("lostBefore ${hold.lostBefore}", hold.lostBefore >= 0L)
+            }
+        }
+        arrivals.forEach {
+            hold.offer(it, it)
+            drainChecked()
+        }
+        hold.release()
+        drainChecked()
+
+        assertEquals("every packet once, in order, 8 included", (0L..15L).toList(), played)
+        assertEquals(0L, hold.lost)
+        assertEquals("the copies of 6 and 7", 2L, hold.recovered)
+
+        // Nothing is left behind to rewind the stream later.
+        hold.release()
+        hold.holdPackets = 0
+        drainChecked()
+        assertEquals(listOf(16L), hold.arrive(16))
+        assertEquals((0L..15L).toList(), played)
+        assertEquals(0L, hold.lostBefore)
+        assertEquals(0L, hold.lost)
+    }
+
+    @Test
     fun releasingPlaysEverythingHeldInOrder() {
         val hold = hold(2)
         listOf(0L, 1L, 2L).forEach { hold.arrive(it) }

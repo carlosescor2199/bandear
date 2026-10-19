@@ -130,7 +130,8 @@ pub(crate) struct RegisterCommand {
 pub const CAPABILITY_STATS_V2: &str = "stats.v2";
 /// The phone plays with a playback buffer the desk sets (Auto or a fixed length).
 pub const CAPABILITY_PLAYBACK_BUFFER: &str = "playback.buffer";
-/// The phone's `stats` carry `recovered`: the packets only a redundant copy brought in time.
+/// The phone's `stats` carry `recovered`: the packets that filled a gap after a newer one arrived,
+/// which a redundant copy brings; a phone that cannot play them late counts them as lost too.
 pub const CAPABILITY_REDUNDANCY_RECOVERED: &str = "redundancy.recovered";
 /// Every capability this server knows the meaning of. A phone may announce others: they are kept
 /// and shown, and gate nothing.
@@ -256,8 +257,9 @@ pub(crate) struct StatsCommand {
     #[serde(default, deserialize_with = "lenient_milliseconds")]
     pub(crate) backlog_ms: Option<f64>,
     /// From a phone that announced [CAPABILITY_REDUNDANCY_RECOVERED]: the packets over the interval
-    /// that only a redundant copy brought in time, filling a gap the first copy left. They count in
-    /// `packets_received`, not in `packets_lost`.
+    /// that filled a gap, each arriving for the first time after a newer one: a redundant copy (or,
+    /// now and then, a packet Wi-Fi reordered). The Android app plays packets as they arrive, so it
+    /// cannot play these yet: they stay in `packets_lost` and are not in `packets_received`.
     #[serde(default, deserialize_with = "lenient_count")]
     pub(crate) recovered: Option<u64>,
 }

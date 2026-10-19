@@ -357,6 +357,7 @@ class ControlChannelTest {
         "packets_lost",
         "underruns",
         "receive_timeouts",
+        "recovered",
     )
 
     @Test
@@ -373,7 +374,7 @@ class ControlChannelTest {
             ),
         )
         val expected = JSONObject(
-            """{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0}""",
+            """{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"recovered":0}""",
         )
 
         assertEquals(wireKeys, message.keySet())
@@ -390,6 +391,7 @@ class ControlChannelTest {
                     packetsLost = 2,
                     underruns = 1,
                     receiveTimeouts = 3,
+                    recovered = 4,
                 ),
             ),
         )
@@ -401,6 +403,7 @@ class ControlChannelTest {
             "packets_lost" to 2L,
             "underruns" to 1L,
             "receive_timeouts" to 3L,
+            "recovered" to 4L,
         )
         for ((key, value) in expected) {
             val raw = message.get(key)
@@ -430,7 +433,7 @@ class ControlChannelTest {
         assertEquals("rounded to a hundredth", 1.23, message.getDouble("jitter_ms"), 0.0)
         assertEquals(10.0, message.getDouble("cushion_ms"), 0.0)
         assertEquals(37.5, message.getDouble("backlog_ms"), 0.0)
-        assertFalse("recovered comes with redundancy", message.has("recovered"))
+        assertEquals(0L, message.getLong("recovered"))
     }
 
     @Test

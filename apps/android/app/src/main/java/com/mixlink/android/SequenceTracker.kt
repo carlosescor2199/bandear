@@ -12,6 +12,15 @@ package com.mixlink.android
 internal const val STREAM_RESTART_PACKETS = 256L
 
 /**
+ * How many sequences behind the last played one the tracker remembers whether they arrived: a late
+ * packet within it is told apart as a duplicate or as one that fills a gap
+ * ([SequenceTracker.recovered]).
+ * One bit each, so 64 fit a `Long`; that is well past the longest delay of a redundant copy (4
+ * blocks) and any reordering Wi-Fi does.
+ */
+internal const val RECOVERY_WINDOW_PACKETS = 64
+
+/**
  * Decides, packet by packet, whether a received packet is played, and counts the packets the
  * stream skipped.
  *
@@ -23,6 +32,12 @@ internal const val STREAM_RESTART_PACKETS = 256L
  *   out of order, and it changes nothing, so it cannot rewind the stream and count a gap twice;
  * - a packet [STREAM_RESTART_PACKETS] or more behind the last played one starts a new stream (the
  *   server restarted) and is played, without counting the jump as loss.
+ *
+ * A late packet whose sequence never arrived before, within [RECOVERY_WINDOW_PACKETS] of the last
+ * played one, filled a gap the stream skipped: it is counted as [recovered]. Only a delayed copy (the
+ * desk's redundancy sends each packet again a few blocks later) or a packet Wi-Fi reordered can do
+ * that, so reordering can add a few to the count without redundancy. A second copy of a packet that
+ * arrived, or one older than the window, is not counted.
  *
  * Pure and single-threaded: it lives on the receive thread and allocates nothing per packet. The
  * header's unsigned 64-bit sequence is compared as a signed `Long`, which is exact for any stream
@@ -41,6 +56,19 @@ internal class SequenceTracker {
         private set
 
     /**
+     * Late packets that filled a gap since the tracker was created: each arrived for the first time
+     * after a newer one was played (see the class documentation). They are still dropped, since
+     * newer audio was already played, and stay counted in [lost]; the count says how many a delayed
+     * copy brought, the number the phone reports as `recovered`.
+     */
+    var recovered = 0L
+        private set
+
+    // Bit i set: sequence `lastPlayed - i` arrived. Sequences before the stream started read as
+    // arrived, so a reordered packet from before the first one is never counted.
+    private var arrived = -1L
+
+    /**
      * Accepts [sequence] if it is to be played, returning how many packets were lost right before
      * it (0 when it follows the last played one), or [DROPPED] when it must not be played.
      */
@@ -48,14 +76,25 @@ internal class SequenceTracker {
         if (!started || lastPlayed - sequence >= STREAM_RESTART_PACKETS) {
             started = true
             lastPlayed = sequence
+            arrived = -1L
             return 0L
         }
         if (sequence <= lastPlayed) {
             dropped++
+            val behind = lastPlayed - sequence
+            if (behind < RECOVERY_WINDOW_PACKETS) {
+                val bit = 1L shl behind.toInt()
+                if ((arrived and bit) == 0L) {
+                    recovered++
+                    arrived = arrived or bit
+                }
+            }
             return DROPPED
         }
         val gap = sequence - lastPlayed - 1
         lost += gap
+        val ahead = sequence - lastPlayed
+        arrived = if (ahead >= RECOVERY_WINDOW_PACKETS) 1L else (arrived shl ahead.toInt()) or 1L
         lastPlayed = sequence
         return gap
     }

@@ -1,7 +1,9 @@
 // <ml-link-health>: one musician's link over the last minutes, as a chart of small multiples on one
 // time axis (loss, round trip, and the phone's jitter and cushion when it reports them), underruns
 // and timeouts as event marks, seconds without reports as shaded breaks and reconnects as labelled
-// markers, with a summary line above it and the same numbers as a table on request.
+// markers, with a summary line above it and the same numbers as a table on request. For a phone
+// that reports them, the packets a redundant copy recovered are counted in the summary, the readout
+// and the table; while redundancy is on for a phone that does not, a note says so.
 //
 // Property: `data` = the view from linkHealthView (link-health-view.js), or null to hide.
 // Events (bubbling, composed): `link-range` { rangeMs } when a range is picked, `link-table`
@@ -269,6 +271,7 @@ const TABLE_COLUMNS = Object.freeze([
   ["cushion", "Cushion", "cushion"],
   ["underruns", "Underruns"],
   ["timeouts", "Timeouts"],
+  ["recovered", "Recovered", "recovered"],
   ["note", "Note"],
 ]);
 
@@ -315,6 +318,7 @@ class MlLinkHealth extends HTMLElement {
           <p id="description" hidden></p>
         </div>
         <p class="note" hidden></p>
+        <p class="note recovered-note" hidden></p>
         <p class="key">
           A line per measure, one point a second. Shaded: seconds with no report. A vertical line:
           the phone reconnected. A tick: an underrun or a timeout in that second.
@@ -345,6 +349,7 @@ class MlLinkHealth extends HTMLElement {
       readout: root.querySelector(".readout"),
       description: root.querySelector("#description"),
       note: root.querySelector(".note"),
+      recoveredNote: root.querySelector(".recovered-note"),
       toggle: root.querySelector(".table-toggle"),
       tableWrap: root.querySelector(".table-wrap"),
       tableHead: root.querySelector("thead tr"),
@@ -411,6 +416,8 @@ class MlLinkHealth extends HTMLElement {
     reflect(parts.svg, "aria-label", data.title);
     parts.note.hidden = data.extrasNote === null;
     setText(parts.note, data.extrasNote ?? "");
+    parts.recoveredNote.hidden = data.recoveredNote === null || data.recoveredNote === undefined;
+    setText(parts.recoveredNote, data.recoveredNote ?? "");
     const shown = data.table !== null;
     parts.tableWrap.hidden = !shown;
     reflect(parts.toggle, "aria-expanded", shown ? "true" : "false");

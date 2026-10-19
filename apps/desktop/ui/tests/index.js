@@ -34,3 +34,4 @@ import "./record-controller.test.js";
 import "./soundcheck.test.js";
 import "./soundcheck-view.test.js";
 import "./playback-buffer.test.js";
+import "./redundancy.test.js";

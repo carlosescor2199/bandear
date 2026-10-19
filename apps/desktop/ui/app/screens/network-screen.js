@@ -8,7 +8,8 @@
 // driver. Picking a musician in the table opens their link health (link-health-controller.js): the
 // panel follows their history once a second while it is open, with the range and the table its own.
 // Each row's Buffer sets that phone's playback buffer from the desk, Auto or Fixed
-// (playback-buffer.js), and says on the row what came of it.
+// (playback-buffer.js), and says on the row what came of it; its Redundancy sends that musician's
+// audio twice or once (redundancy.js), with what it does to their bandwidth.
 
 import "../components/audio-setup.js";
 import "../components/link-health.js";
@@ -80,6 +81,9 @@ export function mountNetworkScreen(main, app) {
     // The last change of a musician's playback buffer, `{ address, ok, message }`, said on that
     // row until the next one.
     bufferSaid: null,
+    // The last change of a musician's redundancy, `{ address, ok, message }`, said on that row
+    // until the next one.
+    redundancySaid: null,
   };
   // The open musician's link health: which one, its range and table, and the follower.
   const health = createLinkHealthController({
@@ -103,6 +107,7 @@ export function mountNetworkScreen(main, app) {
       tableError: local.tableError,
       selected,
       bufferSaid: local.bufferSaid,
+      redundancySaid: local.redundancySaid,
     };
     parts.health.data = data;
     parts.audio.data = {
@@ -239,6 +244,13 @@ export function mountNetworkScreen(main, app) {
     update({ bufferSaid: { address, ok: result.ok, message: result.message } });
   }
 
+  // Redundancy switched on a row: sent with the default delay; what came of it, with what it does
+  // to that musician's bandwidth, is said on the row.
+  async function onMusicianRedundancy({ detail: { address, key, on } }) {
+    const result = await app.setMusicianRedundancy(key, on);
+    update({ redundancySaid: { address, ok: result.ok, message: result.message } });
+  }
+
   async function onRename({ detail: { address, name } }) {
     const result = await app.rename(address, name);
     update({ tableError: result.ok ? null : `Could not save the name: ${result.message}` });
@@ -265,6 +277,7 @@ export function mountNetworkScreen(main, app) {
   screen.addEventListener("musician-rename", onRename);
   screen.addEventListener("musician-select", onSelect);
   screen.addEventListener("musician-buffer", onMusicianBuffer);
+  screen.addEventListener("musician-redundancy", onMusicianRedundancy);
   screen.addEventListener("link-range", ({ detail: { rangeMs } }) => {
     health.setRange(rangeMs);
     render();

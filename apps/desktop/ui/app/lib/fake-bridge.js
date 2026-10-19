@@ -230,8 +230,12 @@ function musicianRow(address, identity, link, mixChanges = {}) {
     rttLastMs: null,
     linkLatest: null,
     buffer: { mode: "auto" },
+    redundancy: { on: false },
+    duplicatesSent: 0,
+    recovered: 0,
     ...identity,
     bufferSupported: (identity.capabilities ?? []).includes("playback.buffer"),
+    redundancySupported: (identity.capabilities ?? []).includes("redundancy.recovered"),
     ...mergeMixUpdate(defaultMix(), mixChanges),
     revision: 1,
     packetsSent: 0,
@@ -373,7 +377,7 @@ export function sampleStatus() {
           clientName: "Bass",
           clientId: "a3d9e7b1-6c2f-4e8a-b5d0-7f1c9e3a2b64",
           name: "Bass",
-          capabilities: ["stats.v2"],
+          capabilities: ["stats.v2", "redundancy.recovered"],
         },
         WARNING,
       ),
@@ -578,8 +582,18 @@ export function fixedCushionMs(ms) {
  * cushion or backlog, and only one that announces "redundancy.recovered" reports recovered packets.
  * `fixed`, `{ ms, since }`, is a fixed buffer the desk set at the second `since`: from that second on
  * the phone reports the cushion it plays for it (fixedCushionMs) instead of its own.
+ * `redundantSince` is the second the desk turned redundancy on for the musician (null while off):
+ * from then on a phone that announces "redundancy.recovered" gets a copy of most packets it lost
+ * (three in four), counted as `recovered` and received, not lost; before it, or off, it reports 0.
+ * An older phone drops the copies, so its losses stay as they were.
  */
-export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES, fixed = null) {
+export function syntheticLinkHistory(
+  row,
+  time,
+  count = LINK_HISTORY_SAMPLES,
+  fixed = null,
+  redundantSince = null,
+) {
   const profile = LINK_PROFILES[row.linkHealth];
   if (!profile || row.linkHealth === "unknown" || !row.controlConnected) {
     return [];
@@ -618,7 +632,9 @@ export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES, fi
       continue;
     }
     const expected = 200;
-    const lost = Math.round(noise(key, second * 5 + 2) * 2 * expected * (profile.loss / 100));
+    const dropped = Math.round(noise(key, second * 5 + 2) * 2 * expected * (profile.loss / 100));
+    const copied = recovering && redundantSince !== null && second >= redundantSince;
+    const lost = copied ? Math.floor(dropped / 4) : dropped;
     const underruns = profile.underrunEvery && second % profile.underrunEvery === 0 ? 1 : 0;
     const [low, high] = profile.jitter;
     const cushion = fixed && second >= fixed.since ? fixedCushionMs(fixed.ms) : profile.cushion;
@@ -639,7 +655,7 @@ export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES, fi
       jitterMs: extras ? round1(low + (high - low) * noise(key, second * 5 + 3)) : null,
       cushionMs: extras ? cushion : null,
       backlogMs: extras ? round1(cushion - 10 * noise(key, second * 5 + 4)) : null,
-      recovered: recovering ? Math.min(lost, 1) : null,
+      recovered: recovering ? dropped - lost : null,
     });
   }
   return samples;
@@ -805,6 +821,11 @@ function backupStamp(at) {
  * id else its address, across engine starts and in named sessions; every row says its `buffer` and
  * `bufferSupported`, and from the second it was set the phone's reported cushion is the fixed
  * length rounded up to whole packets (fixedCushionMs). Any other phone answers "unsupported".
+ * Redundancy too (see redundancy.js): `set_musician_redundancy` keeps it on, with the copies' delay,
+ * for any musician here, kept as buffers are; every row says its `redundancy`, `duplicatesSent` (the
+ * copies sent since it was turned on), `recovered` (the packets the phone reported recovered over
+ * its history) and `redundancySupported` (the phone announces "redundancy.recovered": Bass), and
+ * from the second it was turned on such a phone recovers most of its losses (syntheticLinkHistory).
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -876,6 +897,10 @@ export function createFakeBridge({
   // from then on.
   const bufferBook = new Map();
   const bufferSince = new Map();
+  // The redundancy settings as the desk's session keeps them, `{ delayBlocks }` by labelKey (off is
+  // kept as nothing), and the second each was turned on at.
+  const redundancyBook = new Map();
+  const redundancySince = new Map();
   // The audio input as the desk's session keeps it, `{ host, device, bufferFrames, asioDriver }`,
   // or null before any was kept.
   let keptAudio = savedAudio ? clone(savedAudio) : null;
@@ -1023,6 +1048,7 @@ export function createFakeBridge({
   function statusNow() {
     showMirrors();
     showBuffers();
+    showRedundancy();
     showLinks();
     engine.recording = recordingNow();
     engine.lastTake = lastTake ? clone(lastTake) : null;
@@ -1035,7 +1061,7 @@ export function createFakeBridge({
     const now = clock();
     for (const row of engine.musicians) {
       Object.assign(row, syntheticRoundTrip(row, now));
-      row.linkLatest = syntheticLinkHistory(row, now, 1, fixedOf(row))[0] ?? null;
+      row.linkLatest = syntheticLinkHistory(row, now, 1, fixedOf(row), redundantSinceOf(row))[0] ?? null;
     }
   }
 
@@ -1061,6 +1087,38 @@ export function createFakeBridge({
     for (const row of engine.musicians) {
       row.bufferSupported = (row.capabilities ?? []).includes("playback.buffer");
       row.buffer = clone(keptBuffer(row)?.buffer ?? { mode: "auto" });
+    }
+  }
+
+  // The redundancy kept for `row`'s musician (for their phone first, then their address), `{ key,
+  // redundancy }`, or null when it is off.
+  function keptRedundancy(row) {
+    const key = keysOf(row).find((candidate) => redundancyBook.has(candidate));
+    return key ? { key, redundancy: redundancyBook.get(key) } : null;
+  }
+
+  // The second redundancy was turned on for `row`'s musician, or null while it is off.
+  function redundantSinceOf(row) {
+    const kept = keptRedundancy(row);
+    return kept ? (redundancySince.get(kept.key) ?? 0) : null;
+  }
+
+  // Each row's redundancy as the engine reports it: on with its delay, or off; the copies sent since
+  // it was turned on (a 256-frame block at 48 kHz is 187.5 a second); the packets the phone reported
+  // recovered over its history; and whether the phone reports them.
+  function showRedundancy() {
+    const now = clock();
+    const second = Math.floor(now / LINK_SAMPLE_PERIOD_MS);
+    for (const row of engine.musicians) {
+      const kept = keptRedundancy(row);
+      const since = redundantSinceOf(row);
+      row.redundancySupported = (row.capabilities ?? []).includes("redundancy.recovered");
+      row.redundancy = kept ? { on: true, delayBlocks: kept.redundancy.delayBlocks } : { on: false };
+      row.duplicatesSent = kept && row.controlConnected ? Math.floor(Math.max(0, second - since) * 187.5) : 0;
+      row.recovered = syntheticLinkHistory(row, now, LINK_HISTORY_SAMPLES, null, since).reduce(
+        (total, sample) => total + (sample.recovered ?? 0),
+        0,
+      );
     }
   }
 
@@ -1546,6 +1604,7 @@ export function createFakeBridge({
       channels: savedChannels,
       engineer: [...engineerBook.entries()],
       buffers: [...bufferBook.entries()],
+      redundancies: [...redundancyBook.entries()],
       mirrors: [...mirrorBook.entries()],
       presets: keptPresets,
       audio: keptAudio,
@@ -2538,6 +2597,12 @@ export function createFakeBridge({
         bufferBook.set(key, buffer);
         bufferSince.set(key, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
       }
+      // And its redundancy settings: a musician the loaded session does not keep is sent once.
+      redundancyBook.clear();
+      for (const [key, redundancy] of session.redundancies ?? []) {
+        redundancyBook.set(key, redundancy);
+        redundancySince.set(key, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
+      }
       keptPresets = session.presets ?? [];
       keptAudio = audio.audio;
       // As the desktop does: a saved session from before the local mix leaves the desk's own.
@@ -2602,7 +2667,13 @@ export function createFakeBridge({
       if (!row) {
         throw `\`${key}\` names no musician`;
       }
-      const samples = syntheticLinkHistory(row, clock(), LINK_HISTORY_SAMPLES, fixedOf(row)).filter(
+      const samples = syntheticLinkHistory(
+        row,
+        clock(),
+        LINK_HISTORY_SAMPLES,
+        fixedOf(row),
+        redundantSinceOf(row),
+      ).filter(
         (sample) => sinceSeq === null || sample.seq > sinceSeq,
       );
       if (!historyIds.has(key)) {
@@ -2616,6 +2687,55 @@ export function createFakeBridge({
         maxSamples: LINK_HISTORY_SAMPLES,
         periodMs: LINK_SAMPLE_PERIOD_MS,
       };
+    },
+    set_musician_redundancy({ musicianKey, on, delayBlocks = null } = {}) {
+      // As the desktop answers: a key of the desk's forms, then the delay asked for, then a running
+      // engine, then a musician here. Every phone takes it.
+      const key = String(musicianKey ?? "");
+      if (!key.startsWith("client:") && !key.startsWith("address:")) {
+        throw `\`${key}\` names no phone or address`;
+      }
+      const answer = (outcome, redundancy, message) => ({
+        musicianKey: key,
+        outcome,
+        redundancy,
+        bandwidthFactor: redundancy?.on ? 2 : 1,
+        saved: redundancy !== null,
+        saveError: null,
+        message,
+        minDelayBlocks: 1,
+        maxDelayBlocks: 4,
+        defaultDelayBlocks: 2,
+      });
+      const delay = delayBlocks ?? 2;
+      if (on && (!Number.isInteger(delay) || delay < 1 || delay > 4)) {
+        return answer("invalid", null, `Not set: a copy must be from 1 to 4 blocks late, got ${delay}.`);
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const row = rowForKey(key);
+      if (!row) {
+        const named = key.startsWith("client:") ? `the phone ${key.slice(7)}` : key.slice(8);
+        throw `${named} is not here`;
+      }
+      // Kept for the phone when it has a client id (dropping one kept for its address), else for
+      // the address; off is kept as nothing.
+      const keptFor = labelKey(row);
+      if (row.clientId) {
+        redundancyBook.delete(`address:${row.address}`);
+      }
+      if (on) {
+        redundancyBook.set(keptFor, { delayBlocks: delay });
+        redundancySince.set(keptFor, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
+        return answer(
+          "set",
+          { on: true, delayBlocks: delay },
+          `Each packet is sent twice, the copy ${delay} ${delay === 1 ? "block" : "blocks"} later: this musician's bandwidth doubles.`,
+        );
+      }
+      redundancyBook.delete(keptFor);
+      return answer("set", { on: false }, "Each packet is sent once again: this musician's bandwidth is back to normal.");
     },
     set_musician_buffer({ musicianKey, mode, ms = null } = {}) {
       // As the desktop answers: a key of the desk's forms, then the buffer asked for, then a

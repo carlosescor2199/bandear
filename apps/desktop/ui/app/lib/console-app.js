@@ -61,6 +61,10 @@
 //   `setMusicianBuffer(musicianKey, mode, ms)` sets Auto or a fixed length, in turn with the desk
 //   edits and loads (a load replaces the buffers), answers `{ ok, message }` (formatBufferSet) and
 //   reads the status after it.
+// - A musician's packet redundancy (the Network and system screen; see redundancy.js):
+//   `setMusicianRedundancy(musicianKey, on, delayBlocks)` turns it on or off, in turn with the desk
+//   edits and loads (a load replaces the settings), answers `{ ok, message }` (formatRedundancySet)
+//   and reads the status after it.
 // - Recording takes (the Record screen; see recording.js): the recording settings (read once
 //   connected, `loadRecordingSettings` again) change with `setRecordingSettings(change)`, one change
 //   at a time and each built on the one before it, so two quick toggles both land; a refusal leaves
@@ -128,6 +132,7 @@ import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
 import { formatBufferSet, nameForKey } from "./playback-buffer.js";
+import { formatRedundancySet } from "./redundancy.js";
 import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
 
@@ -904,6 +909,21 @@ export function createConsoleApp({
     });
   }
 
+  // Turns redundancy on or off for the musician `musicianKey` names once every desk edit and load
+  // asked for before it was answered (a load replaces the settings). Answers `{ ok, message }`
+  // (formatRedundancySet) and reads the status after an answer.
+  function setMusicianRedundancy(musicianKey, on, delayBlocks = null) {
+    return inTurn(async () => {
+      try {
+        const answer = await api.setMusicianRedundancy(musicianKey, on, delayBlocks);
+        await readStatus();
+        return formatRedundancySet(answer, nameForKey(store.getState().musicians, musicianKey));
+      } catch (error) {
+        return { ok: false, message: sentenceWithReason("Redundancy was not set", message(error)) };
+      }
+    });
+  }
+
   // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
   function sendWaiting() {
     for (const [address, edits] of Object.entries(store.getState().pending)) {
@@ -1348,6 +1368,12 @@ export function createConsoleApp({
      * `ms` (see setMusicianBuffer in bridge.js); answers `{ ok, message }` (formatBufferSet).
      */
     setMusicianBuffer,
+    /**
+     * Turns redundancy on (`on`, the copies `delayBlocks` blocks late, 2 when null) or off for the
+     * musician `musicianKey` names (see setMusicianRedundancy in bridge.js); answers `{ ok, message
+     * }` (formatRedundancySet).
+     */
+    setMusicianRedundancy,
     /**
      * Puts the mix backup `stamp` back on the musicians who are connected now; answers `{ ok,
      * message }` (formatMixRestored).

@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
     LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin,
-    MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, RecordingState,
-    RecordingStatus, SampleFormat, SoundcheckClock, SoundcheckState, SoundcheckStatus, TakeEnd,
-    TakeMarker, TakeSummary, TakeTrack,
+    MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer,
+    RecordingState, RecordingStatus, SampleFormat, SoundcheckClock, SoundcheckState,
+    SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack, CAPABILITY_PLAYBACK_BUFFER,
 };
 
 use crate::session::{
@@ -234,6 +234,60 @@ pub struct MusicianDto {
     /// Whose mix this musician's follows (see [crate::commands::set_mirror]); null when it
     /// follows nobody.
     pub mirror: Option<MirrorDto>,
+    /// The playback buffer the engine keeps for this musician (see
+    /// [crate::commands::playback_buffer]): `{ mode: "auto" }` or `{ mode: "fixed", ms }`. Auto
+    /// when the desk set none.
+    pub buffer: BufferDto,
+    /// Whether the musician's phone plays the buffer the desk sets (it announced
+    /// [personal_monitoring::CAPABILITY_PLAYBACK_BUFFER]); false for an older app and a configured
+    /// target, which the window shows as "needs a newer app". The cushion it plays is
+    /// `linkLatest.cushionMs`.
+    pub buffer_supported: bool,
+}
+
+/// A musician's playback buffer as the window reads and sets it: `mode` `auto` or `fixed`, and the
+/// length `ms` of a fixed one (absent for Auto).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct BufferDto {
+    pub mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u16>,
+}
+
+impl From<PlaybackBuffer> for BufferDto {
+    fn from(buffer: PlaybackBuffer) -> Self {
+        Self {
+            mode: buffer.mode(),
+            ms: buffer.fixed_ms(),
+        }
+    }
+}
+
+/// What [crate::commands::playback_buffer::set_musician_buffer] did, for the window.
+///
+/// `outcome` is one of:
+///
+/// - `sent`: the phone is connected and was sent it; its next reports say the cushion it plays.
+/// - `notConnected`: the engine keeps it, and the phone gets it when it is back.
+/// - `unsupported`: the phone does not take a buffer from the desk (it needs a newer app); nothing
+///   changed.
+/// - `invalid`: the request was not a buffer the desk can set (a fixed length outside
+///   `minMs`-`maxMs`, or no length); nothing changed.
+///
+/// `buffer` is what the musician has now (for `unsupported` and `invalid`, what was asked is not
+/// it, and it is absent). `saved` says whether the session keeps it for the next start; a save that
+/// failed is in `saveError`, the phone having it all the same. `message` says the outcome in words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferSetDto {
+    pub musician_key: String,
+    pub outcome: &'static str,
+    pub buffer: Option<BufferDto>,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    pub message: String,
+    pub min_ms: u32,
+    pub max_ms: u32,
 }
 
 /// Whose mix a musician's follows, on their status row.
@@ -844,6 +898,11 @@ impl From<&MusicianStatus> for MusicianDto {
             rtt_last_ms: musician.link.round_trip.last_ms,
             link_latest: musician.link.latest.as_ref().map(LinkSampleDto::from),
             mirror: musician.mirror.as_ref().map(MirrorDto::from),
+            buffer: BufferDto::from(musician.playback_buffer),
+            buffer_supported: musician
+                .capabilities
+                .iter()
+                .any(|name| name == CAPABILITY_PLAYBACK_BUFFER),
         }
     }
 }
@@ -1714,6 +1773,25 @@ mod tests {
             silent["packetsPerSecond"], 0.0,
             "a phone hearing nothing is a number the window can tell from a lost link"
         );
+    }
+
+    #[test]
+    fn a_rows_buffer_and_whether_its_phone_takes_one_reach_the_window() {
+        let mut phone = musician_with_link(LinkStatus::default());
+        phone.capabilities = vec!["stats.v2".to_owned(), "playback.buffer".to_owned()];
+        phone.playback_buffer = PlaybackBuffer::Fixed { ms: 40 };
+        let older = musician_with_link(LinkStatus::default());
+
+        let phone = serde_json::to_value(MusicianDto::from(&phone)).expect("serializes");
+        let older = serde_json::to_value(MusicianDto::from(&older)).expect("serializes");
+
+        assert_eq!(
+            phone["buffer"],
+            serde_json::json!({ "mode": "fixed", "ms": 40 })
+        );
+        assert_eq!(phone["bufferSupported"], true);
+        assert_eq!(older["buffer"], serde_json::json!({ "mode": "auto" }));
+        assert_eq!(older["bufferSupported"], false, "an older phone");
     }
 
     #[test]

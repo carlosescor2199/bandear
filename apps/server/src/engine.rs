@@ -768,11 +768,12 @@ fn shown_level(held: &AtomicU32) -> u8 {
         .min(100) as u8
 }
 
-/// How long the send loop waits for a packet before it counts the wait as silence for the meters.
+/// How often the engine thread checks the meters for time no audio covered.
 ///
 /// A capture that stops delivering (a device that vanished, a stopped stream) passes no audio time,
-/// so an audio-time fall alone would freeze the last level. The send loop waits on the packet queue
-/// anyway; when nothing arrives for this long, it lowers every meter by this much audio.
+/// so an audio-time fall alone would freeze the last level. Every this often the engine thread
+/// lowers every meter by the time that passed minus the audio that arrived in it (see
+/// [crate::pipeline::Pipeline::tick]), so time is never counted twice.
 pub(crate) const METER_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// [METER_IDLE_WAIT] in frames at the packaged rate.
@@ -860,14 +861,17 @@ impl LevelMeter {
 ///
 /// One pass, no allocation, the same linear scale as the input meters. A trailing sample that is
 /// not a whole frame is left out.
-fn stereo_peak(stereo: &[i16]) -> [u8; 2] {
-    let mut left = 0u16;
-    let mut right = 0u16;
+fn stereo_peak(stereo: &[f32]) -> [u8; 2] {
+    let mut left = 0.0f32;
+    let mut right = 0.0f32;
     for frame in stereo.chunks_exact(2) {
-        left = left.max(frame[0].unsigned_abs());
-        right = right.max(frame[1].unsigned_abs());
+        left = left.max(frame[0].abs());
+        right = right.max(frame[1].abs());
     }
-    [peak_to_level(left), peak_to_level(right)]
+    [
+        peak_to_level(pcm16_magnitude(left)),
+        peak_to_level(pcm16_magnitude(right)),
+    ]
 }
 
 /// The left and right peak of one musician's mixed output, held for the meter read.
@@ -876,16 +880,19 @@ fn stereo_peak(stereo: &[i16]) -> [u8; 2] {
 /// after their gains, pans, solos, mutes, master and level cap. Like [LevelMeter], an update costs
 /// one pass over the block and two atomic updates, with no allocation, lock or clock, the level
 /// falls with the audio, and reading is a pure load.
-#[derive(Default)]
+///
+/// A clone shares the same levels (they sit behind one [Arc]), so the network sink can take the
+/// meter with the rest of a block's targets and update it after the target table is released.
+#[derive(Clone, Default)]
 pub(crate) struct OutputMeter {
-    levels: [AtomicU32; 2],
+    levels: Arc<[AtomicU32; 2]>,
 }
 
 impl OutputMeter {
     /// Lets the held levels fall by this block's length and raises them to its peaks (see
     /// [hold_peak]). A buffer that is not whole stereo frames is not a mixed output and is ignored,
     /// as [LevelMeter::observe] ignores incomplete frames.
-    pub(crate) fn observe(&self, stereo: &[i16]) {
+    pub(crate) fn observe(&self, stereo: &[f32]) {
         if !stereo.len().is_multiple_of(2) {
             return;
         }
@@ -897,14 +904,14 @@ impl OutputMeter {
 
     /// Lets both sides fall by `frames` of silence, for a wait in which no audio arrived.
     pub(crate) fn fall(&self, frames: usize) {
-        for level in &self.levels {
+        for level in self.levels.iter() {
             hold_peak(level, 0, frames);
         }
     }
 
     /// Returns both sides to zero, for a capture that stopped.
     pub(crate) fn clear(&self) {
-        for level in &self.levels {
+        for level in self.levels.iter() {
             level.store(0, Ordering::Relaxed);
         }
     }
@@ -2610,7 +2617,7 @@ mod tests {
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[16_384, 32_767]), 2);
         let output = OutputMeter::default();
-        output.observe(&[32_767, 16_384]);
+        output.observe(&pcm(&[32_767, 16_384]));
 
         for _ in 0..50 {
             assert_eq!(inputs.read(2), vec![50, 100]);
@@ -2625,20 +2632,20 @@ mod tests {
         let inputs = LevelMeter::new();
         let output = OutputMeter::default();
         inputs.observe(&pcm(&[32_767]), 1);
-        output.observe(&[32_767, 32_767]);
+        output.observe(&pcm(&[32_767, 32_767]));
 
         inputs.observe(&vec![0.0; 7_200], 1);
-        output.observe(&vec![0; 2 * 7_200]);
+        output.observe(&vec![0.0; 2 * 7_200]);
         assert_eq!(inputs.read(1), vec![90], "0.15 s after a full-scale peak");
         assert_eq!(output.read(), [90, 90]);
 
         inputs.observe(&vec![0.0; 64_080], 1);
-        output.observe(&vec![0; 2 * 64_080]);
+        output.observe(&vec![0.0; 2 * 64_080]);
         assert_eq!(inputs.read(1), vec![1], "one step short of 1.5 s");
         assert_eq!(output.read(), [1, 1]);
 
         inputs.observe(&vec![0.0; 720], 1);
-        output.observe(&vec![0; 2 * 720]);
+        output.observe(&vec![0.0; 2 * 720]);
         assert_eq!(inputs.read(1), vec![0], "1.5 s after the peak");
         assert_eq!(output.read(), [0, 0]);
     }
@@ -2649,15 +2656,15 @@ mod tests {
         let inputs = LevelMeter::new();
         let output = OutputMeter::default();
         inputs.observe(&pcm(&[32_767, 32_767]), 2);
-        output.observe(&[32_767, 32_767]);
+        output.observe(&pcm(&[32_767, 32_767]));
         inputs.observe(&vec![0.0; 2 * 36_000], 2);
-        output.observe(&vec![0; 2 * 36_000]);
+        output.observe(&vec![0.0; 2 * 36_000]);
         assert_eq!(inputs.read(2), vec![50, 50], "half way down after 0.75 s");
         assert_eq!(output.read(), [50, 50]);
 
         // One frame: 80 on the first side, 30 on the second.
         inputs.observe(&pcm(&[26_214, 9_830]), 2);
-        output.observe(&[26_214, 9_830]);
+        output.observe(&pcm(&[26_214, 9_830]));
 
         assert_eq!(inputs.read(2), vec![80, 50]);
         assert_eq!(output.read(), [80, 50]);
@@ -2666,21 +2673,21 @@ mod tests {
     #[test]
     fn a_stereo_peak_reads_each_side_of_an_interleaved_buffer() {
         // Left peaks at half scale (on its negative swing), right at full scale.
-        assert_eq!(stereo_peak(&[8_000, 100, -16_384, 32_767]), [50, 100]);
+        assert_eq!(stereo_peak(&pcm(&[8_000, 100, -16_384, 32_767])), [50, 100]);
         assert_eq!(stereo_peak(&[]), [0, 0]);
-        assert_eq!(stereo_peak(&[0, i16::MIN]), [0, 100]);
+        assert_eq!(stereo_peak(&pcm(&[0, i16::MIN])), [0, 100]);
     }
 
     #[test]
     fn an_output_meter_holds_each_sides_peak() {
         let meter = OutputMeter::default();
 
-        meter.observe(&[16_384, 32_767]);
+        meter.observe(&pcm(&[16_384, 32_767]));
         // A quieter block does not pull the held peak below its fall.
-        meter.observe(&[100, 100]);
+        meter.observe(&pcm(&[100, 100]));
         assert_eq!(meter.read(), [50, 100]);
         // A buffer that is not whole stereo frames is ignored.
-        meter.observe(&[32_767, 32_767, 32_767]);
+        meter.observe(&pcm(&[32_767, 32_767, 32_767]));
         assert_eq!(meter.read(), [50, 100]);
     }
 
@@ -2691,7 +2698,9 @@ mod tests {
         let address: SocketAddr = "192.168.1.3:50000".parse().unwrap();
         let registry = TargetRegistry::new(&[address], &GroupLayout::default())
             .expect("registry should build");
-        registry.read()[0].output_meter.observe(&[32_767, 16_384]);
+        registry.read()[0]
+            .output_meter
+            .observe(&pcm(&[32_767, 16_384]));
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[32_767, 16_384]), 2);
 
@@ -2715,7 +2724,9 @@ mod tests {
         let second: SocketAddr = "192.168.1.4:50000".parse().unwrap();
         let registry = TargetRegistry::new(&[first, second], &GroupLayout::default())
             .expect("registry should build");
-        registry.read()[0].output_meter.observe(&[32_767, -16_384]);
+        registry.read()[0]
+            .output_meter
+            .observe(&pcm(&[32_767, -16_384]));
         let inputs = LevelMeter::new();
         inputs.observe(&pcm(&[16_384, 0, -32_767, 0]), 2);
 
@@ -3853,5 +3864,160 @@ mod tests {
             before
         );
         assert!(observed.try_recv().is_err(), "nothing is announced");
+    }
+
+    /// A capture format for a test source with `channels` channels.
+    fn test_format(channels: u16) -> CaptureFormat {
+        CaptureFormat {
+            channels,
+            sample_rate: TARGET_SAMPLE_RATE,
+            sample_format: "F32".to_owned(),
+            buffer_size: describe_buffer(Some(64)),
+        }
+    }
+
+    /// A capture source the test drives itself, writing into the engine like a device's callback.
+    fn test_capture(
+        engine: &EngineHandle,
+        channels: u16,
+    ) -> (crate::pipeline::CaptureWriter, OpenedCapture) {
+        let (writer, reader) = crate::pipeline::CaptureWriter::new(
+            TARGET_SAMPLE_RATE,
+            crate::pipeline::SourceFormat {
+                channels: usize::from(channels),
+                block_frames: 64,
+            },
+            engine.capture_links().expect("the engine is running"),
+        )
+        .expect("a 48 kHz source builds");
+        let opened = OpenedCapture {
+            stream: None,
+            reader,
+            device_name: format!("Test input ({channels})"),
+            format: test_format(channels),
+        };
+        (writer, opened)
+    }
+
+    /// A running engine with no audio device: the engine thread and the network sink run as in a
+    /// session, with one phone at `phone`, and the capture is a stereo source the test drives.
+    fn engine_without_device(phone: SocketAddr) -> (EngineHandle, crate::pipeline::CaptureWriter) {
+        let targets = Arc::new(
+            TargetRegistry::new(&[phone], &GroupLayout::default()).expect("registry should build"),
+        );
+        let levels = Arc::new(LevelMeter::new());
+        let packet_stats = Arc::new(PacketStats {
+            sent: AtomicU64::new(0),
+            discarded: AtomicU64::new(0),
+        });
+        let network = NetworkSink::new(Arc::clone(&targets), Arc::clone(&packet_stats))
+            .expect("the sink binds");
+        let pipeline =
+            PipelineHandle::spawn(Pipeline::new(vec![Box::new(network)], Arc::clone(&levels)))
+                .expect("the engine thread starts");
+        let mut engine = EngineHandle {
+            device_name: String::new(),
+            capture_format: test_format(0),
+            control_port: 0,
+            buffer_frames: Some(64),
+            host: AudioHost::Auto,
+            source_channels: 0,
+            group_definitions: Vec::new(),
+            levels,
+            targets,
+            stopped: Arc::new(AtomicBool::new(false)),
+            capture_stats: Arc::new(CaptureStats::default()),
+            packet_stats,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            config_state: Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default())),
+            events: EventBus::default(),
+            stream: None,
+            pipeline: Some(pipeline),
+            control_thread: None,
+            discovery_thread: None,
+        };
+        let (capture, opened) = test_capture(&engine, 2);
+        engine
+            .install_capture(opened)
+            .expect("the test source installs");
+        (engine, capture)
+    }
+
+    /// Polls the engine's meters until `done` holds, for at most two seconds.
+    fn meters_until(engine: &EngineHandle, done: impl Fn(&EngineMeters) -> bool) -> EngineMeters {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let meters = engine.meters();
+            if done(&meters) || Instant::now() > deadline {
+                return meters;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Stopping ends capture and the engine thread, which would leave the last levels frozen, so
+    /// the engine clears every input and output meter itself.
+    #[test]
+    fn stopping_the_engine_clears_every_meter() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let address = phone.local_addr().expect("phone address");
+        let (mut engine, mut capture) = engine_without_device(address);
+
+        capture.write(&[0.5f32; 2 * 64]);
+        let lit = meters_until(&engine, |meters| {
+            meters.musicians[0]
+                .output_levels
+                .iter()
+                .all(|level| *level > 0)
+        });
+        assert!(lit.channel_levels.iter().all(|level| *level > 0), "{lit:?}");
+        assert!(lit.musicians[0]
+            .output_levels
+            .iter()
+            .all(|level| *level > 0));
+
+        engine.stop().expect("the engine stops");
+
+        assert_eq!(
+            engine.meters(),
+            EngineMeters {
+                channel_levels: vec![0, 0],
+                musicians: vec![MusicianMeters {
+                    address,
+                    output_levels: [0, 0],
+                }],
+            }
+        );
+    }
+
+    /// A switch clears the input meters at once (the old device's levels describe a stream that is
+    /// gone), and the new device raises its own from its first block.
+    #[test]
+    fn switching_the_input_clears_the_input_meters_and_the_new_one_raises_its_own() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (mut engine, mut old) = engine_without_device(phone.local_addr().expect("address"));
+        // The capture meters each block as it writes it (a fall the engine thread counts for idle
+        // time can only lower a level, so a lit meter is checked as lit, not at an exact value).
+        old.write(&[0.5f32; 2 * 64]);
+        assert!(engine
+            .meters()
+            .channel_levels
+            .iter()
+            .all(|level| *level > 0));
+
+        let (mut new, opened) = test_capture(&engine, 2);
+        drop(old);
+        let format = engine.install_capture(opened).expect("the switch commits");
+
+        assert_eq!(format.channels, 2);
+        assert_eq!(engine.meters().channel_levels, vec![0, 0]);
+        new.write(&[0.25f32; 2 * 64]);
+        let raised = engine.meters().channel_levels;
+        assert!(
+            raised.iter().all(|level| *level > 0 && *level <= 25),
+            "{raised:?}"
+        );
+
+        engine.stop().expect("the engine stops");
     }
 }

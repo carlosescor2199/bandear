@@ -1040,21 +1040,25 @@ fn pan_gains(pan: u8) -> (f32, f32) {
     (theta.cos(), theta.sin())
 }
 
-fn clamp_sample(value: f32, ceiling: f32) -> i16 {
-    value
-        .clamp(-ceiling, ceiling)
-        .round()
-        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+/// One heard source channel of a [MixPlan]: where it is in the frame, its gain and its pan.
+#[derive(Clone, Copy, Default)]
+struct Voice {
+    channel: usize,
+    gain: f32,
+    left: f32,
+    right: f32,
 }
 
-/// Mixes one client's interleaved source buffer down to a stereo bus.
+/// One client's mix of one block, worked out once from a snapshot of their [MixValues]: the
+/// channels they hear, each with its gain and pan weights, and the output ceiling. Lives on the
+/// stack, so building one per musician per block costs no allocation.
 ///
 /// Every source channel contributes to both outputs weighted by its pan, so source channel `k`
 /// is no longer bound to output slot `k`. The default pan table keeps the captured layout (even
 /// sources hard left, odd sources hard right), which with neutral gains on a two-channel source
-/// reproduces the pre-pan output exactly, apart from the full-scale ceiling clamp that also
-/// applied before. Master volume, mute and the ceiling are applied after the sum. The ceiling is
-/// the lower of the phone's level cap (`max_level_percent`) and the engineer's limit
+/// reproduces the captured output exactly, apart from the full-scale ceiling clamp. Master volume
+/// and mute are folded into each gain; the ceiling is applied after the sum. The ceiling is the
+/// lower of the phone's level cap (`max_level_percent`) and the engineer's limit
 /// ([EngineerControls::limit_percent]), both read from `values`.
 ///
 /// A channel contributes only when it is not hidden, not muted and either nothing is soloed or it
@@ -1062,23 +1066,33 @@ fn clamp_sample(value: f32, ceiling: f32) -> i16 {
 /// of solo restores exactly the levels the musician had set. A hidden channel's solo counts for
 /// nothing: a spare input the engineer hid cannot leave a musician hearing nothing. Like the rest of
 /// the mix, the hidden channels are one value read from `values`, so this stays free of locks.
-pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -> Vec<i16> {
-    if channels == 0 || source.len() < channels {
-        return source.to_vec();
-    }
+///
+/// The arithmetic is the 16-bit mixer's, operation for operation (the same gain expression, the
+/// same `sample * gain * weight` order, the same channel order), on samples scaled by 2^-15. A
+/// power-of-two scale is exact in floating point, so for 16-bit capture every output is exactly
+/// the 16-bit mixer's divided by 32768, and the phones receive the same packets.
+pub(crate) struct MixPlan {
+    voices: [Voice; MAX_MIX_CHANNELS],
+    count: usize,
+    channels: usize,
+    ceiling: f32,
+}
 
-    let frames = source.len() / channels;
-    let active = channels.min(MAX_MIX_CHANNELS);
-    let audible = |channel: usize| values.hidden_channels & (1 << channel) == 0;
-    let any_solo = (0..active).any(|channel| values.channel_solo[channel] && audible(channel));
-    let ceiling_percent = values.max_level_percent.min(values.engineer.limit_percent);
-    let ceiling = (i32::from(i16::MAX) * i32::from(ceiling_percent) / 100) as f32;
-    let master = f32::from(values.volume_percent) / 100.0;
-    let mut output = vec![0i16; frames * usize::from(OUTPUT_CHANNELS)];
+impl MixPlan {
+    pub(crate) fn new(values: &MixValues, channels: usize) -> Self {
+        let active = channels.min(MAX_MIX_CHANNELS);
+        let audible = |channel: usize| values.hidden_channels & (1 << channel) == 0;
+        let any_solo = (0..active).any(|channel| values.channel_solo[channel] && audible(channel));
+        let ceiling_percent = values.max_level_percent.min(values.engineer.limit_percent);
+        let ceiling = (i32::from(i16::MAX) * i32::from(ceiling_percent) / 100) as f32 / 32_768.0;
+        let master = f32::from(values.volume_percent) / 100.0;
+        let mut plan = Self {
+            voices: [Voice::default(); MAX_MIX_CHANNELS],
+            count: 0,
+            channels: channels.max(1),
+            ceiling,
+        };
 
-    for frame in 0..frames {
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
         for channel in 0..active {
             if !audible(channel) || values.channel_muted[channel] {
                 continue;
@@ -1097,22 +1111,213 @@ pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -
             if gain == 0.0 || values.muted {
                 continue;
             }
-            let sample = f32::from(source[frame * channels + channel]);
-            let (left_weight, right_weight) = pan_gains(values.pans[channel]);
-            left += sample * gain * left_weight;
-            right += sample * gain * right_weight;
+            let (left, right) = pan_gains(values.pans[channel]);
+            plan.voices[plan.count] = Voice {
+                channel,
+                gain,
+                left,
+                right,
+            };
+            plan.count += 1;
         }
-        output[frame * 2] = clamp_sample(left, ceiling);
-        output[frame * 2 + 1] = clamp_sample(right, ceiling);
+        plan
     }
 
-    output
+    /// Mixes the whole frames of `source` into `stereo` (interleaved left and right, at most as
+    /// many frames as it holds) and returns the frames written. Allocation-free.
+    pub(crate) fn mix_into(&self, source: &[f32], stereo: &mut [f32]) -> usize {
+        let voices = &self.voices[..self.count];
+        let mut frames = 0;
+        for (frame, output) in source
+            .chunks_exact(self.channels)
+            .zip(stereo.chunks_exact_mut(usize::from(OUTPUT_CHANNELS)))
+        {
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+            for voice in voices {
+                let sample = frame[voice.channel];
+                left += sample * voice.gain * voice.left;
+                right += sample * voice.gain * voice.right;
+            }
+            output[0] = left.clamp(-self.ceiling, self.ceiling);
+            output[1] = right.clamp(-self.ceiling, self.ceiling);
+            frames += 1;
+        }
+        frames
+    }
+}
+
+/// Mixes a 16-bit buffer through [MixPlan] and back to 16 bits, as the phones receive it: the
+/// shape the mixer's tests are written in.
+#[cfg(test)]
+pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -> Vec<i16> {
+    use crate::pipeline::CaptureSample;
+
+    if channels == 0 || source.len() < channels {
+        return source.to_vec();
+    }
+    let floats: Vec<f32> = source.iter().map(|sample| sample.to_f32()).collect();
+    let mut stereo = vec![0.0; source.len() / channels * usize::from(OUTPUT_CHANNELS)];
+    MixPlan::new(&values, channels).mix_into(&floats, &mut stereo);
+    stereo
+        .iter()
+        .map(|sample| crate::protocol::to_pcm16(*sample))
+        .collect()
+}
+
+/// The 16-bit mixer the phones heard before the float path, kept verbatim as the reference the
+/// float path must reproduce, and a deterministic source of inputs and mixes to compare them on.
+#[cfg(test)]
+pub(crate) mod golden {
+    use super::*;
+
+    fn clamp_sample(value: f32, ceiling: f32) -> i16 {
+        value
+            .clamp(-ceiling, ceiling)
+            .round()
+            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+    }
+
+    /// The previous `mix_channels`, unchanged: 16-bit in, 16-bit out, pan gains per frame.
+    pub(crate) fn legacy_mix_channels(
+        source: &[i16],
+        channels: usize,
+        values: MixValues,
+    ) -> Vec<i16> {
+        if channels == 0 || source.len() < channels {
+            return source.to_vec();
+        }
+
+        let frames = source.len() / channels;
+        let active = channels.min(MAX_MIX_CHANNELS);
+        let audible = |channel: usize| values.hidden_channels & (1 << channel) == 0;
+        let any_solo = (0..active).any(|channel| values.channel_solo[channel] && audible(channel));
+        let ceiling_percent = values.max_level_percent.min(values.engineer.limit_percent);
+        let ceiling = (i32::from(i16::MAX) * i32::from(ceiling_percent) / 100) as f32;
+        let master = f32::from(values.volume_percent) / 100.0;
+        let mut output = vec![0i16; frames * usize::from(OUTPUT_CHANNELS)];
+
+        for frame in 0..frames {
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+            for channel in 0..active {
+                if !audible(channel) || values.channel_muted[channel] {
+                    continue;
+                }
+                if any_solo && !values.channel_solo[channel] {
+                    continue;
+                }
+                let group_gain = match values.channel_group[channel] {
+                    Some(group) => f32::from(values.group_levels[group]) / 100.0,
+                    None => 1.0,
+                };
+                let gain = f32::from(values.channel_gains[channel]) / 100.0 * group_gain * master;
+                if gain == 0.0 || values.muted {
+                    continue;
+                }
+                let sample = f32::from(source[frame * channels + channel]);
+                let (left_weight, right_weight) = pan_gains(values.pans[channel]);
+                left += sample * gain * left_weight;
+                right += sample * gain * right_weight;
+            }
+            output[frame * 2] = clamp_sample(left, ceiling);
+            output[frame * 2 + 1] = clamp_sample(right, ceiling);
+        }
+
+        output
+    }
+
+    /// A xorshift stream: the same inputs and mixes on every run, with no dependency.
+    pub(crate) struct Noise(pub(crate) u64);
+
+    impl Noise {
+        pub(crate) fn next(&mut self) -> u64 {
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value
+        }
+
+        pub(crate) fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        /// A sample: full-range noise, quiet noise or a full-scale extreme.
+        pub(crate) fn sample(&mut self) -> i16 {
+            match self.below(8) {
+                0 => i16::MIN,
+                1 => i16::MAX,
+                2..=4 => (self.below(2_001) as i16) - 1_000,
+                _ => self.next() as i16,
+            }
+        }
+
+        /// A mix with every field drawn: gains, pans, mutes, solos, groups and their levels,
+        /// hidden channels, master, both ceilings and the master mute.
+        pub(crate) fn mix(&mut self) -> MixValues {
+            let mut values = MixValues::default();
+            for channel in 0..MAX_MIX_CHANNELS {
+                values.channel_gains[channel] = self.below(101) as u8;
+                values.pans[channel] = self.below(101) as u8;
+                values.channel_muted[channel] = self.below(8) == 0;
+                values.channel_solo[channel] = self.below(24) == 0;
+                values.channel_group[channel] =
+                    (self.below(3) == 0).then(|| self.below(MAX_GROUPS as u64) as usize);
+            }
+            for level in &mut values.group_levels {
+                *level = self.below(101) as u8;
+            }
+            values.hidden_channels = (self.next() & self.next() & self.next()) as u32;
+            values.volume_percent = self.below(101) as u8;
+            values.max_level_percent = 40 + self.below(61) as u8;
+            values.engineer.limit_percent = 40 + self.below(61) as u8;
+            values.muted = self.below(32) == 0;
+            values
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::golden::{legacy_mix_channels, Noise};
     use super::*;
     use crate::protocol::parse_mix_command;
+
+    /// The float mixer reproduces the 16-bit mixer exactly on 16-bit input: thousands of drawn
+    /// mixes (every field: groups, hidden channels, solos, mutes, both ceilings, the master mute)
+    /// over drawn inputs with full-scale extremes, from 1 to 34 channels.
+    #[test]
+    fn the_float_mixer_matches_the_16_bit_mixer_on_16_bit_input() {
+        let mut noise = Noise(0x2545_f491_4f6c_dd1d);
+        for case in 0..3_000 {
+            let channels = 1 + noise.below(34) as usize;
+            let frames = 1 + noise.below(32) as usize;
+            let values = noise.mix();
+            let input: Vec<i16> = (0..channels * frames).map(|_| noise.sample()).collect();
+
+            assert_eq!(
+                mix_channels(&input, channels, values),
+                legacy_mix_channels(&input, channels, values),
+                "case {case}: {channels} channels"
+            );
+        }
+    }
+
+    /// Below the 16-bit step the float mix keeps what the 16-bit one rounded away: one 24-bit step
+    /// on the left input comes out on the left output unchanged.
+    #[test]
+    fn the_float_mixer_keeps_24_bit_detail() {
+        let step = 1.0 / 8_388_608.0;
+        let mut stereo = [0.0; 2];
+
+        let frames = MixPlan::new(&MixValues::default(), 2).mix_into(&[step, 0.0], &mut stereo);
+
+        assert_eq!(frames, 1);
+        assert_eq!(stereo[0], step);
+        assert!(stereo[1].abs() < step);
+    }
     use crate::targets::TargetRegistry;
     use std::net::IpAddr;
     use std::sync::{Arc, Barrier};

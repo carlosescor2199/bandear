@@ -112,10 +112,38 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 
 ## Tasks
 
-- [ ] T1 (engine pipeline): f32 capture into an `rtrb` ring with an anti-alias decimator and no
+- [x] T1 (engine pipeline): f32 capture into an `rtrb` ring with an anti-alias decimator and no
   allocation in the callback; one engine thread with sinks; the network sink with reused buffers
   and no sends under the registry guard; a single producer across device switches; the meter
-  fixes R3-001..R3-003 from phase 1. Route: delegated writer.
+  fixes R3-001..R3-003 from phase 1. Route: delegated writer (mapping, writer and 2+ non-trivial
+  files triggers).
+  - Shape: `decimate.rs` (Kaiser-windowed sinc, cutoff 24 kHz, flat to 20 kHz, >= 80 dB from
+    28 kHz; 63 taps at 96 kHz, 123 at 192 kHz, 0.32 ms delay); `pipeline.rs` (`CaptureSample`
+    conversion keeping 24-bit, `CaptureWriter` per stream with its own `rtrb` ring of at least
+    0.5 s or 4 blocks, `Pipeline` engine thread pulling blocks of one callback length (default
+    256, at most 8192 frames), `Sink` trait with `process`, `silence` and `source_changed` for T2
+    and T4 to add sinks); `network.rs` `NetworkSink` (destinations copied under the read guard,
+    mixed and sent after it, reused stereo and packet buffers); `mix.rs` `MixPlan` (gains and pan
+    weights once per block); `protocol.rs` `encode_audio_packet`.
+  - RED: frame-dropping decimation folds 28 kHz back at -0.0 dB
+    (`content_above_24_khz_is_attenuated_before_decimation`); the 16-bit adapter sink made
+    (7000, 7000) allocations/frees per 1000 blocks (`the_capture_to_phone_path_never_allocates`)
+    and held the table while sending (`a_target_can_be_removed_while_a_block_is_being_sent`); the
+    fixed 100 ms fall read 0 instead of 30 for 150 ms blocks, 0 instead of 34 for bursts and 40
+    instead of 34 for a stall (`long_blocks_are_not_counted_again_by_the_idle_fall`,
+    `bursty_delivery_falls_by_the_audio_and_nothing_more`,
+    `a_stalled_capture_falls_by_the_time_that_passes`); the EngineHandle clear tests fail with
+    the clears removed (mutation: [50, 50] left on stop and switch).
+  - GREEN: server unit tests 300 -> 315 -> 322 -> 327, all passing. Measured: stop band -83.8 dB
+    or lower from 28 kHz, pass band within 0.002 dB to 19 kHz; packets byte-identical to the
+    16-bit mixer over 400 drawn blocks on UDP and 3000 drawn mixes; zero allocations and frees
+    over 1000 blocks from a 24-bit 96 kHz callback to three phones (thread-local counting
+    allocator in the unit-test binary, so integration tests could not reach `pub(crate)`).
+  - Latency: callback-to-sink hand-off 89 us median, 257 us p99 (debug build); otherwise at most
+    one block when the driver's callback length differs from the block (WASAPI), plus 0.32 ms of
+    filter delay at 96/192 kHz only. Documented in the `pipeline.rs` module comment.
+  - Earlier commits: cdb5d84 (capture, ring, decimator, engine thread), ebadce2 (float network
+    sink). Commit: this commit (meter fixes R3-001..R3-003).
 - [ ] T2 (local mix and output): the engine-owned local mix, the cpal output sink with drift
   handling and the ASIO rules, session persistence, Tauri commands, the Local mix tab and the
   "Local mix out" select. Route: delegated writer.
@@ -133,8 +161,11 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 ## Progress
 
 - Branch `feat/desktop-recording` from main 0bb278b (phases 1 and 2 merged as PRs #17-#38).
-- The user approved adding the `rtrb` crate (a download from crates.io).
+- The user approved adding the `rtrb` crate (a download from crates.io); `rtrb` 0.3.5 is in.
+- T1 done in three work units: cdb5d84, ebadce2 and the meter-fix commit. T2 plugs the local
+  output in as a `Sink` (fed by `process`, sized in `source_changed`) and T4 the recorder the same
+  way; neither touches the capture path.
 
 ## Next step
 
-T1.
+T2.

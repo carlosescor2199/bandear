@@ -378,7 +378,8 @@ internal class PmonPlayer(
      * ([PlaybackLatency.keepsLowLatency]). A track that will not shrink is released and reopened at
      * the minimum: Auto plays as tight as before, and a fixed buffer goes only as long as that track
      * holds (its capacity is what the cushion is clamped to), the cushion reported being the size
-     * the track applied.
+     * the track applied. A track that fails to start is released before the failure goes on
+     * ([openTrackKeepingLowLatency]).
      */
     private fun openLowLatencyTrack(sampleRate: Int, packetFrames: Int): AudioTrack {
         val minimum = AudioTrack.getMinBufferSize(
@@ -387,20 +388,35 @@ internal class PmonPlayer(
             AudioFormat.ENCODING_PCM_16BIT,
         )
         if (minimum <= 0) throw IllegalStateException("sample rate $sampleRate is not supported")
-        val large = createAudioTrack(
-            sampleRate,
-            maxOf(minimum, PlaybackLatency.trackCapacityFrames(sampleRate, packetFrames) * BYTES_PER_FRAME),
-        )
-        large.play()
-        val applied = applyPlaybackBufferTarget(large, packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
         val wanted = PlaybackLatency.targetBufferFrames(packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
-        if (PlaybackLatency.keepsLowLatency(wanted, applied, minimum / BYTES_PER_FRAME, sampleRate)) {
-            return large
+        return openTrackKeepingLowLatency(
+            openLarge = {
+                createAudioTrack(
+                    sampleRate,
+                    maxOf(minimum, PlaybackLatency.trackCapacityFrames(sampleRate, packetFrames) * BYTES_PER_FRAME),
+                )
+            },
+            openMinimum = { createAudioTrack(sampleRate, minimum) },
+            start = { track -> track.play() },
+            applyLowestCushion = { track ->
+                applyPlaybackBufferTarget(track, packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
+            },
+            keepsLowLatency = { applied ->
+                PlaybackLatency.keepsLowLatency(wanted, applied, minimum / BYTES_PER_FRAME, sampleRate)
+            },
+            close = ::closeTrack,
+        )
+    }
+
+    /** Stops [track] and gives back its resources; a track that never played is released too. */
+    private fun closeTrack(track: AudioTrack) {
+        try {
+            track.pause()
+            track.flush()
+        } catch (_: IllegalStateException) {
+            // Not playing: there is nothing to stop, only to release.
         }
-        large.pause()
-        large.flush()
-        large.release()
-        return createAudioTrack(sampleRate, minimum).also { it.play() }
+        track.release()
     }
 
     /** Builds a low-latency stream track at [sampleRate] with a capacity of [bufferBytes]. */

@@ -715,7 +715,7 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
       change; the controller is tested without a DOM).
     - Commits: 3621242 (engine and fake, 140 lines), 1782a1a (record controller, 113 lines),
       07dd529 (desktop, 114 lines).
-- [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
+- [x] T7 (close): PRD update, docs, live test. Route: inline or writer.
   - Docs: `PRD.md` (version 0.3; recording leaves "out of scope", which now names editing takes and
     a resampler for the local output; RF13 local mix, RF14 multitrack recording, RF15 virtual
     soundcheck, RF16 the Record screen; the float engine and the recorder under technical
@@ -732,6 +732,12 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     - the soundcheck of that take with the phone's mix (it hears the take as live, Back to live
       inputs returns at once);
     - disk-full behaviour (optional).
+  - Live test (2026-10-18, desktop debug build at 8ef0d4f, Volt 4 under WASAPI, Galaxy S23 with
+    the phase 2 APK, unchanged because the wire format is): Record with nothing armed was refused
+    with its reason; the user armed inputs, recorded a take, saw it in the takes list and ran its
+    soundcheck with the S23 listening, with no dropouts on the counters. The user's verdict: "todo
+    funcionó bien". Not exercised: an ASIO output (not picked by the user), a deliberately long
+    take for drift, and disk full; these stay open as follow-ups, not blockers.
 
 ## Progress
 
@@ -802,8 +808,11 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   fake's seek of a take at its end, moves skipping the transport's guard, the recording refusal's
   words untested through the boxed error, the take folder checked under the engine's lock) are
   fixed by T6b-fix (3621242, 1782a1a, 07dd529). Next review base: ee89b0c.
-- T6b-fix and the T7 docs commit are pending review in the slice from ee89b0c.
+- T6b-fix and the T7 docs commit were reviewed as review-c1a69b09a4efa7be (ee89b0c..8ef0d4f),
+  approved with no findings and acknowledged. Next review base: 8ef0d4f.
+- T7's live test passed (see T7). Phase 3 is complete.
 
 ## Next step
 
-T7's live test with the user (see T7's "Remaining").
+Push and stacked pull requests to main, only with the user's approval; then phase 4 (network and
+system).

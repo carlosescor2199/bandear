@@ -2585,6 +2585,7 @@ mod tests {
                     mix: MixDto::from(&personal_monitoring::MixValues::default()),
                     packets_sent: 0,
                     packets_discarded: 0,
+                    last_send_error: None,
                     link_health: "unknown",
                     packets_per_second: None,
                     underruns_per_second: None,

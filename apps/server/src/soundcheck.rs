@@ -1198,17 +1198,27 @@ impl ActiveSoundcheck {
         self.shared.set_paused(true);
     }
 
-    /// Plays on; a take stopped at its end starts again at its first frame.
+    /// Plays on; a take at its end starts again at its first frame, whether it stopped there or
+    /// was paused and moved there (the frame the status shows: a move's, while it is on its way).
     pub(crate) fn resume(&self) {
         let shared = &self.shared;
-        if shared.ended.load(Ordering::Relaxed) && !shared.seek_pending() {
+        let pending = shared.seek_pending();
+        let frame = if pending {
+            shared.seek_frame.load(Ordering::Acquire)
+        } else {
+            shared.position.load(Ordering::Relaxed)
+        };
+        let stopped_at_end = shared.ended.load(Ordering::Relaxed) && !pending;
+        let paused_at_end = shared.paused.load(Ordering::Relaxed) && frame >= self.length;
+        if stopped_at_end || paused_at_end {
             shared.request_seek(0);
             self.wake_disk();
         }
         shared.set_paused(false);
     }
 
-    /// Plays on from `frame` (the end at most), paused or not.
+    /// Plays on from `frame` (the end at most). The seek rule: a take the engineer paused stays
+    /// paused at the new frame; a take that stopped at its end (not paused) plays on from it.
     pub(crate) fn seek(&self, frame: u64) -> Result<(), SoundcheckError> {
         if frame > self.length {
             return Err(SoundcheckError::PastEnd {

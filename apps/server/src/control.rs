@@ -2794,8 +2794,18 @@ mod tests {
         stop_server(address, &stopped, server).await;
     }
 
+    /// A moment `later` than now, as the accept loop's tick would pass it then.
+    fn moment_in(later: Duration) -> LinkMoment {
+        let now = LinkMoment::now();
+        LinkMoment {
+            at: now.at + later,
+            wall_ms: now.wall_ms + u64::try_from(later.as_millis()).expect("a short delay"),
+        }
+    }
+
     /// Once the phone's connection closed (its guard ended the link session), the tick keeps no
-    /// more gaps: the time away is not a silence of a connected phone.
+    /// more gaps: the time away is not a silence of a connected phone. The tick is driven by hand,
+    /// seconds ahead: the same tick fills gaps while the phone is connected and none once it left.
     #[tokio::test]
     async fn a_closed_connection_stops_the_gaps() {
         let targets =
@@ -2811,16 +2821,27 @@ mod tests {
         let mut client = connect_client(address).await;
         send_then_sync(&mut client, REGISTER_ANA).await;
         send_then_sync(&mut client, CLEAN_STATS).await;
+        targets.fill_link_gaps(moment_in(Duration::from_secs(5)));
+        let connected = ana_history_gaps(&targets);
+        assert!(
+            connected.len() >= 3 && connected[1..].iter().all(|&gap| gap),
+            "a tick seconds after the report keeps gaps while connected: {connected:?}"
+        );
+
         client.close(None).await.expect("the client should close");
         drop(client);
         assert!(
             wait_until(|| control_connections(&peers, target_ip) == 0).await,
             "the connection is gone"
         );
+        let closed = ana_history_gaps(&targets);
 
-        // Longer than the gap delay, with the accept loop ticking all along.
-        tokio::time::sleep(Duration::from_millis(3_000)).await;
-        assert_eq!(ana_history_gaps(&targets), vec![false], "the report alone");
+        targets.fill_link_gaps(moment_in(Duration::from_secs(60)));
+        assert_eq!(
+            ana_history_gaps(&targets),
+            closed,
+            "a tick a minute later keeps no gap"
+        );
 
         stop_server(address, &stopped, server).await;
     }

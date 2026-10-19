@@ -13,8 +13,11 @@
 // the choices in its session, and the window starts from them (restoredAudio); when the input they
 // name is gone, a start gives way to the system's default input on the same driver, or on the
 // system's own when the choice was ASIO (fallbackAudio), and never on ASIO.
+//
+// "demo" is the demo source (demo-source.js): a generated band with no interface, its one device
+// "Demo (no interface)". Only the engineer chooses it; nothing here ever picks it on its own.
 
-export const HOSTS = Object.freeze(["auto", "wasapi", "asio"]);
+export const HOSTS = Object.freeze(["auto", "wasapi", "asio", "demo"]);
 
 const DEFAULT_CONTROL_PORT = 50001;
 
@@ -35,7 +38,7 @@ export const DEFAULT_AUDIO = Object.freeze({
 
 const AUDIO_FIELDS = Object.freeze(Object.keys(DEFAULT_AUDIO));
 
-/** A driver the engine knows ("auto", "wasapi", "asio"); anything else is "auto". */
+/** A driver the engine knows ("auto", "wasapi", "asio", "demo"); anything else is "auto". */
 export function normalizeHost(host) {
   const value = typeof host === "string" ? host.trim().toLowerCase() : "";
   return HOSTS.includes(value) ? value : "auto";

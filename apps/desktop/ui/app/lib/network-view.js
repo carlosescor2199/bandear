@@ -6,9 +6,12 @@
 // - Only WASAPI switches the input device live; any other driver restarts the engine on the
 //   chosen device (ASIO holds one driver at a time, so a live switch there always fails).
 // - A switch that would leave configured groups without their inputs asks first.
+// - The demo source is a driver of its own with one device, chosen only by the engineer, never by
+//   default (demo-source.js); it restarts the engine as any driver but WASAPI does.
 // - While a take records (or its files are being finished) the driver, the device and the buffer
 //   stay as they are, and the setup says why: a take never mixes two devices.
 
+import { DEMO_DEVICE, DEMO_HOST, isDemoRunning } from "./demo-source.js";
 import { rememberedDevice } from "./engine-config.js";
 import { formatCaptureFormat, formatPercent, linkState } from "./format.js";
 import { bufferView } from "./playback-buffer.js";
@@ -18,11 +21,15 @@ import { SOUNDCHECK_BLOCKS_SWITCH, isSoundchecking, soundcheckOf } from "./sound
 
 const DASH = "—";
 
-/** The drivers, the safe one first. */
+/**
+ * The drivers, the safe one first, and last the demo source (demo-source.js), a generated band for
+ * a machine with no interface, which only the engineer ever chooses.
+ */
 export const HOST_OPTIONS = Object.freeze([
   Object.freeze({ value: "auto", label: "Auto — the system's own (safe)" }),
   Object.freeze({ value: "wasapi", label: "WASAPI (shared)" }),
   Object.freeze({ value: "asio", label: "ASIO — kernel driver (risky)" }),
+  Object.freeze({ value: DEMO_HOST, label: DEMO_DEVICE }),
 ]);
 
 /** The capture buffer sizes, in frames. */
@@ -217,8 +224,11 @@ export function confirmReady(armedAt, now, delay = CONFIRM_DELAY_MS) {
   return armedAt !== null && now - armedAt >= delay;
 }
 
-/** The app window's title: the old window's, after the input device in use. */
+/** The app window's title: the old window's, after the input device in use, or "Demo source". */
 export function windowTitle(state) {
+  if (isDemoRunning(state)) {
+    return "MixLink Server — Demo source";
+  }
   const device = state.engine.status?.deviceName;
   return device ? `MixLink Server — ${device}` : "MixLink Server";
 }

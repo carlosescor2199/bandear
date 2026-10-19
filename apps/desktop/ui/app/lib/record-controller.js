@@ -19,6 +19,7 @@
 //   in it to be corrected, a kept one shows as the desk has it and its takes are listed.
 
 import { actions, isSoundcheckNow, recordingStatus, soundcheckStatus } from "./console-state.js";
+import { demoChip } from "./demo-source.js";
 import { sentenceWithReason } from "./format.js";
 import { stripLevel } from "./mix-view.js";
 import { frameAt } from "./soundcheck.js";
@@ -366,20 +367,26 @@ export function createRecordController(app, { onChange = () => {} } = {}) {
  * Shows the shell's status strip while it has a chip to show: the REC chip (`[data-chip="rec"]`,
  * or the strip's first <ml-rec-chip>) while the console `app` reports a take recording, being
  * finished or stopped on an error, and the SOUNDCHECK chip (`[data-chip="soundcheck"]`, when the
- * strip has one) while a take plays in place of the inputs; hidden otherwise. Returns the
- * unsubscribe.
+ * strip has one) while a take plays in place of the inputs, and the demo badge
+ * (`[data-chip="demo"]`, when the strip has one) while the engine plays the demo source; hidden
+ * otherwise. Returns the unsubscribe.
  */
 export function mountRecChip(strip, app) {
   const rec = strip.querySelector('[data-chip="rec"]') ?? strip.querySelector("ml-rec-chip");
   const check = strip.querySelector('[data-chip="soundcheck"]');
+  const demo = strip.querySelector('[data-chip="demo"]');
   function render() {
     const state = app.store.getState();
     const recView = recChip(state);
     const checkView = check ? soundcheckChip(state) : null;
-    strip.hidden = recView === null && checkView === null;
+    const demoView = demo ? demoChip(state) : null;
+    strip.hidden = recView === null && checkView === null && demoView === null;
     rec.data = recView;
     if (check) {
       check.data = checkView;
+    }
+    if (demo) {
+      demo.data = demoView;
     }
   }
   render();

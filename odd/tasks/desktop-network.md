@@ -620,8 +620,102 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     c0c3f24 `feat(server): tell a capable phone how long to hold for copies` (+406/-41); 0d4ea3f
     `feat(desktop): redundancy delay with a latency cost` (+516/-157); this commit
     `feat(android): hold packets so a late copy can fill its gap`.
-- [ ] T8 (demo source): generator reader, engine start without a capture device, audio-setup
-  entry. Route: delegated writer.
+- [x] T7-fix (findings of review-b5f8ba40d9e19a3d, review-483392b647c8df00 and the correction
+  review-4a4559b6b013fee4). Route: delegated writer (trigger: findings across the target table,
+  the control server, the protocol, the Android player and the desktop UI; done with T8). Each
+  finding checked against b82d3a3 first.
+  - WARNING fixed (e5398f9): `hold_copies` kept the held-copies store when the delay was unchanged,
+    also when another musician took the row over at the same IP, so the previous occupant's
+    personal-mix datagrams could be sent to the new phone. A takeover now always gets a fresh
+    store (`new_held`, off the engine thread); the same musician registering again keeps theirs.
+    Test `a_row_taken_over_at_the_same_delay_never_sends_the_previous_musicians_copies` (another
+    client id, and a phone with no id). RED: 1 of 2 failed (same store kept).
+  - SUGGESTION fixed (8f9c893): `recovered` is bounded at the parse by `packets_received` (they
+    are among the packets received) and the running total saturates (`fetch_update` with
+    `saturating_add`). Tests: protocol `recovered_packets_are_never_more_than_the_packets_received`
+    and control `the_recovered_packets_a_phone_reports_add_up` (two reports of `u64::MAX` end at
+    `u64::MAX`, not wrapped). RED: 2 of 4 failed.
+  - WARNING (piece 2) found already fixed in 0d4ea3f: the desktop command maps
+    `RedundancyOutcome::NeedsHold` to `unsupported`, nothing saved
+    (`commands/redundancy.rs:165`, test `a_delayed_copy_for_a_phone_that_cannot_hold_is_
+    unsupported_and_changes_nothing`).
+  - WARNING (piece 2) found already fixed in 0d4ea3f: `DEFAULT_DELAY_BLOCKS = 0` and the wording
+    "Copy: immediate" / "2× bandwidth, no added latency" (`lib/redundancy.js:21,68,101`, tests in
+    `redundancy.test.js` for the default path and the fake's default).
+  - WARNING (piece 2) found already fixed in 0d4ea3f: the fake's `set_musician_redundancy` takes
+    0-4, 0 by default, says "from 0 to 4 blocks" and answers `unsupported` without
+    `redundancy.hold` (`fake-bridge.js` `set_musician_redundancy`).
+  - WARNING (piece 2) fixed (8f9c893, 44790a9): the semantics already agreed in the docs
+    (`protocol.rs` `StatsCommand::recovered`, `LinkStats.kt`, `ReorderHold.kt`); now a contract
+    fixture on both sides: `HoldPlayoutTest` plays a delayed copy into its gap and checks the
+    `stats` it sends equal `STATS_AFTER_A_COPY_FILLED_A_GAP` (4 received, 0 lost, 1 recovered),
+    and the server's `the_stats_a_phone_sends_after_a_copy_filled_a_gap` reads that same literal.
+  - SUGGESTION fixed (d54a698): `openLowLatencyTrack`'s steps are `openTrackKeepingLowLatency`,
+    generic over the track: a track that fails to start or to take the cushion is closed before
+    the failure goes on (a failing close kept as suppressed); `TrackOpeningTest` (6 tests: kept
+    when it shrinks, reopened at the minimum, large or minimum failing to start, cushion refused).
+  - SUGGESTION fixed (44790a9): the receive loop's hold wiring is `HoldPlayout` (hold read per
+    wake-up, a timeout releasing what is held, each played packet counted with its gap, the
+    report taking the hold's recovered count); `HoldPlayoutTest` (4 tests).
+  - RED (Android, both pieces stubbed): `:app:testDebugUnitTest --tests HoldPlayoutTest --tests
+    TrackOpeningTest`: 10 tests, 7 failed. GREEN below (T8).
+- [x] T8 (demo source): generator reader, engine start without a capture device, audio-setup
+  entry. Route: delegated writer (trigger: 2+ non-trivial files on every layer: a generator, the
+  pipeline, the soundcheck clock, engine start, capture hosts, desktop command and DTO, console
+  logic, fake bridge, shell and chip).
+  - Generator (`apps/server/src/demo.rs`): 8 voices of a four-bar loop at 120 BPM (8 s): kick,
+    snare, hi-hat, bass, keys, pad, a vocal-ish line with vibrato and a sweeping tone, pink-ish room
+    noise; more channels repeat them. Every sample is a pure function of its frame (noise is a hash
+    of the frame), so it is the same on every run and in any block size. Each voice is -18 dBFS RMS
+    over the loop with peaks at most -1 dBFS (gain measured once per process off the engine thread;
+    measured: every voice -18.00 dBFS, peaks -1.25 to -11.21 dBFS). No samples or assets.
+  - Engine: `AudioHost::Demo` ("demo"), one device `DEMO_DEVICE_NAME` "Demo (no interface)",
+    `DEMO_CHANNELS` 8. `list_input_devices_for(Demo)` answers it without touching any host;
+    `start` with it lists, opens and loads nothing (no cpal stream, `capture_device` none): the
+    pipeline's `SourceReader` is a ring or `SourceReader::demo`, whose blocks the engine thread
+    writes when its clock makes them due. The clock is the soundcheck's, extracted as
+    `soundcheck::BlockPacer` (the local output's callbacks when one plays, else the timer;
+    `playback_clock.set_active(true)` so callbacks wake the engine). Blocks of the buffer asked
+    for at 48 kHz, F32, metered and counted in `samples_received` as a capture. Local outputs are
+    the system's (as Auto). `EngineStatus.demo`, `EngineHandle::is_demo`.
+  - Decisions: recording from the demo is allowed (a source like any other; the take's device is
+    "Demo (no interface)"); a soundcheck is refused (`SoundcheckError::DemoSource`: a take plays in
+    place of an interface's inputs); a switch to any device but its own is refused. Auto never
+    resolves to the demo; a machine with no input device is told it can choose the Demo driver.
+  - Desktop: `demo` accepted as a driver (start, device list, session `audio` kept and restored
+    like any driver), DTO `demo`, refusal words for the soundcheck.
+  - UI: `lib/demo-source.js` (`DEMO_HOST`, `DEMO_DEVICE`, `demoDevices`, `isDemoRunning`,
+    `demoChip`); driver "Demo (no interface)" last in `HOST_OPTIONS`; `HOSTS` includes it;
+    `DEFAULT_AUDIO` stays auto; the top bar's badge "Demo source — no interface in use" (an
+    `ml-rec-chip` of kind `demo` linking to Network and system, added by the shell and shown by
+    `mountRecChip`); the window title "MixLink Server — Demo source". The fake mirrors it (its one
+    device, 8 inputs at 48 kHz F32, `demo` on the status, other devices and a soundcheck refused).
+  - RED: server, `demo::` 2 of 4 failed with a silent generator; the engine start test failed
+    with `is_demo` stubbed false (the pipeline and capture tests were written with their code and
+    passed on their first run). Desktop: 1 of 3 failed (the DTO had no `demo`). UI: 7 of 539
+    failed (module and wiring missing).
+  - No allocation: `pipeline::tests::the_demo_source_plays_through_the_engine_thread_without_
+    allocating` (2,000 blocks with pump, tick and wait: 0 allocations, 0 frees).
+  - Browser check (`desktop-ui`, `?fake#/network`): Driver "Demo (no interface)" restarted on it;
+    the device list showed only "Demo (no interface) — 8 channels", the format "8 ch · 48 kHz ·
+    32-bit float · 256"; the top bar showed "Demo source — no interface in use" (link to
+    #/network); Channels and groups showed CH 1-8 with moving level meters; Bass's redundancy on
+    said "Copy: immediate", "2× bandwidth, no added latency" and "... each copy right after its
+    original: their bandwidth doubles (×2), with no added latency."; no console errors. (The
+    800 px pane cuts the strip's right edge, as it does for the REC chip.)
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 518 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 306 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 539 passed; `gradle -p apps/android :app:testDebugUnitTest
+    --max-workers=2 --no-daemon`: 517 tests, 0 failures; `:app:assembleDebug`: BUILD SUCCESSFUL,
+    APK `apps/android/app/build/outputs/apk/debug/app-debug.apk` (not installed).
+  - Commits: e5398f9 `fix(server): drop held copies when another musician takes the address`
+    (+43/-1); 8f9c893 `fix(server): bound the recovered packets a phone reports` (+62/-5); d54a698
+    `fix(android): release the large track if it fails to start` (+192/-13); 44790a9
+    `test(android): cover the receive loop's hold wiring` (+189/-12); e5d0d32 `feat(engine): a demo
+    source that needs no interface` (+964/-91); 645a324 `feat(desktop): choose the demo source in
+    the audio setup` (+78/-5); this commit `feat(desktop-ui): demo source entry and badge`
+    (+337/-18 before this document).
 - [ ] T9 (close): PRD update, docs, live test with the S23. Route: inline or writer.
 
 ## Delivery
@@ -667,7 +761,13 @@ per reviewed slice, only with the user's approval.
   cannot play a late copy yet (see T7).
 - The user chose "immediate copy + optional delay" for redundancy; T7b done, four commits, closing
   T7's open note. Next review base stays a5cfa2c: T6-fix, T7 and T7b are reviewed together.
+- review-b5f8ba40d9e19a3d (a5cfa2c..531ece6) and review-483392b647c8df00 (531ece6..c0c3f24)
+  approved and acknowledged, with findings fixed or found already fixed in T7-fix.
+  review-4a4559b6b013fee4 (c0c3f24..230778a) returned `correction_required` for a CRITICAL
+  ReorderHold stale-waiting bug, corrected in b82d3a3, validated and acknowledged. Next review base
+  b82d3a3.
+- T7-fix and T8 done (demo source), seven commits.
 
 ## Next step
 
-T8 (demo source: generator reader, engine start without a capture device, audio-setup entry).
+T9 (close: PRD update, docs, live test with the S23).

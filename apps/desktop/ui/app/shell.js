@@ -1,5 +1,6 @@
 // The console shell: the sidebar, hash routing (#/mix by default, #/record, #/channels,
-// #/network), the REC chip above every screen while a take records, and the main region.
+// #/network), the REC chip above every screen while a take records (and the demo badge while the
+// engine plays the demo source), and the main region.
 //
 // Each section renders into the main region through a screen: a function `(main, route)` that
 // builds the section and may return a cleanup function, called when the engineer leaves it.
@@ -153,6 +154,12 @@ if (nav && main) {
   const { app, simulated } = connectEngine();
   const strip = document.querySelector("[data-shell-status]");
   if (app && strip) {
+    // The demo badge leads the strip, so "no interface in use" is the first thing it says.
+    if (!strip.querySelector('[data-chip="demo"]')) {
+      const demo = document.createElement("ml-rec-chip");
+      demo.dataset.chip = "demo";
+      strip.prepend(demo);
+    }
     mountRecChip(strip, app);
   }
   mountShell({

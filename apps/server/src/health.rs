@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::link_history::{LinkSample, RoundTrip};
 use crate::protocol::StatsCommand;
 
 /// How long a report stays meaningful. A phone reports about once a second, so a report older than
@@ -148,6 +149,13 @@ pub struct LinkStatus {
     /// Lost packets as a percentage of the packets the phone expected (received plus lost).
     pub loss_percent: Option<f64>,
     pub receive_timeouts_per_second: Option<f64>,
+    /// The control channel's round trip (see [crate::link_history]). It does not come from the
+    /// phone's reports, so it is there for a phone that never reports too, once its first pong
+    /// came back.
+    pub round_trip: RoundTrip,
+    /// The newest second of the musician's link history, a gap included; the history itself is read
+    /// on its own (see [crate::EngineHandle::link_history]).
+    pub latest: Option<LinkSample>,
 }
 
 /// Classifies a link from its latest report and whether the musician's control channel is still
@@ -192,6 +200,7 @@ pub(crate) fn link_status(
             underruns_per_second: Some(report.per_second(report.underruns)),
             loss_percent: Some(report.loss_percent()),
             receive_timeouts_per_second: Some(report.per_second(report.receive_timeouts)),
+            ..LinkStatus::default()
         },
         None => LinkStatus {
             health,
@@ -517,6 +526,7 @@ mod tests {
                 underruns_per_second: None,
                 loss_percent: None,
                 receive_timeouts_per_second: None,
+                ..LinkStatus::default()
             },
             "the last numbers no longer describe the link, so none are shown"
         );

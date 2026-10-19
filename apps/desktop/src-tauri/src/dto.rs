@@ -1556,6 +1556,7 @@ mod tests {
             underruns_per_second: Some(0.5),
             loss_percent: Some(1.25),
             receive_timeouts_per_second: Some(0.0),
+            ..LinkStatus::default()
         });
 
         let dto = MusicianDto::from(&musician);
@@ -1601,6 +1602,7 @@ mod tests {
             underruns_per_second: Some(0.0),
             loss_percent: Some(0.25),
             receive_timeouts_per_second: Some(0.0),
+            ..LinkStatus::default()
         })))
         .expect("a musician serializes");
         let silent = serde_json::to_value(MusicianDto::from(&musician_with_link(LinkStatus {
@@ -1609,6 +1611,7 @@ mod tests {
             underruns_per_second: Some(0.0),
             loss_percent: Some(0.0),
             receive_timeouts_per_second: Some(0.0),
+            ..LinkStatus::default()
         })))
         .expect("a musician serializes");
 

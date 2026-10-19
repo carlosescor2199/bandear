@@ -229,6 +229,9 @@ pub(crate) const MAX_STATS_INTERVAL_MS: u32 = 60_000;
 ///
 /// The counts are deltas for that interval, not running totals, so a report stands on its own and a
 /// lost report never skews the next one.
+///
+/// The four counts are required. The extras after them are optional and read leniently: an older
+/// phone sends none, and a value the server cannot use is read as absent, never as an error.
 #[derive(Debug, Deserialize)]
 pub(crate) struct StatsCommand {
     #[serde(rename = "type")]
@@ -238,6 +241,50 @@ pub(crate) struct StatsCommand {
     pub(crate) packets_lost: u64,
     pub(crate) underruns: u64,
     pub(crate) receive_timeouts: u64,
+    /// From a phone that announced [CAPABILITY_STATS_V2]: how much the packets' arrival varied over
+    /// the interval (the interarrival jitter, RFC 3550 style), in milliseconds.
+    #[serde(default, deserialize_with = "lenient_milliseconds")]
+    pub(crate) jitter_ms: Option<f64>,
+    /// From a phone that announced [CAPABILITY_STATS_V2]: the playback cushion it aims to keep at
+    /// the end of the interval, in milliseconds. Milliseconds rather than packets, so phones with
+    /// different block sizes read on one scale and the desk never needs a phone's packet length.
+    #[serde(default, deserialize_with = "lenient_milliseconds")]
+    pub(crate) cushion_ms: Option<f64>,
+    /// From a phone that announced [CAPABILITY_STATS_V2]: the audio queued for playback at the end
+    /// of the interval, in milliseconds.
+    #[serde(default, deserialize_with = "lenient_milliseconds")]
+    pub(crate) backlog_ms: Option<f64>,
+    /// From a phone that announced [CAPABILITY_REDUNDANCY_RECOVERED]: the packets over the interval
+    /// that only a redundant copy brought in time, filling a gap the first copy left. They count in
+    /// `packets_received`, not in `packets_lost`.
+    #[serde(default, deserialize_with = "lenient_count")]
+    pub(crate) recovered: Option<u64>,
+}
+
+/// The longest duration a `stats` extra may name, in milliseconds; a longer one is read as absent.
+pub(crate) const MAX_STATS_MILLISECONDS: f64 = 60_000.0;
+
+/// Reads an optional duration in milliseconds without ever failing the report: anything but a
+/// finite number from 0 to [MAX_STATS_MILLISECONDS] is read as absent.
+fn lenient_milliseconds<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .filter(|milliseconds| (0.0..=MAX_STATS_MILLISECONDS).contains(milliseconds)))
+}
+
+/// Reads an optional count without ever failing the report: anything but an unsigned integer is
+/// read as absent.
+fn lenient_count<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(serde_json::Value::as_u64))
 }
 
 /// Parses a `stats` control message, rejecting an interval the rates cannot be normalised by.
@@ -980,6 +1027,60 @@ mod tests {
         assert_eq!(command.packets_lost, 3);
         assert_eq!(command.underruns, 1);
         assert_eq!(command.receive_timeouts, 2);
+        assert_eq!(command.jitter_ms, None, "an older phone sends no extras");
+        assert_eq!(command.cushion_ms, None);
+        assert_eq!(command.backlog_ms, None);
+        assert_eq!(command.recovered, None);
+    }
+
+    #[test]
+    fn a_stats_report_keeps_the_extras_a_newer_phone_sends() {
+        let command = parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"jitter_ms":2.5,"cushion_ms":40,"backlog_ms":37.5,"recovered":3}"#,
+        )
+        .expect("a stats report with extras should parse");
+
+        assert_eq!(command.jitter_ms, Some(2.5));
+        assert_eq!(command.cushion_ms, Some(40.0));
+        assert_eq!(command.backlog_ms, Some(37.5));
+        assert_eq!(command.recovered, Some(3));
+        assert_eq!(command.packets_received, 200, "the counts as before");
+    }
+
+    /// An extra the server cannot use is read as absent: the report itself still counts.
+    #[test]
+    fn unusable_stats_extras_are_read_as_absent_and_the_report_still_parses() {
+        for extra in [
+            r#""jitter_ms":-1"#,
+            r#""jitter_ms":"2""#,
+            r#""jitter_ms":null"#,
+            r#""jitter_ms":60001"#,
+            r#""jitter_ms":[1]"#,
+        ] {
+            let command = parse_stats_command(&format!(
+                r#"{{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,{extra}}}"#
+            ))
+            .unwrap_or_else(|error| panic!("{extra} broke the parse: {error}"));
+            assert_eq!(command.jitter_ms, None, "{extra}");
+        }
+        for extra in [
+            r#""recovered":-1"#,
+            r#""recovered":1.5"#,
+            r#""recovered":"3""#,
+            r#""recovered":true"#,
+        ] {
+            let command = parse_stats_command(&format!(
+                r#"{{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,{extra}}}"#
+            ))
+            .unwrap_or_else(|error| panic!("{extra} broke the parse: {error}"));
+            assert_eq!(command.recovered, None, "{extra}");
+        }
+        let at_limit = parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"cushion_ms":60000,"backlog_ms":0}"#,
+        )
+        .expect("parses");
+        assert_eq!(at_limit.cushion_ms, Some(MAX_STATS_MILLISECONDS));
+        assert_eq!(at_limit.backlog_ms, Some(0.0));
     }
 
     #[test]

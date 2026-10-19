@@ -3,7 +3,7 @@ use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -17,6 +17,7 @@ use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, G
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
+use crate::link_history::LinkSample;
 use crate::mix::{
     group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
     MixPreset, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
@@ -753,7 +754,8 @@ pub(crate) fn join_musicians(
 /// A stale report is judged by whether the musician's control channel is still connected: the
 /// reports travel over the same Wi-Fi as the audio, so a phone that lost its link is still connected
 /// but can no longer report it. Each report is copied out under its own short lock and every
-/// musician is judged against the same clock read.
+/// musician is judged against the same clock read. Each musician's round trip and newest history
+/// sample are copied the same way, under their history's own lock.
 pub(crate) fn link_statuses(
     entries: &[TargetEntry],
     connected: &HashSet<IpAddr>,
@@ -764,9 +766,20 @@ pub(crate) fn link_statuses(
         .map(|entry| {
             let ip = entry.address.ip();
             let report = *entry.link_report.lock().expect("link report lock poisoned");
+            let (round_trip, latest) = {
+                let history = entry
+                    .link_history
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                (history.round_trip(), history.latest())
+            };
             (
                 ip,
-                link_status(report.as_ref(), connected.contains(&ip), now),
+                LinkStatus {
+                    round_trip,
+                    latest,
+                    ..link_status(report.as_ref(), connected.contains(&ip), now)
+                },
             )
         })
         .collect()
@@ -1482,6 +1495,17 @@ impl EngineHandle {
 
     pub fn control_port(&self) -> u16 {
         self.control_port
+    }
+
+    /// The link history of the musician `key` names (see [crate::link_history]): the samples taken
+    /// after `since_ms` (Unix milliseconds), or all of them, the oldest first. A phone that left is
+    /// still found by its client id while its history is kept. `None` when `key` names nobody.
+    pub fn link_history(
+        &self,
+        key: &MusicianKey,
+        since_ms: Option<u64>,
+    ) -> Option<Vec<LinkSample>> {
+        self.targets.link_history(key, since_ms)
     }
 
     /// A snapshot of the current state, including the joined per-musician view.
@@ -2734,6 +2758,7 @@ mod tests {
             underruns_per_second: Some(1.0),
             loss_percent: Some(0.0),
             receive_timeouts_per_second: Some(0.0),
+            ..LinkStatus::default()
         };
         let mut links = HashMap::new();
         links.insert(ip("192.168.1.3"), reporting);
@@ -2841,6 +2866,66 @@ mod tests {
             links[&ip("192.168.1.5")].health,
             LinkHealth::Unknown,
             "connected but never reported: a phone without stats reports"
+        );
+    }
+
+    /// The status carries each musician's round trip and newest history sample, never the history
+    /// itself; a stale report leaves the round trip (it comes from the control channel).
+    #[test]
+    fn the_link_status_carries_the_round_trip_and_the_newest_sample() {
+        use crate::health::{LinkReport, REPORT_STALE_AFTER};
+        use crate::link_history::RoundTrip;
+        use std::time::Duration;
+
+        let registry = TargetRegistry::new(
+            &[
+                "192.168.1.3:50000".parse().unwrap(),
+                "192.168.1.4:50000".parse().unwrap(),
+            ],
+            &GroupLayout::default(),
+        )
+        .expect("registry should build");
+        let received_at = Instant::now();
+        let command = crate::protocol::parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"cushion_ms":40}"#,
+        )
+        .expect("a stats report");
+        let report = LinkReport::from_command(&command, received_at);
+        *registry
+            .link_report(ip("192.168.1.3"))
+            .expect("configured")
+            .lock()
+            .expect("report lock") = Some(report);
+        registry.record_round_trip(ip("192.168.1.3"), Duration::from_millis(9));
+        registry.record_link_report(ip("192.168.1.3"), &report, &command, 5_000);
+        let connected: HashSet<IpAddr> = [ip("192.168.1.3")].into_iter().collect();
+
+        let links = link_statuses(&registry.read(), &connected, received_at);
+        let reporting = links[&ip("192.168.1.3")];
+        assert_eq!(
+            reporting.round_trip,
+            RoundTrip {
+                last_ms: Some(9.0),
+                smoothed_ms: Some(9.0),
+            }
+        );
+        let latest = reporting.latest.expect("the newest sample");
+        assert_eq!(latest.at_ms, 5_000);
+        assert_eq!(latest.cushion_ms, Some(40.0));
+        assert_eq!(latest.rtt_ms, Some(9.0));
+        assert_eq!(links[&ip("192.168.1.4")].latest, None, "never reported");
+        assert_eq!(links[&ip("192.168.1.4")].round_trip, RoundTrip::default());
+
+        let stale = link_statuses(
+            &registry.read(),
+            &connected,
+            received_at + REPORT_STALE_AFTER + Duration::from_secs(1),
+        );
+        assert_eq!(stale[&ip("192.168.1.3")].loss_percent, None);
+        assert_eq!(
+            stale[&ip("192.168.1.3")].round_trip.last_ms,
+            Some(9.0),
+            "the round trip does not go stale with the reports"
         );
     }
 

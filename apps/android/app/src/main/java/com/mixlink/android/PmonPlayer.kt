@@ -131,6 +131,8 @@ internal class PmonPlayer(
         var playbackRate: Int? = null
         val metricsStartedAtNanos = System.nanoTime()
         val linkStats = LinkStatsAccumulator(metricsStartedAtNanos / NANOS_PER_MILLISECOND)
+        // The hold and the link report together, wake-up by wake-up (see [HoldPlayout]).
+        val playout = HoldPlayout(hold, linkStats)
         var previousPacketAtNanos: Long? = null
         var interArrivalMs = 0.0
         var jitterMs = 0.0
@@ -176,14 +178,13 @@ internal class PmonPlayer(
                             framesWritten = framesWritten,
                             presentedFrame = audioTimestamp.framePosition,
                             appliedBufferFrames = appliedBufferFrames,
-                            holdPackets = hold.holdPackets,
+                            holdPackets = playout.holdPackets,
                         )
-                        linkStats.poll(
+                        playout.poll(
                             nowMs,
                             track?.underrunCount ?: 0,
                             cushionMs = extras.cushionMs,
                             backlogMs = extras.backlogMs,
-                            cumulativeRecovered = hold.recovered,
                         )?.let { report ->
                             listener.onLinkStats(report)
                         }
@@ -195,16 +196,15 @@ internal class PmonPlayer(
                         openedSocket.receive(datagram)
                         true
                     } catch (_: java.net.SocketTimeoutException) {
-                        linkStats.onReceiveTimeout()
                         // Nothing came for a while: what is held is not worth waiting for any longer.
-                        hold.release()
+                        playout.onTimeout()
                         false
                     }
 
                     try {
                         // The desk's hold is read once per wake-up (one volatile read), so a change
                         // applies from the next packet.
-                        hold.holdPackets = mixState.redundancyHoldPackets
+                        playout.wake(mixState.redundancyHoldPackets)
                         if (arrived) {
                             val packet = PmonPacketParser.parse(datagram.data, datagram.length)
                             if (packet.channels > MAX_CHANNELS) {
@@ -212,7 +212,7 @@ internal class PmonPlayer(
                                     "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
                                 )
                             }
-                            if (!hold.offer(packet.sequence, packet)) {
+                            if (!playout.offer(packet.sequence, packet)) {
                                 // A duplicate, or a packet that arrived after a newer one was played
                                 // or given up on: playing it now would be out of order, and its gap is
                                 // already counted.
@@ -236,12 +236,10 @@ internal class PmonPlayer(
                         // Every packet now due, in sequence order: at once with no hold, else once
                         // the hold has passed or a late copy filled its gap.
                         while (true) {
-                            val packet = hold.next() ?: break
-                            val lostBefore = hold.lostBefore
+                            val packetPlayedAtNanos = System.nanoTime()
+                            val packet = playout.nextToPlay(packetPlayedAtNanos / NANOS_PER_MILLISECOND) ?: break
                             packetsReceived++
                             lastSampleRate = packet.sampleRate
-                            val packetPlayedAtNanos = System.nanoTime()
-                            linkStats.onPacket(lostBefore, packetPlayedAtNanos / NANOS_PER_MILLISECOND)
                             val elapsedSeconds = (packetPlayedAtNanos - metricsStartedAtNanos) / 1_000_000_000.0
                             packetsPerSecond = if (elapsedSeconds > 0.0) packetsReceived / elapsedSeconds else 0.0
 
@@ -306,7 +304,7 @@ internal class PmonPlayer(
                             }
                             listener.onStats(
                                 packetsReceived,
-                                hold.lost,
+                                playout.lost,
                                 lastSampleRate,
                                 packetsPerSecond,
                                 interArrivalMs,

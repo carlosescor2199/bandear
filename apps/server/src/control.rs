@@ -352,12 +352,12 @@ pub(crate) fn spawn_control_thread(
         let listener = match std::net::TcpListener::bind(("0.0.0.0", control_port)) {
             Ok(listener) => listener,
             Err(error) => {
-                eprintln!("control listener bind error: {error}");
+                crate::log_error!("control", "control listener bind error: {error}");
                 return;
             }
         };
         if let Err(error) = listener.set_nonblocking(true) {
-            eprintln!("control listener setup error: {error}");
+            crate::log_error!("control", "control listener setup error: {error}");
             return;
         }
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -366,7 +366,7 @@ pub(crate) fn spawn_control_thread(
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                eprintln!("control runtime error: {error}");
+                crate::log_error!("control", "control runtime error: {error}");
                 return;
             }
         };
@@ -394,7 +394,7 @@ async fn run_control_server(
     let listener = match TcpListener::from_std(listener) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("control listener error: {error}");
+            crate::log_error!("control", "control listener error: {error}");
             return;
         }
     };
@@ -409,7 +409,10 @@ async fn run_control_server(
         // The accept loop already ticks a few times a second, so it is also the clock that removes
         // registered targets whose control channel stayed gone past the grace period.
         for address in targets.sweep_expired(Instant::now()) {
-            println!("control registration {address} removed after the grace period");
+            crate::log_info!(
+                "control",
+                "control registration {address} removed after the grace period"
+            );
         }
         match accepted {
             None => continue,
@@ -431,11 +434,11 @@ async fn run_control_server(
                         )
                         .await
                         {
-                            eprintln!("control connection {peer} error: {error}");
+                            crate::log_warn!("control", "control connection {peer} error: {error}");
                         }
                     });
                 }
-                Err(error) => eprintln!("control accept error: {error}"),
+                Err(error) => crate::log_warn!("control", "control accept error: {error}"),
             },
         }
     }
@@ -751,10 +754,12 @@ async fn handle_control_connection(
                                 .map(|from| format!(", moved from {from}"))
                                 .unwrap_or_default();
                             match &name {
-                                Some(name) => println!(
+                                Some(name) => crate::log_info!(
+                                    "control",
                                     "control registration from {peer}: {address} as \"{name}\"{moved}"
                                 ),
-                                None => println!(
+                                None => crate::log_info!(
+                                    "control",
                                     "control registration from {peer}: {address} (unnamed){moved}"
                                 ),
                             }
@@ -858,7 +863,8 @@ fn announce_engine_changes(events: &EventBus, addresses: Vec<SocketAddr>) {
 
 /// The one line a connection closed by the heartbeat leaves in the log.
 fn log_missed_heartbeat(peer: SocketAddr, dead_after: Duration) {
-    println!(
+    crate::log_info!(
+        "control",
         "control connection {peer} closed: nothing received for {dead_after:?}, heartbeat missed"
     );
 }

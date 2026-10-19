@@ -164,20 +164,26 @@ fn build_broadcast_senders(addresses: &[IpAddr]) -> Vec<UdpSocket> {
         match UdpSocket::bind(SocketAddr::new(address, 0)) {
             Ok(socket) => match socket.set_broadcast(true) {
                 Ok(()) => senders.push(socket),
-                Err(error) => eprintln!("discovery beacon setup error for {address}: {error}"),
+                Err(error) => crate::log_warn!(
+                    "discovery",
+                    "discovery beacon setup error for {address}: {error}"
+                ),
             },
-            Err(error) => eprintln!("discovery beacon bind error for {address}: {error}"),
+            Err(error) => crate::log_warn!(
+                "discovery",
+                "discovery beacon bind error for {address}: {error}"
+            ),
         }
     }
     if senders.is_empty() {
         match UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => {
                 if let Err(error) = socket.set_broadcast(true) {
-                    eprintln!("discovery beacon setup error: {error}");
+                    crate::log_warn!("discovery", "discovery beacon setup error: {error}");
                 }
                 senders.push(socket);
             }
-            Err(error) => eprintln!("discovery beacon bind error: {error}"),
+            Err(error) => crate::log_warn!("discovery", "discovery beacon bind error: {error}"),
         }
     }
     senders
@@ -209,7 +215,7 @@ pub(crate) fn spawn_discovery_thread(
                 beacon_interfaces(&live_targets, local_address_for, default_route_address);
             for socket in build_broadcast_senders(&addresses) {
                 if let Err(error) = socket.send_to(&datagram, destination) {
-                    eprintln!("discovery beacon send error: {error}");
+                    crate::log_warn!("discovery", "discovery beacon send error: {error}");
                 }
             }
             // Sleep in short steps so a stop request is honoured promptly instead of waiting out a

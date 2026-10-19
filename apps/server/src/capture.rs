@@ -74,7 +74,10 @@ fn asio_host() -> &'static cpal::Host {
     HOST.get_or_init(|| match cpal::host_from_id(cpal::HostId::Asio) {
         Ok(host) => host,
         Err(error) => {
-            eprintln!("ASIO host unavailable ({error}); falling back to the default host");
+            crate::log_warn!(
+                "capture",
+                "ASIO host unavailable ({error}); falling back to the default host"
+            );
             cpal::default_host()
         }
     })
@@ -381,7 +384,8 @@ pub(crate) fn build_input_stream(
         }),
         Err(error) => match requested_frames {
             Some(frames) => {
-                eprintln!(
+                crate::log_warn!(
+                    "capture",
                     "Requested input buffer of {frames} frames was rejected ({error}); falling back to the device default buffer."
                 );
                 let fallback = with_buffer_size(base, None);
@@ -439,6 +443,8 @@ fn open_typed<T: SizedSample + CaptureSample>(
         .build_input_stream(
             *config,
             move |data: &[T], _info: &InputCallbackInfo| writer.write(data),
+            // The driver may call this on its audio thread, so it stays out of the log sink
+            // (which formats, locks and writes a file): it keeps the stderr line it always had.
             |error| eprintln!("Audio input error: {error}"),
             None,
         )

@@ -5,6 +5,7 @@ mod decimate;
 mod discovery;
 mod engine;
 mod health;
+pub mod logging;
 mod mix;
 mod network;
 mod output;

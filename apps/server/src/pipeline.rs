@@ -31,6 +31,9 @@
 //! A take can stand in for the capture (a virtual soundcheck, see [crate::soundcheck]): the engine
 //! thread then takes its blocks, in the capture's layout, from the take's ring as the take's clock
 //! makes them due, and the capture callback lets its audio go until the engine goes back to it.
+//!
+//! The demo source ([crate::demo]) has no ring and no callback: the engine thread writes each of
+//! its blocks itself when its clock (the local output's callbacks, else the timer) makes it due.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -42,6 +45,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::decimate::Decimator;
+use crate::demo::DemoReader;
 use crate::engine::{LevelMeter, METER_IDLE_FRAMES, METER_IDLE_WAIT};
 use crate::soundcheck::PlaybackReader;
 
@@ -153,16 +157,46 @@ pub(crate) struct CaptureWriter {
     links: CaptureLinks,
 }
 
-/// The engine thread's half of a stream: the ring it reads and the layout of its frames.
+/// The engine thread's half of a stream: where its frames come from and their layout.
 pub(crate) struct SourceReader {
-    consumer: Consumer<f32>,
+    input: SourceInput,
     format: SourceFormat,
 }
 
+/// Where a source's frames come from.
+enum SourceInput {
+    /// A capture stream's ring, filled by its device callback.
+    Ring(Consumer<f32>),
+    /// The demo source, written on the engine thread as its clock makes blocks due (see
+    /// [crate::demo]).
+    Demo(DemoReader),
+}
+
 impl SourceReader {
-    /// The layout of the frames in this ring.
+    /// The layout of the frames in this source.
     pub(crate) fn format(&self) -> SourceFormat {
         self.format
+    }
+
+    /// The demo source in blocks of `block_frames` (see [crate::demo]): no ring and no device, the
+    /// engine thread writes each block when its clock makes it due.
+    pub(crate) fn demo(demo: DemoReader, block_frames: usize) -> Self {
+        Self {
+            format: SourceFormat {
+                channels: demo.channels(),
+                block_frames: block_frames.clamp(1, MAX_BLOCK_FRAMES),
+            },
+            input: SourceInput::Demo(demo),
+        }
+    }
+
+    /// The capture ring, `None` for the demo source.
+    #[cfg(test)]
+    pub(crate) fn ring(&self) -> Option<&Consumer<f32>> {
+        match &self.input {
+            SourceInput::Ring(consumer) => Some(consumer),
+            SourceInput::Demo(_) => None,
+        }
     }
 }
 
@@ -185,7 +219,13 @@ impl CaptureWriter {
             channels: format.channels,
             links,
         };
-        Ok((writer, SourceReader { consumer, format }))
+        Ok((
+            writer,
+            SourceReader {
+                input: SourceInput::Ring(consumer),
+                format,
+            },
+        ))
     }
 
     /// Takes one device buffer: converts it, decimates it to 48 kHz, meters it and hands it to the
@@ -341,9 +381,11 @@ impl Pipeline {
         let Some(playback) = self.playback.take() else {
             return;
         };
-        if let Some(source) = self.source.as_mut() {
-            let queued = source.consumer.slots();
-            if let Ok(chunk) = source.consumer.read_chunk(queued) {
+        if let Some(SourceInput::Ring(consumer)) =
+            self.source.as_mut().map(|source| &mut source.input)
+        {
+            let queued = consumer.slots();
+            if let Ok(chunk) = consumer.read_chunk(queued) {
                 chunk.commit_all();
             }
         }
@@ -369,9 +411,24 @@ impl Pipeline {
         };
         let channels = source.format.channels;
         let length = self.block.len();
+        let consumer = match &mut source.input {
+            SourceInput::Ring(consumer) => consumer,
+            SourceInput::Demo(demo) => {
+                return pump_demo(
+                    demo,
+                    source.format,
+                    now,
+                    &mut self.block,
+                    &mut self.sequence,
+                    &mut self.sinks,
+                    &self.levels,
+                    &mut self.received,
+                );
+            }
+        };
         let mut blocks = 0;
-        while length > 0 && source.consumer.slots() >= length {
-            if source.consumer.pop_entire_slice(&mut self.block).is_err() {
+        while length > 0 && consumer.slots() >= length {
+            if consumer.pop_entire_slice(&mut self.block).is_err() {
                 break;
             }
             let block = Block {
@@ -481,9 +538,50 @@ impl Pipeline {
         };
         match (&self.playback, &self.source) {
             (Some(playback), Some(source)) => meters.min(playback.wait(source.format.block_frames)),
+            (
+                None,
+                Some(SourceReader {
+                    input: SourceInput::Demo(demo),
+                    format,
+                }),
+            ) => meters.min(demo.wait(format.block_frames)),
             _ => meters,
         }
     }
+}
+
+/// Hands the sinks every block of the demo its clock has made due by `now`, metered as a capture
+/// callback meters its own; returns how many.
+#[allow(clippy::too_many_arguments)]
+fn pump_demo(
+    demo: &mut DemoReader,
+    format: SourceFormat,
+    now: Instant,
+    block: &mut [f32],
+    sequence: &mut u64,
+    sinks: &mut [Box<dyn Sink>],
+    levels: &LevelMeter,
+    received: &mut usize,
+) -> usize {
+    if format.channels == 0 || block.len() != format.block_frames * format.channels {
+        return 0;
+    }
+    let due = demo.due(now, format.block_frames);
+    for _ in 0..due {
+        demo.fill(block);
+        levels.observe(block, format.channels);
+        let handed = Block {
+            samples: block,
+            channels: format.channels,
+            sequence: *sequence,
+        };
+        for sink in sinks.iter_mut() {
+            sink.process(&handed);
+        }
+        *sequence = sequence.wrapping_add(1);
+        *received += format.block_frames;
+    }
+    due
 }
 
 /// The running engine thread.
@@ -811,7 +909,7 @@ pub(crate) mod tests {
         assert_eq!(links.stats.dropped_frames.load(Ordering::Relaxed), 6_000);
         assert_eq!(links.stats.dropped_blocks.load(Ordering::Relaxed), 6);
         assert_eq!(links.stats.samples.load(Ordering::Relaxed), 30_000);
-        assert_eq!(reader.consumer.slots(), 24_000);
+        assert_eq!(reader.ring().expect("a ring").slots(), 24_000);
     }
 
     #[test]
@@ -948,6 +1046,87 @@ pub(crate) mod tests {
                 writer.write(&callback);
                 pipeline.pump();
                 pipeline.tick(Instant::now());
+            }
+        });
+
+        assert_eq!((allocations, frees), (0, 0));
+    }
+
+    fn demo_source(block_frames: usize, links: &CaptureLinks) -> SourceReader {
+        let clock = Arc::new(crate::soundcheck::PlaybackClock::new());
+        let pacer = crate::soundcheck::BlockPacer::new(clock);
+        SourceReader::demo(
+            DemoReader::new(8, pacer, Arc::clone(&links.stats)),
+            block_frames,
+        )
+    }
+
+    /// The demo source has no ring: its blocks fall due with the timer, numbered like a capture's,
+    /// in its layout, metered and counted as a capture callback would.
+    #[test]
+    fn the_demo_source_makes_its_blocks_due_with_the_time_that_passes() {
+        let links = links();
+        let recorder = Recorder::new();
+        let seen = Arc::clone(&recorder.seen);
+        let mut pipeline = Pipeline::new(vec![Box::new(recorder)], Arc::clone(&links.levels));
+        let source = demo_source(64, &links);
+        assert!(source.ring().is_none());
+        assert_eq!(
+            source.format(),
+            SourceFormat {
+                channels: 8,
+                block_frames: 64
+            }
+        );
+        pipeline.set_source(source);
+
+        let start = Instant::now();
+        pipeline.pump_at(start);
+        // 10 ms are 480 frames: seven blocks of 64, 32 frames carried.
+        assert_eq!(pipeline.pump_at(start + Duration::from_millis(10)), 7);
+        assert_eq!(pipeline.pump_at(start + Duration::from_millis(20)), 8);
+        assert!(pipeline.wait(start + Duration::from_millis(20)) <= Duration::from_micros(1_334));
+
+        let blocks = seen.lock().unwrap();
+        assert_eq!(blocks.len(), 15);
+        assert!(blocks
+            .iter()
+            .enumerate()
+            .all(|(index, block)| block.sequence == index as u64
+                && block.channels == 8
+                && block.frames == 64));
+        assert_eq!(
+            links.stats.samples.load(Ordering::Relaxed),
+            15 * 64 * 8,
+            "counted as captured samples"
+        );
+        // The loop starts on a beat: the kick sounds at once (the snare waits for beat 2).
+        let levels = links.levels.read(8);
+        assert!(
+            levels[0] > 0 && levels[1] == 0,
+            "metered as a capture is: {levels:?}"
+        );
+    }
+
+    /// The engine thread's whole path for the demo source, from its clock to the sinks, makes no
+    /// allocation and frees nothing.
+    #[test]
+    fn the_demo_source_plays_through_the_engine_thread_without_allocating() {
+        let links = links();
+        let recorder = Recorder::new();
+        let mut pipeline = Pipeline::new(vec![Box::new(recorder)], Arc::clone(&links.levels));
+        pipeline.set_source(demo_source(64, &links));
+        let start = Instant::now();
+        // 1334 µs is 64.03 frames: one block falls due at each step.
+        let at = |block: u64| start + Duration::from_micros(block * 1_334);
+        pipeline.pump_at(at(0));
+        assert_eq!(pipeline.pump_at(at(1)), 1);
+
+        let (allocations, frees) = allocations::count(|| {
+            for block in 2..2_000 {
+                pipeline.pump_at(at(block));
+                pipeline.tick(at(block));
+                let _ = pipeline.wait(at(block));
             }
         });
 

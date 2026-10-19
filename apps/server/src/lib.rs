@@ -2,6 +2,7 @@ mod capture;
 mod cli;
 mod control;
 mod decimate;
+mod demo;
 mod discovery;
 mod engine;
 mod health;
@@ -21,6 +22,7 @@ mod wav;
 
 pub use capture::{list_input_devices, list_input_devices_for, AudioHost, InputDevice};
 pub use cli::{check_groups, parse_arguments, EngineConfig, GroupDefinition};
+pub use demo::{DEMO_CHANNELS, DEMO_DEVICE_NAME, DEMO_VOICES};
 pub use engine::{
     check_channels, start, CaptureFormat, ChannelKind, ChannelMeta, EngineEvent, EngineHandle,
     EngineMeters, EngineStatus, GroupStatus, MirrorOutcome, MirrorSource, MixOrigin,

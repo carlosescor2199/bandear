@@ -32,12 +32,17 @@ pub struct InputDevice {
 /// no third-party driver. ASIO is deliberately explicit, because choosing it loads a kernel-mode
 /// driver, and an unstable one takes the whole machine down: a Realtek ASIO driver did exactly that
 /// during testing, with two bugchecks in one afternoon.
+///
+/// `Demo` is no host at all: the demo source ([crate::demo]), a generated band with no interface.
+/// It is only ever chosen by name, never what `Auto` resolves to, and choosing it opens, lists and
+/// loads no device and no driver.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AudioHost {
     #[default]
     Auto,
     Asio,
     Wasapi,
+    Demo,
 }
 
 impl AudioHost {
@@ -47,7 +52,10 @@ impl AudioHost {
             "auto" => Ok(Self::Auto),
             "asio" => Ok(Self::Asio),
             "wasapi" => Ok(Self::Wasapi),
-            other => Err(format!("--host `{other}` is not one of auto, asio, wasapi")),
+            "demo" => Ok(Self::Demo),
+            other => Err(format!(
+                "--host `{other}` is not one of auto, asio, wasapi, demo"
+            )),
         }
     }
 
@@ -57,6 +65,7 @@ impl AudioHost {
             Self::Auto => "auto",
             Self::Asio => "asio",
             Self::Wasapi => "wasapi",
+            Self::Demo => "demo",
         }
     }
 }
@@ -114,6 +123,13 @@ pub fn list_input_devices() -> Result<Vec<InputDevice>, Box<dyn Error>> {
 
 /// Enumerates one backend's input devices with the channel count a switch would capture.
 pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<dyn Error>> {
+    // The demo source is its one device, and listing it touches no audio host at all.
+    if host == AudioHost::Demo {
+        return Ok(vec![InputDevice {
+            name: crate::demo::DEMO_DEVICE_NAME.to_owned(),
+            channels: crate::demo::DEMO_CHANNELS,
+        }]);
+    }
     // ASIO is listed from the registry instead of from cpal. cpal describes a device by loading its
     // driver, and ASIO only holds one driver at a time, so a running session hides every driver but
     // its own. The installed names are exactly what a DAW lists, and they are the names cpal uses.
@@ -454,6 +470,26 @@ fn open_typed<T: SizedSample + CaptureSample>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demo source is chosen by name only: never the default, never what `auto` means, and its
+    /// one device is listed without any audio host.
+    #[test]
+    fn the_demo_is_its_own_driver_with_one_device_and_never_the_default() {
+        assert_eq!(AudioHost::parse("Demo"), Ok(AudioHost::Demo));
+        assert_eq!(AudioHost::Demo.as_str(), "demo");
+        assert_eq!(AudioHost::default(), AudioHost::Auto);
+        assert_eq!(AudioHost::parse("auto"), Ok(AudioHost::Auto));
+        let error = AudioHost::parse("jack").expect_err("not a driver");
+        assert!(error.contains("demo"), "{error}");
+
+        assert_eq!(
+            list_input_devices_for(AudioHost::Demo).expect("listed"),
+            vec![InputDevice {
+                name: "Demo (no interface)".to_owned(),
+                channels: 8,
+            }]
+        );
+    }
 
     #[test]
     fn accepts_target_sample_rate_inside_supported_range() {

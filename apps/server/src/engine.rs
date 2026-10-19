@@ -15,6 +15,7 @@ use crate::capture::{
 };
 use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
+use crate::demo::{DemoReader, DEMO_CHANNELS, DEMO_DEVICE_NAME};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
 use crate::link_history::LinkHistoryRead;
@@ -37,7 +38,7 @@ use crate::recorder::{
 };
 use crate::redundancy::{Redundancy, RedundancyOutcome, RedundancySetting};
 use crate::soundcheck::{
-    PlaybackClock, Soundcheck, SoundcheckError, SoundcheckRequest, SoundcheckStatus,
+    BlockPacer, PlaybackClock, Soundcheck, SoundcheckError, SoundcheckRequest, SoundcheckStatus,
 };
 use crate::targets::{BufferSet, MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
 
@@ -401,6 +402,8 @@ pub struct EngineStatus {
     pub recording: RecordingStatus,
     /// The take playing in place of the inputs, if any (see [EngineHandle::soundcheck]).
     pub soundcheck: SoundcheckStatus,
+    /// The engine runs on the demo source ([crate::demo]), not on an interface.
+    pub demo: bool,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -1603,6 +1606,11 @@ impl EngineHandle {
         &self.device_name
     }
 
+    /// Whether the engine runs on the demo source ([crate::demo]) rather than an interface.
+    pub fn is_demo(&self) -> bool {
+        self.host == AudioHost::Demo
+    }
+
     pub fn capture_format(&self) -> &CaptureFormat {
         &self.capture_format
     }
@@ -1674,6 +1682,7 @@ impl EngineHandle {
             local_output: self.local_output(),
             recording: self.recording(),
             soundcheck: self.soundcheck(),
+            demo: self.is_demo(),
         }
     }
 
@@ -1719,6 +1728,18 @@ impl EngineHandle {
         }
         self.recorder.refuse_source_change()?;
         self.soundcheck.refuse_source_change()?;
+        if self.is_demo() {
+            // The demo source is its one device: there is nothing to list or switch to, and no
+            // audio host is touched. An interface is another driver, which a start chooses.
+            return match filter {
+                None => Ok(self.capture_format.clone()),
+                Some(name) if name == DEMO_DEVICE_NAME => Ok(self.capture_format.clone()),
+                Some(name) => Err(format!(
+                    "\"{name}\" is not the demo source's device: choose an interface's driver to use it"
+                )
+                .into()),
+            };
+        }
         let device = {
             let host = input_host(self.host);
             let devices = host
@@ -1973,7 +1994,9 @@ impl EngineHandle {
                 .capture_device
                 .clone()
                 .ok_or("no ASIO driver is open for the local output")?,
-            AudioHost::Auto | AudioHost::Wasapi => system_output_device(&request.device)?,
+            AudioHost::Auto | AudioHost::Wasapi | AudioHost::Demo => {
+                system_output_device(&request.device)?
+            }
         };
         let opened = open_output(
             &device,
@@ -2171,6 +2194,9 @@ impl EngineHandle {
         if self.soundcheck.is_active() {
             return Err(SoundcheckError::AlreadyPlaying.into());
         }
+        if self.is_demo() {
+            return Err(SoundcheckError::DemoSource.into());
+        }
         if self.recorder.refuse_source_change().is_err() {
             return Err(SoundcheckError::Recording.into());
         }
@@ -2191,6 +2217,9 @@ impl EngineHandle {
         let Some(pipeline) = self.pipeline.as_ref() else {
             return Err(SoundcheckError::EngineStopping.into());
         };
+        if self.is_demo() {
+            return Err(SoundcheckError::DemoSource.into());
+        }
         let (mut reader, active) = crate::soundcheck::prepare(
             take,
             request,
@@ -2684,6 +2713,15 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     for target in &targets {
         crate::log_info!("engine", "  {target}");
     }
+    if config.host == AudioHost::Demo {
+        // No interface: no audio host is touched, and no device is listed, opened or loaded.
+        crate::log_info!(
+            "engine",
+            "Selected input: {DEMO_DEVICE_NAME}, {DEMO_CHANNELS} generated channels at {TARGET_SAMPLE_RATE} Hz, buffer={}",
+            describe_buffer(config.buffer_frames.or(Some(DEFAULT_BUFFER_FRAMES)))
+        );
+        return launch(config, &targets, StartCapture::Demo).map(Some);
+    }
     let host = input_host(config.host);
     let devices = host
         .input_devices()
@@ -2725,11 +2763,43 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
             supported_config.sample_rate()
         );
     }
+    launch(
+        config,
+        &targets,
+        StartCapture::Device {
+            device,
+            config: supported_config,
+        },
+    )
+    .map(Some)
+}
 
+/// What a start captures from: an input device in the format chosen for it, or the demo source.
+enum StartCapture {
+    Device {
+        device: cpal::Device,
+        config: cpal::SupportedStreamConfig,
+    },
+    Demo,
+}
+
+/// Starts every part of the engine on `capture` (see [start]): the control server, discovery, the
+/// engine thread with its sinks, and the capture stream, or for the demo source no stream at all
+/// (the engine thread writes its blocks, see [crate::demo]).
+fn launch(
+    config: EngineConfig,
+    targets: &[SocketAddr],
+    capture: StartCapture,
+) -> Result<EngineHandle, Box<dyn Error>> {
+    let buffer_frames = config.buffer_frames.or(Some(DEFAULT_BUFFER_FRAMES));
+    let channels = match &capture {
+        StartCapture::Device { config, .. } => config.channels(),
+        StartCapture::Demo => DEMO_CHANNELS,
+    };
     let stopped = Arc::new(AtomicBool::new(false));
-    let source_channels = supported_config.channels().min(u16::from(u8::MAX)) as u8;
+    let source_channels = channels.min(u16::from(u8::MAX)) as u8;
     let group_layout = validate_groups(&config.groups, usize::from(source_channels))?;
-    let target_registry = Arc::new(TargetRegistry::new(&targets, &group_layout)?);
+    let target_registry = Arc::new(TargetRegistry::new(targets, &group_layout)?);
     let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
     let config_state = Arc::new(ConfigState::new(
         source_channels,
@@ -2769,27 +2839,56 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     ))?;
     let playback_clock = Arc::new(PlaybackClock::new());
     playback_clock.set_waker(pipeline.waker());
-    let links = CaptureLinks {
-        levels: Arc::clone(&levels),
-        stats: Arc::clone(&capture_stats),
-        wake: Some(pipeline.waker()),
+    let (stream, capture_device, device_name, capture_format, block_frames) = match capture {
+        StartCapture::Device {
+            device,
+            config: supported_config,
+        } => {
+            let links = CaptureLinks {
+                levels: Arc::clone(&levels),
+                stats: Arc::clone(&capture_stats),
+                wake: Some(pipeline.waker()),
+            };
+            let opened = build_input_stream(&device, &supported_config, buffer_frames, &links)?;
+            let block_frames = opened.reader.format().block_frames;
+            pipeline.set_source(opened.reader)?;
+            opened
+                .stream
+                .play()
+                .map_err(|error| format!("could not start input capture: {error}"))?;
+            let capture_format = CaptureFormat {
+                channels: supported_config.channels(),
+                sample_rate: supported_config.sample_rate(),
+                sample_format: format!("{:?}", supported_config.sample_format()),
+                buffer_size: describe_buffer(opened.buffer_frames),
+            };
+            let device_name = device.to_string();
+            (
+                Some(opened.stream),
+                Some(device),
+                device_name,
+                capture_format,
+                block_frames,
+            )
+        }
+        StartCapture::Demo => {
+            let (reader, capture_format) =
+                demo_source(&playback_clock, &capture_stats, buffer_frames);
+            let block_frames = reader.format().block_frames;
+            pipeline.set_source(reader)?;
+            // The local output's callbacks pace it once one plays, and wake the engine thread.
+            playback_clock.set_active(true);
+            (
+                None,
+                None,
+                DEMO_DEVICE_NAME.to_owned(),
+                capture_format,
+                block_frames,
+            )
+        }
     };
-    let opened = build_input_stream(&device, &supported_config, buffer_frames, &links)?;
-    let block_frames = opened.reader.format().block_frames;
-    pipeline.set_source(opened.reader)?;
-    opened
-        .stream
-        .play()
-        .map_err(|error| format!("could not start input capture: {error}"))?;
 
-    let capture_format = CaptureFormat {
-        channels: supported_config.channels(),
-        sample_rate: supported_config.sample_rate(),
-        sample_format: format!("{:?}", supported_config.sample_format()),
-        buffer_size: describe_buffer(opened.buffer_frames),
-    };
-
-    Ok(Some(EngineHandle {
+    Ok(EngineHandle {
         device_name,
         capture_format,
         control_port: config.control_port,
@@ -2808,16 +2907,40 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         local_mix,
         local_meter,
         local_output: LocalOutput::new(output_control),
-        capture_device: Some(device),
+        capture_device,
         block_frames,
         recorder: Recorder::new(recorder_lines),
         playback_clock,
         soundcheck: Soundcheck::default(),
-        stream: Some(opened.stream),
+        stream,
         pipeline: Some(pipeline),
         control_thread: Some(control_thread),
         discovery_thread: Some(discovery_thread),
-    }))
+    })
+}
+
+/// The demo source for an engine on `clock`, counting into `stats`, in blocks of the buffer asked
+/// for (at 48 kHz, as it is generated), and the capture format it reports.
+fn demo_source(
+    clock: &Arc<PlaybackClock>,
+    stats: &Arc<CaptureStats>,
+    buffer_frames: Option<u32>,
+) -> (SourceReader, CaptureFormat) {
+    let reader = DemoReader::new(
+        usize::from(DEMO_CHANNELS),
+        BlockPacer::new(Arc::clone(clock)),
+        Arc::clone(stats),
+    );
+    let format = CaptureFormat {
+        channels: DEMO_CHANNELS,
+        sample_rate: TARGET_SAMPLE_RATE,
+        sample_format: "F32".to_owned(),
+        buffer_size: describe_buffer(buffer_frames),
+    };
+    (
+        SourceReader::demo(reader, crate::pipeline::block_frames(buffer_frames, 1)),
+        format,
+    )
 }
 
 #[cfg(test)]
@@ -5497,6 +5620,79 @@ mod tests {
             .expect("read timeout should set");
         let mut packet = [0u8; 1_024];
         phone.recv(&mut packet).is_ok()
+    }
+
+    /// The demo source starts an engine on a machine with no interface: no capture stream and no
+    /// device, its blocks paced by the engine thread's timer reach a phone, the status says it is
+    /// the demo, a take can be recorded from it, and a switch or a soundcheck is refused.
+    #[test]
+    fn the_demo_source_starts_an_engine_with_no_interface_and_streams_to_a_phone() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        phone
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout should set");
+        let mut engine = start(EngineConfig {
+            device_filter: None,
+            targets: vec![phone.local_addr().expect("address").to_string()],
+            control_port: 0,
+            groups: Vec::new(),
+            buffer_frames: Some(256),
+            host: AudioHost::Demo,
+        })
+        .expect("the demo starts")
+        .expect("an engine with no interface");
+
+        assert!(engine.stream.is_none(), "no capture stream");
+        assert!(engine.capture_device.is_none(), "no device");
+        assert!(engine.is_demo());
+        assert_eq!(engine.device_name(), DEMO_DEVICE_NAME);
+        assert_eq!(engine.block_frames, 256);
+        let format = engine.capture_format().clone();
+        assert_eq!(
+            (format.channels, format.sample_rate),
+            (DEMO_CHANNELS, 48_000)
+        );
+
+        let mut packet = [0u8; 65_536];
+        let received = phone.recv(&mut packet).expect("the phone hears the demo");
+        assert!(received > 256, "a whole block of audio: {received} bytes");
+        assert!(until(|| engine.status().samples_received > 0));
+        let status = engine.status();
+        assert!(status.demo);
+        assert_eq!(status.source_channels, 8);
+
+        // A take records from it like from any input.
+        let parent = crate::recorder::tests::scratch_directory("engine-demo-take");
+        engine
+            .start_recording(take_of(&parent, vec![0]))
+            .expect("the demo records");
+        assert!(until(|| engine.recording().frames >= 256));
+        let summary = engine.stop_recording().expect("the take stops");
+        assert_eq!(summary.device, DEMO_DEVICE_NAME);
+
+        // Its one device is itself: anything else is another driver's, and nothing is listed.
+        assert_eq!(
+            engine
+                .switch_device(Some(DEMO_DEVICE_NAME))
+                .expect("its own device"),
+            format
+        );
+        let other = engine
+            .switch_device(Some("Volt 4"))
+            .expect_err("no interface under the demo");
+        assert!(other.to_string().contains("demo source"), "{other}");
+        let soundcheck = engine
+            .start_soundcheck(SoundcheckRequest {
+                take_folder: summary.folder.clone(),
+                start_frame: 0,
+                looping: false,
+            })
+            .expect_err("a take plays in place of an interface");
+        assert!(
+            soundcheck.to_string().contains("demo source"),
+            "{soundcheck}"
+        );
+        engine.stop().expect("the engine stops");
     }
 
     #[test]

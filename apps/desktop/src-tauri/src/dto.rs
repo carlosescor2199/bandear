@@ -1542,6 +1542,7 @@ mod tests {
             local_output: Default::default(),
             recording: Default::default(),
             soundcheck: Default::default(),
+            demo: false,
         }
     }
 

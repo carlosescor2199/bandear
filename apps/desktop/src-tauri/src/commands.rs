@@ -6333,6 +6333,7 @@ mod tests {
             local_output: personal_monitoring::LocalOutputStatus::default(),
             recording: personal_monitoring::RecordingStatus::default(),
             soundcheck: Default::default(),
+            demo: false,
         }
     }
 

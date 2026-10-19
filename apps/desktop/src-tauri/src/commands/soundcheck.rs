@@ -115,6 +115,11 @@ pub fn refusal_words(refusal: &SoundcheckError) -> String {
              input device"
                 .to_owned()
         }
+        SoundcheckError::DemoSource => {
+            "the engine runs on the demo source: a take plays in place of an interface's inputs, \
+             so choose an interface's driver first"
+                .to_owned()
+        }
         SoundcheckError::TakeUnreadable { reason } => {
             format!("the take cannot be read: {reason}")
         }

@@ -498,7 +498,8 @@ impl Sink for LocalOutputSink {
 ///
 /// Under ASIO only the capture driver's own outputs: ASIO holds one driver at a time and listing
 /// any other would load it, so `system` is never called and no driver is opened. On any other host
-/// every output device the system lists (`system`), WASAPI's on Windows. The default host is never
+/// every output device the system lists (`system`), WASAPI's on Windows; the demo source plays on
+/// those too, so the engineer hears it on the computer's own outputs. The default host is never
 /// ASIO, so no ASIO output is ever offered unless the engineer chose ASIO for capture.
 pub(crate) fn offered_outputs(
     host: AudioHost,
@@ -510,7 +511,7 @@ pub(crate) fn offered_outputs(
             .into_iter()
             .filter(|device| device.channels > 0)
             .collect()),
-        AudioHost::Auto | AudioHost::Wasapi => system(),
+        AudioHost::Auto | AudioHost::Wasapi | AudioHost::Demo => system(),
     }
 }
 
@@ -527,7 +528,7 @@ pub(crate) fn check_request(
             AudioHost::Asio => format!(
                 "\"{name}\" is not an output the engine offers: under ASIO only the capture driver's own outputs can be used"
             ),
-            AudioHost::Auto | AudioHost::Wasapi => {
+            AudioHost::Auto | AudioHost::Wasapi | AudioHost::Demo => {
                 format!("\"{name}\" is not an output device of this computer")
             }
         });

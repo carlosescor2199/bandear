@@ -174,6 +174,9 @@ pub enum SoundcheckError {
     RecordingRefused,
     /// A device switch was asked for while a soundcheck plays.
     SwitchRefused,
+    /// The engine runs on the demo source: a take plays in place of an interface's inputs, so a
+    /// soundcheck needs one.
+    DemoSource,
     /// The take's folder has no readable `take.json`.
     TakeUnreadable { reason: String },
     /// A track's file is missing or cannot be read as its track.
@@ -215,6 +218,10 @@ impl std::fmt::Display for SoundcheckError {
             SoundcheckError::SwitchRefused => write!(
                 formatter,
                 "a soundcheck is playing a take: stop it before switching the input device"
+            ),
+            SoundcheckError::DemoSource => write!(
+                formatter,
+                "the engine runs on the demo source: a take plays in place of an interface's inputs, so choose an interface first"
             ),
             SoundcheckError::TakeUnreadable { reason } => {
                 write!(formatter, "the take cannot be read: {reason}")
@@ -327,6 +334,91 @@ impl PlaybackClock {
     #[cfg(test)]
     pub(crate) fn follows_output(&self) -> bool {
         self.follow_output.load(Ordering::Relaxed)
+    }
+}
+
+/// What makes blocks due for a source with no device of its own (a take, the demo source, see
+/// [crate::demo]): the installed local output's callbacks when they come, else the engine thread's
+/// timer. Lives on the engine thread; never allocates, locks or waits.
+pub(crate) struct BlockPacer {
+    clock: Arc<PlaybackClock>,
+    /// Frames due that no block has taken yet.
+    credit: usize,
+    /// The output clock's count when last read.
+    last_output: u64,
+    /// When the output clock last moved (or the pacer started).
+    last_tick: Instant,
+    /// When the timer took over as the clock, and the frames it has made due since.
+    timer: Option<(Instant, u64)>,
+    /// The output's callbacks paced the last blocks (else the timer), as last found.
+    on_output: bool,
+}
+
+impl BlockPacer {
+    /// A pacer on `clock`, following the local output's callbacks if one is installed.
+    pub(crate) fn new(clock: Arc<PlaybackClock>) -> Self {
+        Self {
+            last_output: clock.output_frames.load(Ordering::Relaxed),
+            on_output: clock.follow_output.load(Ordering::Relaxed),
+            clock,
+            credit: 0,
+            last_tick: Instant::now(),
+            timer: None,
+        }
+    }
+
+    /// Starts on the timer: the local output installed, if any, does not play now. Its callbacks
+    /// still take over as the clock as soon as they come (see [Self::due]).
+    pub(crate) fn start_on_timer(&mut self) {
+        self.timer = Some((Instant::now(), 0));
+        self.on_output = false;
+    }
+
+    /// Whether the local output's callbacks paced the last blocks, else the timer.
+    pub(crate) fn on_output(&self) -> bool {
+        self.on_output
+    }
+
+    /// The whole blocks of `block_frames` the clock has made due by `now`.
+    ///
+    /// The installed local output's callbacks are the clock whenever they come, from the start or
+    /// later (they take over from the timer at once); the timer is the clock without an output,
+    /// once the output's callbacks have stopped for the grace, or from the start when the output
+    /// did not play then ([Self::start_on_timer]). The timer counts the frames in the time since
+    /// it took over.
+    pub(crate) fn due(&mut self, now: Instant, block_frames: usize) -> usize {
+        let block_frames = block_frames.max(1);
+        let ticks = self.clock.output_frames.load(Ordering::Relaxed);
+        let played = ticks.wrapping_sub(self.last_output);
+        self.last_output = ticks;
+        let follow = self.clock.follow_output.load(Ordering::Relaxed);
+        if follow && played > 0 {
+            self.credit = self.credit.saturating_add(played as usize);
+            self.last_tick = now;
+            self.timer = None;
+            self.on_output = true;
+        } else if !follow
+            || self.timer.is_some()
+            || now.saturating_duration_since(self.last_tick) >= self.clock.grace()
+        {
+            let (origin, counted) = self.timer.get_or_insert((now, 0));
+            let total = frames_in(now.saturating_duration_since(*origin)) as u64;
+            self.credit = self
+                .credit
+                .saturating_add(total.saturating_sub(*counted) as usize);
+            *counted = total;
+            self.on_output = false;
+        }
+        self.credit = self.credit.min(MAX_DUE_FRAMES.max(block_frames));
+        let blocks = self.credit / block_frames;
+        self.credit -= blocks * block_frames;
+        blocks
+    }
+
+    /// How long until the next block of `block_frames` is due on the timer.
+    pub(crate) fn wait(&self, block_frames: usize) -> Duration {
+        let missing = block_frames.saturating_sub(self.credit).max(1) as u64;
+        Duration::from_micros(missing * 1_000_000 / u64::from(TARGET_SAMPLE_RATE))
     }
 }
 
@@ -839,7 +931,6 @@ impl<R: Read + Seek> DiskPlayer<R> {
 pub(crate) struct PlaybackReader {
     consumer: Consumer<f32>,
     shared: Arc<PlaybackShared>,
-    clock: Arc<PlaybackClock>,
     /// The capture's counters, whose `suspended` flag sets the capture aside.
     capture: Arc<CaptureStats>,
     channels: usize,
@@ -850,14 +941,8 @@ pub(crate) struct PlaybackReader {
     generation: u64,
     /// The ring has held the preroll since it last ran short.
     primed: bool,
-    /// Frames due that no block has taken yet.
-    credit: usize,
-    /// The output clock's count when last read.
-    last_output: u64,
-    /// When the output clock last moved (or the take started).
-    last_tick: Instant,
-    /// When the timer took over as the clock, and the frames it has made due since.
-    timer: Option<(Instant, u64)>,
+    /// What makes the take's blocks due: the local output's callbacks, else the timer.
+    pacer: BlockPacer,
 }
 
 impl PlaybackReader {
@@ -874,50 +959,22 @@ impl PlaybackReader {
     /// Starts the take on the timer: the local output installed, if any, does not play now. Its
     /// callbacks still take over as the clock as soon as they come (see [Self::due]).
     pub(crate) fn start_on_timer(&mut self) {
-        self.timer = Some((Instant::now(), 0));
+        self.pacer.start_on_timer();
         self.shared.output_clock.store(false, Ordering::Relaxed);
     }
 
-    /// The whole blocks of `block_frames` the clock has made due by `now`.
-    ///
-    /// The installed local output's callbacks are the clock whenever they come, from the start or
-    /// later (they take over from the timer at once); the timer is the clock without an output,
-    /// once the output's callbacks have stopped for the grace, or from the start when the output
-    /// did not play then ([Self::start_on_timer]). The timer counts the frames in the time since
-    /// it took over.
+    /// The whole blocks of `block_frames` the clock has made due by `now` (see [BlockPacer::due]).
     pub(crate) fn due(&mut self, now: Instant, block_frames: usize) -> usize {
-        let block_frames = block_frames.max(1);
-        let ticks = self.clock.output_frames.load(Ordering::Relaxed);
-        let played = ticks.wrapping_sub(self.last_output);
-        self.last_output = ticks;
-        let follow = self.clock.follow_output.load(Ordering::Relaxed);
-        if follow && played > 0 {
-            self.credit = self.credit.saturating_add(played as usize);
-            self.last_tick = now;
-            self.timer = None;
-            self.shared.output_clock.store(true, Ordering::Relaxed);
-        } else if !follow
-            || self.timer.is_some()
-            || now.saturating_duration_since(self.last_tick) >= self.clock.grace()
-        {
-            let (origin, counted) = self.timer.get_or_insert((now, 0));
-            let total = frames_in(now.saturating_duration_since(*origin)) as u64;
-            self.credit = self
-                .credit
-                .saturating_add(total.saturating_sub(*counted) as usize);
-            *counted = total;
-            self.shared.output_clock.store(false, Ordering::Relaxed);
-        }
-        self.credit = self.credit.min(MAX_DUE_FRAMES.max(block_frames));
-        let blocks = self.credit / block_frames;
-        self.credit -= blocks * block_frames;
+        let blocks = self.pacer.due(now, block_frames);
+        self.shared
+            .output_clock
+            .store(self.pacer.on_output(), Ordering::Relaxed);
         blocks
     }
 
     /// How long until the next block of `block_frames` is due on the timer.
     pub(crate) fn wait(&self, block_frames: usize) -> Duration {
-        let missing = block_frames.saturating_sub(self.credit).max(1) as u64;
-        Duration::from_micros(missing * 1_000_000 / u64::from(TARGET_SAMPLE_RATE))
+        self.pacer.wait(block_frames)
     }
 
     /// Fills `block` (whole frames of the device's inputs) with the next frames of the take, or
@@ -1004,12 +1061,12 @@ impl PlaybackReader {
         let Self {
             consumer,
             shared,
-            clock,
+            pacer,
             capture,
             ..
         } = self;
         drop(shared);
-        drop(clock);
+        drop(pacer);
         drop(capture);
         drop(consumer);
     }
@@ -1095,8 +1152,7 @@ pub(crate) fn playback_link<R: Read + Seek>(
     let reader = PlaybackReader {
         consumer,
         shared: Arc::clone(&shared),
-        last_output: clock.output_frames.load(Ordering::Relaxed),
-        clock,
+        pacer: BlockPacer::new(clock),
         capture,
         channels,
         length: take.length,
@@ -1104,9 +1160,6 @@ pub(crate) fn playback_link<R: Read + Seek>(
         position: start_frame,
         generation: 0,
         primed: false,
-        credit: 0,
-        last_tick: Instant::now(),
-        timer: None,
     };
     Ok((disk, reader, shared))
 }

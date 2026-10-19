@@ -875,6 +875,9 @@ export function createFakeBridge({
   // them all, as a new engine starts every history anew.
   let historyIds = new Map();
   let nextHistoryId = 1;
+  // The interface's capture format, reported again when a start leaves the demo: the one held
+  // before the demo started (the sample interface's for a bridge that begins on the demo).
+  let interfaceFormat = clone(engine.demo ? sampleStatus().captureFormat : engine.captureFormat);
   let run = running ? engine.run : 0;
   let startError = failStart;
   let revision = Math.max(
@@ -2085,16 +2088,27 @@ export function createFakeBridge({
         wanted = offered[0];
       }
       // As the engine reports it: the demo is generated as 32-bit float at 48 kHz in blocks of the
-      // buffer asked for; an interface is the sample one's 24-bit format again.
+      // buffer asked for; an interface is the sample one's 24-bit format again. Leaving the demo
+      // rebuilds the interface's whole format (channels, rate and buffer as before the demo), so
+      // none of the demo's leaks into the interface run; the device chosen sets its channels below.
+      const wasDemo = Boolean(engine.demo);
+      if (demo && !wasDemo) {
+        interfaceFormat = clone(engine.captureFormat);
+      }
       engine.demo = demo;
-      engine.captureFormat = demo
-        ? {
-            channels: DEMO_CHANNELS,
-            sampleRate: 48000,
-            sampleFormat: "F32",
-            bufferSize: `Fixed(${config?.bufferFrames ?? 256})`,
-          }
-        : { ...engine.captureFormat, sampleFormat: "I24" };
+      if (demo) {
+        engine.captureFormat = {
+          channels: DEMO_CHANNELS,
+          sampleRate: 48000,
+          sampleFormat: "F32",
+          bufferSize: `Fixed(${config?.bufferFrames ?? 256})`,
+        };
+      } else if (wasDemo) {
+        engine.captureFormat = { ...clone(interfaceFormat), sampleFormat: "I24" };
+        engine.sourceChannels = engine.captureFormat.channels;
+      } else {
+        engine.captureFormat = { ...engine.captureFormat, sampleFormat: "I24" };
+      }
       // As the desktop does: a start that names no groups takes the kept ones; one that names
       // some runs with those and keeps nothing.
       const named = config?.groups ?? [];

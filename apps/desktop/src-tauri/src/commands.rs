@@ -186,6 +186,11 @@ fn stop_pump(pump: &mut Option<EventPump>) {
 
 const DEFAULT_CONTROL_PORT: u16 = 50001;
 
+/// What a start says on a machine with no input device: it never falls back to the demo source on
+/// its own, it says how to choose it.
+const NO_INPUT_DEVICE: &str = "No input device is available. Connect an audio interface and try \
+     again, or choose the Demo driver to run the demo source without one.";
+
 /// Translates the webview's request into the engine's own configuration.
 ///
 /// An empty target list stays empty: the musician list is editable at runtime now, so the window
@@ -535,9 +540,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
             }
             Ok(summary)
         }
-        None => Err(
-            "No input device is available. Connect an audio interface and try again.".to_owned(),
-        ),
+        None => Err(NO_INPUT_DEVICE.to_owned()),
     }
 }
 
@@ -1920,7 +1923,8 @@ pub fn audio_settings(state: &DesktopState) -> Option<SessionAudio> {
 /// system's default input it fell back to when the kept input was missing, so a missing interface
 /// never replaces the engineer's choice.
 ///
-/// The driver must be `auto`, `wasapi` or `asio` (kept by its own lowercase name), and `asio` needs
+/// The driver must be `auto`, `wasapi`, `asio` or `demo` (kept by its own lowercase name; `demo` is
+/// the demo source, kept like any driver with its one device), and `asio` needs
 /// the ASIO driver the engineer picked: ASIO is never kept without one. Names are trimmed and an
 /// empty one is none. With no engine running nothing is kept: only settings an engine runs with
 /// are. A refused choice, or a save that fails, changes nothing.
@@ -1969,7 +1973,7 @@ fn session_audio(settings: AudioSettingsRequest) -> Result<SessionAudio, String>
     };
     let host = AudioHost::parse(settings.host.trim()).map_err(|_| {
         format!(
-            "the audio driver `{}` is none of auto, wasapi, asio",
+            "the audio driver `{}` is none of auto, wasapi, asio, demo",
             settings.host
         )
     })?;
@@ -2685,6 +2689,7 @@ mod tests {
             soundcheck: crate::dto::SoundcheckDto::from(
                 &personal_monitoring::SoundcheckStatus::default(),
             ),
+            demo: false,
         }
     }
 
@@ -3028,6 +3033,31 @@ mod tests {
 
         assert!(config.targets.is_empty());
         assert_eq!(config.control_port, DEFAULT_CONTROL_PORT);
+    }
+
+    /// The demo source is a driver of its own, started only when the window names it: no driver,
+    /// or one the desk does not know, is the system's own, never the demo.
+    #[test]
+    fn the_demo_source_starts_only_when_the_window_names_it() {
+        let named = |host: Option<&str>| {
+            to_engine_config(StartRequest {
+                host: host.map(str::to_owned),
+                ..StartRequest::default()
+            })
+            .host
+        };
+        assert_eq!(named(Some("demo")), AudioHost::Demo);
+        assert_eq!(named(None), AudioHost::Auto);
+        assert_eq!(named(Some("jack")), AudioHost::Auto);
+        assert!(
+            NO_INPUT_DEVICE.contains("demo source"),
+            "a machine with no interface is told about it: {NO_INPUT_DEVICE}"
+        );
+
+        let listed = list_input_devices(Some("demo".to_owned())).expect("listed");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, personal_monitoring::DEMO_DEVICE_NAME);
+        assert_eq!(listed[0].channels, personal_monitoring::DEMO_CHANNELS);
     }
 
     fn request(id: Option<&str>, name: &str, channels: &[usize]) -> GroupRequest {
@@ -4632,6 +4662,30 @@ mod tests {
             Some(volt),
             "and after a restart"
         );
+    }
+
+    /// The demo source is kept as any driver is, with its one device, for every later start.
+    #[test]
+    fn the_demo_source_is_kept_for_the_next_start() {
+        let directory = session_directory("audio-demo");
+        let session = SessionStore::open(&directory);
+        let engine = running(StandInEngine::default());
+
+        let kept = keep_audio_settings(
+            &engine,
+            &session,
+            audio_request("demo", Some(personal_monitoring::DEMO_DEVICE_NAME), None),
+        )
+        .expect("kept");
+
+        let demo = SessionAudio {
+            host: "demo".to_owned(),
+            device: Some("Demo (no interface)".to_owned()),
+            buffer_frames: Some(256),
+            asio_driver: None,
+        };
+        assert_eq!(kept, demo);
+        assert_eq!(SessionStore::open(&directory).audio(), Some(demo));
     }
 
     #[test]

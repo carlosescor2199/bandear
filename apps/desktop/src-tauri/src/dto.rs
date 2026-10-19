@@ -1106,6 +1106,9 @@ pub struct EngineStatusDto {
     pub last_take: Option<TakeSummaryDto>,
     /// The take played back in place of the inputs, if any (see [crate::commands::soundcheck]).
     pub soundcheck: SoundcheckDto,
+    /// The engine runs on the demo source, a generated band with no interface: the window says
+    /// "Demo source".
+    pub demo: bool,
 }
 
 impl From<&EngineStatus> for EngineStatusDto {
@@ -1166,6 +1169,7 @@ impl From<&EngineStatus> for EngineStatusDto {
                 .as_ref()
                 .map(TakeSummaryDto::from),
             soundcheck: SoundcheckDto::from(&status.soundcheck),
+            demo: status.demo,
         }
     }
 }
@@ -2714,6 +2718,20 @@ mod tests {
                 "clock": "output"
             })
         );
+    }
+
+    /// The window says "Demo source" from the status: an engine on an interface is no demo.
+    #[test]
+    fn the_status_says_whether_the_engine_runs_on_the_demo_source() {
+        let mut status = status_with(Vec::new(), vec![0, 0]);
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+        assert_eq!(json["demo"], serde_json::json!(false));
+
+        status.demo = true;
+        status.device_name = personal_monitoring::DEMO_DEVICE_NAME.to_owned();
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+        assert_eq!(json["demo"], serde_json::json!(true));
+        assert_eq!(json["deviceName"], "Demo (no interface)");
     }
 
     #[test]

@@ -582,6 +582,7 @@ mod tests {
             soundcheck: crate::dto::SoundcheckDto::from(
                 &personal_monitoring::SoundcheckStatus::default(),
             ),
+            demo: false,
         }
     }
 

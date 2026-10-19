@@ -240,6 +240,23 @@ export function createEngineApi(bridge) {
     listTakes: () => bridge.invoke("list_takes"),
     /** Opens a take folder (as a take lists it) in the system's file manager. */
     openTakeFolder: (folder) => bridge.invoke("open_take_folder", { folder }),
+    /**
+     * Plays the take in `takeFolder` (as a take lists it) in place of the live inputs, from
+     * `startFrame`, looping when `looping`. Resolves to the soundcheck (see soundcheck.js); a take
+     * that does not fit the device, a take recording or no engine is refused. A take's Play is this.
+     */
+    startSoundcheck: (takeFolder, startFrame = 0, looping = false) =>
+      bridge.invoke("start_soundcheck", { takeFolder, startFrame, looping }),
+    /** Pauses the soundcheck's take; resolves to the soundcheck. */
+    pauseSoundcheck: () => bridge.invoke("pause_soundcheck"),
+    /** Plays the soundcheck's take on (from its start when it stopped at its end). */
+    resumeSoundcheck: () => bridge.invoke("resume_soundcheck"),
+    /** Moves the soundcheck's take to `frame`. */
+    seekSoundcheck: (frame) => bridge.invoke("seek_soundcheck", { frame }),
+    /** Whether the soundcheck's take starts again at its end. */
+    setSoundcheckLoop: (looping) => bridge.invoke("set_soundcheck_loop", { looping }),
+    /** Stops the soundcheck and goes back to the live inputs. */
+    stopSoundcheck: () => bridge.invoke("stop_soundcheck"),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

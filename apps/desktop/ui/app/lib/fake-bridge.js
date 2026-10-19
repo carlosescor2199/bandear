@@ -17,6 +17,7 @@ import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
 import { IDLE_RECORDING, RECORD_FORMATS } from "./recording.js";
+import { IDLE_SOUNDCHECK } from "./soundcheck.js";
 import { checkSessionName } from "./sessions.js";
 import { clampLevel } from "./values.js";
 
@@ -382,6 +383,8 @@ export function sampleStatus() {
     // No take records, and none has ended yet.
     recording: clone(IDLE_RECORDING),
     lastTake: null,
+    // The inputs are live: no soundcheck plays.
+    soundcheck: clone(IDLE_SOUNDCHECK),
   };
 }
 
@@ -572,6 +575,18 @@ function withPort(address) {
  * `freeBytes`; `list_takes` lists `savedTakes` and the takes recorded, the newest first, with
  * `unreadableTakes` left out; `open_take_folder` opens only a listed take (`openedFolders()`
  * reads them); `failRecording(reason)` stops the take as a disk error does.
+ *
+ * The virtual soundcheck too, with the desktop's rules (see soundcheck.js): `start_soundcheck`
+ * plays only a listed take of the recordings folder, refused as the engine refuses it (a
+ * soundcheck already playing, a take recording, a rate other than 48 kHz, tracks that do not fit
+ * the device's inputs and linked pairs now, no input audio, a start past the end), each in the
+ * desktop's words; its position advances with `clock`, a take that does not loop pauses at its end
+ * (resume starts it again), a looping one starts again at its first frame. `pause_soundcheck`,
+ * `resume_soundcheck`, `seek_soundcheck`, `set_soundcheck_loop` and `stop_soundcheck` answer the
+ * soundcheck and send a status at once; the status carries `soundcheck` (paced by the local output
+ * while it plays, else the timer). While a soundcheck plays, a take and a device switch are
+ * refused; a stop or start of the engine ends it. `failSoundcheck(reason)` stops the take as a read
+ * error does: only going back to the live inputs is left.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -773,6 +788,7 @@ export function createFakeBridge({
     showMirrors();
     engine.recording = recordingNow();
     engine.lastTake = lastTake ? clone(lastTake) : null;
+    engine.soundcheck = soundcheckNow();
     return clone(engine);
   }
 
@@ -989,6 +1005,155 @@ export function createFakeBridge({
         (one, other) =>
           other.started.localeCompare(one.started) || other.folder.localeCompare(one.folder),
       );
+  }
+
+  // ---- The virtual soundcheck, with the desktop's rules (see soundcheck.js and
+  // commands/soundcheck.rs).
+
+  // The refusals in the desktop's words (its `refusal_words`).
+  const SOUNDCHECK_WORDS = Object.freeze({
+    notRunning: "the engine is not running, so no soundcheck is playing",
+    recording: "a take is recording: stop the recording before the soundcheck",
+    already: "a soundcheck is already playing a take: go back to the live inputs first",
+    notPlaying: "no soundcheck is playing",
+    recordingRefused:
+      "a soundcheck is playing a take: go back to the live inputs before recording (a take never " +
+      "records playback)",
+    switchRefused:
+      "a soundcheck is playing a take: go back to the live inputs before switching the input device",
+    empty: "the take has no input audio to play",
+  });
+
+  // `frames` of a take as the refusals say them: "2.5 s".
+  function refusalSeconds(frames) {
+    return `${(frames / RECORD_RATE).toFixed(1)} s`;
+  }
+
+  function pastEnd(frame, length) {
+    return `${refusalSeconds(frame)} is past the end of the take (${refusalSeconds(length)})`;
+  }
+
+  // Why the tracks of `listed` (a take as `list_takes` lists it) do not fit the running device's
+  // inputs now, as the engine checks them, or null when they fit; also the frames they play for.
+  function checkLayout(listed) {
+    const count = engine.sourceChannels;
+    const units = [];
+    for (let index = 0; index < count; index += 1) {
+      const pair = Boolean(engine.channels[index]?.link) && index + 1 < count;
+      units.push(pair ? [index, index + 1] : [index]);
+      index += pair ? 1 : 0;
+    }
+    const taken = new Set();
+    let length = null;
+    for (const track of listed.tracks) {
+      if (track.kind === "local") {
+        continue;
+      }
+      const inputs = track.channels.map((channel) => channel - 1);
+      const past = inputs.find((input) => input >= count);
+      if (past !== undefined) {
+        return { reason: `the take recorded CH ${past + 1}, and this device has ${count} inputs` };
+      }
+      const twice = inputs.find((input) => taken.has(input));
+      if (twice !== undefined) {
+        return { reason: `CH ${twice + 1} is in two tracks of the take` };
+      }
+      const same = (unit) => unit.length === inputs.length && unit.every((side, at) => side === inputs[at]);
+      if (!units.some(same)) {
+        const first = inputs[0] + 1;
+        if (inputs.length === 2) {
+          return {
+            reason: `CH ${first}-${first + 1} were recorded as a linked pair, which they are not now`,
+          };
+        }
+        const pair = units.find((unit) => unit.includes(inputs[0]))?.[0] ?? inputs[0];
+        return {
+          reason: `CH ${first} was recorded on its own, and it is a side of the linked pair CH ${pair + 1}-${pair + 2} now`,
+        };
+      }
+      inputs.forEach((input) => taken.add(input));
+      const frames = track.frames ?? listed.frames ?? 0;
+      length = length === null ? frames : Math.min(length, frames);
+    }
+    return { reason: null, length: length ?? 0 };
+  }
+
+  // The take playing in place of the inputs, `{ folder, name, length, base, since, paused, ended,
+  // looping, failure }` (`base` the frame at `since`), or null while the inputs are live.
+  let check = null;
+
+  // The take's frame now: it advances with `clock` while it plays; at the end of a take that does
+  // not loop it stops there (paused), and a looping one starts again from its first frame.
+  function checkPosition() {
+    if (check.paused || check.ended || check.failure) {
+      return check.base;
+    }
+    const advanced = check.base + Math.floor(((clock() - check.since) * RECORD_RATE) / 1000);
+    if (advanced < check.length) {
+      return advanced;
+    }
+    if (check.looping) {
+      return advanced % check.length;
+    }
+    check.base = check.length;
+    check.ended = true;
+    return check.base;
+  }
+
+  // Makes the frame now the take's base, before a change of how it plays.
+  function settleCheck() {
+    check.base = checkPosition();
+    check.since = clock();
+  }
+
+  // The soundcheck as the status reports it.
+  function soundcheckNow() {
+    if (!check) {
+      return clone(IDLE_SOUNDCHECK);
+    }
+    const position = checkPosition();
+    let state = "playing";
+    if (check.failure) {
+      state = "failed";
+    } else if (check.paused || check.ended) {
+      state = "paused";
+    }
+    return {
+      state,
+      reason: check.failure,
+      takeFolder: check.folder,
+      takeName: check.name,
+      positionFrames: position,
+      positionSeconds: position / RECORD_RATE,
+      lengthFrames: check.length,
+      lengthSeconds: check.length / RECORD_RATE,
+      looping: check.looping,
+      underrunFrames: 0,
+      // As the engine does: the local output's device paces the take while it plays.
+      clock: engine.localOutput.state === "running" ? "output" : "timer",
+    };
+  }
+
+  // The take that plays, to change how it plays: refused as the engine refuses it.
+  function playingCheck() {
+    if (!isRunning) {
+      throw SOUNDCHECK_WORDS.notRunning;
+    }
+    if (!check) {
+      throw SOUNDCHECK_WORDS.notPlaying;
+    }
+    if (check.failure) {
+      throw `the soundcheck stopped playing: ${check.failure}; go back to the live inputs to stop it`;
+    }
+    return check;
+  }
+
+  // A soundcheck change made from the desk: the status goes out at once, as the desktop sends it.
+  function soundcheckChanged() {
+    if (isRunning) {
+      emit("status", statusNow());
+    }
+    return soundcheckNow();
   }
 
   // As the engine does: `row`'s mix takes `leader`'s channels and group levels under a new
@@ -1475,8 +1640,9 @@ export function createFakeBridge({
         // As the engine does: a take ends with its engine.
         finishTake("engineStopped");
       }
-      // A new engine has had no take yet.
+      // A new engine has had no take yet, and its inputs are live.
       lastTake = null;
+      check = null;
       isRunning = false;
       if (startError) {
         throw startError;
@@ -1533,6 +1699,8 @@ export function createFakeBridge({
         // As the engine does: the take ends with it, its files finished.
         finishTake("engineStopped");
       }
+      // A soundcheck ends with its engine too.
+      check = null;
       isRunning = false;
       return null;
     },
@@ -1569,6 +1737,9 @@ export function createFakeBridge({
       requireRunning();
       if (take && !take.failure) {
         throw "a take is recording: stop the recording before switching the input device (a take never mixes two devices)";
+      }
+      if (check) {
+        throw SOUNDCHECK_WORDS.switchRefused;
       }
       const found = devices.find((candidate) => candidate.name === device);
       if (!found || found.channels === 0) {
@@ -2114,6 +2285,9 @@ export function createFakeBridge({
       if (!isRunning) {
         throw "the engine is not running: start it to record";
       }
+      if (check) {
+        throw SOUNDCHECK_WORDS.recordingRefused;
+      }
       if (take && !take.failure) {
         throw "a take is already recording: stop it first";
       }
@@ -2241,6 +2415,101 @@ export function createFakeBridge({
       }
       openedFolders.push(folder);
       return null;
+    },
+    start_soundcheck({ takeFolder = "", startFrame = 0, looping = false } = {}) {
+      if (!isRunning) {
+        throw "the engine is not running: start it to soundcheck a take";
+      }
+      // As the desktop does: only a take folder directly inside the recordings folder.
+      const root = recordingsFolderOf(keptRecording);
+      const folder = String(takeFolder ?? "").trim();
+      const listed = listedTakes().find((summary) => summary.folder === folder);
+      if (!listed) {
+        throw `${folder} is not a take folder in the recordings folder ${root}`;
+      }
+      // Then as the engine does, in its order.
+      if (check) {
+        throw SOUNDCHECK_WORDS.already;
+      }
+      if (take && !take.failure) {
+        throw SOUNDCHECK_WORDS.recording;
+      }
+      if (listed.sampleRate !== RECORD_RATE) {
+        throw (
+          `the take was recorded at ${listed.sampleRate} Hz; only ${RECORD_RATE} Hz takes play ` +
+          "(there is no resampler)"
+        );
+      }
+      const { reason, length } = checkLayout(listed);
+      if (reason) {
+        throw (
+          `the take does not fit this device's inputs now: ${reason}; play it on the device and ` +
+          "with the linked pairs it was recorded with"
+        );
+      }
+      if (length === 0) {
+        throw SOUNDCHECK_WORDS.empty;
+      }
+      const from = Math.max(0, Math.floor(Number(startFrame) || 0));
+      if (from > length) {
+        throw pastEnd(from, length);
+      }
+      check = {
+        folder,
+        name: listed.name,
+        length,
+        base: from,
+        since: clock(),
+        paused: false,
+        ended: false,
+        looping: Boolean(looping),
+        failure: null,
+      };
+      return soundcheckChanged();
+    },
+    pause_soundcheck() {
+      playingCheck();
+      settleCheck();
+      check.paused = true;
+      return soundcheckChanged();
+    },
+    resume_soundcheck() {
+      playingCheck();
+      settleCheck();
+      if (check.ended) {
+        // As the engine does: a take stopped at its end starts again from its first frame.
+        check.base = 0;
+        check.ended = false;
+      }
+      check.paused = false;
+      return soundcheckChanged();
+    },
+    seek_soundcheck({ frame = 0 } = {}) {
+      playingCheck();
+      const to = Math.max(0, Math.floor(Number(frame) || 0));
+      if (to > check.length) {
+        throw pastEnd(to, check.length);
+      }
+      settleCheck();
+      check.base = to;
+      check.ended = false;
+      return soundcheckChanged();
+    },
+    set_soundcheck_loop({ looping = false } = {}) {
+      playingCheck();
+      settleCheck();
+      check.looping = Boolean(looping);
+      return soundcheckChanged();
+    },
+    stop_soundcheck() {
+      if (!isRunning) {
+        throw SOUNDCHECK_WORDS.notRunning;
+      }
+      if (!check) {
+        throw SOUNDCHECK_WORDS.notPlaying;
+      }
+      check = null;
+      return soundcheckChanged();
     },
   };
 
@@ -2372,6 +2641,16 @@ export function createFakeBridge({
       if (take && !take.failure) {
         take.failure = reason;
         take.endedAt ??= clock();
+        if (isRunning) {
+          emit("status", statusNow());
+        }
+      }
+    },
+    /** The take playing in place of the inputs stops on a read error with `reason`. */
+    failSoundcheck(reason) {
+      if (check && !check.failure) {
+        settleCheck();
+        check.failure = reason;
         if (isRunning) {
           emit("status", statusNow());
         }

@@ -12,6 +12,7 @@
 import { rememberedDevice } from "./engine-config.js";
 import { formatCaptureFormat, formatPercent, linkState } from "./format.js";
 import { RECORDING_BLOCKS_SWITCH, isRecording, recordingOf } from "./recording.js";
+import { SOUNDCHECK_BLOCKS_SWITCH, isSoundchecking, soundcheckOf } from "./soundcheck.js";
 
 const DASH = "—";
 
@@ -130,7 +131,9 @@ export function switchMethod(audio) {
  */
 export function audioSetupView(state, local) {
   const status = state.engine.status;
-  const recording = isRecording(recordingOf(status));
+  // A take recording, or a take playing in place of the inputs, holds the input device as it is.
+  const soundcheck = isSoundchecking(soundcheckOf(status));
+  const recording = isRecording(recordingOf(status)) || soundcheck;
   const host = local.draftHost ?? state.audio.host;
   const listing = state.devices.host !== host;
   const devices = listing ? [] : state.devices.list;
@@ -151,7 +154,11 @@ export function audioSetupView(state, local) {
     canApplyAsio: !recording && asioPending && Boolean(local.draftDevice),
     buffer: state.audio.bufferFrames,
     bufferDisabled: recording,
-    recordingLock: recording ? RECORDING_BLOCKS_SWITCH : null,
+    recordingLock: soundcheck
+      ? SOUNDCHECK_BLOCKS_SWITCH
+      : recording
+        ? RECORDING_BLOCKS_SWITCH
+        : null,
     warning: local.pendingSwitch?.message ?? null,
     readouts: {
       format: status

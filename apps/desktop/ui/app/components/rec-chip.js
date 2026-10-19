@@ -1,8 +1,10 @@
 // <ml-rec-chip>: the REC chip the shell shows above every screen while a take records, its files
-// are being finished or it stopped on an error. It is a link to the Record screen.
+// are being finished or it stopped on an error, and the SOUNDCHECK chip while a take plays in
+// place of the live inputs. It is a link to the Record screen.
 //
-// Property: `data`, from recChip (record-view.js): `{ kind, word, time, detail, label }`, or null
-//   to hide the chip. `kind` is "recording", "stopping" or "failed"; `label` is the link's
+// Property: `data`, from recChip (record-view.js) or soundcheckChip (soundcheck-view.js): `{ kind,
+//   word, time, detail, label }`, or null to hide the chip. `kind` is "recording", "stopping",
+//   "failed", "soundcheck", "soundcheck-paused" or "soundcheck-failed"; `label` is the link's
 //   accessible name, which says it all in words.
 // No events: it is a plain link to #/record.
 
@@ -52,6 +54,32 @@ const styles = sheet(`
   }
   a[data-kind="failed"] .dot {
     border-radius: 2px;
+  }
+  a[data-kind^="soundcheck"] {
+    border-color: var(--ml-warn-border);
+    background: var(--ml-accent-bg);
+  }
+  a[data-kind^="soundcheck"]:hover {
+    border-color: var(--ml-accent);
+  }
+  a[data-kind^="soundcheck"] .dot {
+    width: 0;
+    height: 0;
+    border-radius: 0;
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+    border-left: 10px solid var(--ml-accent);
+    background: none;
+  }
+  a[data-kind="soundcheck"] .dot {
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  a[data-kind="soundcheck-failed"] {
+    border-color: var(--ml-danger-border);
+    background: var(--ml-danger-bg);
+  }
+  a[data-kind="soundcheck-failed"] .dot {
+    border-left-color: var(--ml-red);
   }
   .time {
     font-family: var(--ml-font-mono);

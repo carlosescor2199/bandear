@@ -118,13 +118,15 @@
   min-width: 0;
 }
 
-/* The REC chip, above every screen while a take records. */
+/* The REC and SOUNDCHECK chips, above every screen while a take records or plays back. */
 .shell-status {
   position: sticky;
   top: 0;
   z-index: 5;
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  gap: var(--ml-space-2);
   padding: var(--ml-space-2) 22px 0;
   background: var(--ml-ground);
 }

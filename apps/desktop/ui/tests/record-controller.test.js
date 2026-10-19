@@ -227,6 +227,85 @@ test("a refused folder stays in the field to be corrected, a kept one shows as t
   app.dispose();
 });
 
+/** A console on a fake engine whose clock the test moves, with a two-second take recorded. */
+async function withTake() {
+  const time = { now: Date.UTC(2026, 9, 16, 19, 4, 5) };
+  const fake = createFakeBridge({ running: true, clock: () => time.now });
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  await app.setRecordingSettings({ armed: [1] });
+  await app.startRecording("First");
+  time.now += 2_000;
+  const first = (await app.stopRecording()).take;
+  await app.startRecording("Second");
+  time.now += 2_000;
+  const second = (await app.stopRecording()).take;
+  return { fake, time, app, first, second };
+}
+
+const soundcheckOf = (app) => app.store.getState().engine.status.soundcheck;
+
+test("Play starts the chosen take as a soundcheck, pauses and resumes it; Stop goes back live", async () => {
+  const { fake, app, first, second } = await withTake();
+  const controller = createRecordController(app);
+
+  controller.chooseTake(first.folder);
+  const started = await controller.play();
+  assert.equal(started.ok, true, started.message);
+  assert.equal(soundcheckOf(app).takeFolder, first.folder, "the chosen take, not the last");
+  assert.equal(soundcheckOf(app).state, "playing");
+
+  assert.equal((await controller.play()).ok, true);
+  assert.equal(soundcheckOf(app).state, "paused", "Play pauses a take playing");
+  assert.equal((await controller.play()).ok, true);
+  assert.equal(soundcheckOf(app).state, "playing", "and plays a paused one on");
+
+  const recordsBefore = fake.calls.filter(({ command }) => command === "stop_recording").length;
+  await controller.stop();
+  assert.equal(soundcheckOf(app).state, "off", "back to the live inputs");
+  assert.equal(
+    fake.calls.filter(({ command }) => command === "stop_recording").length,
+    recordsBefore,
+    "no recording was stopped",
+  );
+
+  controller.chooseTake(null);
+  await controller.play();
+  assert.equal(soundcheckOf(app).takeFolder, second.folder, "with none chosen, the last take");
+  await controller.stop();
+  const fromRow = await controller.soundcheckTake(first.folder);
+  assert.equal(fromRow.ok, true, fromRow.message);
+  assert.equal(soundcheckOf(app).takeFolder, first.folder, "a take row's Soundcheck plays that take");
+  app.dispose();
+});
+
+test("Back to start and the slider move the take, and a loop chosen before the start loops", async () => {
+  const { fake, time, app, first } = await withTake();
+  let changes = 0;
+  const controller = createRecordController(app, { onChange: () => (changes += 1) });
+
+  await controller.setLoop(true);
+  assert.equal(controller.local.loopNext, true, "kept for the start");
+  await controller.soundcheckTake(first.folder);
+  const [start] = fake.calls.filter(({ command }) => command === "start_soundcheck");
+  assert.equal(start.args.looping, true);
+
+  time.now += 1_000;
+  controller.drag(1.5);
+  assert.equal(controller.local.drag, 1.5, "the slider shows where it is dragged to");
+  const moved = await controller.seekTo(1.5);
+  assert.equal(moved.ok, true, moved.message);
+  assert.equal(controller.local.drag, null);
+  assert.equal(soundcheckOf(app).positionFrames, 72_000);
+
+  await controller.rewind();
+  assert.equal(soundcheckOf(app).positionFrames, 0, "Back to start moves the take to its start");
+  await controller.setLoop(false);
+  assert.equal(soundcheckOf(app).looping, false, "the take playing stops looping");
+  assert.ok(changes >= 5, "each change renders again");
+  app.dispose();
+});
+
 test("the REC chip strip shows while a take records, is finished or failed, hidden otherwise", () => {
   const app = storeApp();
   const chip = { data: undefined };
@@ -250,4 +329,32 @@ test("the REC chip strip shows while a take records, is finished or failed, hidd
   unsubscribe();
   app.store.dispatch(actions.status(statusRecording("D:\\Recordings\\take-2")));
   assert.equal(strip.hidden, true, "nothing follows the store once unsubscribed");
+});
+
+test("the strip shows the SOUNDCHECK chip on every screen while a take plays in place of the inputs", () => {
+  const app = storeApp();
+  const rec = { data: undefined };
+  const soundcheck = { data: undefined };
+  const chips = { '[data-chip="rec"]': rec, '[data-chip="soundcheck"]': soundcheck };
+  const strip = { hidden: false, querySelector: (selector) => chips[selector] ?? null };
+
+  mountRecChip(strip, app);
+  assert.equal(strip.hidden, true);
+  app.store.dispatch(
+    actions.status({
+      ...sampleStatus(),
+      soundcheck: {
+        ...sampleStatus().soundcheck,
+        state: "playing",
+        takeFolder: "D:\\Recordings\\take-1",
+        takeName: "Show",
+      },
+    }),
+  );
+  assert.equal(strip.hidden, false);
+  assert.equal(rec.data, null, "no take records");
+  assert.equal(soundcheck.data.kind, "soundcheck");
+  assert.equal(soundcheck.data.word, "SOUNDCHECK");
+  app.store.dispatch(actions.status(sampleStatus()));
+  assert.equal(strip.hidden, true, "back to the live inputs");
 });

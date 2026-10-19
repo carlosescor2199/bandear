@@ -215,15 +215,18 @@ export function createEngineApi(bridge) {
     restoreMixBackup: (stamp) => bridge.invoke("restore_mix_backup", { stamp }),
     /**
      * The link history of the musician `musicianKey` names (`client:<id>` or `address:<ip:port>`):
-     * `{ musicianKey, samples, maxSamples, periodMs }`, one sample a second, the oldest first,
-     * only those after `sinceMs` (Unix milliseconds) when given. A sample is `{ atMs, gap,
-     * reconnected, health, intervalMs, packetsReceived, packetsLost, lossPercent, underruns,
-     * receiveTimeouts, rttMs, jitterMs, cushionMs, backlogMs, recovered }`; a gap has only `rttMs`.
+     * `{ musicianKey, historyId, samples, maxSamples, periodMs }`, one sample a second, the oldest
+     * first, only those numbered after `sinceSeq` when given (the newest `seq` a window has). A
+     * `historyId` the window has not seen is a new history (an engine restart, another phone on the
+     * row): drop what it had and read it whole. A sample is `{ seq, monoMs, atMs, gap, reconnected,
+     * health, intervalMs, packetsReceived, packetsLost, lossPercent, underruns, receiveTimeouts,
+     * rttMs, jitterMs, cushionMs, backlogMs, recovered }`: `monoMs` is the monotonic time a chart
+     * draws on and `atMs` (Unix milliseconds) the wall clock shown; a gap has only `rttMs`.
      * A key that names nobody, or no engine, rejects. Status rows carry only the newest sample
      * (`linkLatest`) and the round trip (`rttMs`, `rttLastMs`).
      */
-    linkHistory: (musicianKey, sinceMs = null) =>
-      bridge.invoke("link_history", { musicianKey, sinceMs }),
+    linkHistory: (musicianKey, sinceSeq = null) =>
+      bridge.invoke("link_history", { musicianKey, sinceSeq }),
     /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.

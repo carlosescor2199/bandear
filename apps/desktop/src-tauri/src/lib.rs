@@ -454,15 +454,15 @@ async fn restore_mix_backup(
 }
 
 /// The link history of the musician `musicianKey` names (`client:<id>` or `address:<ip:port>`):
-/// `{ musicianKey, samples, maxSamples, periodMs }`, the samples after `sinceMs` (Unix
-/// milliseconds) or all of them, the oldest first (see [commands::link_history]).
+/// `{ musicianKey, historyId, samples, maxSamples, periodMs }`, the samples numbered after `sinceSeq`
+/// or all of them, the oldest first (see [commands::link_history]).
 #[tauri::command]
 async fn link_history(
     state: State<'_, DesktopState>,
     musician_key: String,
-    since_ms: Option<u64>,
+    since_seq: Option<u64>,
 ) -> Result<dto::LinkHistoryDto, String> {
-    commands::link_history::link_history(state.inner(), &musician_key, since_ms)
+    commands::link_history::link_history(state.inner(), &musician_key, since_seq)
 }
 
 /// Builds and runs the desktop application.

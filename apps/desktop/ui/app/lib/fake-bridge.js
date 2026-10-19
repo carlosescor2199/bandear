@@ -556,7 +556,8 @@ function sampleHealth(lost, expected, underruns) {
 
 /**
  * The link history of `row` (a status row) up to `time` milliseconds, as `link_history` answers
- * its samples: one a second, the oldest first, the newest `count` of at most LINK_HISTORY_SAMPLES.
+ * its samples: one a second, the oldest first, the newest `count` of at most LINK_HISTORY_SAMPLES,
+ * each numbered by its second (`seq`) with the clock's milliseconds as its monotonic time.
  * The same row and time give the same samples. A row that never reported (`linkHealth` "unknown")
  * or is not connected has none; a "warning" link reconnects once every ten minutes; a lost ("bad")
  * link's newest 20 seconds are gaps; a phone that does not announce "stats.v2" reports no jitter,
@@ -580,6 +581,8 @@ export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES) {
     const reconnected = profile.reconnectedAt === second % LINK_HISTORY_SAMPLES;
     if (back < profile.silentFor) {
       samples.push({
+        seq: second,
+        monoMs: atMs,
         atMs,
         gap: true,
         reconnected,
@@ -603,6 +606,8 @@ export function syntheticLinkHistory(row, time, count = LINK_HISTORY_SAMPLES) {
     const underruns = profile.underrunEvery && second % profile.underrunEvery === 0 ? 1 : 0;
     const [low, high] = profile.jitter;
     samples.push({
+      seq: second,
+      monoMs: atMs,
       atMs,
       gap: false,
       reconnected,
@@ -776,7 +781,8 @@ function backupStamp(at) {
  * backup and a restore with the engine stopped; `mixBackups()` reads them. Link histories too:
  * every connected row carries a round trip (`rttMs`, `rttLastMs`) and its newest second
  * (`linkLatest`), and `link_history` answers a musician's ten minutes of generated seconds (see
- * syntheticLinkHistory) by their key, newer than `sinceMs` when given, as the desktop does.
+ * syntheticLinkHistory) by their key, numbered after `sinceSeq` when given, as the desktop does,
+ * with a `historyId` per musician that a new engine start replaces.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -805,6 +811,10 @@ export function createFakeBridge({
   const listeners = new Map();
   const calls = [];
   let isRunning = running;
+  // Each musician's link history id in the running engine, handed out as asked; a start forgets
+  // them all, as a new engine starts every history anew.
+  let historyIds = new Map();
+  let nextHistoryId = 1;
   let run = running ? engine.run : 0;
   let startError = failStart;
   let revision = Math.max(
@@ -1951,6 +1961,7 @@ export function createFakeBridge({
       linkMixes([]);
       giveKeptControls();
       giveKeptMirrors();
+      historyIds = new Map();
       isRunning = true;
       engine.run = run;
       engine.stopped = false;
@@ -2517,7 +2528,7 @@ export function createFakeBridge({
         localOutputNotice,
       };
     },
-    link_history({ musicianKey, sinceMs = null } = {}) {
+    link_history({ musicianKey, sinceSeq = null } = {}) {
       // As the desktop answers: a key of the desk's forms, then a running engine, then a musician.
       const key = String(musicianKey ?? "");
       if (!key.startsWith("client:") && !key.startsWith("address:")) {
@@ -2531,10 +2542,15 @@ export function createFakeBridge({
         throw `\`${key}\` names no musician`;
       }
       const samples = syntheticLinkHistory(row, clock()).filter(
-        (sample) => sinceMs === null || sample.atMs > sinceMs,
+        (sample) => sinceSeq === null || sample.seq > sinceSeq,
       );
+      if (!historyIds.has(key)) {
+        historyIds.set(key, nextHistoryId);
+        nextHistoryId += 1;
+      }
       return {
         musicianKey: key,
+        historyId: historyIds.get(key),
         samples,
         maxSamples: LINK_HISTORY_SAMPLES,
         periodMs: LINK_SAMPLE_PERIOD_MS,

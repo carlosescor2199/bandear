@@ -1,6 +1,6 @@
 // Link histories: the bridge's `linkHistory` call as the desktop takes it, and the fake bridge's
 // generated history (syntheticLinkHistory), which the Network and system screen's chart is built
-// against: its shape, bounds, gaps and reconnects, the `sinceMs` filter and the refusals, and the
+// against: its shape, bounds, gaps and reconnects, the `sinceSeq` cursor, the history id and the refusals, and the
 // round trip and newest second every status row carries.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,6 +21,8 @@ const KEYS = "address:192.168.1.17:50000";
 const DRUMS = "client:e4b7c1d9-2a6f-4d3e-9b8c-5f0a7e2d6c18";
 
 const SAMPLE_FIELDS = [
+  "seq",
+  "monoMs",
   "atMs",
   "gap",
   "reconnected",
@@ -42,7 +44,7 @@ function running() {
   return createEngineApi(createFakeBridge({ running: true, clock: () => NOW }));
 }
 
-test("linkHistory asks the desktop for a musician's history, all of it or since a time", async () => {
+test("linkHistory asks the desktop for a musician's history, all of it or since a sample", async () => {
   const calls = [];
   const api = createEngineApi({
     invoke: async (command, args) => {
@@ -53,11 +55,11 @@ test("linkHistory asks the desktop for a musician's history, all of it or since 
   });
 
   await api.linkHistory(LEAD);
-  await api.linkHistory(LEAD, 1_000);
+  await api.linkHistory(LEAD, 41);
 
   assert.deepEqual(calls, [
-    ["link_history", { musicianKey: LEAD, sinceMs: null }],
-    ["link_history", { musicianKey: LEAD, sinceMs: 1_000 }],
+    ["link_history", { musicianKey: LEAD, sinceSeq: null }],
+    ["link_history", { musicianKey: LEAD, sinceSeq: 41 }],
   ]);
 });
 
@@ -67,6 +69,7 @@ test("a musician's history is ten minutes of seconds, the oldest first, in the d
   assert.equal(history.musicianKey, LEAD);
   assert.equal(history.maxSamples, LINK_HISTORY_SAMPLES);
   assert.equal(history.periodMs, LINK_SAMPLE_PERIOD_MS);
+  assert.equal(typeof history.historyId, "number");
   assert.equal(history.samples.length, 600);
   const newest = history.samples.at(-1);
   assert.equal(newest.atMs, Math.floor(NOW / 1000) * 1000, "the newest second is now");
@@ -74,6 +77,8 @@ test("a musician's history is ten minutes of seconds, the oldest first, in the d
     assert.deepEqual(Object.keys(sample), SAMPLE_FIELDS);
     if (index > 0) {
       assert.equal(sample.atMs - history.samples[index - 1].atMs, 1000, "a second apart");
+      assert.equal(sample.monoMs - history.samples[index - 1].monoMs, 1000, "on the monotonic clock");
+      assert.equal(sample.seq, history.samples[index - 1].seq + 1, "numbered in order");
     }
   }
   assert.ok(history.samples.every((sample) => !sample.gap && sample.health !== "unknown"));
@@ -112,17 +117,32 @@ test("a link that needs attention reconnected once and a lost one ends in gaps",
   );
 });
 
-test("a phone that never reported has no history, and sinceMs answers only what is newer", async () => {
+test("a phone that never reported has no history, and sinceSeq answers only what is newer", async () => {
   const api = running();
 
   assert.deepEqual((await api.linkHistory(KEYS)).samples, []);
   const newest = Math.floor(NOW / 1000) * 1000;
-  const newer = (await api.linkHistory(LEAD, newest - 3_000)).samples;
+  const whole = (await api.linkHistory(LEAD)).samples;
+  const cursor = whole.at(-4).seq;
+  const newer = (await api.linkHistory(LEAD, cursor)).samples;
   assert.deepEqual(
     newer.map((sample) => sample.atMs),
     [newest - 2_000, newest - 1_000, newest],
   );
-  assert.deepEqual((await api.linkHistory(LEAD, newest)).samples, []);
+  assert.deepEqual((await api.linkHistory(LEAD, whole.at(-1).seq)).samples, []);
+});
+
+test("each musician's history has its own id, and an engine restart starts new ones", async () => {
+  const bridge = createFakeBridge({ running: true, clock: () => NOW });
+  const api = createEngineApi(bridge);
+  const lead = (await api.linkHistory(LEAD)).historyId;
+  const bass = (await api.linkHistory(BASS)).historyId;
+
+  assert.notEqual(lead, bass);
+  assert.equal((await api.linkHistory(LEAD)).historyId, lead, "the same history");
+  await api.stop();
+  await api.start();
+  assert.notEqual((await api.linkHistory(LEAD)).historyId, lead, "a new engine, a new history");
 });
 
 test("a key of another form, a key that names nobody and a stopped engine are refused", async () => {

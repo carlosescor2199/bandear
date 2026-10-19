@@ -25,7 +25,7 @@ pub use engine::{
     MusicianCounters, MusicianMeters, MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
 };
 pub use health::{LinkHealth, LinkStatus};
-pub use link_history::{LinkSample, RoundTrip, HISTORY_SAMPLES};
+pub use link_history::{LinkHistoryRead, LinkSample, RoundTrip, HISTORY_SAMPLES};
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
 pub use protocol::{

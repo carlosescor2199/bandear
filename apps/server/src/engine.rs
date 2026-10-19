@@ -17,7 +17,7 @@ use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, G
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
-use crate::link_history::LinkSample;
+use crate::link_history::LinkHistoryRead;
 use crate::mix::{
     group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
     MixPreset, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
@@ -1497,15 +1497,15 @@ impl EngineHandle {
         self.control_port
     }
 
-    /// The link history of the musician `key` names (see [crate::link_history]): the samples taken
-    /// after `since_ms` (Unix milliseconds), or all of them, the oldest first. A phone that left is
+    /// The link history of the musician `key` names (see [crate::link_history]): its id and the
+    /// samples numbered after `since_seq`, or all of them, the oldest first. A phone that left is
     /// still found by its client id while its history is kept. `None` when `key` names nobody.
     pub fn link_history(
         &self,
         key: &MusicianKey,
-        since_ms: Option<u64>,
-    ) -> Option<Vec<LinkSample>> {
-        self.targets.link_history(key, since_ms)
+        since_seq: Option<u64>,
+    ) -> Option<LinkHistoryRead> {
+        self.targets.link_history(key, since_seq)
     }
 
     /// A snapshot of the current state, including the joined per-musician view.
@@ -2897,7 +2897,12 @@ mod tests {
             .lock()
             .expect("report lock") = Some(report);
         registry.record_round_trip(ip("192.168.1.3"), Duration::from_millis(9));
-        registry.record_link_report(ip("192.168.1.3"), &report, &command, 5_000);
+        registry.record_link_report(
+            ip("192.168.1.3"),
+            &report,
+            &command,
+            crate::link_history::test_moment(5_000),
+        );
         let connected: HashSet<IpAddr> = [ip("192.168.1.3")].into_iter().collect();
 
         let links = link_statuses(&registry.read(), &connected, received_at);

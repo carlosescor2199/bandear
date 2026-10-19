@@ -16,7 +16,7 @@ use crate::engine::{
     channel_flags, fit_channels, ChannelMeta, EngineEvent, EventBus, GroupStatus, MixOrigin,
 };
 use crate::health::LinkReport;
-use crate::link_history::{unix_millis_now, PingClock};
+use crate::link_history::{LinkMoment, PingClock};
 use crate::mix::{GroupLayout, Membership, MixState};
 use crate::protocol::{
     control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
@@ -415,7 +415,7 @@ async fn run_control_server(
         // registered targets whose control channel stayed gone past the grace period.
         // And the clock that keeps a second with no link report as a gap in the musicians' link
         // histories (see [crate::link_history]).
-        targets.fill_link_gaps(unix_millis_now());
+        targets.fill_link_gaps(LinkMoment::now());
         for address in targets.sweep_expired(Instant::now()) {
             crate::log_info!(
                 "control",
@@ -801,7 +801,7 @@ async fn handle_control_connection(
                                     peer.ip(),
                                     &report,
                                     &command,
-                                    unix_millis_now(),
+                                    LinkMoment::now(),
                                 );
                                 None
                             }
@@ -2742,7 +2742,8 @@ mod tests {
                 &MusicianKey::Address("127.0.0.1:50123".parse().unwrap()),
                 None,
             )
-            .expect("the musician has a history");
+            .expect("the musician has a history")
+            .samples;
         let sample = samples.last().expect("the report is a sample");
         assert!(!sample.gap);
         assert_eq!(sample.packets_received, Some(200));
@@ -2750,6 +2751,76 @@ mod tests {
         assert_eq!(sample.jitter_ms, Some(1.5));
         assert_eq!(sample.cushion_ms, Some(40.0));
         assert_eq!(sample.backlog_ms, None, "not sent");
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The link history samples of the phone registered as [REGISTER_ANA]: whether each is a gap.
+    fn ana_history_gaps(targets: &TargetRegistry) -> Vec<bool> {
+        targets
+            .link_history(
+                &crate::targets::MusicianKey::Address("127.0.0.1:50123".parse().unwrap()),
+                None,
+            )
+            .map(|read| read.samples.iter().map(|sample| sample.gap).collect())
+            .unwrap_or_default()
+    }
+
+    /// A phone that stays connected but stops reporting gets a gap for each silent second from the
+    /// accept loop's own tick, with no report to end the silence.
+    #[tokio::test]
+    async fn a_connected_phone_that_stops_reporting_gets_gaps_from_the_accept_loop() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+
+        let mut client = connect_client(address).await;
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        send_then_sync(&mut client, CLEAN_STATS).await;
+        assert_eq!(ana_history_gaps(&targets), vec![false]);
+
+        // Connected (it answers the pings by reading) and silent.
+        answer_pings_until(&mut client, Duration::from_secs(5), || {
+            ana_history_gaps(&targets).contains(&true)
+        })
+        .await;
+        let gaps = ana_history_gaps(&targets);
+        assert_eq!(gaps.first(), Some(&false), "the report");
+        assert!(
+            gaps.len() >= 2 && gaps[1..].iter().all(|&gap| gap),
+            "then gaps from the tick: {gaps:?}"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// Once the phone's connection closed (its guard ended the link session), the tick keeps no
+    /// more gaps: the time away is not a silence of a connected phone.
+    #[tokio::test]
+    async fn a_closed_connection_stops_the_gaps() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers = ControlPeers::default();
+        let (address, stopped, server) = start_server(
+            Arc::clone(&targets),
+            Arc::clone(&peers),
+            Heartbeat::default(),
+        );
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+
+        let mut client = connect_client(address).await;
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        send_then_sync(&mut client, CLEAN_STATS).await;
+        client.close(None).await.expect("the client should close");
+        drop(client);
+        assert!(
+            wait_until(|| control_connections(&peers, target_ip) == 0).await,
+            "the connection is gone"
+        );
+
+        // Longer than the gap delay, with the accept loop ticking all along.
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert_eq!(ana_history_gaps(&targets), vec![false], "the report alone");
 
         stop_server(address, &stopped, server).await;
     }

@@ -855,7 +855,12 @@ impl From<&MusicianStatus> for MusicianDto {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkSampleDto {
-    /// When, in Unix milliseconds (UTC).
+    /// The sample's number in its history: the cursor (`sinceSeq`) a window passes for what is new.
+    pub seq: u64,
+    /// When, on the monotonic clock: milliseconds since the history began. Only ever grows, by the
+    /// time that really passed; the axis a chart draws on.
+    pub mono_ms: u64,
+    /// When, in Unix milliseconds (UTC), for display only: the wall clock may have been stepped.
     pub at_ms: u64,
     /// No report arrived for this second while the phone was connected.
     pub gap: bool,
@@ -879,6 +884,8 @@ pub struct LinkSampleDto {
 impl From<&LinkSample> for LinkSampleDto {
     fn from(sample: &LinkSample) -> Self {
         Self {
+            seq: sample.seq,
+            mono_ms: sample.mono_ms,
             at_ms: sample.at_ms,
             gap: sample.gap,
             reconnected: sample.reconnected,
@@ -898,12 +905,14 @@ impl From<&LinkSample> for LinkSampleDto {
     }
 }
 
-/// What `link_history` answers: the musician's key as asked, their samples after `sinceMs` (all of
-/// them without it), the oldest first, and how many a history keeps and how far apart they are.
+/// What `link_history` answers: the musician's key as asked, the history's id (a new one means a new
+/// history, read whole), their samples numbered after `sinceSeq` (all of them without it), the
+/// oldest first, and how many a history keeps and how far apart they are.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkHistoryDto {
     pub musician_key: String,
+    pub history_id: u64,
     pub samples: Vec<LinkSampleDto>,
     pub max_samples: usize,
     pub period_ms: u64,
@@ -1747,6 +1756,8 @@ mod tests {
     #[test]
     fn a_row_carries_the_round_trip_and_the_newest_sample_but_never_the_history() {
         let latest = LinkSample {
+            seq: 5,
+            mono_ms: 5_000,
             at_ms: 5_000,
             gap: false,
             reconnected: false,

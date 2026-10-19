@@ -7,9 +7,10 @@
 //! peaks 0-100):
 //!
 //! - `meters`, about 30 times a second: `{ "run": n, "channels": [peak, ...], "musicians":
-//!   { "<address>": { "left": peak, "right": peak } } }`. `channels` holds the input peaks,
-//!   index-aligned with the status's `channels`; `musicians` holds the peak of the stereo mix each
-//!   musician is sent.
+//!   { "<address>": { "left": peak, "right": peak } }, "local": { "left": peak, "right": peak } }`.
+//!   `channels` holds the input peaks, index-aligned with the status's `channels`; `musicians`
+//!   holds the peak of the stereo mix each musician is sent; `local` the peak of the engineer's
+//!   local mix, whether or not an output plays it.
 //! - `status`, about 4 times a second: the `EngineStatusDto` that `engine_status` returns, with the
 //!   local names applied; and at once when the groups change (an edit, or a device switch that
 //!   changes which groups the device can feed), ahead of the `mix-changed` of every musician whose
@@ -20,7 +21,10 @@
 //!   new stereo pair set; each channel carries its `name`, `kind`, `hidden` and `link`.
 //! - `mix-changed`, as soon as a mix changes:
 //!   `{ "run": n, "address": "<address>", "origin": "phone" | "desktop", "mix": { ...MixDto } }`,
-//!   the whole mix stored after the change. A musician removed in between is not announced.
+//!   the whole mix stored after the change. A musician removed in between is not announced. The
+//!   engineer's local mix is announced the same way under the id `local` and with no address:
+//!   `{ "run": n, "id": "local", "origin": "desktop", "mix": { ...MixDto } }`, after an edit from
+//!   the desk and after a group, channel or device change that moved it.
 //!
 //! `<address>` is always the musician's address as the status rows show it, even for a change from
 //! the phone, whose control connection has another port. The window still asks `engine_status`
@@ -42,7 +46,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::commands::{self, DesktopState};
-use crate::dto::{EngineStatusDto, MetersDto, MixChangedDto};
+use crate::dto::{EngineStatusDto, LocalMixChangedDto, MetersDto, MixChangedDto};
 
 pub const METERS_EVENT: &str = "meters";
 pub const STATUS_EVENT: &str = "status";
@@ -70,6 +74,20 @@ pub fn mix_changed(
     };
     let (address, mix) = lookup(*address)?;
     Some(MixChangedDto::new(address, *origin, &mix, run))
+}
+
+/// The `mix-changed` payload of engine run `run` for a change of the engineer's local mix, or
+/// `None` for any other event. `read` is the engine's local mix now (`EngineHandle::local_mix`);
+/// `None` when no engine runs any more, and then there is nothing to announce.
+pub fn local_mix_changed(
+    event: &EngineEvent,
+    run: u64,
+    read: impl FnOnce() -> Option<MixValues>,
+) -> Option<LocalMixChangedDto> {
+    if !matches!(event, EngineEvent::LocalMixChanged) {
+        return None;
+    }
+    Some(LocalMixChangedDto::new(&read()?, run))
 }
 
 /// What one pass of the pump has to send.
@@ -134,6 +152,8 @@ pub trait PumpSource: Send + 'static {
     fn status(&self) -> Option<EngineStatusDto>;
     /// The engine's join on IP for a mix change (see [mix_changed]).
     fn musician_mix(&self, address: SocketAddr) -> Option<(SocketAddr, MixValues)>;
+    /// The engine's local mix now (see [local_mix_changed]).
+    fn local_mix(&self) -> Option<MixValues>;
 }
 
 /// Where the pump sends its events: the window in the app, a recorder in tests.
@@ -228,6 +248,11 @@ fn pump(
                     sink.emit(STATUS_EVENT, EngineStatusDto { run, ..status });
                 }
             }
+            Ok(event @ EngineEvent::LocalMixChanged) => {
+                if let Some(change) = local_mix_changed(&event, run, || source.local_mix()) {
+                    sink.emit(MIX_CHANGED_EVENT, change);
+                }
+            }
             Ok(event) => {
                 let lookup = |address| source.musician_mix(address);
                 if let Some(change) = mix_changed(&event, run, lookup) {
@@ -255,6 +280,10 @@ impl<R: Runtime> PumpSource for AppHandle<R> {
     fn musician_mix(&self, address: SocketAddr) -> Option<(SocketAddr, MixValues)> {
         commands::musician_mix(self.try_state::<DesktopState>()?.inner(), address)
     }
+
+    fn local_mix(&self) -> Option<MixValues> {
+        commands::local_mix(self.try_state::<DesktopState>()?.inner())
+    }
 }
 
 impl<R: Runtime> PumpSink for AppHandle<R> {
@@ -273,7 +302,7 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::sync::Mutex;
 
-    use crate::dto::CaptureFormatDto;
+    use crate::dto::{CaptureFormatDto, LocalOutputDto, MixDto, OutputLevelsDto};
     use personal_monitoring::MixOrigin;
 
     fn address(value: &str) -> SocketAddr {
@@ -350,9 +379,46 @@ mod tests {
             EngineEvent::ClientDisconnected {
                 address: address(PHONE),
             },
+            EngineEvent::LocalMixChanged,
         ] {
             assert!(mix_changed(&event, 1, never).is_none());
         }
+    }
+
+    #[test]
+    fn a_change_of_the_local_mix_is_announced_with_its_id_and_no_address() {
+        let mix = || {
+            Some(MixValues {
+                volume_percent: 61,
+                ..MixValues::default()
+            })
+        };
+
+        let change = local_mix_changed(&EngineEvent::LocalMixChanged, 3, mix)
+            .expect("a change of the local mix");
+        let json = serde_json::to_value(&change).expect("serializes");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "run": 3,
+                "id": "local",
+                "origin": "desktop",
+                "mix": serde_json::to_value(MixDto::from(&mix().expect("a mix"))).expect("a mix")
+            })
+        );
+        assert!(
+            local_mix_changed(&EngineEvent::LocalMixChanged, 3, || None).is_none(),
+            "an engine that is gone has nothing to announce"
+        );
+        let musician = EngineEvent::MixChanged {
+            address: address(MUSICIAN),
+            origin: MixOrigin::Engine,
+        };
+        assert!(
+            local_mix_changed(&musician, 3, || panic!("not the local mix")).is_none(),
+            "a musician's change is not the local mix's"
+        );
     }
 
     #[test]
@@ -478,6 +544,8 @@ mod tests {
             packets_sent: 0,
             packets_discarded: 0,
             musicians: Vec::new(),
+            local_mix: MixDto::from(&MixValues::default()),
+            local_output: LocalOutputDto::from(&personal_monitoring::LocalOutputStatus::default()),
         }
     }
 
@@ -493,6 +561,10 @@ mod tests {
                 run: 0,
                 channels: vec![50, 0],
                 musicians: BTreeMap::new(),
+                local: OutputLevelsDto {
+                    left: 20,
+                    right: 30,
+                },
             })
         }
 
@@ -502,6 +574,13 @@ mod tests {
 
         fn musician_mix(&self, address: SocketAddr) -> Option<(SocketAddr, MixValues)> {
             one_musician(address)
+        }
+
+        fn local_mix(&self) -> Option<MixValues> {
+            Some(MixValues {
+                volume_percent: 77,
+                ..MixValues::default()
+            })
         }
     }
 
@@ -535,7 +614,12 @@ mod tests {
         ));
         assert_eq!(
             recorder.last(METERS_EVENT),
-            Some(serde_json::json!({ "run": 7, "channels": [50, 0], "musicians": {} })),
+            Some(serde_json::json!({
+                "run": 7,
+                "channels": [50, 0],
+                "musicians": {},
+                "local": { "left": 20, "right": 30 }
+            })),
             "meters name the pump's run"
         );
         let status = recorder.last(STATUS_EVENT).expect("a status went out");
@@ -554,6 +638,16 @@ mod tests {
         assert_eq!(change["origin"], "phone");
         assert_eq!(change["mix"]["volumePercent"], 42);
         assert_eq!(change["run"], 7, "a mix change names the pump's run");
+
+        bus.send(EngineEvent::LocalMixChanged)
+            .expect("the pump listens");
+        assert!(wait_until(|| recorder.count(MIX_CHANGED_EVENT) == 2));
+        let local = recorder.last(MIX_CHANGED_EVENT).expect("announced");
+        assert_eq!(local["id"], "local");
+        assert_eq!(local["origin"], "desktop");
+        assert_eq!(local["mix"]["volumePercent"], 77, "the local mix now");
+        assert_eq!(local["run"], 7);
+        assert!(local.get("address").is_none(), "{local}");
 
         pump.stop();
     }

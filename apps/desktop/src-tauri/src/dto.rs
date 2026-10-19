@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
     CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
-    LinkHealth, MirrorStatus, MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus,
+    LinkHealth, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin, MixUpdate, MixValues,
+    MusicianKey, MusicianStatus, OutputDevice,
 };
 
 use crate::session::{
-    address_key, client_key, SessionAudio, SessionChannel, SessionGroup, SessionPreset,
+    address_key, client_key, SessionAudio, SessionChannel, SessionGroup, SessionOutput,
+    SessionPreset,
 };
 use crate::sessions::SnapshotSummary;
 
@@ -364,6 +366,13 @@ pub struct SessionLoadedDto {
     pub audio_loaded: bool,
     pub audio_skipped: Option<String>,
     pub presets: Vec<SessionPreset>,
+    /// Whether the saved session had a local section and the desk took it; one saved before the
+    /// local mix existed leaves the desk's own.
+    pub local_loaded: bool,
+    /// The local mix now stored, when a running engine took the saved one; else null.
+    pub local_mix: Option<MixDto>,
+    /// Why the saved session's local output was not opened by the running engine, else null.
+    pub local_output_notice: Option<String>,
 }
 
 /// A saved mix a loaded session pushed to a musician.
@@ -526,6 +535,122 @@ impl MixChangedDto {
     }
 }
 
+/// The id the window knows the engineer's local mix by: its tab, its pending edits and its
+/// `mix-changed` event. No musician's address can be it.
+pub const LOCAL_MIX_ID: &str = "local";
+
+/// The payload of the `mix-changed` event for the engineer's local mix: the whole mix right after
+/// a change, made here or moved by a group, channel or device change. It names the id
+/// [LOCAL_MIX_ID] and no address, so it can never be taken for a musician's.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalMixChangedDto {
+    /// The engine run the change happened in.
+    pub run: u64,
+    /// Always [LOCAL_MIX_ID].
+    pub id: &'static str,
+    /// Always "desktop": no phone changes the local mix.
+    pub origin: &'static str,
+    /// The whole mix now stored, nested as in a musician's change.
+    pub mix: MixDto,
+}
+
+impl LocalMixChangedDto {
+    pub fn new(mix: &MixValues, run: u64) -> Self {
+        Self {
+            run,
+            id: LOCAL_MIX_ID,
+            origin: "desktop",
+            mix: MixDto::from(mix),
+        }
+    }
+}
+
+/// One output device the local mix can play on, with its output channel count (see
+/// [crate::commands::local::output_devices]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDeviceDto {
+    pub name: String,
+    pub channels: u16,
+}
+
+impl From<&OutputDevice> for OutputDeviceDto {
+    fn from(device: &OutputDevice) -> Self {
+        Self {
+            name: device.name.clone(),
+            channels: device.channels,
+        }
+    }
+}
+
+/// The output the window asks the local mix to play on ([crate::commands::local::set_local_output]):
+/// the device by its exact name and the first output of the stereo pair, 0-based (outputs 1/2 are
+/// `0`). A field the desk does not know is rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalOutputRequestDto {
+    pub device: String,
+    pub first_channel: u16,
+}
+
+/// Where the local mix plays and how, on the status (`localOutput`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalOutputDto {
+    /// The output device in use (or the one that failed); null when the local output is off.
+    pub device: Option<String>,
+    /// The first output of its stereo pair, 0-based; null when off.
+    pub first_channel: Option<u16>,
+    /// "off", "running" or "failed".
+    pub state: &'static str,
+    /// Why it failed; null unless `state` is "failed".
+    pub reason: Option<String>,
+    /// Frames of silence played because no audio was there, since this output was chosen.
+    pub underrun_frames: u64,
+    /// Frames dropped to hold the delay, since this output was chosen.
+    pub dropped_frames: u64,
+    /// Why the output the session keeps was not opened when the engine started or a session was
+    /// loaded (the running driver does not offer it, or it could not be opened); null otherwise.
+    /// Filled by the command layer: the engine knows nothing of the session.
+    pub notice: Option<String>,
+}
+
+impl From<&LocalOutputStatus> for LocalOutputDto {
+    fn from(status: &LocalOutputStatus) -> Self {
+        let (state, reason) = match &status.state {
+            LocalOutputState::Off => ("off", None),
+            LocalOutputState::Running => ("running", None),
+            LocalOutputState::Failed { reason } => ("failed", Some(reason.clone())),
+        };
+        Self {
+            device: status.output.as_ref().map(|output| output.device.clone()),
+            first_channel: status.output.as_ref().map(|output| output.first_channel),
+            state,
+            reason,
+            underrun_frames: status.underrun_frames,
+            dropped_frames: status.dropped_frames,
+            notice: None,
+        }
+    }
+}
+
+/// What [crate::commands::local::set_local_output] did, as [GroupsSetDto] says it for groups:
+/// `applied` whether a running engine took the choice (the local mix plays there now, or stopped),
+/// `saved` whether the session keeps it for the next start, and `saveError` why not. With no engine
+/// running it is kept and applies at the next start.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalOutputSetDto {
+    /// The output now chosen, as the session keeps it; null for none.
+    pub output: Option<SessionOutput>,
+    /// The local output as the running engine reports it now; null with no engine.
+    pub local_output: Option<LocalOutputDto>,
+    pub applied: bool,
+    pub saved: bool,
+    pub save_error: Option<String>,
+}
+
 /// The payload of the `meters` event: the live levels.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -536,6 +661,8 @@ pub struct MetersDto {
     pub channels: Vec<u8>,
     /// Each musician's 0-100 output peak, keyed by the address the status rows show.
     pub musicians: BTreeMap<String, OutputLevelsDto>,
+    /// The 0-100 peak of the engineer's local mix, whether or not an output plays it.
+    pub local: OutputLevelsDto,
 }
 
 /// The 0-100 peak of the stereo mix one musician is sent.
@@ -561,6 +688,10 @@ impl From<&EngineMeters> for MetersDto {
                     )
                 })
                 .collect(),
+            local: OutputLevelsDto {
+                left: meters.local_levels[0],
+                right: meters.local_levels[1],
+            },
         }
     }
 }
@@ -730,6 +861,11 @@ pub struct EngineStatusDto {
     pub packets_sent: u64,
     pub packets_discarded: u64,
     pub musicians: Vec<MusicianDto>,
+    /// The engineer's local mix (see [crate::commands::local]): a whole mix as a musician's, with
+    /// no level cap, limit or locks the window shows.
+    pub local_mix: MixDto,
+    /// Where the local mix plays and how.
+    pub local_output: LocalOutputDto,
 }
 
 impl From<&EngineStatus> for EngineStatusDto {
@@ -781,6 +917,8 @@ impl From<&EngineStatus> for EngineStatusDto {
             packets_sent: status.packets_sent,
             packets_discarded: status.packets_discarded,
             musicians: status.musicians.iter().map(MusicianDto::from).collect(),
+            local_mix: MixDto::from(&status.local_mix),
+            local_output: LocalOutputDto::from(&status.local_output),
         }
     }
 }
@@ -1266,7 +1404,7 @@ mod tests {
                     output_levels: [100, 50],
                 },
             ],
-            local_levels: [0, 0],
+            local_levels: [25, 90],
         };
 
         let json = serde_json::to_value(MetersDto::from(&meters)).expect("meters serialize");
@@ -1280,7 +1418,143 @@ mod tests {
                     "192.168.1.3:50000": { "left": 100, "right": 50 },
                     "192.168.1.4:50000": { "left": 0, "right": 7 },
                 },
+                "local": { "left": 25, "right": 90 },
+            }),
+            "the local mix's peak, left then right, beside the musicians'"
+        );
+    }
+
+    #[test]
+    fn the_local_mix_and_its_output_reach_the_window_on_the_status() {
+        let mut status = status_with(Vec::new(), vec![0, 0]);
+        status.local_mix = MixValues {
+            volume_percent: 70,
+            revision: 4,
+            ..MixValues::default()
+        };
+        status.local_output = LocalOutputStatus {
+            output: Some(personal_monitoring::LocalOutputRequest {
+                device: "OUTPUT 1/2 (Volt 4)".to_owned(),
+                first_channel: 2,
+            }),
+            state: LocalOutputState::Running,
+            underrun_frames: 480,
+            dropped_frames: 12,
+        };
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+
+        assert_eq!(json["localMix"]["volumePercent"], 70);
+        assert_eq!(json["localMix"]["revision"], 4);
+        assert_eq!(
+            json["localMix"]["channelGains"].as_array().map(Vec::len),
+            Some(32),
+            "a whole mix, as a musician's"
+        );
+        assert_eq!(
+            json["localOutput"],
+            serde_json::json!({
+                "device": "OUTPUT 1/2 (Volt 4)",
+                "firstChannel": 2,
+                "state": "running",
+                "reason": null,
+                "underrunFrames": 480,
+                "droppedFrames": 12,
+                "notice": null
             })
+        );
+
+        status.local_output = LocalOutputStatus {
+            state: LocalOutputState::Failed {
+                reason: "the device was unplugged".to_owned(),
+            },
+            ..status.local_output
+        };
+        let failed = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+        assert_eq!(failed["localOutput"]["state"], "failed");
+        assert_eq!(failed["localOutput"]["reason"], "the device was unplugged");
+
+        status.local_output = LocalOutputStatus::default();
+        let off = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+        assert_eq!(
+            off["localOutput"],
+            serde_json::json!({
+                "device": null,
+                "firstChannel": null,
+                "state": "off",
+                "reason": null,
+                "underrunFrames": 0,
+                "droppedFrames": 0,
+                "notice": null
+            }),
+            "no local output is the default"
+        );
+    }
+
+    #[test]
+    fn a_local_mix_change_names_the_id_local_and_no_address() {
+        let mix = MixValues {
+            volume_percent: 33,
+            ..MixValues::default()
+        };
+
+        let json = serde_json::to_value(LocalMixChangedDto::new(&mix, 5)).expect("serializes");
+
+        assert_eq!(json["run"], 5);
+        assert_eq!(json["id"], LOCAL_MIX_ID);
+        assert_eq!(json["origin"], "desktop");
+        assert_eq!(json["mix"]["volumePercent"], 33);
+        assert!(
+            json.get("address").is_none(),
+            "never taken for a musician's: {json}"
+        );
+    }
+
+    #[test]
+    fn an_output_choice_reads_camel_case_and_answers_what_was_done() {
+        let request: LocalOutputRequestDto = serde_json::from_value(
+            serde_json::json!({ "device": "Speakers (Realtek)", "firstChannel": 2 }),
+        )
+        .expect("a request reads");
+        assert_eq!(
+            request,
+            LocalOutputRequestDto {
+                device: "Speakers (Realtek)".to_owned(),
+                first_channel: 2,
+            }
+        );
+        let misspelt = serde_json::from_value::<LocalOutputRequestDto>(
+            serde_json::json!({ "device": "Speakers", "firstChannel": 0, "channel": 1 }),
+        );
+        assert!(misspelt.is_err(), "an unknown field is refused");
+
+        let outcome = LocalOutputSetDto {
+            output: Some(SessionOutput {
+                device: "Speakers (Realtek)".to_owned(),
+                first_channel: 2,
+            }),
+            local_output: None,
+            applied: false,
+            saved: true,
+            save_error: None,
+        };
+        assert_eq!(
+            serde_json::to_value(outcome).expect("serializes"),
+            serde_json::json!({
+                "output": { "device": "Speakers (Realtek)", "firstChannel": 2 },
+                "localOutput": null,
+                "applied": false,
+                "saved": true,
+                "saveError": null
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(OutputDeviceDto::from(&OutputDevice {
+                name: "Volt 4".to_owned(),
+                channels: 4,
+            }))
+            .expect("serializes"),
+            serde_json::json!({ "name": "Volt 4", "channels": 4 })
         );
     }
 

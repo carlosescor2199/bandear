@@ -26,7 +26,6 @@
 
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -42,7 +41,7 @@ use crate::capture::{
 };
 use crate::engine::OutputMeter;
 use crate::mix::{MixPlan, MixState, OUTPUT_CHANNELS};
-use crate::pipeline::{Block, Sink, SourceFormat, DEFAULT_BLOCK_FRAMES};
+use crate::pipeline::{Block, Sink, SourceFormat, DEFAULT_BLOCK_FRAMES, MAX_BLOCK_FRAMES};
 use crate::protocol::to_pcm16;
 
 /// The smallest output ring, in stereo frames: half a second at 48 kHz.
@@ -329,55 +328,129 @@ fn write_frame<T: OutputSample>(frame: &mut [T], first: usize, left: T, right: T
 /// The local output's sink: every block is mixed with the local mix, metered, and pushed to the
 /// output's ring when one plays.
 ///
-/// The output is changed between blocks: the engine sends a new feed (or `None` to stop) over
-/// `outputs`, which the sink takes before its next block, dropping the previous feed. So a change
-/// or a removal never waits on the engine thread and never touches capture or the phones.
+/// The output is changed between blocks: the engine sends a new feed (or `None` to stop) through
+/// [OutputControl], which the sink takes before its next block (or within one idle wait when no
+/// audio comes). So a change or a removal never waits on the engine thread and never touches
+/// capture or the phones.
+///
+/// Nothing here allocates or frees on the engine thread: the stereo buffer is sized for the
+/// longest block when the sink is built, the feeds travel in preallocated `rtrb` rings, and a feed
+/// the sink lets go of is handed back to [OutputControl] to be freed on the engine's side, never
+/// dropped here. (Only when the engine thread ends does it drop what it still holds.)
 pub(crate) struct LocalOutputSink {
     mix: Arc<MixState>,
     meter: OutputMeter,
-    outputs: Receiver<Option<OutputFeed>>,
+    commands: Consumer<Option<OutputFeed>>,
+    returns: Producer<OutputFeed>,
+    /// A feed the return ring had no room for, handed back at the next chance. The ring is sized
+    /// so this cannot happen (see [OutputControl::send]); it is the guard against dropping one.
+    parked: Option<OutputFeed>,
     feed: Option<OutputFeed>,
-    stereo: Vec<f32>,
+    /// Room for the stereo mix of the longest block.
+    stereo: Box<[f32]>,
     block_frames: usize,
 }
 
+/// The engine's end of the local output sink's lines: feeds go to the sink, and the feeds it lets
+/// go of come back here to be freed off the engine thread.
+pub(crate) struct OutputControl {
+    commands: Producer<Option<OutputFeed>>,
+    returns: Consumer<OutputFeed>,
+}
+
+/// Feeds (or stops) waiting for the sink to take them.
+const COMMAND_SLOTS: usize = 4;
+
+/// The local output's sink for the local mix `mix`, metered into `meter`, and the engine's end of
+/// its lines.
+pub(crate) fn local_output_sink(
+    mix: Arc<MixState>,
+    meter: OutputMeter,
+) -> (LocalOutputSink, OutputControl) {
+    let (command_producer, commands) = RingBuffer::new(COMMAND_SLOTS);
+    // Every command lets go of at most one feed, and the engine frees the returned feeds before
+    // each command it sends, so at most the commands sent since then can come back.
+    let (returns, return_consumer) = RingBuffer::new(COMMAND_SLOTS + 1);
+    let sink = LocalOutputSink {
+        mix,
+        meter,
+        commands,
+        returns,
+        parked: None,
+        feed: None,
+        stereo: vec![0.0; MAX_BLOCK_FRAMES * usize::from(OUTPUT_CHANNELS)].into_boxed_slice(),
+        block_frames: DEFAULT_BLOCK_FRAMES,
+    };
+    let control = OutputControl {
+        commands: command_producer,
+        returns: return_consumer,
+    };
+    (sink, control)
+}
+
+impl OutputControl {
+    /// Sends `feed` to the sink (`None` stops the output), after freeing the feeds it gave back.
+    /// An error when the engine thread has ended, or when changes come faster than the sink takes
+    /// them (it takes them every block, or every idle wait without audio).
+    pub(crate) fn send(&mut self, feed: Option<OutputFeed>) -> Result<(), String> {
+        self.reap();
+        if self.commands.is_abandoned() {
+            return Err("the engine thread has stopped".to_owned());
+        }
+        self.commands
+            .push(feed)
+            .map_err(|_| "the local output is still changing; try again".to_owned())
+    }
+
+    /// Frees the feeds the sink has let go of, here, off the engine thread; returns how many.
+    pub(crate) fn reap(&mut self) -> usize {
+        let mut freed = 0;
+        while let Ok(feed) = self.returns.pop() {
+            drop(feed);
+            freed += 1;
+        }
+        freed
+    }
+}
+
 impl LocalOutputSink {
-    pub(crate) fn new(
-        mix: Arc<MixState>,
-        meter: OutputMeter,
-        outputs: Receiver<Option<OutputFeed>>,
-    ) -> Self {
-        Self {
-            mix,
-            meter,
-            outputs,
-            feed: None,
-            stereo: Vec::new(),
-            block_frames: DEFAULT_BLOCK_FRAMES,
+    /// Takes the feeds the engine sent, in order, and hands back each one let go of.
+    fn take_commands(&mut self) {
+        if let Some(parked) = self.parked.take() {
+            self.hand_back(parked);
+        }
+        while let Ok(command) = self.commands.pop() {
+            if let Some(feed) = &command {
+                feed.shared
+                    .block_frames
+                    .store(self.block_frames, Ordering::Relaxed);
+            }
+            if let Some(previous) = std::mem::replace(&mut self.feed, command) {
+                self.hand_back(previous);
+            }
+        }
+    }
+
+    fn hand_back(&mut self, feed: OutputFeed) {
+        if let Err(rtrb::PushError::Full(feed)) = self.returns.push(feed) {
+            self.parked = Some(feed);
         }
     }
 }
 
 impl Sink for LocalOutputSink {
     fn process(&mut self, block: &Block<'_>) {
-        while let Ok(feed) = self.outputs.try_recv() {
-            if let Some(feed) = &feed {
-                feed.shared
-                    .block_frames
-                    .store(self.block_frames, Ordering::Relaxed);
-            }
-            self.feed = feed;
-        }
+        self.take_commands();
 
         let frames = block.samples.len() / block.channels.max(1);
-        self.stereo
-            .resize(frames * usize::from(OUTPUT_CHANNELS), 0.0);
-        MixPlan::new(&self.mix.snapshot(), block.channels)
-            .mix_into(block.samples, &mut self.stereo);
-        self.meter.observe(&self.stereo);
+        let Some(stereo) = self.stereo.get_mut(..frames * usize::from(OUTPUT_CHANNELS)) else {
+            return;
+        };
+        MixPlan::new(&self.mix.snapshot(), block.channels).mix_into(block.samples, stereo);
+        self.meter.observe(stereo);
 
         if let Some(feed) = &mut self.feed {
-            if feed.shared.running() && feed.producer.push_entire_slice(&self.stereo).is_err() {
+            if feed.shared.running() && feed.producer.push_entire_slice(stereo).is_err() {
                 feed.shared
                     .dropped_frames
                     .fetch_add(frames as u64, Ordering::Relaxed);
@@ -385,15 +458,14 @@ impl Sink for LocalOutputSink {
         }
     }
 
+    /// Lets the meter fall, and takes any change of output while no audio comes.
     fn silence(&mut self, frames: usize) {
+        self.take_commands();
         self.meter.fall(frames);
     }
 
     fn source_changed(&mut self, format: SourceFormat) {
         self.block_frames = format.block_frames;
-        let samples = format.block_frames * usize::from(OUTPUT_CHANNELS);
-        self.stereo
-            .reserve(samples.saturating_sub(self.stereo.len()));
         if let Some(feed) = &self.feed {
             feed.shared
                 .block_frames
@@ -600,7 +672,6 @@ mod tests {
     use super::*;
     use crate::mix::MixUpdate;
     use crate::pipeline::tests::allocations;
-    use std::sync::mpsc::channel;
 
     fn request(device: &str, first_channel: u16) -> LocalOutputRequest {
         LocalOutputRequest {
@@ -742,16 +813,9 @@ mod tests {
         assert_eq!((allocations, frees), (0, 0));
     }
 
-    fn sink_with(
-        mix: Arc<MixState>,
-    ) -> (
-        LocalOutputSink,
-        std::sync::mpsc::Sender<Option<OutputFeed>>,
-        OutputMeter,
-    ) {
-        let (outputs, receiver) = channel();
+    fn sink_with(mix: Arc<MixState>) -> (LocalOutputSink, OutputControl, OutputMeter) {
         let meter = OutputMeter::default();
-        let mut sink = LocalOutputSink::new(mix, meter.clone(), receiver);
+        let (mut sink, outputs) = local_output_sink(mix, meter.clone());
         sink.source_changed(SourceFormat {
             channels: 2,
             block_frames: 4,
@@ -777,7 +841,7 @@ mod tests {
             ..MixUpdate::default()
         })
         .expect("a valid update");
-        let (mut sink, outputs, meter) = sink_with(Arc::clone(&mix));
+        let (mut sink, mut outputs, meter) = sink_with(Arc::clone(&mix));
         let input = [0.5f32, 0.25, 0.5, 0.25, 0.5, 0.25, 0.5, 0.25];
 
         sink.process(&block(&input, 0));
@@ -800,7 +864,7 @@ mod tests {
     /// stops the output. A failed output is not fed either.
     #[test]
     fn the_sink_moves_between_outputs_and_stops_feeding_a_failed_one() {
-        let (mut sink, outputs, _meter) = sink_with(Arc::new(MixState::default()));
+        let (mut sink, mut outputs, _meter) = sink_with(Arc::new(MixState::default()));
         let input = [0.5f32; 8];
         let (first, mut first_player, _) = output_link(2, 0, 4);
         let (second, mut second_player, second_shared) = output_link(2, 0, 4);
@@ -828,9 +892,59 @@ mod tests {
         assert!(sink.feed.is_none());
     }
 
+    /// The output a live change replaces is handed back, not freed: the block that makes the
+    /// change frees nothing on the engine thread, even when the previous output's stream (here its
+    /// player) is already gone, so the sink would hold the last reference to its ring.
+    #[test]
+    fn a_live_output_change_frees_nothing_on_the_engine_thread() {
+        let (mut sink, mut outputs, _meter) = sink_with(Arc::new(MixState::default()));
+        let input = [0.5f32; 8];
+        let (first, first_player, _) = output_link(2, 0, 4);
+        outputs.send(Some(first)).expect("the sink listens");
+        sink.process(&block(&input, 0));
+        drop(first_player);
+        let (second, _second_player, _) = output_link(2, 0, 4);
+        outputs.send(Some(second)).expect("the sink listens");
+
+        let (allocations, frees) = allocations::count(|| sink.process(&block(&input, 1)));
+
+        assert_eq!((allocations, frees), (0, 0));
+        // The previous output is freed where the engine reaps it, off the engine thread.
+        let (_, freed) = allocations::count(|| assert_eq!(outputs.reap(), 1));
+        assert!(freed > 0, "the previous output's ring is freed by the reap");
+    }
+
+    /// With no audio coming, the sink still takes a change of output within one idle wait.
+    #[test]
+    fn a_change_of_output_is_taken_while_no_audio_comes() {
+        let (mut sink, mut outputs, _meter) = sink_with(Arc::new(MixState::default()));
+        let (feed, _player, _) = output_link(2, 0, 4);
+        outputs.send(Some(feed)).expect("the sink listens");
+
+        sink.silence(4_800);
+
+        assert!(sink.feed.is_some());
+    }
+
+    /// Changes faster than the sink takes them are refused, never dropped on the engine thread;
+    /// an ended engine thread refuses every change.
+    #[test]
+    fn changes_the_sink_has_not_taken_yet_are_bounded() {
+        let (sink, mut outputs, _meter) = sink_with(Arc::new(MixState::default()));
+        for _ in 0..COMMAND_SLOTS {
+            outputs.send(None).expect("there is room");
+        }
+        let refused = outputs.send(None).expect_err("the line is full");
+        assert!(refused.contains("still changing"), "{refused}");
+
+        drop(sink);
+        let ended = outputs.send(None).expect_err("nobody takes it");
+        assert!(ended.contains("stopped"), "{ended}");
+    }
+
     #[test]
     fn a_full_ring_drops_the_block_and_counts_it() {
-        let (mut sink, outputs, _meter) = sink_with(Arc::new(MixState::default()));
+        let (mut sink, mut outputs, _meter) = sink_with(Arc::new(MixState::default()));
         let (feed, _player, shared) = output_link(2, 0, 4);
         let capacity = feed.producer.buffer().capacity() / 2;
         outputs.send(Some(feed)).expect("the sink listens");

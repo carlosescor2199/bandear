@@ -15,6 +15,10 @@
 //!   "groups": [{ "id": "g3f9a0c1d2e4b5a6", "name": "Drums", "channels": [1, 2, 3] }],
 //!   "presets": [],
 //!   "audio": { "host": "wasapi", "device": "INPUT 1/2 (Volt 4)", "bufferFrames": 256 },
+//!   "local": {
+//!     "mix": { "channels": [], "groups": { "g3f9a0c1d2e4b5a6": 60 }, "volumePercent": 70 },
+//!     "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 0 }
+//!   },
 //!   "name": "Sunday service",
 //!   "savedAt": 1760641500000,
 //!   "mixes": {
@@ -35,6 +39,11 @@
 //!   groups whatever their order), and the musician's master volume and master mute. Never the
 //!   phone's own level cap, which is the phone's; the engineer's limit and locks are kept with the
 //!   musician in `musicians`.
+//! - `local` is the session's local section (the engineer's local mix and its output, see
+//!   [crate::session]). A snapshot saved while an engine runs keeps the local mix the engine plays;
+//!   loading one pushes it through the desk's path and opens its output only when the running
+//!   driver offers it. A snapshot without one (saved before the local mix existed) leaves the
+//!   desk's own local mix and output as they are.
 //! - The id is the file's name: `s` and 16 hex digits for a snapshot the desk saved. Only a name of
 //!   letters, digits, `-` and `_` is ever read or written, so an id can never reach outside the
 //!   folder.
@@ -55,7 +64,7 @@ use serde_json::Value;
 
 use crate::session::{
     read_session, unix_millis, versioned_fields, write_atomically, DamagedSection, Session,
-    SessionPresetChannel, Versioned, SESSION_VERSION,
+    Versioned, SESSION_VERSION,
 };
 
 /// The folder of the app config directory the named sessions live in.
@@ -65,23 +74,9 @@ pub const MAX_SESSION_NAME_LENGTH: usize = 40;
 /// The longest id the desk reads, in characters.
 const MAX_ID_LENGTH: usize = 64;
 
-/// One musician's mix as a snapshot keeps it (see the module documentation).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionMix {
-    #[serde(default)]
-    pub channels: Vec<SessionPresetChannel>,
-    #[serde(default)]
-    pub groups: BTreeMap<String, u8>,
-    #[serde(default = "full_volume")]
-    pub volume_percent: u8,
-    #[serde(default)]
-    pub muted: bool,
-}
-
-fn full_volume() -> u8 {
-    100
-}
+/// One musician's mix as a snapshot keeps it (see the module documentation); the session keeps the
+/// engineer's local mix in the same shape.
+pub use crate::session::SessionMix;
 
 /// A named snapshot of the session, as saved and as read back.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -412,8 +407,8 @@ fn parse_snapshot(id: &str, bytes: &[u8]) -> Result<(Snapshot, Vec<String>), Str
 mod tests {
     use super::*;
     use crate::session::{
-        MusicianEntry, SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionMirror,
-        SessionPreset, SessionPresetMix,
+        MusicianEntry, SessionAudio, SessionChannel, SessionEngineer, SessionGroup, SessionLocal,
+        SessionMirror, SessionOutput, SessionPreset, SessionPresetChannel, SessionPresetMix,
     };
 
     /// An empty scratch folder for one test's named sessions.
@@ -499,6 +494,18 @@ mod tests {
                 buffer_frames: Some(256),
                 asio_driver: None,
             }),
+            local: Some(SessionLocal {
+                mix: Some(SessionMix {
+                    channels: vec![channel(90, 30, false, false)],
+                    groups: BTreeMap::from([("kit".to_owned(), 60)]),
+                    volume_percent: 70,
+                    muted: false,
+                }),
+                output: Some(SessionOutput {
+                    device: "OUTPUT 1/2 (Volt 4)".to_owned(),
+                    first_channel: 2,
+                }),
+            }),
             ..Session::default()
         }
     }
@@ -568,6 +575,40 @@ mod tests {
                 .is_none(),
             "the phone's own cap is never kept"
         );
+        assert_eq!(
+            file["local"],
+            serde_json::json!({
+                "mix": {
+                    "channels": [{ "gain": 90, "pan": 30, "muted": false, "solo": false }],
+                    "groups": { "kit": 60 },
+                    "volumePercent": 70,
+                    "muted": false
+                },
+                "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 2 }
+            }),
+            "the local mix and its output are kept beside the other sections"
+        );
+    }
+
+    #[test]
+    fn a_damaged_local_section_of_a_snapshot_costs_only_itself() {
+        let directory = test_directory("damaged-local");
+        let store = SnapshotStore::new(directory.clone());
+        write(
+            &directory,
+            "show",
+            r#"{"version":1,"name":"Show","groups":[{"id":"kit","name":"Drums","channels":[1]}],
+                "local":{"output":{"firstChannel":"three"}},
+                "mixes":{"client:phone-ana":{"volumePercent":70}}}"#,
+        );
+
+        let read = store.read("show").expect("what can be read loads");
+
+        assert_eq!(read.snapshot.session.local, None);
+        assert_eq!(read.snapshot.session.groups.len(), 1);
+        assert_eq!(read.snapshot.mixes.len(), 1);
+        assert_eq!(read.damaged.len(), 1, "{:?}", read.damaged);
+        assert!(read.damaged[0].contains("`local`"), "{:?}", read.damaged);
     }
 
     #[test]

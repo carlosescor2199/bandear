@@ -23,9 +23,9 @@ use crate::mix::{
 };
 use crate::network::{NetworkSink, PacketStats};
 use crate::output::{
-    check_request, offered_outputs, open_output, output_channels, system_output_device,
-    system_output_devices, LocalOutputRequest, LocalOutputSink, LocalOutputStatus, OpenedOutput,
-    OutputDevice, OutputFeed, OutputShared,
+    check_request, local_output_sink, offered_outputs, open_output, output_channels,
+    system_output_device, system_output_devices, LocalOutputRequest, LocalOutputStatus,
+    OpenedOutput, OutputControl, OutputDevice, OutputShared,
 };
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
 use crate::targets::{MirrorStatus, MusicianKey, TargetEntry, TargetRegistry};
@@ -1374,10 +1374,11 @@ pub(crate) struct OpenedCapture {
     pub(crate) format: CaptureFormat,
 }
 
-/// The engine's side of the local output: the line to its sink on the engine thread, and the
+/// The engine's side of the local output: the lines to its sink on the engine thread, and the
 /// output that plays.
 pub(crate) struct LocalOutput {
-    feeds: Sender<Option<OutputFeed>>,
+    /// Behind a lock so a status read (`&self`) can free the feeds the sink handed back.
+    control: Mutex<OutputControl>,
     active: Option<ActiveOutput>,
 }
 
@@ -1391,11 +1392,18 @@ struct ActiveOutput {
 }
 
 impl LocalOutput {
-    /// No output yet, with `feeds` the line to the local output's sink.
-    pub(crate) fn new(feeds: Sender<Option<OutputFeed>>) -> Self {
+    /// No output yet, with `control` the engine's end of the local output sink's lines.
+    pub(crate) fn new(control: OutputControl) -> Self {
         Self {
-            feeds,
+            control: Mutex::new(control),
             active: None,
+        }
+    }
+
+    /// Frees, here, the feeds the sink has let go of.
+    fn reap(&self) {
+        if let Ok(mut control) = self.control.lock() {
+            control.reap();
         }
     }
 }
@@ -1798,7 +1806,9 @@ impl EngineHandle {
     }
 
     /// Makes `output` the local output, or turns it off with `None`: the local output's sink takes
-    /// the new feed before its next block, then the previous output's stream is dropped.
+    /// the new feed before its next block, then the previous output's stream is dropped. The feed
+    /// the sink lets go of comes back and is freed here, at a later call, never on the engine
+    /// thread.
     pub(crate) fn install_output(
         &mut self,
         output: Option<OpenedOutput>,
@@ -1815,16 +1825,18 @@ impl EngineHandle {
             None => (None, None),
         };
         self.local_output
-            .feeds
-            .send(feed)
-            .map_err(|_| "the engine thread has stopped")?;
+            .control
+            .get_mut()
+            .map_err(|_| "the local output's lines were poisoned")?
+            .send(feed)?;
         self.local_output.active = active;
         Ok(())
     }
 
     /// Where the local mix plays and how: off, running, or failed with the reason, and the frames
-    /// padded and dropped to hold its delay.
+    /// padded and dropped to hold its delay. Also frees any output the sink has let go of.
     pub fn local_output(&self) -> LocalOutputStatus {
+        self.local_output.reap();
         match &self.local_output.active {
             Some(active) => active.shared.status(&active.request),
             None => LocalOutputStatus::default(),
@@ -2126,8 +2138,9 @@ impl EngineHandle {
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.stop()?;
         }
-        // Nothing feeds the local output any more: close it.
+        // Nothing feeds the local output any more: close it, and free what the sink handed back.
         self.local_output.active = None;
+        self.local_output.reap();
         // Capture and the engine thread have ended, so nothing would ever lower the last levels.
         clear_meters(&self.levels, &self.local_meter, &self.targets.read());
         if let Some(thread) = self.control_thread.take() {
@@ -2228,9 +2241,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let levels = Arc::new(LevelMeter::new());
     let capture_stats = Arc::new(CaptureStats::default());
     let network = NetworkSink::new(Arc::clone(&target_registry), Arc::clone(&packet_stats))?;
-    let (feeds, outputs) = std::sync::mpsc::channel();
     let local_meter = OutputMeter::default();
-    let local = LocalOutputSink::new(Arc::clone(&local_mix), local_meter.clone(), outputs);
+    let (local, output_control) = local_output_sink(Arc::clone(&local_mix), local_meter.clone());
     let pipeline = PipelineHandle::spawn(Pipeline::new(
         vec![Box::new(network), Box::new(local)],
         Arc::clone(&levels),
@@ -2273,7 +2285,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         events,
         local_mix,
         local_meter,
-        local_output: LocalOutput::new(feeds),
+        local_output: LocalOutput::new(output_control),
         capture_device: Some(device),
         block_frames,
         stream: Some(opened.stream),
@@ -4212,8 +4224,8 @@ mod tests {
         let config_state = Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default()));
         let local_mix = Arc::new(config_state.new_mix());
         let local_meter = OutputMeter::default();
-        let (feeds, outputs) = std::sync::mpsc::channel();
-        let local = LocalOutputSink::new(Arc::clone(&local_mix), local_meter.clone(), outputs);
+        let (local, output_control) =
+            local_output_sink(Arc::clone(&local_mix), local_meter.clone());
         let pipeline = PipelineHandle::spawn(Pipeline::new(
             vec![Box::new(network), Box::new(local)],
             Arc::clone(&levels),
@@ -4237,7 +4249,7 @@ mod tests {
             events: EventBus::default(),
             local_mix,
             local_meter,
-            local_output: LocalOutput::new(feeds),
+            local_output: LocalOutput::new(output_control),
             capture_device: None,
             block_frames: DEFAULT_BLOCK_FRAMES,
             stream: None,

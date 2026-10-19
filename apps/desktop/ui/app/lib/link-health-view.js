@@ -51,6 +51,23 @@ export function musicianKey(musician) {
   return musician.clientId ? `client:${musician.clientId}` : `address:${musician.address}`;
 }
 
+/**
+ * The listed musician the panel follows by `key`, last seen at `address`, or null. A phone listed by
+ * its address that then registers is keyed by its client id from then on: when an `address:` key
+ * is gone, the row at that same address that now has a client id is the same musician. A phone
+ * that already had a client id is never followed to another one at its old address.
+ */
+export function followedMusician(musicians, key, address) {
+  if (key === null) {
+    return null;
+  }
+  const same = musicians.find((musician) => musicianKey(musician) === key);
+  if (same || !key.startsWith("address:")) {
+    return same ?? null;
+  }
+  return musicians.find((musician) => musician.clientId && musician.address === address) ?? null;
+}
+
 /** The cursor to ask with for what is new: the newest `seq` held, or null to read the whole. */
 export function cursorOf(buffer) {
   return buffer?.samples.at(-1)?.seq ?? null;

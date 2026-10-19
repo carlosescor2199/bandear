@@ -674,9 +674,64 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   - Not built: the design's separate takes "Play" (folded into Soundcheck: Play is a soundcheck
     start) and its "On" toggle (Start / Back to live inputs instead); a take's markers on the seek
     slider.
-  - Commits: c6c02ae (desktop, 967 lines), f178fa7 (console and fake, 937 lines). Commit: this
-    commit.
+  - Commits: c6c02ae (desktop, 967 lines), f178fa7 (console and fake, 937 lines), ee89b0c (screen).
+  - [x] T6b-fix (findings of review-a1f8d7626e4420c8 and review-70fc9a647ac6de25). Route: delegated
+    writer.
+    - Finding 1 (WARNING, the fake's seek of a take stopped at its end): the engine's rule, read in
+      `soundcheck.rs` (`PlaybackReader::moving` clears `ended` when it takes a move; `seek` never
+      touches `paused`; the status masks `ended` while a move is pending): a seek plays a take that
+      stopped at its end (the status shows playing at once) and keeps a take the engineer paused
+      paused at the new frame. The fake already did exactly that, so it was not changed for the
+      seek; the rule is now pinned on both sides
+      (`a_seek_plays_a_take_stopped_at_its_end_and_keeps_a_paused_one_paused` in the engine, its
+      twin in `soundcheck.test.js`). Pinning it found one real defect: a paused take moved to its
+      end showed "At the end" / "Play again", but resume played on from the end and stopped there
+      again. `ActiveSoundcheck::resume` (and the fake's `resume_soundcheck`) now starts a take at
+      its end from 0 whether it stopped there or was paused and moved there (the frame the status
+      shows, a pending move's included). No `ended` flag was added: the UI's "At the end" (paused
+      and position at the length) is now exactly the engine's restart condition.
+    - Finding 2 (SUGGESTION, record controller): Back to start, the seek slider and the loop go
+      through the transport's busy guard: nothing goes out while Stop (or another command) is on
+      its way, so a refused move can no longer replace the stop's words; moves share the guard as
+      "move" and do not wait for each other (the console sends the latest). A dropped press renders
+      again.
+    - Finding 3 (SUGGESTION): `start_refusal` (the `EngineHandle` `start_recording` mapping) is
+      tested with `SoundcheckError::RecordingRefused` boxed by `?`, as the engine returns it.
+    - Finding 4 (SUGGESTION): `start_with` checks the take folder (`take_in_recordings`, the session
+      read and `canonicalize`) with the engine's lock free (`start_checked`), after a quick "engine
+      running" check so the words stay the same; the engine's own load of the take (take.json and
+      each file's header, `EngineHandle::start_soundcheck`) runs on the caller's thread, under the
+      lock, as noted in the comment. The engine was not restructured.
+    - RED: engine, the new test failed at "played on from its end, it starts again" (left 4800,
+      right 0); its seek-rule assertions passed against the unfixed engine (the rule was right) and
+      were shown able to fail by a mutation (`seek` clearing `paused`: "a paused take stays paused",
+      Playing vs Paused), then restored. UI: 3 of 459 failed against the unfixed controller and fake
+      (the two controller interleaving tests: the move during Stop answered "The soundcheck did not
+      move: no soundcheck is playing."; busy null instead of "move"; the fake's resume at the end
+      said "playing from 0:03"). Desktop: 2 of 250 failed (`start_refusal` as `to_string` said "stop
+      it before recording"; the folder check saw the engine's lock held).
+    - GREEN: server unit tests 433 -> 434 (the new test 5 runs green); desktop 248 -> 250, `cargo
+      check --all-targets` clean; UI 456 -> 459. No browser preview (the screen's markup did not
+      change; the controller is tested without a DOM).
+    - Commits: 3621242 (engine and fake, 140 lines), 1782a1a (record controller, 113 lines),
+      07dd529 (desktop, 114 lines).
 - [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
+  - Docs: `PRD.md` (version 0.3; recording leaves "out of scope", which now names editing takes and
+    a resampler for the local output; RF13 local mix, RF14 multitrack recording, RF15 virtual
+    soundcheck, RF16 the Record screen; the float engine and the recorder under technical
+    decisions; kept in Spanish, the PRD's language) and `apps/desktop/README.md` (three screens;
+    Local mix, Recording and Virtual soundcheck sections: where takes go, folder and file naming,
+    what a take folder holds, formats, disk estimate, disk error and crash behaviour, the
+    soundcheck's limits). Commit: this commit.
+  - Remaining: live test with the user, covering
+    - the local output on the Volt under WASAPI, and under ASIO only if the user picks it (the
+      driver's own outputs listed, the kept output reopened at start);
+    - the drift and underrun counters over a long take;
+    - a real take recorded from the Volt while the Galaxy S23 listens (files, `take.json`,
+      markers, the takes list, Open folder);
+    - the soundcheck of that take with the phone's mix (it hears the take as live, Back to live
+      inputs returns at once);
+    - disk-full behaviour (optional).
 
 ## Progress
 
@@ -742,7 +797,13 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   work unit (4a48c81). Next review base: 4cbdbb9.
 - T6b done in five work units: 4a48c81, 5f3cde5, c6c02ae, f178fa7 and the screen commit; all after
   4cbdbb9.
+- T6b was reviewed in two parts, both approved and acknowledged: review-a1f8d7626e4420c8
+  (4cbdbb9..c6c02ae) and review-70fc9a647ac6de25 (c6c02ae..ee89b0c). Their four findings (the
+  fake's seek of a take at its end, moves skipping the transport's guard, the recording refusal's
+  words untested through the boxed error, the take folder checked under the engine's lock) are
+  fixed by T6b-fix (3621242, 1782a1a, 07dd529). Next review base: ee89b0c.
+- T6b-fix and the T7 docs commit are pending review in the slice from ee89b0c.
 
 ## Next step
 
-T7.
+T7's live test with the user (see T7's "Remaining").

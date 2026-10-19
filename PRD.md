@@ -1,4 +1,4 @@
-Versión 0.2, ajustada para una primera validación técnica realizada por una sola persona, con 1 a 3 horas de trabajo por noche.
+Versión 0.3 (agrega mezcla local, grabación multipista y soundcheck virtual), ajustada para una primera validación técnica realizada por una sola persona, con 1 a 3 horas de trabajo por noche.
 
 # PRD: Sistema de monitoreo personal inalámbrico (nombre provisional: _MixLink_)
 
@@ -17,7 +17,7 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 
 - Procesamiento avanzado (EQ, compresión, reverb por músico).
 - Control de la mezcla principal de la consola.
-- Grabación multipista.
+- Edición o recorte de tomas grabadas, y remuestreo de la salida local (la grabación multipista y el soundcheck virtual sí entran en v1: RF13 a RF16).
 - Transmisión por internet; v1 funciona solo en red local.
 - Escalado a 10-16 músicos antes de validar el flujo con 1-2 dispositivos.
 
@@ -39,6 +39,10 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 - RF6. Descubrimiento automático (mDNS) y código QR para conectar.
 - RF7. Guardar y cargar presets de sesión y de mezcla.
 - RF12. Permitir al ingeniero bloquear canales y establecer límites de volumen por músico.
+- RF13. Mezcla local: una mezcla propia del ingeniero, editable como cualquier otra, que suena en una salida de la computadora (ninguna por defecto). Con ASIO solo se ofrecen las salidas del mismo driver; con WASAPI, cualquier salida, compensando la deriva de reloj con relleno o descarte de muestras.
+- RF14. Grabación multipista mientras suena el show: cada entrada armada a su propio archivo WAV (un par enlazado en estéreo, y la mezcla local si se pide), en 24 bits enteros o 32 bits flotante a 48 kHz, RF64 por encima de 4 GB y cabeceras refrescadas para que un corte deje archivos legibles. Una carpeta por toma con su `take.json` (pistas, inicio, marcadores, muestras perdidas), marcadores durante la toma y estimación del tiempo de disco restante. No se cambia de dispositivo mientras se graba.
+- RF15. Soundcheck virtual: reproducir una toma dentro del mezclador en lugar de las entradas en vivo, con pausa, búsqueda, bucle y vuelta inmediata a las entradas. Solo tomas de 48 kHz cuyas pistas encajen en las entradas y pares actuales; mientras suena no se graba ni se cambia de dispositivo.
+- RF16. Pantalla de grabación en la app de escritorio: transporte, una pista por entrada con armado, medidor y forma de onda, lista de tomas, ajustes (carpeta, formato, mezcla local) y la tarjeta del soundcheck virtual.
 
 **Apps móviles (Swift y Kotlin)**
 
@@ -59,6 +63,8 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 
 - **Transporte:** UDP unicast con números de secuencia y buffer anticipado adaptativo.
 - **Códec:** PCM en v1; Opus con tramas de 2,5 a 5 ms como opción para redes saturadas.
+- **Audio interno:** flotante de 32 bits a 48 kHz desde la captura; la conversión a 16 bits ocurre solo al enviar a los celulares, así que la grabación conserva los 24 bits de la entrada. Las entradas a 96 o 192 kHz pasan por un filtro antialias antes de diezmar.
+- **Grabación:** escritor WAV/RF64 propio; el audio va a disco en un hilo aparte por un búfer sin bloqueos, y si el búfer se llena se descartan y cuentan muestras sin bloquear nunca el audio.
 - **Audio móvil:** AVAudioEngine en iOS y Oboe/AAudio en Android.
 - **Control:** WebSocket para faders, nombres y estado.
 - **Red:** el cuello de botella con 10+ clientes es el WiFi, no la CPU. Se recomienda un router o AP dedicado en 5 GHz, y varios puntos de acceso para grupos grandes. La app debe avisar de redes inadecuadas.

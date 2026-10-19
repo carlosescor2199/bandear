@@ -114,6 +114,40 @@ class ControlChannelTest {
         assertTrue(events.errors.isEmpty())
     }
 
+    // The hold the desk's delayed redundant copies need.
+
+    @Test
+    fun aRedundancyMessageHandsOnTheHoldWithNothingSentBack() {
+        val socket = openChannel()
+        val sent = socket.sent.size
+
+        socket.receive("""{"type":"redundancy","delay_blocks":2}""")
+        socket.receive("""{"type":"redundancy","delay_blocks":0}""")
+        socket.receive("""{"type":"redundancy","delay_blocks":4,"later":true}""")
+
+        assertEquals(listOf(2, 0, 4), events.holds)
+        assertEquals(sent, socket.sent.size)
+        assertTrue(events.errors.isEmpty())
+    }
+
+    @Test
+    fun aRedundancyMessageThePhoneCannotUseIsIgnored() {
+        val socket = openChannel()
+
+        for (unusable in listOf(
+            """{"type":"redundancy"}""",
+            """{"type":"redundancy","delay_blocks":-1}""",
+            """{"type":"redundancy","delay_blocks":5}""",
+            """{"type":"redundancy","delay_blocks":1.5}""",
+            """{"type":"redundancy","delay_blocks":"2"}""",
+        )) {
+            socket.receive(unusable)
+        }
+
+        assertTrue(events.holds.toString(), events.holds.isEmpty())
+        assertTrue(events.errors.isEmpty())
+    }
+
     @Test
     fun aPlaybackMessageThePhoneCannotUseIsIgnored() {
         val socket = openChannel()
@@ -457,6 +491,7 @@ class ControlChannelTest {
         val errors = mutableListOf<String>()
         val details = mutableListOf<List<ChannelInfo>?>()
         val buffers = mutableListOf<Int>()
+        val holds = mutableListOf<Int>()
         var acknowledged = 0
 
         override fun onOpened() = Unit
@@ -481,6 +516,10 @@ class ControlChannelTest {
 
         override fun onPlaybackBuffer(fixedMs: Int) {
             buffers += fixedMs
+        }
+
+        override fun onRedundancyHold(holdPackets: Int) {
+            holds += holdPackets
         }
 
         override fun onClosed() = Unit

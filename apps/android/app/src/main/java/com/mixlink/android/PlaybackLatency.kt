@@ -122,6 +122,8 @@ object PlaybackLatency {
      *   unknown (0) the buffer asked of it ([cushionMs]: [cushionPackets] packets of [packetFrames]
      *   frames); not measured (`NaN`) before the first packet sized it or while no track set the
      *   rate (null).
+     *   The [holdPackets] held back for delayed redundant copies ([ReorderHold]) count in it too: they
+     *   are audio held back before playing, as the track's buffer is.
      * - The backlog is the audio queued now ([backlogMs]): the [framesWritten] past the
      *   [presentedFrame] the track's timestamp read; not measured (`NaN`) when there is no track or
      *   its timestamp could not be read ([timestampRead] false). A track always has its rate, so a
@@ -135,14 +137,18 @@ object PlaybackLatency {
         framesWritten: Long,
         presentedFrame: Long,
         appliedBufferFrames: Int = 0,
+        holdPackets: Int = 0,
     ): ReportExtras {
         val rate = playbackRate ?: 0
+        val track = if (appliedBufferFrames > 0 && packetFrames > 0 && rate > 0) {
+            appliedBufferFrames * 1000.0 / rate
+        } else {
+            cushionMs(packetFrames, cushionPackets, rate)
+        }
+        // NaN stays NaN: no packet, no cushion, held or not.
+        val held = if (holdPackets > 0) cushionMs(packetFrames, holdPackets, rate) else 0.0
         return ReportExtras(
-            cushionMs = if (appliedBufferFrames > 0 && packetFrames > 0 && rate > 0) {
-                appliedBufferFrames * 1000.0 / rate
-            } else {
-                cushionMs(packetFrames, cushionPackets, rate)
-            },
+            cushionMs = track + held,
             backlogMs = if (timestampRead) backlogMs(framesWritten, presentedFrame, rate) else Double.NaN,
         )
     }

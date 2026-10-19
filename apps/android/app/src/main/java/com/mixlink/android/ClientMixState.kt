@@ -107,6 +107,14 @@ internal class ClientMixState {
      * It is never stored: a session starts on Auto and the server sends it again on registering.
      */
     @Volatile var deskBufferMs = PlaybackLatency.DESK_BUFFER_AUTO
+
+    /**
+     * The packets the receive loop holds back so a delayed redundant copy can fill its lost
+     * original's gap (`redundancy`, see [ReorderHold]): 0 to [MAX_HOLD_PACKETS], 0 for none. The
+     * control thread writes it, the receive loop follows it. Never stored: a session starts with
+     * none and the server sends it again on registering.
+     */
+    @Volatile var redundancyHoldPackets = 0
 }
 
 /**

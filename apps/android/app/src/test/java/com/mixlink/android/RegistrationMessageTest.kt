@@ -67,11 +67,16 @@ class RegistrationMessageTest {
         val announced = JSONObject(buildRegisterMessage("Ana", 50000)).getJSONArray("capabilities")
 
         assertEquals(
-            listOf("stats.v2", "playback.buffer", "redundancy.recovered"),
+            listOf("stats.v2", "playback.buffer", "redundancy.recovered", "redundancy.hold"),
             List(announced.length()) { announced.getString(it) },
         )
         assertEquals(
-            listOf(CAPABILITY_STATS_V2, CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_RECOVERED),
+            listOf(
+                CAPABILITY_STATS_V2,
+                CAPABILITY_PLAYBACK_BUFFER,
+                CAPABILITY_REDUNDANCY_RECOVERED,
+                CAPABILITY_REDUNDANCY_HOLD,
+            ),
             CLIENT_CAPABILITIES,
         )
     }

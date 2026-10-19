@@ -38,11 +38,17 @@ board "Network and system".
 - **Capabilities**: a phone announces what it supports in an optional `capabilities` list on
   `register`; old servers ignore unknown fields. The server only sends new message types to phones
   that announced them, and the desk shows "needs a newer app" otherwise. Old phones keep working.
-- **Redundancy**: the same datagram is sent again one or more blocks later (a delay offset, so a
-  Wi-Fi burst does not take both copies). The PMON wire format stays byte-identical: old phones
-  already drop duplicates by sequence (`SequenceTracker.kt:53-56`). Per musician on/off; costs
-  double bandwidth for that musician. The held copy is preallocated; the network sink keeps its
-  no-allocation guarantee.
+- **Redundancy (user decision, 2026-10-19: "immediate copy + optional delay")**: the same datagram
+  is sent twice, per musician on/off, double bandwidth for that musician. By default the copy goes
+  right after its original (delay 0): no added latency, and every phone takes it (a lost
+  original's copy arrives before the next packet and plays in order; a second copy is dropped as a
+  duplicate), which covers isolated losses. Optionally the copy goes 1-4 blocks later, so a Wi-Fi
+  burst must last that long to take both: only for a phone that announces `redundancy.hold`, which
+  the server tells the delay (`{"type":"redundancy","delay_blocks":N}`) and which then holds packets
+  back that many blocks so a late copy fills its gap, at that much latency for that musician; the
+  desk refuses a delay for any other phone ("needs a newer app"). The PMON wire format stays
+  byte-identical. Delayed copies are held in a store preallocated off the engine thread, immediate
+  ones are the datagram just sent; the network sink keeps its no-allocation guarantee.
 - **Log file**: an own small writer, no new crate. Server and desktop lines go through one sink to
   `<app log dir>/mixlink.log` with size-based rotation (a few files of a few MB) and still to
   stderr in development. A line is timestamped and tagged by area.
@@ -501,8 +507,9 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     can do that, so reordering can inflate it slightly; a second copy, or one older than the window,
     is not counted, and a new stream forgets the window. `LinkStatsAccumulator.poll(...,
     cumulativeRecovered)` reports the difference per interval, as underruns.
-  - Open (product decision, before the live test): the Android player plays packets as they arrive,
-    so a copy that fills a gap always comes after newer audio was played and is still dropped: today
+  - Closed by T7b (the user chose "immediate copy + optional delay"). Was open: the Android player
+    plays packets as they arrive, so a copy that fills a gap always comes after newer audio was
+    played and is still dropped: today
     redundancy recovers no audio on Android, and `recovered` counts the copies that would have
     filled a gap (they stay in `packets_lost`; `protocol.rs` says so now). Recovering them needs the
     phone to hold newer packets while copies are arriving (up to the copy delay, which its cushion
@@ -531,6 +538,88 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     `feat(desktop): set redundancy per musician` (+725/-7); a2eead1 `feat(desktop-ui): redundancy
     toggle and recovered packets` (+703/-24); this commit `feat(android): report packets a
     duplicate recovered`.
+- [x] T7b (redundancy that prevents dropouts; user decision "immediate copy + optional delay").
+  Route: delegated writer (trigger: 2+ non-trivial files on every layer: network sink, protocol,
+  registry, engine, control server, desktop command and DTO, redundancy view, table, screen,
+  console, fake bridge, Android player, a new reorder hold, control channel and view model).
+  - Engine: `Redundancy::On { delay_blocks }` takes 0-4, 0 by default
+    (`MIN/DEFAULT_REDUNDANCY_DELAY_BLOCKS = 0`): a delay of 0 sends the datagram just sent again
+    right after it in the same block's send loop (no store, `HeldCopies::new(0)` holds nothing);
+    1-4 as before. `Redundancy::hold_blocks()` is the hold a phone needs (the delay; 0 off or
+    immediate). The no-allocation test runs with one phone at delay 2 and one at delay 0.
+  - Wire (documented in `protocol.rs`, `redundancy_message`): server to phone
+    `{"type":"redundancy","delay_blocks":N}`, N 0-4, 0 = no hold (off or immediate copies); sent
+    only to a phone that announced `redundancy.hold` (`CAPABILITY_REDUNDANCY_HOLD`), on every
+    registration (after `playback`, none included) and on every change
+    (`EngineEvent::RedundancyChanged`, `Push::Redundancy`; a lagged feed pushes it too). No ack.
+  - Engine gate: `EngineHandle::set_redundancy` sets a delay > 0 only for a phone that announced
+    `redundancy.hold`; any other musician answers `RedundancyOutcome::NeedsHold` and nothing changes
+    (`RedundancySetting.outcome`). Immediate copies are set for anyone. `replace_redundancies`
+    announces the hold-capable phones whose hold changed; a delay kept in a session for a phone
+    without the hold is put in force as kept (its copies are dropped as duplicates, as before T7b).
+  - `recovered` (protocol.rs, LinkStats.kt, ReorderHold.kt): packets played after filling a gap,
+    each arriving for the first time after a newer one while the phone held that newer one back;
+    they count in `packets_received`, not `packets_lost`. A late packet not played, and an immediate
+    copy (it arrives in order and cannot be told from its original), are never counted.
+  - Hold reporting: decided to count it in `stats.cushion_ms` (audio held back before playing, as
+    the track's buffer is: `PlaybackLatency.reportExtras(holdPackets)`), so the Buffer cell's "plays
+    X ms" and the cushion chart show the real latency; no new stat.
+  - Desktop: command `set_musician_redundancy(musicianKey, on, delayBlocks?)` takes 0-4, 0 when
+    absent; outcome `set`, `unsupported` (a delay for a phone without the hold: "needs a newer app",
+    nothing changed or saved, `redundancy` null, bandwidth factor 1) or `invalid`; `minDelayBlocks`
+    0, `defaultDelayBlocks` 0. The row gains `redundancyHoldSupported`. Sessions keep
+    `{ "delayBlocks": 0 }` like any delay (absent reads as 0).
+  - UI: the Redundancy cell shows, while on, a Copy select: "Copy: immediate" and "Copy: N blocks
+    later (+X ms)", the cost from the engine's block (`blockMsOf(captureFormat)`: Fixed(n) at the
+    device rate, else 256 frames at 48 kHz); for a phone without the hold the delays are disabled
+    with ", needs a newer app" and a note "Delayed copies: needs a newer app". Cost line "2×
+    bandwidth, no added latency" or "2× bandwidth, +10.7 ms latency on this phone"; for immediate
+    copies the recovered line says "Recovered packets are counted for delayed copies only". Outcome
+    words with the latency. Event `musician-redundancy { address, key, on, delayBlocks }`; the fake
+    mirrors the range, the default and `unsupported`, Bass announces `redundancy.hold`, immediate
+    copies save three in four losses for any phone (never counted), delayed ones only for a phone
+    that holds (counted, and the hold added to its cushion).
+  - Android: `redundancy.hold` in `CLIENT_CAPABILITIES`; `parseRedundancyHold` (a whole number 0-4,
+    anything else ignored) to `ClientMixState.redundancyHoldPackets` (0 at every session start).
+    `ReorderHold<T>` replaces `SequenceTracker` in front of the AudioTrack write: preallocated slots
+    (`MAX_HOLD_PACKETS + 2` references, sequences, late flags), nothing allocated per packet (no
+    boxing). A packet is played in sequence order once the newest is `holdPackets` ahead of it; a
+    missing one is waited for until the newest is more than `holdPackets` ahead (its copy can no
+    longer come), then skipped and counted once as lost before the next packet played; duplicates
+    and packets already played or given up on are dropped; a sequence 256 or more behind the newest
+    starts a new stream (what the old one left held is dropped); a long jump ahead plays what was
+    held first; a receive timeout releases everything held; a shorter hold plays what is now due.
+    With a hold of 0 it is exactly the old tracker (its tests ported). The receive loop reads the
+    hold once per wake-up, offers each arrival (jitter measured at arrival) and plays every packet
+    `next()` answers (stats, track, cushion at play).
+  - RED: server, with `redundancy_hold` stubbed, 4 of 27 filtered tests failed (delay 0 refused,
+    hold, empty store, immediate copy), then with the hold support and push stubbed 2 of 507 failed
+    (the engine gate and the control push; the feed and replace tests passed, written with their
+    code). Desktop, with the outcome unmapped and the row field false, 2 of 303 failed. UI: the
+    suite failed to load against the old `redundancy.js` (missing exports); the pure logic was
+    written before its tests ran, then 4 of 10 failed before the rows, fake and console were wired.
+    Android, with compile-only stubs, 22 of 518 failed (18 hold, control, registration, view model,
+    cushion report; the "unusable message is ignored" guard passed).
+  - Browser check (`desktop-ui`, `?fake#/network`): Bass switched on showed "Copy: immediate", "2×
+    bandwidth, no added latency", "Recovered packets are counted for delayed copies only" and
+    "Bass's audio is now sent twice, each copy right after its original: their bandwidth doubles
+    (×2), with no added latency."; Copy "2 blocks later (+10.7 ms)" showed "2× bandwidth, +10.7 ms
+    latency on this phone", packets recovered and "... their phone plays 10.7 ms later."; Keys on
+    showed delays 1-4 disabled with ", needs a newer app" and "Delayed copies: needs a newer app".
+    No console errors.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 507 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 303 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 532 passed; `gradle -p apps/android :app:testDebugUnitTest
+    --max-workers=2 --no-daemon`: 506 tests, 0 failures (12 tracker tests removed with it, 23
+    added); `:app:assembleDebug`: BUILD SUCCESSFUL, APK
+    `apps/android/app/build/outputs/apk/debug/app-debug.apk` (not installed).
+  - To confirm in the live test (T9): a delayed copy filling a real gap on the S23, and the hold's
+    latency against the cushion.
+  - Commits: 0233252 `feat(engine): send the redundant copy right away by default` (+144/-50);
+    c0c3f24 `feat(server): tell a capable phone how long to hold for copies` (+406/-41); 0d4ea3f
+    `feat(desktop): redundancy delay with a latency cost` (+516/-157); this commit
+    `feat(android): hold packets so a late copy can fill its gap`.
 - [ ] T8 (demo source): generator reader, engine start without a capture device, audio-setup
   entry. Route: delegated writer.
 - [ ] T9 (close): PRD update, docs, live test with the S23. Route: inline or writer.
@@ -576,6 +665,8 @@ per reviewed slice, only with the user's approval.
   and T6, approved and acknowledged, with four findings fixed in T6-fix. Next review base a5cfa2c.
 - T6-fix and T7 done (redundancy), seven commits. Open before the live test: the Android player
   cannot play a late copy yet (see T7).
+- The user chose "immediate copy + optional delay" for redundancy; T7b done, four commits, closing
+  T7's open note. Next review base stays a5cfa2c: T6-fix, T7 and T7b are reviewed together.
 
 ## Next step
 

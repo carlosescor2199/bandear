@@ -33,6 +33,13 @@
 //              were listed, and why the last listing failed. A run's end keeps them.
 //   sessionNotice what the desk said when it opened its session (a damaged part set aside, a newer
 //              session left alone, labels imported), or null.
+//   localMix   the engineer's local mix (the status's `localMix`, see local-mix.js), or null while
+//              no engine runs. It is opened, edited and answered like a musician's mix under the
+//              id LOCAL_MIX, which no musician's address can be: `selected`, `pending` and
+//              `mixError` take it as they take an address. It has no level cap, limit or locks, so
+//              edits of those are never kept for it.
+//   outputs    { list, error }: the output devices the running engine offers for the local mix
+//              (`output_devices`), null until listed; a run's end forgets them.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -54,9 +61,27 @@
 import { pairUnits } from "./channels.js";
 import { DEFAULT_AUDIO, audioChoice, restoredAudio } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
-import { MIX_FIELDS, applyEdits, mixFromDto, parseEditKey, settleEdits } from "./mix.js";
+import {
+  ENGINEER_FIELDS,
+  MIX_FIELDS,
+  applyEdits,
+  mixFromDto,
+  parseEditKey,
+  settleEdits,
+} from "./mix.js";
 
 export const PHASES = Object.freeze(["idle", "starting", "running", "stopping", "stopped", "error"]);
+
+/**
+ * The id of the engineer's local mix (the desktop's `LOCAL_MIX_ID`): its tab, its pending edits
+ * and its `mix-changed` event. A musician's address always has a port, so it is never this.
+ */
+export const LOCAL_MIX = "local";
+
+/** The fields the local mix has no use for: a phone's level cap and the engineer's controls. */
+const NOT_LOCAL = new Set(["maxLevelPercent", ...ENGINEER_FIELDS]);
+
+const NO_OUTPUTS = Object.freeze({ list: null, error: null });
 
 /** The phases in which the engine of the current run is gone or being replaced. */
 const RUN_ENDING_PHASES = new Set(["idle", "starting", "error"]);
@@ -80,6 +105,8 @@ export const initialState = Object.freeze({
   presets: null,
   sessions: Object.freeze({ list: null, error: null }),
   sessionNotice: null,
+  localMix: null,
+  outputs: NO_OUTPUTS,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -94,8 +121,17 @@ export const actions = Object.freeze({
    */
   engine: (phase, error = null) => ({ type: "engine", phase, error }),
   select: (address) => ({ type: "select", address }),
-  /** A `mix-changed` payload: `{ run, address, origin, mix }`. */
-  mixChanged: ({ run, address, origin, mix }) => ({ type: "mix-changed", run, address, origin, mix }),
+  /**
+   * A `mix-changed` payload: `{ run, address, origin, mix }` for a musician's mix, or `{ run, id,
+   * origin, mix }` with the id LOCAL_MIX for the engineer's local mix.
+   */
+  mixChanged: ({ run, address, id, origin, mix }) => ({
+    type: "mix-changed",
+    run,
+    address: id === LOCAL_MIX ? LOCAL_MIX : address,
+    origin,
+    mix,
+  }),
   /** Local edits to one musician's mix, keyed as `editKey` makes them. */
   mixEdit: (address, edits) => ({ type: "mix-edit", address, edits }),
   /** The engine answered a `set_mix` that carried the edits `sent` with the mix it stored. */
@@ -122,6 +158,10 @@ export const actions = Object.freeze({
   audioNotice: (notice) => ({ type: "audio-notice", notice }),
   /** The input devices listed for `host`, or the reason they could not be listed. */
   devices: (host, list, error = null) => ({ type: "devices", devices: { host, list, error } }),
+  /** The output devices the running engine offers for the local mix (`output_devices`). */
+  outputs: (list) => ({ type: "outputs", outputs: { list, error: null } }),
+  /** The output devices could not be listed, for `message`; the last list known stays. */
+  outputsFailed: (message) => ({ type: "outputs-failed", message }),
   /** The engineer's mix presets as the desk answered them. */
   presets: (presets) => ({ type: "presets", presets }),
   /** The engineer's saved sessions as the desk listed them. */
@@ -252,6 +292,16 @@ function isNewer(incoming, current) {
   return incoming.revision > current.revision;
 }
 
+// The newer of the local mix a status carries and the copy the console has; null for a status
+// without one (a desk from before the local mix).
+function receivedLocalMix(state, status) {
+  if (!status.localMix) {
+    return null;
+  }
+  const incoming = mixFromDto(status.localMix);
+  return state.localMix && !isNewer(incoming, state.localMix) ? state.localMix : incoming;
+}
+
 function receiveStatus(state, status) {
   if (!isLiveRun(state, status.run)) {
     return state;
@@ -262,7 +312,12 @@ function receiveStatus(state, status) {
     const known = musicianByAddress(state, musician.address);
     return known && !isNewer(musician.mix, known.mix) ? { ...musician, mix: known.mix } : musician;
   });
+  const localMix = receivedLocalMix(state, status);
+  // Every mix the console can open: the musicians' addresses, and the local mix's id.
   const addresses = new Set(musicians.map((musician) => musician.address));
+  if (localMix) {
+    addresses.add(LOCAL_MIX);
+  }
   let phase = status.stopped ? "stopped" : "running";
   if (state.engine.phase === "stopping") {
     phase = "stopping";
@@ -284,6 +339,7 @@ function receiveStatus(state, status) {
       run: status.run,
     },
     musicians,
+    localMix,
     selected: stays ? state.selected : (musicians[0]?.address ?? null),
     departed,
     pending: settleLayout(onlyListed(state.pending, addresses), state.engine.status, status),
@@ -309,6 +365,8 @@ function setPhase(state, { phase, error }) {
       ...state,
       engine: { phase, error, status: null, run: null, endedRun: Math.max(endedRun, run ?? 0) },
       musicians: [],
+      localMix: null,
+      outputs: NO_OUTPUTS,
       departed: null,
       pending: NO_EDITS,
       mixError: null,
@@ -334,16 +392,21 @@ function commandFailed(state, { action, message }) {
   };
 }
 
+// Whether the console has the mix `address` names: a listed musician's, or the local mix.
 function isListed(state, address) {
-  return state.musicians.some((musician) => musician.address === address);
+  return mixOf(state, address) !== null;
 }
 
-// Takes `mix` for `address` when it is newer than the copy the console has; never goes back.
+// Takes `mix` for `address` (a musician's address, or LOCAL_MIX) when it is newer than the copy
+// the console has; never goes back.
 function offerMix(state, address, mix) {
-  const known = musicianByAddress(state, address);
+  const known = mixOf(state, address);
   const incoming = mixFromDto(mix);
-  if (!known || !isNewer(incoming, known.mix)) {
+  if (!known || !isNewer(incoming, known)) {
     return state;
+  }
+  if (address === LOCAL_MIX) {
+    return { ...state, localMix: incoming };
   }
   return {
     ...state,
@@ -351,6 +414,17 @@ function offerMix(state, address, mix) {
       musician.address === address ? { ...musician, mix: incoming } : musician,
     ),
   };
+}
+
+// The edits a mix keeps: all of them for a musician; for the local mix none of a level cap, a
+// limit or a lock, which it has no use for.
+function keptEdits(address, edits) {
+  if (address !== LOCAL_MIX) {
+    return edits;
+  }
+  return Object.fromEntries(
+    Object.entries(edits).filter(([key]) => !NOT_LOCAL.has(parseEditKey(key).field)),
+  );
 }
 
 function withPending(state, address, edits) {
@@ -364,14 +438,14 @@ function withPending(state, address, edits) {
 }
 
 function edit(state, address, edits) {
-  const keys = Object.keys(edits);
-  keys.forEach(parseEditKey);
-  if (keys.length === 0 || !isListed(state, address)) {
+  Object.keys(edits).forEach(parseEditKey);
+  const kept = keptEdits(address, edits);
+  if (Object.keys(kept).length === 0 || !isListed(state, address)) {
     return state;
   }
   return {
     ...state,
-    pending: withPending(state, address, { ...(state.pending[address] ?? NO_EDITS), ...edits }),
+    pending: withPending(state, address, { ...(state.pending[address] ?? NO_EDITS), ...kept }),
   };
 }
 
@@ -472,6 +546,10 @@ export function consoleReducer(state, action) {
       return { ...state, connection: action.connection };
     case "devices":
       return { ...state, devices: action.devices };
+    case "outputs":
+      return { ...state, outputs: action.outputs };
+    case "outputs-failed":
+      return { ...state, outputs: { ...state.outputs, error: action.message } };
     case "presets":
       return { ...state, presets: action.presets };
     case "sessions":
@@ -500,14 +578,28 @@ export function pendingEdits(state, address) {
   return state.pending[address] ?? NO_EDITS;
 }
 
-/** The mix a screen shows for `address`: the engine's mix with the pending edits on top. */
+/**
+ * The engine's mix `address` names: the musician's at that address, or the local mix for
+ * LOCAL_MIX; null when the console has none.
+ */
+export function mixOf(state, address) {
+  if (address === LOCAL_MIX) {
+    return state.localMix ?? null;
+  }
+  return musicianByAddress(state, address)?.mix ?? null;
+}
+
+/**
+ * The mix a screen shows for `address` (a musician's address, or LOCAL_MIX): the engine's mix
+ * with the pending edits on top.
+ */
 export function viewMix(state, address) {
-  const musician = musicianByAddress(state, address);
-  if (!musician) {
+  const mix = mixOf(state, address);
+  if (!mix) {
     return null;
   }
   const edits = state.pending[address];
-  return edits ? applyEdits(musician.mix, edits) : musician.mix;
+  return edits ? applyEdits(mix, edits) : mix;
 }
 
 /** The musicians whose link is a warning or bad, in the status's order. */

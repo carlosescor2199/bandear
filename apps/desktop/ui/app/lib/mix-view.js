@@ -2,7 +2,13 @@
 // screen's organisms only render these plain objects.
 
 import { balanceToPans, channelLabel, pairUnits, pansToBalance } from "./channels.js";
-import { musicianByAddress, musiciansNeedingAttention, viewMix } from "./console-state.js";
+import {
+  LOCAL_MIX,
+  musicianByAddress,
+  musiciansNeedingAttention,
+  viewMix,
+} from "./console-state.js";
+import { localTab } from "./local-mix.js";
 import {
   formatCaptureFormat,
   formatEngineerControlsSet,
@@ -46,6 +52,15 @@ export function topBarView(state) {
   };
 }
 
+/**
+ * The Mix screen's tabs: one per musician (musicianTabs), then the engineer's Local mix
+ * (localTab) while an engine runs.
+ */
+export function mixTabs(state) {
+  const local = localTab(state);
+  return local ? [...musicianTabs(state), local] : musicianTabs(state);
+}
+
 /** One tab per musician, in the engine's order: `{ address, label, link, selected }`. */
 export function musicianTabs(state) {
   return state.musicians.map((musician) => ({
@@ -84,7 +99,8 @@ export function followingOf(state, address) {
  * (channelLabel). A muted strip reads "muted", not only a duller fill. A channel's group is found
  * by id: two groups may share a name. `locked` says the engineer locked the strip for this
  * musician's phone (a pair when either side is; the engine locks both), and `lockText` says so in
- * words ("Locked" or "Unlocked").
+ * words ("Locked" or "Unlocked"). `lockable` is false for the engineer's local mix (LOCAL_MIX),
+ * which no phone plays, so it has no lock.
  */
 export function channelStrips(state, address) {
   const mix = viewMix(state, address);
@@ -95,6 +111,7 @@ export function channelStrips(state, address) {
   const groups = groupsWithTones(state);
   const channels = status.channels.slice(0, status.sourceChannels);
   const following = followingOf(state, address);
+  const lockable = address !== LOCAL_MIX;
   return pairUnits(channels)
     .filter(([first]) => !channels[first].hidden)
     .map((sides) => {
@@ -105,7 +122,7 @@ export function channelStrips(state, address) {
         : null;
       const stereo = second !== undefined;
       const muted = mix.channelMuted[index];
-      const locked = sides.some((side) => Boolean(mix.lockedChannels?.[side]));
+      const locked = lockable && sides.some((side) => Boolean(mix.lockedChannels?.[side]));
       return {
         index,
         sides,
@@ -121,6 +138,7 @@ export function channelStrips(state, address) {
         solo: mix.channelSolo[index],
         tone: muted ? "muted" : "default",
         readout: muted ? "muted" : formatPercent(mix.channelGains[index]),
+        lockable,
         locked,
         lockText: locked ? "Locked" : "Unlocked",
         following,
@@ -174,7 +192,8 @@ export function groupStrips(state, address) {
  * The musician's master: `{ volume, cap, limit, muted, readout, ceilingNote }`, or null without
  * that musician. `cap` is the phone's own level cap (the musician sets it too), `limit` the
  * engineer's limit for this musician (only the desk sets it); the engine plays at most the lower
- * of the two, which `ceilingNote` says in words.
+ * of the two, which `ceilingNote` says in words. The engineer's local mix (LOCAL_MIX) has neither:
+ * its `cap`, `limit` and `ceilingNote` are null and its readout is the level alone.
  */
 export function masterStrip(state, address) {
   const mix = viewMix(state, address);
@@ -182,6 +201,16 @@ export function masterStrip(state, address) {
     return null;
   }
   const level = mix.muted ? "muted" : formatPercent(mix.volumePercent);
+  if (address === LOCAL_MIX) {
+    return {
+      volume: mix.volumePercent,
+      cap: null,
+      limit: null,
+      muted: mix.muted,
+      readout: level,
+      ceilingNote: null,
+    };
+  }
   const limit = mix.engineerLimitPercent ?? 100;
   const ceiling = Math.min(mix.maxLevelPercent, limit);
   return {
@@ -199,7 +228,8 @@ export function masterStrip(state, address) {
 /**
  * Why the mix area has no strips, or null when it has some: `{ kind }` with kind "disconnected"
  * (with `message`; the console cannot hear the engine), "connecting", "stopped", "starting",
- * "stopping", "error" (with `message`) or "no-musicians".
+ * "stopping", "error" (with `message`) or "no-musicians" (unless the local mix is open: it plays
+ * with no phone here).
  */
 export function mixNotice(state) {
   const { phase, error } = state.engine;
@@ -218,6 +248,9 @@ export function mixNotice(state) {
   }
   if (phase === "error") {
     return { kind: "error", message: error };
+  }
+  if (state.selected === LOCAL_MIX && state.localMix) {
+    return null;
   }
   return state.musicians.length === 0 ? { kind: "no-musicians" } : null;
 }
@@ -253,9 +286,13 @@ function musicianMessages(state) {
   }
   let error = null;
   if (state.mixError) {
-    const musician = musicianByAddress(state, state.mixError.address);
-    const name = musician ? musicianLabel(musician) : state.mixError.address;
-    error = `A change to ${name}'s mix was not applied: ${state.mixError.message}.`;
+    const { address, message } = state.mixError;
+    const musician = musicianByAddress(state, address);
+    const whose =
+      address === LOCAL_MIX
+        ? "the local mix"
+        : `${musician ? musicianLabel(musician) : address}'s mix`;
+    error = `A change to ${whose} was not applied: ${message}.`;
   }
   let controls = null;
   if (state.controlsNotice) {

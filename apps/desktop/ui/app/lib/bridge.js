@@ -12,11 +12,17 @@
  * the engine run it belongs to; see `isLiveRun` in console-state.js.
  */
 export const EVENTS = Object.freeze({
-  /** About 30 a second: `{ run, channels: [peak], musicians: { address: { left, right } } }`. */
+  /**
+   * About 30 a second: `{ run, channels: [peak], musicians: { address: { left, right } }, local:
+   * { left, right } }`, `local` the peak of the engineer's local mix.
+   */
   meters: "meters",
   /** About 4 a second: the `engine_status` snapshot, with its `run`. */
   status: "status",
-  /** At once: `{ run, address, origin: "phone" | "desktop", mix }`. */
+  /**
+   * At once: `{ run, address, origin: "phone" | "desktop", mix }` for a musician's mix, and
+   * `{ run, id: "local", origin: "desktop", mix }` for the engineer's local mix.
+   */
   mixChanged: "mix-changed",
 });
 
@@ -60,6 +66,24 @@ export function createEngineApi(bridge) {
     setMusicianName: (address, name) => bridge.invoke("set_musician_name", { address, name }),
     /** `mix` is a partial `set_mix` request (see buildMixRequest); resolves to the whole mix. */
     setMix: (address, mix) => bridge.invoke("set_mix", { address, mix }),
+    /**
+     * Changes the engineer's local mix: `mix` as for setMix, without `maxLevelPercent` (the local
+     * mix has no level cap); resolves to the whole mix, which the desk keeps for the next start.
+     */
+    setLocalMix: (mix) => bridge.invoke("set_local_mix", { mix }),
+    /**
+     * The output devices the running engine offers for the local mix, `[{ name, channels }]`:
+     * under ASIO the input driver's own outputs, under WASAPI every output device. It rejects with
+     * no engine running.
+     */
+    outputDevices: () => bridge.invoke("output_devices"),
+    /**
+     * Plays the local mix on `output`, `{ device, firstChannel }` (the pair's first output,
+     * 0-based), or nowhere with null. Resolves to `{ output, localOutput, applied, saved, saveError
+     * }` (see formatLocalOutputSet); with no engine it is kept for the next start. An output the
+     * engine does not offer rejects, and the one in use keeps playing.
+     */
+    setLocalOutput: (output) => bridge.invoke("set_local_output", { output }),
     /**
      * Replaces the groups: the whole list in its order, `[{ id, name, channels }]` with 1-based
      * channels and no `id` for a new group. Resolves to `{ groups, applied, saved, saveError }`:

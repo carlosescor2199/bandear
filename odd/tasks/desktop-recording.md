@@ -199,9 +199,46 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     the full engine path with the network and local sinks makes (0, 0) over 1000 blocks with no
     output and with an output playing; desktop `cargo check --all-targets` clean.
     Commit: this commit.
-- [ ] T2b (local mix and output, desktop): session persistence of the local mix and the output
+- [x] T2b (local mix and output, desktop): session persistence of the local mix and the output
   choice, Tauri commands over the T2a API, the Local mix tab and the "Local mix out" select.
-  Route: delegated writer.
+  Route: delegated writer (writer and 2+ non-trivial files triggers).
+  - Session: a `local` section `{ mix, output }` (version 1): `mix` is a `SessionMix` (inputs in
+    channel order, group levels by group id, master volume and mute, never a cap), absent until
+    the local mix was changed; `output` is `{ device, firstChannel }` (0-based pair) or null. It
+    loads on its own (a damaged one is set aside); named sessions carry it.
+  - Commands (`commands/local.rs`): `set_local_mix(mix) -> MixDto` (as `set_mix`, `maxLevelPercent`
+    refused) applies under the engine lock, then saves by group id (a save failure is logged);
+    `output_devices()` needs a running engine; `set_local_output(output | null)` answers
+    `{ output, localOutput, applied, saved, saveError }` and with no engine keeps it for the next
+    start. Status gains `localMix` and `localOutput { device, firstChannel, state, reason,
+    underrunFrames, droppedFrames, notice }`; meters gain `local`; a local change goes out as
+    `mix-changed { run, id: "local", origin: "desktop", mix }` with no address.
+  - Start and load: the kept mix goes through the desk's path by group id, then the output opens
+    only if `output_devices()` offers that exact device and pair (under ASIO only the capture
+    driver's own); otherwise it stays off with `localOutput.notice` and never another device. A
+    snapshot saved while running keeps the engine's local mix; one without a local section leaves
+    the desk's own.
+  - UI: a "Local mix" tab last ("This computer · <output or no output>"), the same strips with no
+    lock, cap, limit or tools, through pending edits and the coalescer (`set_local_mix`); "Local
+    mix out" in the audio setup ("None (lowest load)" and each output pair), state and counters in
+    words, a stop and an unopened kept output as alerts; outputs listed again for every run. The
+    fake mirrors the rules (outputs, ASIO's own outputs only, refusals, start/load notice, regroup
+    and new pairs moving the local mix, meters, sessions).
+  - Blocked once on a corrupt tauri-build artifact (`out/capabilities.json` all NUL, from the
+    October bugcheck); the parent deleted it and touched the capabilities, with no `cargo clean`.
+  - RED: desktop by 8 mutations (session dropping `local` on read, no save after a local edit,
+    opening an output not offered, the notice not cleared, snapshots without the engine's local
+    mix, loads ignoring the local section, no local `mix-changed`, meters without `local`): 13 of
+    196 failed. UI: the module missing, then 16 of 23 new tests failing. The master-controls null
+    test was written after its change (no RED).
+  - GREEN: desktop tests 170 -> 176 (84ce3be) -> 196, `cargo check --all-targets` and `cargo build`
+    clean; UI tests 350 -> 375. Preview `?fake#/mix` and `#/network`: no console errors; tab, edit,
+    output choice and the tab's word checked.
+  - Follow-ups: save the local mix with a debounce (each coalesced fader step now writes the
+    session under the engine lock); live with the Volt: WASAPI OUTPUT 1/2 counters over a long run,
+    ASIO listing the Volt driver's own outputs and reopening the kept output at start, and a
+    WASAPI-kept output showing the notice and staying off under ASIO.
+  - Commits: 84ce3be (session), b70131d (commands, DTOs, events). Commit: this commit.
 - [ ] T3 (WAV/RF64 writer): pure, heavily tested writer for 24-bit and 32-bit float, mono and
   stereo, RF64 upgrade, crash-safe headers; and a reader for playback. Route: delegated writer.
 - [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
@@ -230,7 +267,9 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   skips) are fixed by T2a-fix. Next review base: f83180f.
   Live checks still owed for T7: an ASIO output on the Volt next to its capture (cpal opens both
   directions on one driver), and drift over a long WASAPI run.
+- T2b done in three work units: 84ce3be, b70131d and the UI commit. Next review base: f83180f
+  (T2a-fix and T2b not reviewed yet).
 
 ## Next step
 
-T2b.
+T3.

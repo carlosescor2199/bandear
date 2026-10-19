@@ -95,6 +95,14 @@ pub fn flush_local_mix(state: &DesktopState) {
     state.local_saver.flush();
 }
 
+/// The local section a start applies: the session's, with a local mix marked and not written yet
+/// (a fader moved just before the start) in it, read with the saver paused so no write lands in
+/// between. The marked mix stays marked and is written later.
+pub(super) fn kept_local(session: &SessionStore, saver: &LocalMixSaver) -> Option<SessionLocal> {
+    let paused = saver.pause();
+    with_pending(session.local(), paused.pending())
+}
+
 /// The session's local section with `pending`, a local mix marked and not written yet, in it.
 pub(super) fn with_pending(
     local: Option<SessionLocal>,
@@ -650,6 +658,68 @@ mod tests {
             "the engine took nothing"
         );
         assert_eq!(session.local(), None);
+    }
+
+    #[test]
+    fn a_start_right_after_a_fader_edit_plays_the_edit_and_still_keeps_it() {
+        let session =
+            std::sync::Arc::new(SessionStore::open(&session_directory("start-after-edit")));
+        session
+            .set_local_mix(SessionMix {
+                channels: vec![channel(80)],
+                groups: BTreeMap::new(),
+                volume_percent: 30,
+                muted: false,
+            })
+            .expect("kept");
+        session
+            .set_local_output(Some(output(VOLT, 2)))
+            .expect("kept");
+        let running_now = shared(Some(two_inputs_two_groups()));
+        let lock_free = std::sync::Arc::default();
+        let saver = saver_into(&session, &running_now, &lock_free);
+        edit_local_mix(
+            &running_now,
+            &saver,
+            MixUpdateRequest {
+                volume_percent: Some(85),
+                ..MixUpdateRequest::default()
+            },
+        )
+        .expect("taken");
+
+        // The engine restarts before the saver wrote the edit.
+        let kept = super::kept_local(&session, &saver).expect("a local section");
+        let mut started = two_inputs_two_groups();
+        let applied = apply_kept_local(&mut started, &kept);
+
+        assert_eq!(
+            started
+                .updates
+                .last()
+                .and_then(|update| update.volume_percent),
+            Some(85),
+            "the new engine plays the edit, not the session's older mix"
+        );
+        assert_eq!(applied.notice, None);
+        assert_eq!(started.output, playing(VOLT, 2), "with the kept output");
+        assert_eq!(
+            session
+                .local()
+                .and_then(|local| local.mix)
+                .map(|mix| mix.volume_percent),
+            Some(30),
+            "not written yet"
+        );
+        saver.flush();
+        assert_eq!(
+            session
+                .local()
+                .and_then(|local| local.mix)
+                .map(|mix| mix.volume_percent),
+            Some(85),
+            "and still kept afterwards"
+        );
     }
 
     #[test]

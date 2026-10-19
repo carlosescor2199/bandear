@@ -21,7 +21,7 @@ use personal_monitoring::{
 };
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
-use self::local::{apply_kept_local, with_pending, LocalEngine};
+use self::local::{apply_kept_local, kept_local, with_pending, LocalEngine};
 use crate::dto::{
     locked_table, session_key, AudioSettingsRequest, CaptureFormatDto, ChannelRequest,
     ChannelsSetDto, EngineStateDto, EngineStatusDto, EngineerControlsRequest,
@@ -120,6 +120,20 @@ impl DesktopState {
     /// The current engine run: the run of the engine now running, or of the last start attempt.
     pub fn run(&self) -> u64 {
         self.run.load(Ordering::SeqCst)
+    }
+}
+
+/// What the crate's tests, which run without an engine, need of the local mix's keeping.
+#[cfg(test)]
+impl DesktopState {
+    /// Marks `mix` to be kept, as a local mix edit does.
+    pub(crate) fn mark_local_mix(&self, mix: SessionMix) {
+        self.local_saver.mark(mix);
+    }
+
+    /// The local section the session keeps now.
+    pub(crate) fn kept_local(&self) -> Option<SessionLocal> {
+        self.session.local()
     }
 }
 
@@ -408,12 +422,9 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_channels = session_channels(&state.session);
     let saved_controls = session_engineer_controls(&state.session);
     let saved_mirrors = session_mirrors(&state.session);
-    // With the saver paused, so a local mix marked and not written yet is read with the session
-    // (it stays marked, and is written later).
-    let saved_local = {
-        let paused = state.local_saver.pause();
-        with_pending(state.session.local(), paused.pending())
-    };
+    // A local mix marked and not written yet is read with the session (it stays marked, and is
+    // written later).
+    let saved_local = kept_local(&state.session, &state.local_saver);
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;

@@ -258,9 +258,52 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     no throttle, a failure logged every time): 4 of 203 failed, one per mutation. UI: 7 of 31 new
     tests failing before the change. GREEN: desktop 196 -> 203 (3 runs), `cargo build` clean; UI
     375 -> 382; preview with no console errors (two quick choices end on the last one).
-    Commits: 1decd1d (backend). Commit: this commit.
-- [ ] T3 (WAV/RF64 writer): pure, heavily tested writer for 24-bit and 32-bit float, mono and
-  stereo, RF64 upgrade, crash-safe headers; and a reader for playback. Route: delegated writer.
+    Commits: 1decd1d (backend), 9ce6711 (UI).
+  - [x] T2b-fix2 (review-a198f89aefeca3bf findings): the output-choice lane never stays rejected
+    (R3-001): every choice settles with an answer, the lane catches, a refusal, an answer that
+    cannot be read and a status that cannot be read are said in the message, and a later choice
+    still goes out. Seam tests (R3-002): a start right after a fader edit plays the edit through
+    `kept_local` (`with_pending`) and the edit is still written later; the exit hook is
+    `on_run_event`, which writes the waiting local mix on `RunEvent::Exit` only.
+    RED: UI, the 2 new lane tests failing (the status failure unsaid; an unreadable answer said as
+    "not changed"); desktop, by 2 mutations (the start ignoring the waiting edit, exit not
+    flushing): 2 of 205 failed. GREEN: desktop 203 -> 205 (3 runs), `cargo build` clean; UI
+    382 -> 384. Commit: this commit.
+- [x] T3 (WAV/RF64 writer): pure, heavily tested writer for 24-bit and 32-bit float, mono and
+  stereo, RF64 upgrade, crash-safe headers; and a reader for playback. Route: delegated writer
+  (preparation trigger: the format research and the module are one write).
+  - API (`wav.rs`, re-exported from the crate): `WavSpec { channels, sample_rate, format }` with
+    `bytes_per_frame()` and `bytes_per_second()`; `SampleFormat::{Int16, Int24, Int32, Float32}`
+    (the writer records `Int24` and `Float32` and refuses the others, the reader reads all four);
+    `WavWriter` with `create(path, spec)` (never overwrites a file), `new(target, spec)`,
+    `write_frames(&[f32])` (whole interleaved frames), `refresh()`, `sync()`, `finish() -> target`
+    and `frames()`, over any `WavTarget` (`File`, whose `sync` is `sync_data`, or
+    `Cursor<Vec<u8>>`); `WavReader` with `open(path)`, `new(source)`, `spec()`, `frames()`,
+    `position()`, `read_frames(&mut [f32]) -> frames` and `seek(frame)`;
+    `WavError::{Io, Malformed, Unsupported, InvalidInput, Stopped}`. No panics, no new crates.
+  - Header: always 104 bytes: `RIFF`/`WAVE`, a 28-byte `JUNK` at offset 12 (where `ds64` goes),
+    a 40-byte WAVE_FORMAT_EXTENSIBLE `fmt ` (24-bit PCM with 24 valid bits, or IEEE float; channel
+    mask front centre for mono, front left and right for stereo, none otherwise), `data` at 96; no
+    `fact` chunk. Int24 scales by 2^23 like capture, so 24-bit capture samples are written back bit
+    for bit; +1.0 and above clamp to 8,388,607, -1.0 is -8,388,608, NaN is 0; float is written as
+    is. A pad byte follows odd-sized audio (written by `finish`).
+  - Crash safety: `refresh` hands the audio to the file before rewriting the RIFF and data sizes
+    in place and puts the write position back; `sync` also calls `sync_data`; a failed write stops
+    the writer (`Stopped` from then on) and the header is never touched again. The reader takes
+    the whole frames present when the data size is 0, missing (RF64 without `ds64`) or past the
+    end of the file, and honours a smaller one (later bytes may be other chunks), so a crash loses
+    at most what came after the last refresh.
+  - RF64: when the RIFF size passes 0xFFFFFFFE (injectable with `with_size_limit` for tests),
+    `refresh` and `finish` write `RF64` with 0xFFFFFFFF, turn `JUNK` into `ds64` (64-bit RIFF size
+    with the pad byte, data size, frames, an empty table) and set the data size to 0xFFFFFFFF;
+    nothing moves.
+  - RED: 25 of the 26 new tests failed against stubs that returned an error from every call; the
+    unsupported-encoding test passed against the stubs' blanket `Unsupported`, so it was checked
+    by mutation (any PCM bit depth read as 16-bit): it failed on 8-bit PCM with `Malformed`.
+  - GREEN: server unit tests 353 -> 379, all passing; clippy reports nothing in `wav.rs` (its 7
+    warnings are older, in capture, engine, mix and control). Tests run in memory, plus one 4 KB
+    temporary file; RF64 is reached with a 120-160 byte limit, never by writing 4 GiB.
+  - Commit: this commit.
 - [ ] T4 (recorder and takes): the recorder sink and disk thread, arming, take folders and
   `take.json`, markers, dropped-frame accounting, refusing device switches while recording, disk
   estimate, Tauri commands. Route: delegated writer.
@@ -292,7 +335,11 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
   acknowledged: review-dab3acc47185a219 (f83180f..b70131d) and review-8a82f3af04262a69
   (b70131d..25530e6). Their findings (part 1 R3-001 and R3-002, part 2 R3-001 to R3-004) are fixed
   by T2b-fix. Next review base: 25530e6.
+- Review lineage review-a198f89aefeca3bf over 25530e6..9ce6711 (T2b-fix) approved and
+  acknowledged; both findings (R3-001 the output lane, R3-002 the start and exit seams) are fixed
+  by T2b-fix2. Next review base: 9ce6711.
+- T2b-fix2 (d8f2ab1) is pending review in the slice from 9ce6711.
 
 ## Next step
 
-T3.
+T4.

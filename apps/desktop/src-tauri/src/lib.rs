@@ -360,12 +360,69 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")
         .run(|app, event| {
-            // The local mix is kept off the engine lock, a few times a second at most: what is
-            // still waiting is written before the app goes.
-            if let tauri::RunEvent::Exit = event {
-                if let Some(state) = app.try_state::<DesktopState>() {
-                    commands::local::flush_local_mix(state.inner());
-                }
-            }
+            let state = app.try_state::<DesktopState>();
+            on_run_event(state.as_deref(), &event);
         });
+}
+
+/// What the app does as it runs, given its state once managed: on exit, the local mix still
+/// waiting to be kept (it is kept off the engine lock, a few times a second at most) is written
+/// before the app goes.
+fn on_run_event(state: Option<&DesktopState>, event: &tauri::RunEvent) {
+    if let (tauri::RunEvent::Exit, Some(state)) = (event, state) {
+        commands::local::flush_local_mix(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionMix;
+
+    fn mix(volume_percent: u8) -> SessionMix {
+        SessionMix {
+            channels: Vec::new(),
+            groups: Default::default(),
+            volume_percent,
+            muted: false,
+        }
+    }
+
+    fn kept_volume(state: &DesktopState) -> Option<u8> {
+        state
+            .kept_local()
+            .and_then(|local| local.mix)
+            .map(|mix| mix.volume_percent)
+    }
+
+    #[test]
+    fn quitting_the_app_writes_the_local_mix_still_waiting() {
+        let directory = std::env::temp_dir()
+            .join("mixlink-run-event-tests")
+            .join("exit");
+        let _ = std::fs::remove_dir_all(&directory);
+        let state = DesktopState::new(SessionStore::open(&directory));
+        // The saver writes a first change at once and holds the next for its interval.
+        state.mark_local_mix(mix(10));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while kept_volume(&state) != Some(10) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(kept_volume(&state), Some(10));
+        state.mark_local_mix(mix(20));
+
+        on_run_event(Some(&state), &tauri::RunEvent::Ready);
+        assert_eq!(
+            kept_volume(&state),
+            Some(10),
+            "nothing is written on another event"
+        );
+        on_run_event(Some(&state), &tauri::RunEvent::Exit);
+        assert_eq!(
+            kept_volume(&state),
+            Some(20),
+            "written on exit, without waiting out the interval"
+        );
+        on_run_event(None, &tauri::RunEvent::Exit);
+    }
 }

@@ -3407,8 +3407,34 @@ mod tests {
         stop_server(address, &stopped, server).await;
     }
 
+    /// Reads every text message up to and including the next `mix_ack`, and answers their types.
+    async fn types_until_mix_ack(client: &mut ClientStream) -> Vec<String> {
+        let mut types = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, client.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&text).expect("the server sends JSON");
+                    let kind = value["type"].as_str().unwrap_or_default().to_owned();
+                    types.push(kind.clone());
+                    if kind == "mix_ack" {
+                        return types;
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        panic!("no mix_ack arrived; seen so far: {types:?}");
+    }
+
     /// An older phone never sees the message: not on registering, and not when a change of the
-    /// buffer kept for its IP is announced.
+    /// buffer kept for its IP is announced once its registration is in place. The change is
+    /// announced only after a round trip proves the registration was handled, and two more round
+    /// trips follow it: the connection pushes between handling messages, so a buffer it wrongly
+    /// pushed would arrive before one of the two answers.
     #[tokio::test]
     async fn an_older_phone_is_never_sent_a_buffer() {
         let targets =
@@ -3420,20 +3446,27 @@ mod tests {
             Heartbeat::default(),
             events.clone(),
         );
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
 
         let mut phone = connect_client(address).await;
         send_text(&mut phone, REGISTER_ANA).await;
+        send_text(&mut phone, mix).await;
+        let mut seen = types_until_mix_ack(&mut phone).await;
+        assert!(
+            targets.mix_state("127.0.0.1".parse().unwrap()).is_some(),
+            "the registration is in place before the change is announced"
+        );
+
         events.emit(EngineEvent::PlaybackBufferChanged {
             address: "127.0.0.1:50123".parse().unwrap(),
         });
-        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
-        send_text(&mut phone, mix).await;
-        let next = read_next_reply(&mut phone)
-            .await
-            .expect("the mix is answered");
-        assert_eq!(
-            next["type"], "mix_ack",
-            "nothing came before the answer to the mix: {next}"
+        for _ in 0..2 {
+            send_text(&mut phone, mix).await;
+            seen.extend(types_until_mix_ack(&mut phone).await);
+        }
+        assert!(
+            !seen.iter().any(|kind| kind == "playback"),
+            "an older phone is never sent a buffer: {seen:?}"
         );
 
         stop_server(address, &stopped, server).await;

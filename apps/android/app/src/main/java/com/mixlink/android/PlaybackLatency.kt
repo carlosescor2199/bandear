@@ -61,6 +61,35 @@ object PlaybackLatency {
             targetBufferFrames(packetFrames, cushionPackets) * 1000.0 / sampleRate
         }
 
+    /** The cushion and the backlog a link report ends its interval with, in milliseconds. */
+    data class ReportExtras(val cushionMs: Double, val backlogMs: Double)
+
+    /**
+     * What the link report due now ends its interval with, from the receive loop's track inputs.
+     *
+     * - The cushion is the buffer asked of the track ([cushionMs]): [cushionPackets] packets of
+     *   [packetFrames] frames at the track's [playbackRate]; not measured (`NaN`) before the first
+     *   packet sized it or while no track set the rate (null).
+     * - The backlog is the audio queued now ([backlogMs]): the [framesWritten] past the
+     *   [presentedFrame] the track's timestamp read; not measured (`NaN`) when there is no track or
+     *   its timestamp could not be read ([timestampRead] false). A track always has its rate, so a
+     *   read timestamp with no rate only happens in a test and reads as 0, as [backlogMs] reads it.
+     */
+    fun reportExtras(
+        packetFrames: Int,
+        cushionPackets: Int,
+        playbackRate: Int?,
+        timestampRead: Boolean,
+        framesWritten: Long,
+        presentedFrame: Long,
+    ): ReportExtras {
+        val rate = playbackRate ?: 0
+        return ReportExtras(
+            cushionMs = cushionMs(packetFrames, cushionPackets, rate),
+            backlogMs = if (timestampRead) backlogMs(framesWritten, presentedFrame, rate) else Double.NaN,
+        )
+    }
+
     /** One adjustment outcome: the cushion to use next, and the clean-interval count to carry. */
     data class CushionDecision(val cushion: Int, val cleanIntervals: Int)
 

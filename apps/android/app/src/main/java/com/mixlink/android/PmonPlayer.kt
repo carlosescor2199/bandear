@@ -166,17 +166,19 @@ internal class PmonPlayer(
                         // The cushion aimed for and the audio queued right now end the interval; the
                         // report holds them as primitives and is handed over as it always was.
                         val track = audioTrack
-                        val rate = playbackRate ?: 0
-                        val backlogNowMs = if (track != null && track.getTimestamp(audioTimestamp)) {
-                            PlaybackLatency.backlogMs(framesWritten, audioTimestamp.framePosition, rate)
-                        } else {
-                            Double.NaN
-                        }
+                        val extras = PlaybackLatency.reportExtras(
+                            packetFrames = packetFrames,
+                            cushionPackets = cushionPackets,
+                            playbackRate = playbackRate,
+                            timestampRead = track != null && track.getTimestamp(audioTimestamp),
+                            framesWritten = framesWritten,
+                            presentedFrame = audioTimestamp.framePosition,
+                        )
                         linkStats.poll(
                             nowMs,
                             track?.underrunCount ?: 0,
-                            cushionMs = PlaybackLatency.cushionMs(packetFrames, cushionPackets, rate),
-                            backlogMs = backlogNowMs,
+                            cushionMs = extras.cushionMs,
+                            backlogMs = extras.backlogMs,
                         )?.let { report ->
                             listener.onLinkStats(report)
                         }

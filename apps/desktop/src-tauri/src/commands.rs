@@ -83,11 +83,15 @@ pub struct DesktopState {
 
 impl DesktopState {
     /// A state with no event pump: the engine runs and the commands answer, but nothing is pushed.
-    /// Takes go to a `Recordings` folder beside the session until [Self::with_recordings_folder]
-    /// names the desk's default.
+    /// Takes go to the default [recording::default_recordings_folder] falls back to (never inside
+    /// the session's folder, the app's config folder) until [Self::with_recordings_folder] names
+    /// the desk's default.
     pub fn new(session: SessionStore) -> Self {
-        let recordings =
-            recording::default_recordings_folder(None, Some(session.directory().to_path_buf()));
+        let recordings = recording::default_recordings_folder(
+            None,
+            Some(session.directory().to_path_buf()),
+            session.directory(),
+        );
         let snapshots = SnapshotStore::new(session.directory().join(SESSIONS_DIRECTORY));
         let session = Arc::new(session);
         let local_saver = {
@@ -2279,8 +2283,10 @@ fn load_session_with<E: SessionEngine>(
         local: saved_local
             .clone()
             .or_else(|| with_pending(previous.local, paused.pending())),
-        // How this desk records is the desk's own, whatever the saved session says.
-        recording: previous.recording,
+        // How this desk records is the desk's own, whatever the saved session says: the store keeps
+        // it as it holds it when the loaded session is written (see [SessionStore::replace]), so a
+        // change saved while this load runs, which does not wait for the engine lock, is kept.
+        recording: None,
         ..snapshot.session.clone()
     };
     let live = match guard.as_mut() {
@@ -3155,9 +3161,9 @@ mod tests {
         }
     }
 
-    /// Holds one group edit between its apply and its save while another edit runs: the edit
-    /// says it is parked, then waits until the session's groups change (another edit saved while
-    /// this one was half done) or `wait` passes, and notes which.
+    /// Holds one group edit or session load between its apply and its save while another change
+    /// runs: it says it is parked, then waits until the session changes (another change saved
+    /// while this one was half done) or `wait` passes, and notes which.
     struct Park {
         session: std::sync::Arc<SessionStore>,
         parked: std::sync::mpsc::Sender<()>,
@@ -3167,11 +3173,11 @@ mod tests {
 
     impl Park {
         fn hold(self) {
-            let before = self.session.groups();
+            let before = self.session.current();
             self.parked.send(()).expect("the test waits for the park");
             let deadline = std::time::Instant::now() + self.wait;
             while std::time::Instant::now() < deadline {
-                if self.session.groups() != before {
+                if self.session.current() != before {
                     self.saved_meanwhile
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     return;
@@ -5885,6 +5891,71 @@ mod tests {
             session.recording(),
             Some(desks),
             "a load keeps the desk's own recording settings"
+        );
+    }
+
+    /// A recording settings change does not wait for the engine lock, so it can be saved while a
+    /// load is between reading the desk's session and writing the loaded one. The round forces
+    /// that overlap: the load is parked right after the engine took its groups, and the change is
+    /// saved meanwhile. The load writes the desk's recording settings as the session holds them
+    /// then, so the change the engineer was told was kept is kept, also after a restart.
+    #[test]
+    fn recording_settings_saved_while_a_session_loads_are_kept() {
+        let test = "session-recording-concurrent";
+        let directory = session_directory(test);
+        let session = std::sync::Arc::new(SessionStore::open(&directory));
+        let snapshots = SnapshotStore::new(directory.join(SESSIONS_DIRECTORY));
+        session
+            .set_recording(crate::session::SessionRecording {
+                folder: Some("D:\\Before".to_owned()),
+                ..crate::session::SessionRecording::default()
+            })
+            .expect("kept");
+        saved_session(test, "show", &snapshot(layout_session(&[], 0), &[]));
+        let (parked, parked_signal) = std::sync::mpsc::channel();
+        let saved_meanwhile = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = running(StandInEngine {
+            park: Some(Park {
+                session: std::sync::Arc::clone(&session),
+                parked,
+                wait: std::time::Duration::from_secs(5),
+                saved_meanwhile: std::sync::Arc::clone(&saved_meanwhile),
+            }),
+            ..StandInEngine::default()
+        });
+        let during = crate::session::SessionRecording {
+            folder: Some("D:\\During".to_owned()),
+            include_local: true,
+            armed: vec![3],
+            ..crate::session::SessionRecording::default()
+        };
+
+        std::thread::scope(|scope| {
+            let (engine, session, snapshots) = (&engine, &session, &snapshots);
+            let loading = scope.spawn(move || load_into(engine, session, snapshots, "show"));
+            parked_signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the load reached the engine");
+            session
+                .set_recording(during.clone())
+                .expect("kept while the load runs");
+            let outcome = loading.join().expect("the load ran").expect("loaded");
+            assert!(outcome.applied && outcome.saved);
+        });
+
+        assert!(
+            saved_meanwhile.load(std::sync::atomic::Ordering::SeqCst),
+            "the change was saved while the load was half done"
+        );
+        assert_eq!(
+            session.recording(),
+            Some(during.clone()),
+            "the load keeps the change saved while it ran"
+        );
+        assert_eq!(
+            SessionStore::open(&directory).recording(),
+            Some(during),
+            "and so does the session file"
         );
     }
 

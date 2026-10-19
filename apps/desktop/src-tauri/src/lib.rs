@@ -382,10 +382,12 @@ pub fn run() {
             // and logged. The engineer's named sessions live beside it, in `sessions`.
             let directory = app.path().app_config_dir()?;
             // Takes go to the user's Music folder + MixLink\Recordings by default; when it cannot
-            // be found, to the app's own data folder, and the recording settings say so.
+            // be found, to the app's own data folder, and the recording settings say so. Never
+            // inside the config folder, which the data folder is on macOS: then the next place.
             let recordings = commands::recording::default_recordings_folder(
                 app.path().audio_dir().ok(),
                 app.path().app_local_data_dir().ok(),
+                &directory,
             );
             if let Some(notice) = &recordings.notice {
                 eprintln!("[mixlink-desktop] {notice}");

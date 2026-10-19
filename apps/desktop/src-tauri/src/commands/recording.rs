@@ -9,8 +9,9 @@
 //! inputs by their 1-based number. The settings can be changed at any time, engine or not, and a
 //! take that records keeps what it started with. The default folder is the user's Music folder +
 //! `MixLink\Recordings`; when the Music folder cannot be found the desk falls back to its own data
-//! folder and the settings say so ([RecordingsFolder]). A folder is created when the first take is
-//! recorded in it.
+//! folder and the settings say so ([RecordingsFolder]). No recordings folder, the default included,
+//! is ever inside the app's own config folder. A folder is created when the first take is recorded
+//! in it.
 //!
 //! A start arms the inputs the settings arm that the running device has (an armed input past its
 //! inputs is left out and named in the answer); the engine records either side of a linked pair as
@@ -70,29 +71,50 @@ pub struct RecordingsFolder {
 
 /// The default recordings folder: `music` (the user's Music folder) + `MixLink\Recordings`; when it
 /// is not known, `fallback` (the app's own data folder) + `Recordings`, and when neither is, the
-/// system's temporary folder + `MixLink\Recordings`, each saying so. Never fails.
+/// system's temporary folder + `MixLink\Recordings`, each saying so. Like any recordings folder it
+/// is never inside `config`, the app's own config folder (the app's data folder is that folder on
+/// macOS): a place inside it gives way to the next, and when even the temporary folder is inside
+/// it, the folder is `MixLink Recordings` beside it. Never fails.
 pub fn default_recordings_folder(
     music: Option<PathBuf>,
     fallback: Option<PathBuf>,
+    config: &Path,
 ) -> RecordingsFolder {
-    if let Some(music) = music {
+    let outside = |folder: &PathBuf| !inside(folder, config);
+    let music_folder = music.map(|music| music.join("MixLink").join("Recordings"));
+    if let Some(folder) = music_folder.clone().filter(outside) {
         return RecordingsFolder {
-            folder: music.join("MixLink").join("Recordings"),
+            folder,
             notice: None,
         };
     }
-    let folder = match fallback {
-        Some(data) => data.join("Recordings"),
-        None => std::env::temp_dir().join("MixLink").join("Recordings"),
+    let data_folder = fallback.map(|data| data.join("Recordings"));
+    let folder = data_folder
+        .clone()
+        .filter(outside)
+        .or_else(|| Some(std::env::temp_dir().join("MixLink").join("Recordings")).filter(outside))
+        .unwrap_or_else(|| beside(config));
+    let mut why = if music_folder.is_some() {
+        "Your Music folder is inside MixLink's own settings folder".to_owned()
+    } else {
+        "Your Music folder could not be found".to_owned()
     };
+    if data_folder.is_some_and(|data| !outside(&data)) {
+        why.push_str(" and MixLink's data folder is inside its settings folder");
+    }
     RecordingsFolder {
         notice: Some(format!(
-            "Your Music folder could not be found, so takes are recorded in {} unless you choose \
-             another folder.",
+            "{why}, so takes are recorded in {} unless you choose another folder.",
             folder.display()
         )),
         folder,
     }
+}
+
+/// `MixLink Recordings` beside the `config` folder, which is never inside it (but for a config
+/// folder that is a whole drive, which has nothing beside it).
+fn beside(config: &Path) -> PathBuf {
+    config.parent().unwrap_or(config).join("MixLink Recordings")
 }
 
 /// Where recording looks for its folders: the default recordings folder and the app's own config
@@ -377,14 +399,16 @@ fn kept_folder(folder: Option<&str>, places: Places<'_>) -> Result<Option<String
             "the recordings folder must not go up with `..`: `{text}`"
         ));
     }
-    if same_path(path, &places.default.folder) {
-        return Ok(None);
-    }
+    // Before the default is matched, so no folder inside the config folder is ever kept, whatever
+    // the default is.
     if inside(path, places.config) {
         return Err(format!(
             "the recordings folder cannot be in MixLink's own settings folder ({}): `{text}`",
             places.config.display()
         ));
+    }
+    if same_path(path, &places.default.folder) {
+        return Ok(None);
     }
     Ok(Some(text.to_owned()))
 }
@@ -1027,15 +1051,16 @@ mod tests {
     fn the_default_folder_is_in_the_music_folder_or_says_where_it_fell_back_to() {
         let music = PathBuf::from("C:\\Users\\Ana\\Music");
         let data = PathBuf::from("C:\\Users\\Ana\\AppData\\Local\\MixLink");
+        let config = PathBuf::from("C:\\Users\\Ana\\AppData\\Roaming\\MixLink");
 
         assert_eq!(
-            default_recordings_folder(Some(music.clone()), Some(data.clone())),
+            default_recordings_folder(Some(music.clone()), Some(data.clone()), &config),
             RecordingsFolder {
                 folder: music.join("MixLink").join("Recordings"),
                 notice: None,
             }
         );
-        let fallen = default_recordings_folder(None, Some(data.clone()));
+        let fallen = default_recordings_folder(None, Some(data.clone()), &config);
         assert_eq!(fallen.folder, data.join("Recordings"));
         let notice = fallen.notice.expect("said");
         assert!(notice.contains("Music folder"), "{notice}");
@@ -1043,12 +1068,91 @@ mod tests {
             notice.contains(&data.join("Recordings").display().to_string()),
             "{notice}"
         );
-        let nowhere = default_recordings_folder(None, None);
+        let nowhere = default_recordings_folder(None, None, &config);
         assert!(nowhere
             .folder
             .ends_with(Path::new("MixLink").join("Recordings")));
         assert!(nowhere.folder.is_absolute());
         assert!(nowhere.notice.is_some());
+    }
+
+    /// The rule a folder the engineer types is held to holds for the default too: it is never in
+    /// the app's own config folder. The app's data folder is its config folder on macOS, and a
+    /// desk with no default named falls back to its session's folder, so each place inside the
+    /// config folder gives way to the next, and the notice says where takes go.
+    #[test]
+    fn the_default_folder_is_never_inside_the_config_folder() {
+        let config = PathBuf::from("C:\\Users\\Ana\\Library\\Application Support\\MixLink");
+        let temporary = std::env::temp_dir().join("MixLink").join("Recordings");
+
+        let same = default_recordings_folder(None, Some(config.clone()), &config);
+        assert_eq!(
+            same.folder, temporary,
+            "the data folder is the config folder"
+        );
+        let notice = same.notice.expect("said");
+        assert!(notice.contains("settings folder"), "{notice}");
+        assert!(
+            notice.contains(&temporary.display().to_string()),
+            "{notice}"
+        );
+
+        let data = PathBuf::from("C:\\Users\\Ana\\AppData\\Local\\MixLink");
+        let music_inside =
+            default_recordings_folder(Some(config.join("Music")), Some(data.clone()), &config);
+        assert_eq!(music_inside.folder, data.join("Recordings"));
+        assert!(music_inside.notice.is_some());
+
+        // Even the temporary folder can be inside it: then a folder beside it.
+        let everywhere = std::env::temp_dir();
+        let beside = default_recordings_folder(None, Some(everywhere.clone()), &everywhere);
+        assert!(
+            !inside(&beside.folder, &everywhere),
+            "{}",
+            beside.folder.display()
+        );
+        assert!(beside.folder.is_absolute());
+        assert!(beside
+            .notice
+            .expect("said")
+            .contains(&beside.folder.display().to_string()));
+    }
+
+    #[test]
+    fn a_desk_with_no_default_named_records_outside_its_config_folder() {
+        let config = scratch("state-default").join("config");
+        let state = DesktopState::new(SessionStore::open(&config));
+
+        let answer = recording_settings(&state).expect("answered");
+
+        let default = PathBuf::from(&answer.default_folder);
+        assert!(!inside(&default, &config), "{}", default.display());
+        assert!(answer.notice.is_some(), "it says where takes go");
+    }
+
+    /// Typed out, a default that is inside the config folder is refused like any folder there,
+    /// rather than slipping through as the default.
+    #[test]
+    fn the_config_folder_is_refused_before_the_default_is_matched() {
+        let desk = Desk::new("settings-default-inside");
+        let default = RecordingsFolder {
+            folder: desk.config.join("Recordings"),
+            notice: None,
+        };
+        let places = Places {
+            default: &default,
+            config: &desk.config,
+        };
+
+        let error = keep_settings(
+            &desk.session,
+            places,
+            settings(default.folder.to_str(), None, &[1]),
+        )
+        .expect_err("refused");
+
+        assert!(error.contains("settings folder"), "{error}");
+        assert_eq!(desk.session.recording(), None, "nothing changed");
     }
 
     #[test]

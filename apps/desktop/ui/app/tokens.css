@@ -59,6 +59,10 @@
   --ml-danger-text: #ffb4ad;
   --ml-accent-bg: #1a1610;
 
+  /* Take markers: a dark blue tag with light blue text. */
+  --ml-marker-bg: #10283a;
+  --ml-marker-text: #9fdcff;
+
   /* Faders and meters. */
   --ml-track: #262f3a;
   --ml-fader-fill: #5b6b7c;

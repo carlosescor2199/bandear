@@ -59,7 +59,8 @@
 //   take with them, its folder named in the window's local time; `stopRecording()` stops it and,
 //   while its files are still being finished, asks again a few times a short wait apart before
 //   saying so; `addMarker(name)` marks it; `refreshTakes()` lists the takes, `refreshEstimate()`
-//   reads what a take would take on the disk (again after every settings change), and
+//   reads what a take would take on the disk (once connected, when an engine starts and after
+//   every settings change), and
 //   `openTakeFolder(folder)` opens one in the file manager. Each command answers `{ ok, message }`
 //   (and keeps it as the store's `recordingOutcome`) and reads the status after it. While a take
 //   records, a device switch and a driver change are refused in words before anything reaches the
@@ -368,6 +369,8 @@ export function createConsoleApp({
     if (error) {
       fillAfterStart(error);
     }
+    // The run before it took its estimate with it; this engine's device decides the tracks.
+    await refreshEstimate();
     return { ok: true };
   }
 
@@ -490,9 +493,12 @@ export function createConsoleApp({
         store.dispatch(actions.connectionFailed(choiceUnread(unread)));
         return;
       }
+      // A start that runs reads the disk estimate once its engine runs.
       await startChoice();
     } else {
       takeEngineState(answer);
+      // What a take would take on the disk, or why that is not known, for the engine found.
+      await refreshEstimate();
     }
   }
 
@@ -877,23 +883,19 @@ export function createConsoleApp({
     return { ok, message: words, ...extra };
   }
 
-  // Settings changes go out one at a time, each built on the settings the change before it asked
-  // for (`wantedSettings`), so a second toggle made before the first was answered keeps the first.
-  // A refusal goes back to the settings the desk answered last.
+  // Settings changes go out one at a time, each built when its turn comes on the settings the desk
+  // answered last, which hold every change before it that was kept, so a second toggle made before
+  // the first was answered keeps the first. A refused change is in no later request: those carry
+  // only the kept settings and their own fields.
   let settingsLane = Promise.resolve();
-  let wantedSettings = null;
 
   function setRecordingSettings(change) {
-    const request = settingsRequest(wantedSettings ?? store.getState().recordingSettings, change);
-    wantedSettings = request;
     const send = async () => {
+      const request = settingsRequest(store.getState().recordingSettings, change);
       let answer;
       try {
         answer = await api.setRecordingSettings(request);
       } catch (error) {
-        if (wantedSettings === request) {
-          wantedSettings = null;
-        }
         return recordingSaid(
           "settings",
           false,
@@ -901,9 +903,6 @@ export function createConsoleApp({
         );
       }
       store.dispatch(actions.recordingSettings(answer));
-      if (wantedSettings === request) {
-        wantedSettings = null;
-      }
       await refreshEstimate();
       return recordingSaid("settings", true, "The recording settings were saved.");
     };

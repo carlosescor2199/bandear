@@ -1,5 +1,5 @@
-// The console shell: the sidebar, hash routing (#/mix by default, #/channels, #/network) and the
-// main region.
+// The console shell: the sidebar, hash routing (#/mix by default, #/record, #/channels,
+// #/network), the REC chip above every screen while a take records, and the main region.
 //
 // Each section renders into the main region through a screen: a function `(main, route)` that
 // builds the section and may return a cleanup function, called when the engineer leaves it.
@@ -11,22 +11,27 @@
 // `index.html?fake` (served by dev/serve.mjs), it runs against the simulated engine of
 // lib/fake-bridge.js instead.
 
+import "./components/rec-chip.js";
 import { createTauriBridge } from "./lib/bridge.js";
 import { createConsoleApp } from "./lib/console-app.js";
 import { createFakeBridge } from "./lib/fake-bridge.js";
+import { recChip } from "./lib/record-view.js";
 import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
 import { mountChannelsScreen } from "./screens/channels-screen.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
 import { mountNetworkScreen } from "./screens/network-screen.js";
+import { mountRecordScreen } from "./screens/record-screen.js";
 
 const ICONS = Object.freeze({
   mix: `<path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 14h4M10 8h4M16 12h4"/>`,
+  record: `<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/>`,
   channels: `<path d="M4 6h16M4 12h16M4 18h10"/>`,
   network: `<path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1"/>`,
 });
 
 const PLACEHOLDERS = Object.freeze({
   mix: "Each musician's channel strips, groups and master appear here.",
+  record: "Record every input to its own track while the show runs.",
   channels: "Name each input, pair stereo sources, hide spares and build groups.",
   network: "Tune each phone's connection, watch its health and look after the server.",
 });
@@ -142,16 +147,36 @@ function connectEngine() {
   }
 }
 
+/**
+ * Shows the REC chip in `strip` (holding an <ml-rec-chip>) while the console `app` reports a take
+ * recording, being finished or stopped on an error; hidden otherwise. Returns the unsubscribe.
+ */
+export function mountRecChip(strip, app) {
+  const chip = strip.querySelector("ml-rec-chip");
+  function render() {
+    const view = recChip(app.store.getState());
+    strip.hidden = view === null;
+    chip.data = view;
+  }
+  render();
+  return app.store.subscribe(render);
+}
+
 const nav = document.querySelector("[data-shell-nav]");
 const main = document.querySelector("[data-shell-main]");
 if (nav && main) {
   const { app, simulated } = connectEngine();
+  const strip = document.querySelector("[data-shell-status]");
+  if (app && strip) {
+    mountRecChip(strip, app);
+  }
   mountShell({
     nav,
     main,
     skipLink: document.querySelector("[data-skip-link]"),
     screens: {
       mix: app ? (screenMain) => mountMixScreen(screenMain, app) : unavailableScreen,
+      record: app ? (screenMain) => mountRecordScreen(screenMain, app) : unavailableScreen,
       channels: app ? (screenMain) => mountChannelsScreen(screenMain, app) : unavailableScreen,
       network: app ? (screenMain) => mountNetworkScreen(screenMain, app) : unavailableScreen,
     },

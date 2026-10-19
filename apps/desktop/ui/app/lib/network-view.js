@@ -6,9 +6,12 @@
 // - Only WASAPI switches the input device live; any other driver restarts the engine on the
 //   chosen device (ASIO holds one driver at a time, so a live switch there always fails).
 // - A switch that would leave configured groups without their inputs asks first.
+// - While a take records (or its files are being finished) the driver, the device and the buffer
+//   stay as they are, and the setup says why: a take never mixes two devices.
 
 import { rememberedDevice } from "./engine-config.js";
 import { formatCaptureFormat, formatPercent, linkState } from "./format.js";
+import { RECORDING_BLOCKS_SWITCH, isRecording, recordingOf } from "./recording.js";
 
 const DASH = "—";
 
@@ -122,9 +125,12 @@ export function switchMethod(audio) {
  * with no engine the one the next start opens), the buffer and the engine's numbers. `local` is the
  * screen's own `{ draftHost, draftDevice, pendingSwitch }`. Devices listed for another driver are
  * never offered: until the shown driver's list arrives, `listing` is true and nothing is offered.
+ * While a take records, `recordingLock` says why the driver, device and buffer cannot change, and
+ * each is disabled (`hostDisabled`, `deviceDisabled`, `bufferDisabled`); otherwise it is null.
  */
 export function audioSetupView(state, local) {
   const status = state.engine.status;
+  const recording = isRecording(recordingOf(status));
   const host = local.draftHost ?? state.audio.host;
   const listing = state.devices.host !== host;
   const devices = listing ? [] : state.devices.list;
@@ -140,9 +146,12 @@ export function audioSetupView(state, local) {
     listing,
     devices: deviceOptions(devices),
     device,
-    deviceDisabled: devices.length === 0 || (!asioPending && !canSwitch),
-    canApplyAsio: asioPending && Boolean(local.draftDevice),
+    hostDisabled: recording,
+    deviceDisabled: recording || devices.length === 0 || (!asioPending && !canSwitch),
+    canApplyAsio: !recording && asioPending && Boolean(local.draftDevice),
     buffer: state.audio.bufferFrames,
+    bufferDisabled: recording,
+    recordingLock: recording ? RECORDING_BLOCKS_SWITCH : null,
     warning: local.pendingSwitch?.message ?? null,
     readouts: {
       format: status

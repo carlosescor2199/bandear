@@ -630,10 +630,13 @@ impl SessionStore {
         }
     }
 
-    /// Replaces the whole session with `session` (a named snapshot loaded, see
-    /// [crate::commands::load_session]), at this build's version. The file is written before
-    /// success is reported; a save that fails, or is refused over a session this build must not
-    /// replace, changes nothing.
+    /// Replaces the session with `session` (a named snapshot loaded, see
+    /// [crate::commands::load_session]), at this build's version, all but how this desk records
+    /// takes: that is the desk's own, and it is taken as the session holds it when the file is
+    /// written, under the same lock [Self::set_recording] keeps it under, so a change kept while
+    /// the load ran is never undone by it (`session.recording` is not read). The file is written
+    /// before success is reported; a save that fails, or is refused over a session this build must
+    /// not replace, changes nothing.
     pub fn replace(&self, session: Session) -> Result<(), String> {
         let mut loaded = self.lock();
         if let Some(refusal) = &loaded.refusal {
@@ -641,6 +644,7 @@ impl SessionStore {
         }
         let session = Session {
             version: SESSION_VERSION,
+            recording: loaded.session.recording.clone(),
             ..session
         };
         write_atomically(&self.path, &session)?;

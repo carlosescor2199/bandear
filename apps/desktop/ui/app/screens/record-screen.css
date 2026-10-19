@@ -1,0 +1,442 @@
+/*
+ * The Record screen: the transport card, the tracks with their waveform lanes, and below them the
+ * takes table beside the settings, which drop under the table in a narrower window.
+ */
+
+.record-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-4);
+  padding-top: var(--ml-space-1);
+}
+
+.record-screen [hidden] {
+  display: none !important;
+}
+
+.record-card {
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-xl);
+  background: var(--ml-surface);
+}
+
+.record-label {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-xs);
+  font-weight: var(--ml-weight-medium);
+  letter-spacing: var(--ml-tracking-caps);
+  text-transform: uppercase;
+}
+
+.record-hint {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+}
+
+.record-empty {
+  padding: var(--ml-space-3) var(--ml-space-4);
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-md);
+}
+
+.record-caution {
+  padding: var(--ml-space-2) 10px;
+  border: 1px solid var(--ml-warn-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-warn-bg);
+  font-size: var(--ml-text-md);
+}
+
+.record-button,
+.record-icon,
+.record-rec {
+  border: 1px solid var(--ml-border);
+  background: var(--ml-surface-raised);
+  color: var(--ml-text);
+  font-weight: var(--ml-weight-medium);
+}
+
+.record-button {
+  min-height: var(--ml-target);
+  padding: 0 12px;
+  border-radius: var(--ml-radius-sm);
+  font-size: var(--ml-text-md);
+}
+
+.record-button:disabled,
+.record-icon:disabled,
+.record-rec:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.record-button:not(:disabled):hover,
+.record-icon:not(:disabled):hover {
+  border-color: var(--ml-text-muted);
+}
+
+/* Transport. */
+
+.record-transport {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: var(--ml-space-3) var(--ml-space-4);
+}
+
+.record-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.record-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: var(--ml-radius-md);
+}
+
+.record-rec {
+  display: flex;
+  align-items: center;
+  gap: var(--ml-space-2);
+  height: 44px;
+  padding: 0 var(--ml-space-4);
+  border-color: var(--ml-danger-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-danger-bg);
+  color: var(--ml-danger-text);
+  font-size: var(--ml-text-base);
+  font-weight: var(--ml-weight-bold);
+}
+
+.record-rec:not(:disabled):hover {
+  border-color: var(--ml-red);
+}
+
+.record-rec[data-recording="true"] {
+  border-color: var(--ml-red);
+  background: var(--ml-red);
+  color: var(--ml-text-on-bright);
+  opacity: 1;
+}
+
+.record-dot {
+  display: inline-block;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ml-red);
+}
+
+.record-rec[data-recording="true"] .record-dot {
+  background: var(--ml-text-on-bright);
+}
+
+.record-position {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 9ch;
+}
+
+.record-time {
+  font-family: var(--ml-font-mono);
+  font-size: 28px;
+  font-weight: var(--ml-weight-bold);
+  line-height: 1.1;
+  letter-spacing: 0.02em;
+}
+
+.record-state {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+  font-weight: var(--ml-weight-bold);
+}
+
+.record-state[data-kind="recording"],
+.record-state[data-kind="failed"] {
+  color: var(--ml-danger-text);
+}
+
+.record-state[data-kind="stopping"] {
+  color: var(--ml-accent);
+}
+
+.record-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-1);
+}
+
+.record-field label,
+.record-format label,
+.record-folder-form label {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-xs);
+  letter-spacing: var(--ml-tracking-caps);
+  text-transform: uppercase;
+}
+
+.record-field input,
+.record-folder-form input,
+.record-format select {
+  min-height: var(--ml-target);
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-sm);
+  background: var(--ml-ground);
+  font-size: var(--ml-text-md);
+}
+
+.record-field input {
+  width: 200px;
+}
+
+.record-transport > .record-button {
+  align-self: flex-end;
+}
+
+.record-spacer {
+  flex-grow: 1;
+}
+
+.record-summary {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px var(--ml-space-3);
+  margin: 0;
+  font-size: var(--ml-text-sm);
+}
+
+.record-summary dt {
+  color: var(--ml-text-muted);
+}
+
+.record-summary dd {
+  margin: 0;
+  font-weight: var(--ml-weight-medium);
+}
+
+.record-full,
+.record-disk-warning {
+  flex-basis: 100%;
+}
+
+.record-disk-warning {
+  padding: var(--ml-space-2) var(--ml-space-3);
+  border: 1px solid var(--ml-warn-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-warn-bg);
+  font-size: var(--ml-text-md);
+}
+
+.record-disk-warning[data-level="critical"] {
+  border-color: var(--ml-danger-border);
+  background: var(--ml-danger-bg);
+  color: var(--ml-danger-text);
+}
+
+.record-markers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ml-space-2) var(--ml-space-3);
+}
+
+.record-marker-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.record-marker-list li {
+  padding: 1px 8px;
+  border-left: 2px solid var(--ml-blue);
+  border-radius: 0 var(--ml-radius-xs) var(--ml-radius-xs) 0;
+  background: var(--ml-marker-bg);
+  color: var(--ml-marker-text);
+  font-size: var(--ml-text-sm);
+  font-weight: var(--ml-weight-bold);
+}
+
+/* Tracks. */
+
+.record-tracks {
+  overflow-x: auto;
+}
+
+.record-tracks-title {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--ml-border-subtle);
+}
+
+.record-tracks [data-tracks] {
+  min-width: 640px;
+}
+
+/* Takes and settings. */
+
+.record-lower {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ml-space-4);
+  align-items: flex-start;
+}
+
+.record-takes {
+  flex: 999 1 560px;
+  min-width: 0;
+}
+
+.record-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ml-space-2);
+  padding: var(--ml-space-3) var(--ml-space-4) var(--ml-space-1);
+}
+
+.record-folder {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.record-takes > .mix-message,
+.record-takes > .record-hint {
+  margin: var(--ml-space-1) var(--ml-space-4);
+}
+
+.record-table-box {
+  overflow-x: auto;
+}
+
+.record-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--ml-text-md);
+}
+
+.record-table th {
+  padding: var(--ml-space-2);
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-xs);
+  font-weight: var(--ml-weight-medium);
+  letter-spacing: var(--ml-tracking-caps);
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.record-table td {
+  padding: 10px var(--ml-space-2);
+  border-top: 1px solid var(--ml-border-subtle);
+  vertical-align: middle;
+}
+
+.record-table th:first-child,
+.record-table td:first-child {
+  padding-left: var(--ml-space-4);
+}
+
+.record-table th:last-child,
+.record-table td:last-child {
+  padding-right: var(--ml-space-4);
+}
+
+.record-take-name {
+  display: flex;
+  align-items: center;
+  gap: var(--ml-space-2);
+  font-weight: var(--ml-weight-bold);
+}
+
+.record-take-name .record-dot {
+  width: 8px;
+  height: 8px;
+}
+
+.record-take-detail {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-xs);
+}
+
+.record-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--ml-ok-border);
+  border-radius: var(--ml-radius-pill);
+  background: var(--ml-ok-bg);
+  font-size: var(--ml-text-sm);
+  white-space: nowrap;
+}
+
+.record-badge[data-kind="warn"] {
+  border-color: var(--ml-warn-border);
+  background: var(--ml-warn-bg);
+}
+
+.record-badge[data-kind="error"],
+.record-badge[data-kind="live"] {
+  border-color: var(--ml-danger-border);
+  background: var(--ml-danger-bg);
+  color: var(--ml-danger-text);
+}
+
+.record-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.record-side {
+  display: flex;
+  flex: 1 1 300px;
+  flex-direction: column;
+  gap: var(--ml-space-4);
+  min-width: 0;
+}
+
+.record-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px var(--ml-space-4);
+}
+
+.record-folder-form,
+.record-format {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.record-folder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.record-check {
+  display: flex;
+  align-items: center;
+  gap: var(--ml-space-2);
+  font-size: var(--ml-text-md);
+}
+
+.record-check input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--ml-accent);
+}

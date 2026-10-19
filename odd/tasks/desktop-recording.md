@@ -427,8 +427,71 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
     browser preview: no screen changed (T5 builds it).
   - Commits: d825ca5 (status and session, 713 lines), 6c8bbc8 (commands, 1,802 lines). Commit:
     this commit (UI logic and fake).
-- [ ] T5 (Record screen): the Record section per the design, the REC chip, takes table and
+- [x] T4b-fix (the four advisory findings of the T4a-fix/T4b reviews). Route: delegated writer.
+  - A session load wrote back the desk's recording settings as read when it began, so a settings
+    save (which does not take the engine lock) landing meanwhile was undone. `SessionStore::replace`
+    now takes the recording section from the store when it writes, under the lock `set_recording`
+    uses; the load passes none. Test: the stand-in engine's `Park` (now watching the whole session)
+    holds the load after the engine took its groups while a settings change is saved; the change
+    survives in memory and in the file (10 repeated runs green).
+  - The default recordings folder is never inside the config folder: `default_recordings_folder`
+    takes the config folder, and the Music folder, the data folder (the config folder on macOS)
+    and the temp folder each give way to the next when inside it, ending at `MixLink Recordings`
+    beside it; the notice says why and where. `DesktopState::new` goes through it too, and
+    `kept_folder` refuses a folder inside the config folder before matching the default.
+  - UI: `setRecordingSettings` builds each request when its turn comes, on the store's last
+    answered settings plus its own fields, so a refused or failed change never rides along in a
+    change queued behind it. The disk estimate is read on connect (engine found or not) and after
+    every engine start.
+  - RED: desktop 4 of 237 failed (the forced load interleaving, the default inside the config
+    folder, `DesktopState::new`'s default, the typed default inside the config folder; the
+    signature was stubbed first so the RED is by assertion). UI 3 of 401 failed (the queued change
+    after a refusal, the estimate on connect with and without an engine); with only the connect
+    read in, the start read failed alone (1 of 401).
+  - GREEN: desktop tests 233 -> 237, `cargo build` clean; UI tests 398 -> 401.
+  - Commits: a928046 (desktop, 245 lines). Commit: this commit (UI).
+- [x] T5 (Record screen): the Record section per the design, the REC chip, takes table and
   settings. Route: delegated writer.
+  - View logic (`lib/record-view.js`, DOM-free): track rows per recorded unit of the running
+    device as the engine lays out tracks (a linked pair one stereo row, either side arms it; hidden
+    inputs record too, "CH 3-4" for an unnamed pair), the stereo "Local mix" row armed by
+    `includeLocal`, `armChange` (through `armedAfter`); take rows (name, start in the window's
+    local time, length, tracks "N tracks + local mix", markers, ended as a short badge with the
+    whole sentence, frames missing; the take being recorded shows the status's length); the REC
+    chip (`recording`, `stopping` "Finishing", `failed` "REC stopped", spoken label); the disk
+    (the recorder's figures while a take records, else the estimate and its `problem`; a warning
+    under 30 minutes, a stronger one under 10); the transport (Record while an engine runs, Stop
+    while a take records or failed, Add marker while recording, Back to start returns the shown
+    position from the last take's length to 0:00); messages; the settings panel; and
+    `createPeakHistory`, a fixed `Float32Array` ring (600 peaks, about 20 s) per track.
+  - Screen (`screens/record-screen.js` and `.css`, `components/record-track.js`): transport with
+    position, state, take name, Add marker, armed/format/disk summary, disk warning and the
+    current (or last) take's markers; one `<ml-record-track>` per row (arm toggle, horizontal
+    meter, a canvas lane drawn from the peak history at most once a frame while recording, and
+    words for an unarmed or armed-for-next-take track); takes table with Open folder and Refresh;
+    settings (folder field with "Use this folder" and "Default folder", the default and notice,
+    format, "Also record the local mix"). Arming and the settings are disabled while a take
+    records and the screen says they apply from the next take. Each command's `{ ok, message }`
+    is said above the transport (`recordingOutcome`), a failed take as an alert; a refused folder
+    stays in the field to be corrected.
+  - REC chip (`components/rec-chip.js`): the shell shows it in a sticky strip above every screen
+    (`index.html` gained a `.shell-body` around `main`), a link to `#/record`. Record is in the
+    sidebar after Mix. The audio setup disables the driver, device and buffer while a take records
+    and shows `RECORDING_BLOCKS_SWITCH` (`audioSetupView.recordingLock`).
+  - Deferred to T6: playback (Play stays disabled with a tooltip), the takes' Play and
+    Soundcheck, and the virtual soundcheck card. Not built: the design's timeline ruler, zoom and
+    markers drawn on the lanes (the lanes are a rolling strip, not a take timeline) and the takes'
+    size column (a take summary carries no byte count).
+  - RED: 23 of 24 new view tests failed against stubs (the "no rows without an engine" test passed
+    against the stub's empty list); the audio-setup lock test and the 2 router tests failed before
+    their change (3 of 21).
+  - GREEN: UI tests 401 -> 426. Browser (`?fake`, port 5199): Record with nothing armed was refused
+    in words; arming 3 inputs and the local mix, a take started, two markers listed, the REC chip
+    and moving lanes shown, the chip on Network and system with the audio setup locked and saying
+    why, the chip leads back to Record; Stop listed the take; format changed to 32-bit float; a
+    relative folder refused and kept in the field, a whole path kept; Open folder said; no console
+    errors.
+  - Commits: 8dd38fc (view logic and the audio setup's lock, 1,031 lines). Commit: this commit.
 - [ ] T6 (virtual soundcheck): the playback source in place of capture and its UI. Route:
   delegated writer.
 - [ ] T7 (close): PRD update, docs, live test. Route: inline or writer.
@@ -472,7 +535,15 @@ Strategy `stacked-to-main`, branch `feat/desktop-recording` from main 0bb278b. F
 - T4a-fix (a089b41) is pending review in the slice from a4d4bf1.
 - T4b done in three work units: d825ca5, 6c8bbc8 and the UI commit; all after a4d4bf1, so the
   next review slice from a4d4bf1 holds T4a-fix and T4b.
+- T4a-fix and T4b were reviewed in two parts, both approved and acknowledged:
+  review-d91be407e09f69aa (a4d4bf1..6c8bbc8) and review-b830744f9a762630 (6c8bbc8..c4ba1a7). Their
+  four advisory findings (a load undoing a recording settings save, a default folder inside the
+  config folder, a queued settings change carrying a refused one, no estimate on connect or start)
+  are fixed by T4b-fix. Next review base: c4ba1a7.
+- T4b-fix (a928046 and the UI commit) is pending review in the slice from c4ba1a7.
+- T4b-fix (a928046, 4f462dd) is still pending review in the slice from c4ba1a7; T5 (8dd38fc and
+  the screen commit) follows it in that slice.
 
 ## Next step
 
-T5.
+T6.

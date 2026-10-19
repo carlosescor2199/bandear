@@ -1,9 +1,9 @@
 /*
- * The console shell: the sidebar and the main region. Laid out for 1100-1440 px windows; a
- * narrower window keeps the sidebar as an icon rail, and a very narrow one stacks it on top.
+ * The console shell: the sidebar, the REC chip's strip and the main region. Laid out for
+ * 1100-1440 px windows; a narrower window keeps the sidebar as an icon rail, and a very narrow one
+ * stacks it on top.
  *
- * The Channels and groups screen's layout comes in here, since index.html links the shell's
- * sheet and the first two screens' sheets only.
+ * The Channels and groups screen's layout comes in here, since index.html does not link its sheet.
  */
 
 @import url("screens/channels-screen.css");
@@ -112,6 +112,27 @@
   font-size: var(--ml-text-sm);
 }
 
+.shell-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The REC chip, above every screen while a take records. */
+.shell-status {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--ml-space-2) 22px 0;
+  background: var(--ml-ground);
+}
+
+.shell-status[hidden] {
+  display: none;
+}
+
 .main {
   display: flex;
   flex-direction: column;
@@ -201,5 +222,9 @@ h1[tabindex="-1"]:focus {
 
   .main {
     padding: var(--ml-space-3);
+  }
+
+  .shell-status {
+    padding: var(--ml-space-2) var(--ml-space-3) 0;
   }
 }

@@ -161,7 +161,7 @@ test("every status row carries its capabilities, round trip and newest second, n
   const [lead, bass, keys, drums] = status.musicians;
 
   assert.deepEqual(lead.capabilities, ["stats.v2", "playback.buffer"]);
-  assert.deepEqual(bass.capabilities, ["stats.v2", "redundancy.recovered"]);
+  assert.deepEqual(bass.capabilities, ["stats.v2", "redundancy.recovered", "redundancy.hold"]);
   assert.deepEqual(keys.capabilities, []);
   for (const row of status.musicians) {
     assert.equal(typeof row.rttMs, "number");

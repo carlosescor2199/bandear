@@ -13,7 +13,8 @@
 //   pressed or their row is clicked outside its fields and buttons (again on the open one closes it).
 //   `musician-buffer` { address, key, mode, ms } when a Buffer is chosen: "auto", or "fixed" with
 //   the length typed (a string, checked by the screen); see playback-buffer.js.
-//   `musician-redundancy` { address, key, on } when Redundancy is switched; see redundancy.js.
+//   `musician-redundancy` { address, key, on, delayBlocks } when Redundancy is switched (the delay
+//   null, the default: an immediate copy) or its Copy is chosen; see redundancy.js.
 //
 // A name commits on Enter or when the field loses focus; Escape puts the saved name back. A name
 // the phone announced is the phone's, so its field is read-only; a local label is marked as such,
@@ -23,10 +24,12 @@
 // it, Escape puts the last one back), with the cushion the phone reports under it; a phone that
 // takes no buffer from the desk shows "needs a newer app" and no control. A choice waiting for its
 // answer stays shown until the row's buffer or its outcome says otherwise.
-// The Redundancy cell: a switch (every packet sent again a few blocks later), what it costs in
-// bandwidth under it and, while on, the copies sent and the packets the phone reports recovered (or
-// that it does not report them); a switch waiting for its answer stays as it was set until the row
-// or its outcome says otherwise.
+// The Redundancy cell: a switch (every packet sent twice) and, while on, its Copy: immediate (the
+// default, no added latency) or 1-4 blocks later with the latency each adds, the delays disabled
+// with "needs a newer app" for a phone that cannot hold packets back for them; what it costs under
+// it and, while on, the copies sent and the packets the phone reports recovered (or that it does
+// not report them); a choice waiting for its answer stays as it was set until the row or its
+// outcome says otherwise.
 // A field being typed in is never overwritten by new data. Remove asks first: the row shows
 // "Keep" where Remove was, and the confirming Remove only works after a short pause, so a double
 // click or a stray click cannot remove anyone.
@@ -160,6 +163,16 @@ const styles = sheet(`
     height: 16px;
     margin: 0;
     accent-color: var(--ml-blue);
+  }
+  .redundancy-delay {
+    display: block;
+    min-height: 26px;
+    margin-top: 4px;
+    padding: 0 6px;
+    border: 1px solid var(--ml-border);
+    border-radius: var(--ml-radius-sm);
+    background: var(--ml-ground);
+    font-size: var(--ml-text-sm);
   }
   .redundancy-said {
     max-width: 16em;
@@ -319,7 +332,7 @@ class MlMusiciansTable extends HTMLElement {
               <th scope="col">Control</th>
               <th scope="col" title="What the musician's phone reports about the audio it receives">Link</th>
               <th scope="col" title="The phone's playback buffer: Auto lets the phone adapt it; Fixed keeps the length set here. Under it, the cushion the phone reports it plays">Buffer</th>
-              <th scope="col" title="Redundancy: every packet sent again a few blocks later; it doubles this musician's bandwidth. Under it, the copies sent and the packets the phone reports a copy recovered">Redundancy</th>
+              <th scope="col" title="Redundancy: every packet sent twice, the copy right after it or a few blocks later; it doubles this musician's bandwidth, and a later copy adds that much latency. Under it, the copies sent and the packets the phone reports a delayed copy recovered">Redundancy</th>
               <th scope="col">Mix</th>
               <th scope="col" class="num">Sent</th>
               <th scope="col" class="num">Discarded</th>
@@ -440,7 +453,9 @@ class MlMusiciansTable extends HTMLElement {
           <input class="redundancy-switch" type="checkbox" role="switch" />
           <span class="redundancy-word"></span>
         </label>
+        <select class="redundancy-delay"></select>
         <div class="detail redundancy-cost"></div>
+        <div class="detail redundancy-note"></div>
         <div class="detail redundancy-counts"></div>
         <div class="redundancy-said" role="status"></div>
       </td>
@@ -474,6 +489,8 @@ class MlMusiciansTable extends HTMLElement {
       said: null,
       redundancySwitch: row.querySelector(".redundancy-switch"),
       redundancyWord: row.querySelector(".redundancy-word"),
+      redundancyDelay: row.querySelector(".redundancy-delay"),
+      redundancyNote: row.querySelector(".redundancy-note"),
       redundancyCost: row.querySelector(".redundancy-cost"),
       redundancyCounts: row.querySelector(".redundancy-counts"),
       redundancySaid: row.querySelector(".redundancy-said"),
@@ -524,8 +541,13 @@ class MlMusiciansTable extends HTMLElement {
     });
     view.redundancySwitch.addEventListener("change", () => {
       const on = view.redundancySwitch.checked;
-      view.redundancyAsked = { on };
-      emit(this, "musician-redundancy", { address, key: view.key, on });
+      view.redundancyAsked = { on, delayBlocks: null };
+      emit(this, "musician-redundancy", { address, key: view.key, on, delayBlocks: null });
+    });
+    view.redundancyDelay.addEventListener("change", () => {
+      const delayBlocks = Number(view.redundancyDelay.value);
+      view.redundancyAsked = { on: true, delayBlocks };
+      emit(this, "musician-redundancy", { address, key: view.key, on: true, delayBlocks });
     });
     row.addEventListener("click", (event) => {
       // A click on the row's own fields and buttons does what they do; anywhere else opens the
@@ -621,9 +643,33 @@ class MlMusiciansTable extends HTMLElement {
     setText(view.redundancyWord, on ? "On" : "Off");
     const label = row.name || row.address;
     reflect(view.redundancySwitch, "aria-label", `Send ${label}'s audio twice (redundancy)`);
+    // The Copy choices, rebuilt only when what they say changed (the block size, the phone).
+    const options = JSON.stringify(cell.delays);
+    if (view.redundancyDelay.dataset.options !== options) {
+      view.redundancyDelay.dataset.options = options;
+      view.redundancyDelay.replaceChildren(
+        ...cell.delays.map((delay) => {
+          const option = document.createElement("option");
+          option.value = String(delay.value);
+          option.textContent = delay.label;
+          option.disabled = delay.disabled;
+          return option;
+        }),
+      );
+    }
+    view.redundancyDelay.hidden = !on;
+    view.redundancyDelay.value = String(view.redundancyAsked?.delayBlocks ?? cell.delayBlocks ?? 0);
+    reflect(view.redundancyDelay, "aria-label", `When ${label}'s copy is sent`);
+    view.redundancyDelay.title =
+      "Immediate: the copy goes right after its packet, with no added latency. Later: a Wi-Fi burst " +
+      "must last that long to take both, and the phone plays that much later";
+    setText(view.redundancyNote, on ? (cell.holdNote ?? "") : "");
+    view.redundancyNote.title = cell.holdNote
+      ? "This phone's app cannot hold packets back for a delayed copy; update MixLink on it"
+      : "";
     setText(view.redundancyCost, cell.bandwidth);
     view.redundancyCost.title =
-      "Every packet is sent again a few blocks later, so a Wi-Fi burst must take both copies to cost audio";
+      "Every packet is sent twice, so a lost one can still arrive as its copy";
     setText(view.redundancyCounts, cell.on ? [cell.duplicates, cell.recovered].join(" · ") : "");
     setText(view.redundancySaid, said?.message ?? "");
     reflect(view.redundancySaid, "data-error", said ? !said.ok : false);

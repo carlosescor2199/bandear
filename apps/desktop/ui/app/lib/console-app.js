@@ -132,7 +132,7 @@ import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
 import { formatBufferSet, nameForKey } from "./playback-buffer.js";
-import { formatRedundancySet } from "./redundancy.js";
+import { blockMsOf, formatRedundancySet } from "./redundancy.js";
 import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
 
@@ -917,7 +917,12 @@ export function createConsoleApp({
       try {
         const answer = await api.setMusicianRedundancy(musicianKey, on, delayBlocks);
         await readStatus();
-        return formatRedundancySet(answer, nameForKey(store.getState().musicians, musicianKey));
+        const state = store.getState();
+        return formatRedundancySet(
+          answer,
+          nameForKey(state.musicians, musicianKey),
+          blockMsOf(state.engine?.status?.captureFormat),
+        );
       } catch (error) {
         return { ok: false, message: sentenceWithReason("Redundancy was not set", message(error)) };
       }

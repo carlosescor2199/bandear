@@ -62,11 +62,22 @@ test("a row per musician with the name, who owns it, the link and the counts", (
       key: `client:${status.musicians[0].clientId}`,
       on: false,
       delayBlocks: null,
+      holdSupported: false,
+      delays: [
+        { value: 0, label: "Copy: immediate", disabled: false },
+        ...[1, 2, 3, 4].map((value) => ({
+          value,
+          label: `Copy: ${value} ${value === 1 ? "block" : "blocks"} later (+${((value * 256) / 48).toFixed(1)} ms), needs a newer app`,
+          disabled: true,
+        })),
+      ],
+      holdNote: "Delayed copies: needs a newer app",
       bandwidth: "Sends once; on doubles this musician's bandwidth",
       recovered: null,
       duplicates: null,
     },
   });
+  assert.equal(rows[1].redundancy.holdSupported, true, "Bass's phone holds packets back for copies");
   assert.equal(rows[1].buffer.note, "needs a newer app", "Bass's phone takes no buffer");
   assert.equal(rows[3].name, "Drums");
   assert.equal(rows[3].editable, true, "no announced name: the desk may label it");

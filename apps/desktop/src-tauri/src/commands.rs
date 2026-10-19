@@ -2671,6 +2671,7 @@ mod tests {
                     duplicates_sent: 0,
                     recovered: 0,
                     redundancy_supported: false,
+                    redundancy_hold_supported: false,
                 })
                 .collect(),
             local_mix: MixDto::from(&personal_monitoring::MixValues::default()),

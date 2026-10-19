@@ -1,22 +1,26 @@
 //! Packet redundancy set from the desk: the `set_musician_redundancy` command, and the settings the
 //! session keeps handed to every engine the desk starts and taken from a loaded session.
 //!
-//! Per musician the engineer turns redundancy on (each packet sent again a few blocks later, so a
-//! Wi-Fi burst must take both copies to cost audio) or off, the default (see
-//! [personal_monitoring::Redundancy]). It doubles that musician's bandwidth and nothing else's. The
+//! Per musician the engineer turns redundancy on (each packet sent twice: by default the copy right
+//! after its original, which adds no latency and any phone takes; or 1-4 blocks later, so a Wi-Fi
+//! burst must last that long to take both, for a phone that holds packets back that long) or off,
+//! the default (see [personal_monitoring::Redundancy]). It doubles that musician's bandwidth and nothing else's. The
 //! engine keeps the setting while it runs, whether the musician is here or not; the session keeps
 //! it for the next start, under the key the engine kept it under (the phone's client id, else the
-//! address). Every phone takes it: an older one drops the copies as duplicates, one that announced
-//! `redundancy.recovered` plays a copy whose original was lost and reports it (`recovered` on the
-//! row and in its link history).
+//! address). A phone that has the original drops its copy as a duplicate. A delayed copy is set
+//! only for a phone that announced `redundancy.hold` (`unsupported` for any other: it needs a newer
+//! app); such a phone holds packets back for the delay, plays a late copy in its lost original's
+//! place and, with `redundancy.recovered`, reports it (`recovered` on the row and in its link
+//! history).
 //!
 //! The mix backups do not carry it: they restore mixes, and the session already keeps it.
 
 use std::sync::Mutex;
 
 use personal_monitoring::{
-    log_info, log_warn, EngineHandle, MusicianKey, Redundancy, RedundancySetting,
-    DEFAULT_REDUNDANCY_DELAY_BLOCKS, MAX_REDUNDANCY_DELAY_BLOCKS, MIN_REDUNDANCY_DELAY_BLOCKS,
+    log_info, log_warn, EngineHandle, MusicianKey, Redundancy, RedundancyOutcome,
+    RedundancySetting, DEFAULT_REDUNDANCY_DELAY_BLOCKS, MAX_REDUNDANCY_DELAY_BLOCKS,
+    MIN_REDUNDANCY_DELAY_BLOCKS,
 };
 
 use super::{musician_key_of, DesktopState};
@@ -91,7 +95,8 @@ pub(crate) fn redundancies_of(session: &Session) -> Vec<(MusicianKey, Redundancy
 /// Turns redundancy on (`on`, with the copies `delay_blocks` blocks late, 0 when it names none) or
 /// off for the musician `musician_key` names (`client:<id>` or `address:<ip:port>`). Answers what
 /// was done ([RedundancySetDto]): `set`, in force from the next block, with what it does to that
-/// musician's bandwidth, or `invalid` (a delay out of range, nothing changed). A setting the engine
+/// musician's bandwidth, `unsupported` (a delayed copy for a phone that cannot hold packets back for
+/// it: it needs a newer app; nothing changed) or `invalid` (a delay out of range, nothing changed). A setting the engine
 /// took is then saved in the session for the next start; a save that fails is reported in the
 /// answer, not as an error.
 ///
@@ -157,6 +162,15 @@ pub(crate) fn set_redundancy_with<E: RedundancyEngine>(
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
     let set = engine.set_redundancy(&key, redundancy)?;
+    if set.outcome == RedundancyOutcome::NeedsHold {
+        return Ok(answer(
+            "unsupported",
+            None,
+            "Not set: this musician's phone needs a newer app to play a delayed copy; an immediate \
+             copy works with any app."
+                .to_owned(),
+        ));
+    }
     let message = match redundancy {
         Redundancy::Off => "Each packet is sent once again: this musician's bandwidth is back to \
                             normal."
@@ -198,8 +212,8 @@ mod tests {
     const ADDRESS: &str = "192.168.1.30:50000";
     const RACK: &str = "192.168.1.31:50000";
 
-    /// An engine with Ana's phone at [ADDRESS] and a rack at [RACK]; it records every setting it
-    /// took.
+    /// An engine with Ana's phone at [ADDRESS], which holds packets back for delayed copies, and a
+    /// rack at [RACK], which does not; it records every setting it took.
     #[derive(Default)]
     struct StandIn {
         took: Mutex<Vec<(MusicianKey, Redundancy)>>,
@@ -222,6 +236,14 @@ mod tests {
                 }
                 _ => return Err("the musician is not here".to_owned()),
             };
+            if address == at(RACK) && redundancy.hold_blocks() > 0 {
+                return Ok(RedundancySetting {
+                    kept_for,
+                    address,
+                    redundancy,
+                    outcome: RedundancyOutcome::NeedsHold,
+                });
+            }
             self.took
                 .lock()
                 .expect("took lock")
@@ -230,7 +252,7 @@ mod tests {
                 kept_for,
                 address,
                 redundancy,
-                outcome: personal_monitoring::RedundancyOutcome::Set,
+                outcome: RedundancyOutcome::Set,
             })
         }
     }
@@ -341,6 +363,30 @@ mod tests {
     }
 
     #[test]
+    fn a_delayed_copy_for_a_phone_that_cannot_hold_is_unsupported_and_changes_nothing() {
+        let session = SessionStore::open(&test_directory("unsupported"));
+        let engine = running();
+
+        let set = set_redundancy_with(&engine, &session, &address_key(RACK), true, Some(2))
+            .expect("answered");
+
+        assert_eq!(set.outcome, "unsupported");
+        assert_eq!(set.redundancy, None);
+        assert_eq!(set.bandwidth_factor, 1);
+        assert!(!set.saved);
+        assert!(set.message.contains("needs a newer app"), "{}", set.message);
+        assert_eq!(took(&engine), Vec::new());
+        assert_eq!(session.redundancies(), Vec::new(), "nothing is kept");
+
+        let immediate = set_redundancy_with(&engine, &session, &address_key(RACK), true, Some(0))
+            .expect("answered");
+        assert_eq!(
+            immediate.outcome, "set",
+            "immediate copies work for any phone"
+        );
+    }
+
+    #[test]
     fn a_delay_out_of_range_is_invalid_and_changes_nothing() {
         let session = SessionStore::open(&test_directory("invalid"));
         let engine = running();
@@ -393,6 +439,7 @@ mod tests {
                     "address:{RACK}":{{"redundancy":{{}}}},
                     "address:192.168.1.33:50000":{{"redundancy":{{"delayBlocks":9}}}},
                     "address:192.168.1.34:50000":{{"redundancy":"lots"}},
+                    "address:192.168.1.35:50000":{{"redundancy":{{"delayBlocks":0}}}},
                     "Rack":{{"redundancy":{{"delayBlocks":2}}}}
                 }}}}"#
             ),
@@ -408,11 +455,15 @@ mod tests {
                     Redundancy::On { delay_blocks: 0 }
                 ),
                 (
+                    MusicianKey::Address("192.168.1.35:50000".parse().unwrap()),
+                    Redundancy::On { delay_blocks: 0 }
+                ),
+                (
                     MusicianKey::Client(PHONE.to_owned()),
                     Redundancy::On { delay_blocks: 3 }
                 ),
             ],
-            "no delay is the default; one out of range, unreadable or under no key is skipped"
+            "no delay is 0, the default; one out of range, unreadable or under no key is skipped"
         );
     }
 }

@@ -116,8 +116,53 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings.
   - Commits: 72f857b `feat(engine): route diagnostics through a log sink`; this commit
     `feat(desktop): write a rotating log file`.
-- [ ] T2 (mixes backup): debounced autosave of live mixes to a rolling backup, restore from the
-  session panel. Route: delegated writer.
+- [x] T1-fix (review-b891debe9d10ebc9 findings): Route: delegated writer (trigger: findings across
+  the desktop log file and the server's network sink, done with T2).
+  - WARNING fixed: a rotation that fails for a lasting reason (old file held or not removable) now
+    appends the line to the current file anyway and backs off until the file has grown by another
+    limit's worth (`retry_rotation_at`), instead of losing every line and retrying on each. Seam:
+    `FileOps` (remove/rename) injected in tests.
+  - SUGGESTION fixed: the stderr explanation is re-armed after a line reaches the file again;
+    `log_location` answers `failedLines` (live count shared with the sink).
+  - SUGGESTION fixed: the network sink keeps the kind of the last failed UDP send in an `AtomicU8`
+    per musician (no allocation on the engine thread); `MusicianCounters.last_send_error` and the
+    window's `lastSendError` name it. The no-allocation test stays green.
+  - RED: logfile, 3 of 11 failed (rotation-fails and remove-fails lost lines, `warned` not
+    re-armed); network, `a_failed_send_is_remembered_per_musician` failed (kind not kept).
+  - Commits: 8eb4f3d `fix(desktop): keep logging when the log file cannot rotate` (+226/-31);
+    e645bf4 `fix(engine): report the last send error per musician` (+132/-4).
+- [x] T2 (mixes backup): debounced autosave of live mixes to a rolling backup, restore from the
+  session panel. Route: delegated writer (trigger: 2+ non-trivial files, Rust store, scheduler,
+  commands and the console UI).
+  - Files: `backups/mixes-<UTC stamp>.json` (stamp `20261018T190405123Z`) in the app config dir,
+    version 1, `{ version, savedAt, musicians: [{ key, name, clientId, address, engineer?, mix }] }`
+    (`mix` as a saved session keeps one), written atomically (`write_atomically`), the newest 10
+    kept. A damaged or newer file is listed with its `problem` and never restored. A stamp is read
+    only in its exact form and the file must be directly in the folder (canonicalized).
+  - When: the event pump notes each musician `mix-changed` (`PumpSource::mix_backup`); a backup is
+    due 3 s after the mixes go still, at most 20 s after the first change (`Debounce`, injected
+    clock), read under the engine lock (in memory) and written by its own thread; also on engine
+    stop and app exit. Empty or unchanged backups are not written. Limit and locks are recorded,
+    not restored (the session keeps them).
+  - Commands: `list_mix_backups()` (newest first: stamp, savedAt, musicians, names, problem) and
+    `restore_mix_backup(stamp)`, through `push_saved_mixes` (the load path): restored rows, and
+    skipped `notConnected` / `notHere` / `refused`, never queued; no engine is an error.
+  - Console: state `mixBackups`, `loadMixBackups()` and `restoreMixBackup(stamp)` answering `{ ok,
+    message }`; fake bridge mirrors both (debounced by `clock`, keep 10, dedupe). Session panel:
+    "Mix backups" list (time to the second, musicians and names), Refresh, Restore with a confirm
+    step and the outcome; logic in `lib/mix-backups-view.js`.
+  - RED: Rust store 7 of 7 failed (stubs), scheduler and backup-of 4 failed; UI suite failed to load
+    (module missing). GREEN below.
+  - Browser check (`desktop-ui`, `?fake#/network`): the demo's phone changes produced backups
+    listed with time and 4 musicians; Restore asked first, Cancel dropped it, the confirming Restore
+    said "Restored the mixes backed up at ... to Lead vocal, Bass, Keys and Drums."; no console
+    errors.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 442 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 277 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 470 passed.
+  - Commits: 67fba08 `feat(desktop): back up the musicians' mixes as they change` (+1380/-3);
+    this commit `feat(desktop-ui): restore a mix backup from the session panel`.
 - [ ] T3 (health history): capabilities on `register`, RTT from ping/pong, history ring per
   musician, phone stats extras (jitter, cushion) parsed when present, DTO and events. Route:
   delegated writer.
@@ -144,7 +189,12 @@ per reviewed slice, only with the user's approval.
   buffer.
 
 - T1 done (log file), two commits.
+- review-b891debe9d10ebc9 (4f2ae0c..d787a05, T1) approved and acknowledged, with three findings:
+  the log rotation failure that loses lines (WARNING), the one-time stderr explanation never
+  re-armed and the failure count not exposed (SUGGESTION), and the discarded UDP send error
+  (SUGGESTION); all fixed in T1-fix. Next review base d787a05.
+- T1-fix and T2 done (mixes backup), four commits.
 
 ## Next step
 
-T2 (mixes backup).
+T3 (health history).

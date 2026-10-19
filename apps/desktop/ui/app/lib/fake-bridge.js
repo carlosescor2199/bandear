@@ -18,6 +18,7 @@ import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto
 import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
 import { IDLE_RECORDING, RECORD_FORMATS } from "./recording.js";
 import { IDLE_SOUNDCHECK } from "./soundcheck.js";
+import { BACKUP_MAX_WAIT_MS, BACKUP_QUIET_MS, KEPT_BACKUPS } from "./mix-backups-view.js";
 import { checkSessionName } from "./sessions.js";
 import { clampLevel } from "./values.js";
 
@@ -489,6 +490,13 @@ function withPort(address) {
   return hasPort ? text : `${text}:${DEFAULT_PORT}`;
 }
 
+// A mix backup's stamp, as the desk names its files: UTC to the millisecond, `20261018T190405123Z`.
+const BACKUP_STAMP = /^\d{8}T\d{9}Z$/;
+
+function backupStamp(at) {
+  return new Date(at).toISOString().replace(/[^0-9TZ]/g, "");
+}
+
 /**
  * The fake bridge. `running` starts the engine already running, as run `status.run`; `failStart`
  * is the error every start fails with (none by default); `answersFirst` delivers a `set_mix`
@@ -588,6 +596,16 @@ function withPort(address) {
  * while it plays, else the timer). While a soundcheck plays, a take and a device switch are
  * refused; a stop or start of the engine ends it. `failSoundcheck(reason)` stops the take as a read
  * error does: only going back to the live inputs is left.
+ *
+ * Mix backups too, with the desktop's rules (see mix-backups-view.js): every musician's mix change
+ * is noted, and a backup of every musician's mix (as of the last change) is taken once the mixes
+ * have been still for BACKUP_QUIET_MS by `clock`, or BACKUP_MAX_WAIT_MS after the first change
+ * while they keep changing, at the first command after it is due; nobody, or the same mixes as the
+ * last backup, takes none, and only the newest KEPT_BACKUPS are kept. `list_mix_backups` lists them
+ * newest first (`mixBackups` seeds them, one with a `problem` cannot be restored), and
+ * `restore_mix_backup` pushes each backed-up mix to the musician here under its key as a load does
+ * (a phone not connected and a musician not here are skipped), refusing a stamp that names no
+ * backup and a restore with the engine stopped; `mixBackups()` reads them.
  */
 export function createFakeBridge({
   status = sampleStatus(),
@@ -602,6 +620,7 @@ export function createFakeBridge({
   presets = [],
   savedSessions = [],
   sessionNotice = null,
+  mixBackups = [],
   clock = () => Date.now(),
   recordingsFolder = FAKE_RECORDINGS_FOLDER,
   savedRecording = null,
@@ -663,6 +682,14 @@ export function createFakeBridge({
     clone(savedSessions).map(({ id, ...saved }) => [id, { mixes: {}, problem: null, ...saved }]),
   );
   let lastSessionId = 0;
+  // The backups of the musicians' mixes, `{ stamp, savedAt, musicians, problem }` (the musicians as
+  // a backup file keeps them), as the desk takes them; the changes waiting for one, `{ first, last,
+  // musicians }` (the mixes as of the last change), and the musicians of the last one taken.
+  const backupBook = clone(mixBackups)
+    .map((kept) => ({ musicians: [], problem: null, ...kept }))
+    .sort((one, other) => (one.stamp < other.stamp ? -1 : 1));
+  let backupWait = null;
+  let lastBackedUp = null;
   // How the desk records takes, as its session keeps them (the folder null for the default).
   let keptRecording = {
     folder: null,
@@ -1600,6 +1627,66 @@ export function createFakeBridge({
 
   function announceMix(address, origin, mix) {
     emit("mix-changed", { run, address, origin, mix: clone(mix) });
+    noteBackup();
+  }
+
+  // Every musician as a backup keeps them: their key, the name the window shows, their client id
+  // and address, and their whole mix (never the phone's cap).
+  function backedUpNow() {
+    return engine.musicians.map((row) => ({
+      key: labelKey(row),
+      name: row.name ?? null,
+      clientId: row.clientId ?? null,
+      address: row.address,
+      mix: savedMixOf(row),
+    }));
+  }
+
+  // A musician's mix changed: as the desk does, a backup is due once the mixes have been still for
+  // BACKUP_QUIET_MS, or BACKUP_MAX_WAIT_MS after the first change while they keep changing. The
+  // fake takes it at the first command after it is due, with the mixes as of the last change.
+  function noteBackup() {
+    settleBackups();
+    const now = clock();
+    backupWait = { first: backupWait?.first ?? now, last: now, musicians: backedUpNow() };
+  }
+
+  function settleBackups() {
+    if (!backupWait) {
+      return;
+    }
+    const due = Math.min(backupWait.last + BACKUP_QUIET_MS, backupWait.first + BACKUP_MAX_WAIT_MS);
+    if (clock() < due) {
+      return;
+    }
+    const { musicians } = backupWait;
+    backupWait = null;
+    // As the desk does: nobody, or the same mixes as the last backup, is not backed up again.
+    const written = JSON.stringify(musicians);
+    if (musicians.length === 0 || written === lastBackedUp) {
+      return;
+    }
+    let at = due;
+    while (backupBook.some((kept) => kept.stamp === backupStamp(at))) {
+      at += 1;
+    }
+    backupBook.push({ stamp: backupStamp(at), savedAt: at, musicians: clone(musicians), problem: null });
+    lastBackedUp = written;
+    backupBook.sort((one, other) => (one.stamp < other.stamp ? -1 : 1));
+    backupBook.splice(0, Math.max(0, backupBook.length - KEPT_BACKUPS));
+  }
+
+  // A backup as `list_mix_backups` lists it.
+  function backupSummary(kept) {
+    return {
+      stamp: kept.stamp,
+      savedAt: kept.problem ? null : (kept.savedAt ?? null),
+      musicians: kept.problem ? 0 : kept.musicians.length,
+      names: kept.problem
+        ? []
+        : kept.musicians.map((musician) => musician.name ?? musician.address ?? "a phone"),
+      problem: kept.problem ?? null,
+    };
   }
 
   function emitMeters() {
@@ -2249,6 +2336,35 @@ export function createFakeBridge({
         localOutputNotice,
       };
     },
+    list_mix_backups() {
+      settleBackups();
+      return [...backupBook].reverse().map(backupSummary);
+    },
+    restore_mix_backup({ stamp } = {}) {
+      settleBackups();
+      // As the desktop does: only a stamp of a backup's form, naming one in the backups folder.
+      const kept = BACKUP_STAMP.test(String(stamp ?? ""))
+        ? backupBook.find((candidate) => candidate.stamp === stamp)
+        : null;
+      if (!kept) {
+        throw `\`${stamp}\` is not a mix backup in ${FAKE_CONFIG_FOLDER}\\backups`;
+      }
+      if (kept.problem) {
+        throw `the mix backup \`${stamp}\` cannot be restored: ${kept.problem}`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running: a backup is put back on the musicians who are connected";
+      }
+      const mixes = Object.fromEntries(kept.musicians.map((musician) => [musician.key, musician.mix]));
+      const skippedMix = (key, reason) => ({
+        key,
+        label: labels.get(key) ?? kept.musicians.find((musician) => musician.key === key)?.name ?? null,
+        reason,
+        error: null,
+      });
+      const { pushed, skipped } = pushSavedMixes(mixes, skippedMix);
+      return { backup: backupSummary(kept), restored: pushed, skipped };
+    },
     recording_settings() {
       return settingsAnswer();
     },
@@ -2627,6 +2743,11 @@ export function createFakeBridge({
     /** The local mix and output the session keeps, `{ mix, output }`: null before either. */
     savedLocal() {
       return keptLocal ? clone(keptLocal) : null;
+    },
+    /** The mix backups taken, `{ stamp, savedAt, musicians, problem }`, the oldest first. */
+    mixBackups() {
+      settleBackups();
+      return clone(backupBook);
     },
     /** The recording settings the session keeps, `{ folder, format, includeLocal, armed }`. */
     savedRecording() {

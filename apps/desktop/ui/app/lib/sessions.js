@@ -388,7 +388,8 @@ export function createSessionPanel({
 
 /**
  * The Network and system screen's side of the Session panel: `handle(type, detail)` runs the
- * console `app`'s command for one of <ml-session-panel>'s events (`types`), then hands its answer
+ * console `app`'s command for one of <ml-session-panel>'s events (`types`, the mix backups' list
+ * and restore among them), then hands its answer
  * `{ ok, message }` to `said(outcome)` and to `panel.answered(kind, ok)`, whatever happened, so a
  * load asked about never stays asked.
  */
@@ -399,6 +400,12 @@ export function sessionPanelCommands({ app, panel, said }) {
     "session-rename": ["rename", (detail) => app.renameSession(detail.id, detail.name)],
     "session-delete": ["delete", (detail) => app.deleteSession(detail.id)],
     "sessions-load": ["list", () => app.loadSessions().then(() => null)],
+    // A list of the mix backups that worked says nothing: the list shows it.
+    "mix-backups-load": [
+      "backups",
+      () => app.loadMixBackups().then((outcome) => (outcome.ok ? null : outcome)),
+    ],
+    "mix-backup-restore": ["restore", (detail) => app.restoreMixBackup(detail.stamp)],
   };
   return {
     types: Object.keys(commands),

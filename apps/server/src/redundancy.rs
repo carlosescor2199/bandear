@@ -12,8 +12,10 @@
 //! The desk may instead delay the copy 1 to [MAX_REDUNDANCY_DELAY_BLOCKS] blocks, right after that
 //! later block's own datagram: a Wi-Fi burst that takes a packet must then last that long to take
 //! its copy too. A delayed copy arrives after newer audio, so only a phone that holds packets back
-//! for that many blocks before playing them can use it ([Redundancy::hold_blocks]). The hold costs
-//! that phone the delay in latency (at the usual 256-frame blocks, 5.3 ms a block).
+//! for that many blocks before playing them can use it ([Redundancy::hold_blocks]): one that
+//! announced [crate::CAPABILITY_REDUNDANCY_HOLD], told the hold by the `redundancy` message, and
+//! the engine sets a delay only for such a phone. The hold costs that phone the delay in latency (at
+//! the usual 256-frame blocks, 5.3 ms a block).
 //!
 //! Redundancy costs that musician's link double the bandwidth (every datagram is sent twice) and
 //! nothing for the others. The engine keeps the setting per musician (by their phone's client id,
@@ -98,6 +100,18 @@ pub struct RedundancySetting {
     /// The musician's row, as the status reports it.
     pub address: SocketAddr,
     pub redundancy: Redundancy,
+    pub outcome: RedundancyOutcome,
+}
+
+/// Whether [crate::EngineHandle::set_redundancy] put the setting in force.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedundancyOutcome {
+    /// In force from the next block, and kept for the musician.
+    Set,
+    /// A delayed copy for a musician whose phone does not hold packets back for one (it did not
+    /// announce [crate::CAPABILITY_REDUNDANCY_HOLD]): it would arrive too late to be played, so
+    /// nothing changed. Immediate copies (delay 0) work for every phone.
+    NeedsHold,
 }
 
 /// The datagrams of one musician waiting to be sent again: one slot per block of delay, each with

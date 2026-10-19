@@ -35,7 +35,7 @@ use crate::recorder::{
     DiskEstimate, FileOpener, RecordRequest, Recorder, RecordingStatus, TakeEnd, TakeMarker,
     TakeOptions, TakeSummary, TrackOpener, STOP_WAIT,
 };
-use crate::redundancy::{Redundancy, RedundancySetting};
+use crate::redundancy::{Redundancy, RedundancyOutcome, RedundancySetting};
 use crate::soundcheck::{
     PlaybackClock, Soundcheck, SoundcheckError, SoundcheckRequest, SoundcheckStatus,
 };
@@ -90,6 +90,10 @@ pub enum EngineEvent {
     /// [EngineHandle::set_playback_buffer]); their phone is sent it when it takes one. The status
     /// reports it ([MusicianStatus::playback_buffer]).
     PlaybackBufferChanged { address: SocketAddr },
+    /// The redundancy the engine keeps for the musician at this address's IP changed (see
+    /// [EngineHandle::set_redundancy]); their phone is told the hold it needs when it holds packets
+    /// back for copies. The status reports it ([MusicianStatus::redundancy]).
+    RedundancyChanged { address: SocketAddr },
 }
 
 /// Where a mix change came from.
@@ -709,6 +713,36 @@ pub(crate) fn set_target_buffer(
             })
         }
     }
+}
+
+/// Sets the redundancy of the musician `key` names, as [EngineHandle::set_redundancy] does: a
+/// delayed copy only for a phone that holds packets back for it, anything else for anyone, put in
+/// force and announced.
+pub(crate) fn set_target_redundancy(
+    targets: &TargetRegistry,
+    events: &EventBus,
+    key: &MusicianKey,
+    redundancy: Redundancy,
+) -> Result<RedundancySetting, String> {
+    if redundancy.hold_blocks() > 0 {
+        let (address, holds) = targets.redundancy_hold_support(key)?;
+        if !holds {
+            return Ok(RedundancySetting {
+                kept_for: key.clone(),
+                address,
+                redundancy,
+                outcome: RedundancyOutcome::NeedsHold,
+            });
+        }
+    }
+    let (kept_for, address) = targets.set_redundancy(key, redundancy)?;
+    events.emit(EngineEvent::RedundancyChanged { address });
+    Ok(RedundancySetting {
+        kept_for,
+        address,
+        redundancy,
+        outcome: RedundancyOutcome::Set,
+    })
 }
 
 /// Keeps `controls` for the musician `key` names and puts them in force if they are here, as
@@ -2554,15 +2588,20 @@ impl EngineHandle {
     }
 
     /// Sets whether the audio of the musician `key` names (their phone's client id, or an address
-    /// by IP) is sent twice, each datagram again a few blocks later (see [crate::redundancy]).
+    /// by IP) is sent twice, each copy right after its original or a few blocks later (see
+    /// [crate::redundancy]).
     ///
     /// It takes effect from the next block and costs that musician's link double the bandwidth.
-    /// Every phone takes it: an older one drops the copies as duplicates, one that announced
-    /// [crate::CAPABILITY_REDUNDANCY_RECOVERED] plays a copy whose original was lost and reports it.
-    /// The engine keeps the setting for the musician (under their phone's client id when it
-    /// announced one, else their address: the key it returns) for as long as it runs, so it
+    /// Immediate copies work for every phone: one that has its original drops the copy as a
+    /// duplicate. A delayed copy only helps a phone that holds packets back for it, so it is set
+    /// only for one that announced [crate::CAPABILITY_REDUNDANCY_HOLD]; for any other musician
+    /// nothing changes ([RedundancyOutcome::NeedsHold]). Such a phone is told the hold (the
+    /// `redundancy` message) now when its control channel is connected and again each time it
+    /// registers. The engine keeps the setting for the musician (under their phone's client id
+    /// when it announced one, else their address: the key it returns) for as long as it runs, so it
     /// survives a reconnect. The status reports it ([MusicianStatus::redundancy]) with the copies
-    /// sent ([MusicianCounters::duplicates_sent]).
+    /// sent ([MusicianCounters::duplicates_sent]); a change is announced as
+    /// [EngineEvent::RedundancyChanged].
     ///
     /// An engine that is stopping, or a key that names nobody here, is an error, and nothing
     /// changes.
@@ -2574,17 +2613,18 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        let (kept_for, address) = self.targets.set_redundancy(key, redundancy)?;
-        Ok(RedundancySetting {
-            kept_for,
-            address,
-            redundancy,
-        })
+        set_target_redundancy(&self.targets, &self.events, key, redundancy)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
     }
 
     /// Replaces every redundancy setting the engine keeps with `kept` (keys as
     /// [Self::set_redundancy] keeps them), as a desk does when it starts an engine or loads a saved
-    /// session: one not in `kept` is forgotten (off), also for a musician who is not here.
+    /// session: one not in `kept` is forgotten (off), also for a musician who is not here. Each
+    /// phone here that holds packets back for copies and whose hold changed is told it.
+    ///
+    /// A delayed copy kept for a phone that does not hold packets back is put in force as kept: its
+    /// copies arrive too late and are dropped as duplicates, as before phones could hold, and the
+    /// desk says that phone needs a newer app.
     pub fn replace_redundancies(
         &self,
         kept: &[(MusicianKey, Redundancy)],
@@ -2592,7 +2632,9 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        self.targets.replace_redundancies(kept);
+        for address in self.targets.replace_redundancies(kept) {
+            self.events.emit(EngineEvent::RedundancyChanged { address });
+        }
         Ok(())
     }
 
@@ -3350,6 +3392,100 @@ mod tests {
         );
         assert_eq!(musicians[0].playback_buffer, PlaybackBuffer::Auto);
         assert_eq!(musicians[1].playback_buffer, forty);
+    }
+
+    /// Immediate copies are set for anyone; a delayed copy only for a phone that holds packets
+    /// back for it, any other musician being left as they were. Each setting put in force is
+    /// announced; replacing them announces the phones that hold and whose hold changed.
+    #[test]
+    fn a_delayed_copy_is_set_only_for_a_phone_that_holds_packets_back() {
+        let layout = GroupLayout::default();
+        let rack: SocketAddr = "192.168.1.3:50000".parse().unwrap();
+        let registry = TargetRegistry::new(&[rack], &layout).expect("registry should build");
+        registry.register(ip("192.168.1.4"), 50000, None, Some(PHONE_ID), &layout);
+        registry.set_capabilities(
+            ip("192.168.1.4"),
+            vec![crate::CAPABILITY_REDUNDANCY_HOLD.to_owned()],
+        );
+        let phone_row: SocketAddr = "192.168.1.4:50000".parse().unwrap();
+        let events = EventBus::default();
+        let observed = events.subscribe();
+        let phone = MusicianKey::Client(PHONE_ID.to_owned());
+        let two = Redundancy::On { delay_blocks: 2 };
+        let immediate = Redundancy::On { delay_blocks: 0 };
+
+        let refused = set_target_redundancy(&registry, &events, &MusicianKey::Address(rack), two)
+            .expect("the rack is listed");
+        assert_eq!(
+            refused,
+            RedundancySetting {
+                kept_for: MusicianKey::Address(rack),
+                address: rack,
+                redundancy: two,
+                outcome: RedundancyOutcome::NeedsHold,
+            }
+        );
+        assert!(
+            registry.read()[0].held.is_none(),
+            "nothing changed for the rack"
+        );
+        let rack_immediate =
+            set_target_redundancy(&registry, &events, &MusicianKey::Address(rack), immediate)
+                .expect("the rack is listed");
+        assert_eq!(rack_immediate.outcome, RedundancyOutcome::Set);
+        let delayed =
+            set_target_redundancy(&registry, &events, &phone, two).expect("the phone is listed");
+        assert_eq!(
+            delayed,
+            RedundancySetting {
+                kept_for: phone.clone(),
+                address: phone_row,
+                redundancy: two,
+                outcome: RedundancyOutcome::Set,
+            }
+        );
+        let nobody = set_target_redundancy(
+            &registry,
+            &events,
+            &MusicianKey::Client("someone-else".to_owned()),
+            two,
+        )
+        .expect_err("nobody");
+        assert!(nobody.contains("is not here"), "{nobody}");
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            vec![
+                EngineEvent::RedundancyChanged { address: rack },
+                EngineEvent::RedundancyChanged { address: phone_row },
+            ],
+            "only what was put in force is announced"
+        );
+        assert_eq!(registry.redundancy_for_phone(phone_row.ip()), Some(two));
+        assert_eq!(
+            registry.redundancy_for_phone(rack.ip()),
+            None,
+            "a rack is never told a hold"
+        );
+
+        // The rack's immediate copies stop and the phone's delay moves: only the phone, which
+        // holds, is announced.
+        let handle_events = EventBus::default();
+        let replaced = handle_events.subscribe();
+        for address in
+            registry.replace_redundancies(&[(phone.clone(), Redundancy::On { delay_blocks: 3 })])
+        {
+            handle_events.emit(EngineEvent::RedundancyChanged { address });
+        }
+        assert_eq!(
+            replaced.try_iter().collect::<Vec<_>>(),
+            vec![EngineEvent::RedundancyChanged { address: phone_row }]
+        );
+        assert!(
+            registry
+                .replace_redundancies(&[(phone, Redundancy::On { delay_blocks: 3 })])
+                .is_empty(),
+            "an unchanged hold is not told again"
+        );
     }
 
     /// Each row reports the redundancy kept for its musician, off when none is, with the copies

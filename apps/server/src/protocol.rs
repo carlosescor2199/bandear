@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::mix::{MixUpdate, MixValues, MAX_MIX_CHANNELS};
 use crate::playback::PlaybackBuffer;
+use crate::redundancy::Redundancy;
 
 const PACKET_MAGIC: [u8; 4] = *b"PMON";
 const PACKET_VERSION: u8 = 1;
@@ -130,15 +131,20 @@ pub(crate) struct RegisterCommand {
 pub const CAPABILITY_STATS_V2: &str = "stats.v2";
 /// The phone plays with a playback buffer the desk sets (Auto or a fixed length).
 pub const CAPABILITY_PLAYBACK_BUFFER: &str = "playback.buffer";
-/// The phone's `stats` carry `recovered`: the packets that filled a gap after a newer one arrived,
-/// which a redundant copy brings; a phone that cannot play them late counts them as lost too.
+/// The phone's `stats` carry `recovered`: the packets played after they filled a gap, arriving
+/// after a newer one, which a delayed redundant copy brings (see [StatsCommand::recovered]).
 pub const CAPABILITY_REDUNDANCY_RECOVERED: &str = "redundancy.recovered";
+/// The phone holds packets back for the blocks the `redundancy` message names before playing them,
+/// so a copy the desk delays can fill the gap of its lost original ([redundancy_message]). Only
+/// such a phone is offered a delayed copy; any phone takes immediate ones.
+pub const CAPABILITY_REDUNDANCY_HOLD: &str = "redundancy.hold";
 /// Every capability this server knows the meaning of. A phone may announce others: they are kept
 /// and shown, and gate nothing.
-pub const KNOWN_CAPABILITIES: [&str; 3] = [
+pub const KNOWN_CAPABILITIES: [&str; 4] = [
     CAPABILITY_STATS_V2,
     CAPABILITY_PLAYBACK_BUFFER,
     CAPABILITY_REDUNDANCY_RECOVERED,
+    CAPABILITY_REDUNDANCY_HOLD,
 ];
 
 /// The most capabilities kept from one registration.
@@ -250,6 +256,8 @@ pub(crate) struct StatsCommand {
     /// From a phone that announced [CAPABILITY_STATS_V2]: the playback cushion it aims to keep at
     /// the end of the interval, in milliseconds. Milliseconds rather than packets, so phones with
     /// different block sizes read on one scale and the desk never needs a phone's packet length.
+    /// A phone that holds packets back for delayed redundant copies ([CAPABILITY_REDUNDANCY_HOLD])
+    /// counts the hold in it: it is audio held back before playing, as the track's buffer is.
     #[serde(default, deserialize_with = "lenient_milliseconds")]
     pub(crate) cushion_ms: Option<f64>,
     /// From a phone that announced [CAPABILITY_STATS_V2]: the audio queued for playback at the end
@@ -257,9 +265,11 @@ pub(crate) struct StatsCommand {
     #[serde(default, deserialize_with = "lenient_milliseconds")]
     pub(crate) backlog_ms: Option<f64>,
     /// From a phone that announced [CAPABILITY_REDUNDANCY_RECOVERED]: the packets over the interval
-    /// that filled a gap, each arriving for the first time after a newer one: a redundant copy (or,
-    /// now and then, a packet Wi-Fi reordered). The Android app plays packets as they arrive, so it
-    /// cannot play these yet: they stay in `packets_lost` and are not in `packets_received`.
+    /// that were played after filling a gap, each arriving for the first time after a newer one,
+    /// while the phone held that newer one back ([CAPABILITY_REDUNDANCY_HOLD]): a delayed redundant
+    /// copy (or, now and then, a packet Wi-Fi reordered). They count in `packets_received`, not in
+    /// `packets_lost`. A late packet the phone could not play (no hold, or past it) is not counted,
+    /// and neither is an immediate copy: it arrives in order and cannot be told from its original.
     #[serde(default, deserialize_with = "lenient_count")]
     pub(crate) recovered: Option<u64>,
 }
@@ -583,6 +593,37 @@ struct BufferReport {
     ms: Option<u16>,
 }
 
+/// The `redundancy` message: how many blocks late the desk sends this musician's redundant copies
+/// (see [crate::redundancy]), so the phone holds packets back that long before playing them and a
+/// copy can fill the gap of its lost original. Sent only to a phone that announced
+/// [CAPABILITY_REDUNDANCY_HOLD]:
+///
+/// ```json
+/// {"type":"redundancy","delay_blocks":2}
+/// {"type":"redundancy","delay_blocks":0}
+/// ```
+///
+/// `delay_blocks` is an integer from 0 to [crate::MAX_REDUNDANCY_DELAY_BLOCKS]: 0 (redundancy off,
+/// or copies sent right after their original, which arrive in order) means no hold, and the phone
+/// plays packets as they arrive, as it always did. The server sends it whenever such a phone
+/// registers (on every connection, so the choice survives a reconnect and a phone never keeps a
+/// hold an earlier server asked for) and whenever the desk changes it. There is no answer; a phone
+/// keeps nothing of it once its session ends, and one that predates the message ignores it, as it
+/// ignores any unknown type.
+pub(crate) fn redundancy_message(redundancy: Redundancy) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&RedundancyReport {
+        message_type: "redundancy",
+        delay_blocks: redundancy.hold_blocks(),
+    })
+}
+
+#[derive(Serialize)]
+struct RedundancyReport {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    delay_blocks: u8,
+}
+
 /// An `error` answering anything but a `mix`; it never carries a number.
 pub(crate) fn control_error(message: String) -> Result<String, serde_json::Error> {
     error_reply(message, None)
@@ -725,6 +766,21 @@ mod tests {
             playback_message(PlaybackBuffer::Fixed { ms: 40 }).unwrap(),
             r#"{"type":"playback","buffer":{"mode":"fixed","ms":40}}"#
         );
+    }
+
+    #[test]
+    fn the_redundancy_message_carries_the_hold_the_copies_need() {
+        assert_eq!(
+            redundancy_message(Redundancy::On { delay_blocks: 2 }).unwrap(),
+            r#"{"type":"redundancy","delay_blocks":2}"#
+        );
+        for none in [Redundancy::Off, Redundancy::On { delay_blocks: 0 }] {
+            assert_eq!(
+                redundancy_message(none).unwrap(),
+                r#"{"type":"redundancy","delay_blocks":0}"#,
+                "{none:?} needs no hold"
+            );
+        }
     }
 
     #[test]
@@ -994,7 +1050,7 @@ mod tests {
     #[test]
     fn a_registration_keeps_the_capabilities_the_phone_announced() {
         let command = parse_register_command(
-            r#"{"type":"register","name":"Ana","udp_port":50000,"capabilities":["stats.v2","playback.buffer","redundancy.recovered","future_thing-2"]}"#,
+            r#"{"type":"register","name":"Ana","udp_port":50000,"capabilities":["stats.v2","playback.buffer","redundancy.recovered","redundancy.hold","future_thing-2"]}"#,
         )
         .expect("a registration with capabilities should parse");
 
@@ -1004,6 +1060,7 @@ mod tests {
                 CAPABILITY_STATS_V2,
                 CAPABILITY_PLAYBACK_BUFFER,
                 CAPABILITY_REDUNDANCY_RECOVERED,
+                CAPABILITY_REDUNDANCY_HOLD,
                 "future_thing-2",
             ],
             "known and unknown names alike, in the order sent"

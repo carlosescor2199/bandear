@@ -9,7 +9,7 @@ use crate::link_history::{LinkHistory, LinkHistoryRead, LinkMoment, SharedLinkHi
 use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixState, MixValues};
 use crate::network::TargetCounters;
 use crate::playback::PlaybackBuffer;
-use crate::protocol::{StatsCommand, CAPABILITY_PLAYBACK_BUFFER};
+use crate::protocol::{StatsCommand, CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_HOLD};
 use crate::redundancy::{HeldCopies, Redundancy};
 
 /// Whom the engineer's controls for a musician are kept for: the stable client id their phone
@@ -289,6 +289,15 @@ fn supports_buffer(entry: &TargetEntry) -> bool {
         .capabilities()
         .iter()
         .any(|name| name == CAPABILITY_PLAYBACK_BUFFER)
+}
+
+/// Whether the phone of `entry` announced it holds packets back so a delayed copy can be played.
+fn supports_hold(entry: &TargetEntry) -> bool {
+    entry
+        .origin
+        .capabilities()
+        .iter()
+        .any(|name| name == CAPABILITY_REDUNDANCY_HOLD)
 }
 
 /// A new store for the copies `redundancy` sends again; `None` while it is off. Allocates, so it is
@@ -1304,8 +1313,10 @@ impl TargetRegistry {
 
     /// Sets the redundancy of the musician `key` names (by their phone's client id, or an address
     /// by IP), keeps it for them as [Self::set_playback_buffer] keeps a buffer (off is kept as
-    /// nothing kept), and puts it in force on their row at once. Every phone takes it: a copy is the
-    /// same datagram, which a phone that does not use it drops as a duplicate. Answers the key it is
+    /// nothing kept), and puts it in force on their row at once. It does not check the phone: the
+    /// engine sets a delayed copy only for one that holds packets back (see
+    /// [crate::engine::set_target_redundancy]); a copy is the same datagram, which a phone that does
+    /// not need it drops as a duplicate. Answers the key it is
     /// kept under and the musician's row; a key that names nobody here is an error.
     pub(crate) fn set_redundancy(
         &self,
@@ -1332,11 +1343,41 @@ impl TargetRegistry {
         Ok((kept_for, entry.address))
     }
 
+    /// The row of the musician `key` names and whether their phone holds packets back for delayed
+    /// copies ([CAPABILITY_REDUNDANCY_HOLD]); a key that names nobody here is an error.
+    pub(crate) fn redundancy_hold_support(
+        &self,
+        key: &MusicianKey,
+    ) -> Result<(SocketAddr, bool), String> {
+        let entries = self.read();
+        let entry = entries
+            .iter()
+            .find(|entry| names(key, entry))
+            .ok_or_else(|| format!("{} is not here", describe_key(key)))?;
+        Ok((entry.address, supports_hold(entry)))
+    }
+
+    /// The redundancy a control connection from `ip` tells its phone, for the hold it asks of it
+    /// (see [Redundancy::hold_blocks]): the one kept for the musician there, when their phone
+    /// announced [CAPABILITY_REDUNDANCY_HOLD]; `None` for an older phone, a configured target and
+    /// an IP with no target, which are never sent one.
+    pub(crate) fn redundancy_for_phone(&self, ip: IpAddr) -> Option<Redundancy> {
+        let entries = self.read();
+        let entry = entries.iter().find(|entry| entry.address.ip() == ip)?;
+        supports_hold(entry)
+            .then(|| Self::kept_redundancy(&self.redundancy_book(), entry.origin.client_id(), ip))
+    }
+
     /// Replaces every redundancy setting kept with `kept`, as a desk starting an engine or loading
     /// a session does: one kept before and not in `kept` is forgotten (off), also for a musician who
-    /// is not here, and every row here takes the one now kept for it.
-    pub(crate) fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) {
+    /// is not here, and every row here takes the one now kept for it. Answers the addresses of the
+    /// musicians here whose phone holds packets back and whose hold changed, so they can be told.
+    pub(crate) fn replace_redundancies(
+        &self,
+        kept: &[(MusicianKey, Redundancy)],
+    ) -> Vec<SocketAddr> {
         let mut entries = self.entries.write().expect("target registry lock poisoned");
+        let before = self.redundancies(&entries);
         let book = {
             let mut book = self.redundancy_book();
             book.clear();
@@ -1347,11 +1388,17 @@ impl TargetRegistry {
             }
             book.clone()
         };
+        let mut changed = Vec::new();
         for entry in entries.iter_mut() {
-            let redundancy =
-                Self::kept_redundancy(&book, entry.origin.client_id(), entry.address.ip());
+            let ip = entry.address.ip();
+            let redundancy = Self::kept_redundancy(&book, entry.origin.client_id(), ip);
+            let hold_before = before.get(&ip).copied().unwrap_or_default().hold_blocks();
+            if supports_hold(entry) && hold_before != redundancy.hold_blocks() {
+                changed.push(entry.address);
+            }
             hold_copies(entry, redundancy);
         }
+        changed
     }
 
     /// Adds the packets the musician at `ip` reports a redundant copy recovered to their running

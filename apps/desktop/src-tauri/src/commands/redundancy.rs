@@ -230,6 +230,7 @@ mod tests {
                 kept_for,
                 address,
                 redundancy,
+                outcome: personal_monitoring::RedundancyOutcome::Set,
             })
         }
     }

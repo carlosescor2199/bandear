@@ -41,6 +41,16 @@
 //   outputs    { list, error }: the output devices the running engine offers for the local mix
 //              (`output_devices`), null until listed; a run's end forgets them, and a listing
 //              answered for a run other than the one shown is not taken.
+//   recordingSettings how the desk records takes (the `recording_settings` answer, see
+//              recording.js), or null until read. They live in the desk's session, so a run's end
+//              keeps them. Whether a take records is the status's `recording` (recordingStatus).
+//   takes      { list, folder, unreadable, missing, error }: the takes in the recordings folder,
+//              the newest first (`list_takes`), null until listed, and why the last listing
+//              failed. A run's end keeps them.
+//   estimate   what a take with the kept settings would take on the disk (`record_estimate`), or
+//              null; a run's end forgets it, since its rate depends on the running device.
+//   recordingOutcome { action, ok, message }: the last recording command's outcome in words
+//              ("settings", "start", "stop", "marker", "open"), or null.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -62,6 +72,7 @@
 import { pairUnits } from "./channels.js";
 import { DEFAULT_AUDIO, audioChoice, restoredAudio } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
+import { isRecording, recordingOf } from "./recording.js";
 import {
   ENGINEER_FIELDS,
   MIX_FIELDS,
@@ -83,6 +94,14 @@ export const LOCAL_MIX = "local";
 const NOT_LOCAL = new Set(["maxLevelPercent", ...ENGINEER_FIELDS]);
 
 const NO_OUTPUTS = Object.freeze({ list: null, error: null });
+
+const NO_TAKES = Object.freeze({
+  list: null,
+  folder: null,
+  unreadable: 0,
+  missing: false,
+  error: null,
+});
 
 /** The phases in which the engine of the current run is gone or being replaced. */
 const RUN_ENDING_PHASES = new Set(["idle", "starting", "error"]);
@@ -108,6 +127,10 @@ export const initialState = Object.freeze({
   sessionNotice: null,
   localMix: null,
   outputs: NO_OUTPUTS,
+  recordingSettings: null,
+  takes: NO_TAKES,
+  estimate: null,
+  recordingOutcome: null,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -190,6 +213,31 @@ export const actions = Object.freeze({
   commandFailed: (action, message) => ({ type: "command-failed", action, message }),
   /** `action` worked: an earlier refusal of the same command no longer holds. */
   commandDone: (action) => ({ type: "command-done", action }),
+  /** How the desk records takes, as `recording_settings` or `set_recording_settings` answered. */
+  recordingSettings: (settings) => ({ type: "recording-settings", settings }),
+  /** The `list_takes` answer: `{ folder, takes, unreadable, missing }`. */
+  takes: ({ folder, takes, unreadable, missing }) => ({
+    type: "takes",
+    takes: {
+      list: takes,
+      folder,
+      unreadable: unreadable ?? 0,
+      missing: Boolean(missing),
+      error: null,
+    },
+  }),
+  /** The takes could not be listed, for `message`; the last list known stays. */
+  takesFailed: (message) => ({ type: "takes-failed", message }),
+  /** The `record_estimate` answer, or null to forget it. */
+  estimate: (estimate) => ({ type: "estimate", estimate }),
+  /**
+   * The outcome of a recording command in words: `action` is "settings", "start", "stop",
+   * "marker" or "open". Null clears it.
+   */
+  recordingOutcome: (action, ok, message) => ({
+    type: "recording-outcome",
+    outcome: action === null ? null : { action, ok, message },
+  }),
   /** The console is (re)connecting to the engine's events and status. */
   connecting: () => ({ type: "connection", connection: { status: "connecting", error: null } }),
   connected: () => ({ type: "connection", connection: READY }),
@@ -382,6 +430,7 @@ function setPhase(state, { phase, error }) {
       musicians: [],
       localMix: null,
       outputs: NO_OUTPUTS,
+      estimate: null,
       departed: null,
       pending: NO_EDITS,
       mixError: null,
@@ -577,6 +626,16 @@ export function consoleReducer(state, action) {
       return { ...state, sessionNotice: action.notice ?? null };
     case "session-loaded":
       return sessionLoaded(state, action.outcome);
+    case "recording-settings":
+      return { ...state, recordingSettings: action.settings ?? null };
+    case "takes":
+      return { ...state, takes: action.takes };
+    case "takes-failed":
+      return { ...state, takes: { ...state.takes, error: action.message } };
+    case "estimate":
+      return { ...state, estimate: action.estimate ?? null };
+    case "recording-outcome":
+      return { ...state, recordingOutcome: action.outcome };
     default:
       return state;
   }
@@ -617,6 +676,24 @@ export function viewMix(state, address) {
   }
   const edits = state.pending[address];
   return edits ? applyEdits(mix, edits) : mix;
+}
+
+/**
+ * The take being recorded as the shown status reports it (see recording.js), or the idle recorder
+ * while no engine runs.
+ */
+export function recordingStatus(state) {
+  return recordingOf(state.engine.status);
+}
+
+/** True while a take records or its files are being finished: the input device cannot change. */
+export function isRecordingNow(state) {
+  return isRecording(recordingStatus(state));
+}
+
+/** The last take that ended while the shown engine ran, or null. */
+export function lastTake(state) {
+  return state.engine.status?.lastTake ?? null;
 }
 
 /** The musicians whose link is a warning or bad, in the status's order. */

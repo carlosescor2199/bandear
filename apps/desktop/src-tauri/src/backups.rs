@@ -5,7 +5,8 @@
 //! `backups/mixes-<stamp>.json`, written atomically as the session is (a temporary file flushed to
 //! disk, then renamed). The stamp is the UTC time it was taken, to the millisecond:
 //! `20261018T190405123Z`. Only the newest [KEPT_BACKUPS] are kept; writing one more drops the
-//! oldest. A file holds:
+//! oldest. An old one that cannot be dropped (held open) does not stop the new one; the next
+//! write tries again. A file holds:
 //!
 //! ```json
 //! {
@@ -44,8 +45,9 @@
 //!   in the folder (checked on the disk, links resolved), so a stamp never reaches outside it.
 
 use std::fs;
+use std::io;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -132,10 +134,22 @@ impl MixBackupSummary {
     }
 }
 
+/// A backup written: its stamp, and why the oldest past the kept number could not be dropped when
+/// they could not (the backup is written all the same; the next write tries again).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Written {
+    pub stamp: String,
+    pub prune_problem: Option<String>,
+}
+
+type Remover = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
 /// The mix backups in one folder.
 pub struct BackupStore {
     directory: PathBuf,
     keep: usize,
+    /// How an old backup is dropped: [fs::remove_file], or a failing one in the tests.
+    remove: Remover,
     /// Held across every write, so two writes never take one stamp or prune each other's file.
     files: Mutex<()>,
 }
@@ -146,14 +160,26 @@ impl BackupStore {
         Self {
             directory,
             keep,
+            remove: Box::new(|path| fs::remove_file(path)),
             files: Mutex::new(()),
         }
     }
 
+    /// The same store, dropping old backups with `remove`: for the tests.
+    #[cfg(test)]
+    pub(crate) fn with_remover(
+        mut self,
+        remove: impl Fn(&Path) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.remove = Box::new(remove);
+        self
+    }
+
     /// Writes `backup` as the one taken at `time` and drops the oldest past the kept number;
     /// answers its stamp. A stamp already taken (two in one millisecond) moves on by a
-    /// millisecond. A write that fails leaves no file and drops nothing.
-    pub fn write(&self, backup: &MixBackup, time: SystemTime) -> Result<String, String> {
+    /// millisecond. A write that fails leaves no file and drops nothing; old backups that cannot be
+    /// dropped leave the written one written, with why in [Written::prune_problem].
+    pub fn write(&self, backup: &MixBackup, time: SystemTime) -> Result<Written, String> {
         let _files = self.lock();
         let mut taken_at = time;
         let mut stamp = stamp_of(taken_at);
@@ -163,8 +189,13 @@ impl BackupStore {
         }
         write_atomically(&self.path_of(&stamp), backup)
             .map_err(|error| format!("the mixes were not backed up: {error}"))?;
-        self.prune()?;
-        Ok(stamp)
+        // The backup is on the disk whatever happens to the old ones: a backup that could not drop
+        // them still counts as written, and the next write tries them again.
+        let prune_problem = self.prune().err();
+        Ok(Written {
+            stamp,
+            prune_problem,
+        })
     }
 
     /// Every backup, the newest first; one that cannot be restored is listed with its problem.
@@ -245,7 +276,7 @@ impl BackupStore {
         let stamps = self.stamps()?;
         let surplus = stamps.len().saturating_sub(self.keep);
         for stamp in &stamps[..surplus] {
-            match fs::remove_file(self.path_of(stamp)) {
+            match (self.remove)(&self.path_of(stamp)) {
                 Err(error) if error.kind() != ErrorKind::NotFound => {
                     return Err(format!(
                         "the old mix backup {stamp} could not be dropped: {error}"
@@ -309,7 +340,7 @@ fn is_stamp(text: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
@@ -377,7 +408,7 @@ mod tests {
             ..backup(1_000, &[])
         };
 
-        let stamp = store.write(&kept, at(1_000)).expect("written");
+        let stamp = store.write(&kept, at(1_000)).expect("written").stamp;
 
         assert_eq!(stamp, "19700101T000001000Z");
         let names: Vec<String> = fs::read_dir(&directory)
@@ -425,15 +456,73 @@ mod tests {
         assert!(store.read(&stamp_of(at(1_000))).is_err());
     }
 
+    /// A store keeping `keep` whose old backups cannot be dropped while `held` is set.
+    pub(crate) fn store_with_held_files(
+        directory: PathBuf,
+        keep: usize,
+        held: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> BackupStore {
+        let held = std::sync::Arc::clone(held);
+        BackupStore::new(directory, keep).with_remover(move |path| {
+            if held.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(io::Error::new(ErrorKind::PermissionDenied, "held open"))
+            } else {
+                fs::remove_file(path)
+            }
+        })
+    }
+
+    #[test]
+    fn a_backup_is_written_when_the_old_ones_cannot_be_dropped_and_they_are_dropped_later() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let held = std::sync::Arc::new(AtomicBool::new(true));
+        let store = store_with_held_files(scratch("prune-fails"), 2, &held);
+
+        for index in 0..4u64 {
+            let taken = 1_000 * (index + 1);
+            let written = store
+                .write(&backup(taken, &[("Ana", index as u8)]), at(taken))
+                .expect("written, though the old ones stay");
+            assert_eq!(written.stamp, stamp_of(at(taken)));
+            assert_eq!(
+                written.prune_problem.is_some(),
+                index >= 2,
+                "only a write past the kept number has old ones to drop"
+            );
+        }
+        assert_eq!(
+            store.list().expect("listed").len(),
+            4,
+            "nothing dropped yet"
+        );
+
+        held.store(false, Ordering::SeqCst);
+        let written = store
+            .write(&backup(5_000, &[("Ana", 5)]), at(5_000))
+            .expect("written");
+
+        assert_eq!(written.prune_problem, None);
+        let listed = store.list().expect("listed");
+        assert_eq!(
+            listed.len(),
+            2,
+            "the next write drops every one past the kept number"
+        );
+        assert_eq!(listed[0].saved_at, Some(5_000));
+        assert_eq!(listed[1].saved_at, Some(4_000));
+    }
+
     #[test]
     fn two_backups_in_one_millisecond_both_keep_a_stamp_of_their_own() {
         let store = BackupStore::new(scratch("same-millisecond"), KEPT_BACKUPS);
         let first = store
             .write(&backup(5, &[("Ana", 1)]), at(5))
-            .expect("written");
+            .expect("written")
+            .stamp;
         let second = store
             .write(&backup(5, &[("Ana", 2)]), at(5))
-            .expect("written");
+            .expect("written")
+            .stamp;
 
         assert_ne!(first, second);
         assert_eq!(
@@ -450,7 +539,8 @@ mod tests {
         let store = BackupStore::new(directory.clone(), KEPT_BACKUPS);
         let good = store
             .write(&backup(2_000, &[("Ana", 60)]), at(2_000))
-            .expect("written");
+            .expect("written")
+            .stamp;
         fs::write(
             directory.join("mixes-19700101T000003000Z.json"),
             b"{ \"version\": 1, \"musicians\": [ trunc",

@@ -112,6 +112,8 @@ struct WriterState {
     last: Option<Vec<BackedUpMusician>>,
     /// The failure said last; said again only once it changes.
     failure: Option<String>,
+    /// Why the old backups could not be dropped, said last; said again only once it changes.
+    prune_failure: Option<String>,
 }
 
 impl MixBackups {
@@ -243,14 +245,28 @@ impl Writer {
         let result = self.store.write(&backup, SystemTime::now());
         let mut state = self.lock_state();
         match result {
-            Ok(stamp) => {
+            Ok(written) => {
                 log_debug!(
                     "backup",
-                    "backed up {} musicians' mixes as {stamp}",
-                    backup.musicians.len()
+                    "backed up {} musicians' mixes as {}",
+                    backup.musicians.len(),
+                    written.stamp
                 );
                 if state.failure.take().is_some() {
                     log_info!("backup", "the musicians' mixes are backed up again");
+                }
+                match written.prune_problem {
+                    Some(problem) => {
+                        if state.prune_failure.as_deref() != Some(problem.as_str()) {
+                            log_warn!("backup", "{problem}; tried again with the next backup");
+                            state.prune_failure = Some(problem);
+                        }
+                    }
+                    None => {
+                        if state.prune_failure.take().is_some() {
+                            log_info!("backup", "the old mix backups are dropped again");
+                        }
+                    }
                 }
                 state.last = Some(backup.musicians);
             }
@@ -536,6 +552,48 @@ mod tests {
             reopened.list().expect("listed").len(),
             2,
             "dropping the backups writes the one waiting"
+        );
+    }
+
+    #[test]
+    fn a_backup_whose_old_ones_cannot_be_dropped_still_counts_as_written() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = std::env::temp_dir()
+            .join("mixlink-backup-tests")
+            .join("writer-prune-fails");
+        let _ = std::fs::remove_dir_all(&directory);
+        let held = Arc::new(AtomicBool::new(true));
+        let store = crate::backups::tests::store_with_held_files(directory, 1, &held);
+        let backups = MixBackups::manual(store);
+
+        backups.submit(backed_up(10));
+        backups.flush();
+        backups.submit(backed_up(20));
+        backups.flush();
+        assert_eq!(
+            backups.list().expect("listed").len(),
+            2,
+            "the old one stays"
+        );
+
+        // The same mixes again: written already, so not again, though the old one still stays.
+        backups.submit(backed_up(20));
+        backups.flush();
+        backups.submit(backed_up(20));
+        backups.flush();
+        assert_eq!(
+            backups.list().expect("listed").len(),
+            2,
+            "an unchanged backup is not written again while pruning fails"
+        );
+
+        held.store(false, Ordering::SeqCst);
+        backups.submit(backed_up(30));
+        backups.flush();
+        assert_eq!(
+            backups.list().expect("listed").len(),
+            1,
+            "pruned again once it can be"
         );
     }
 

@@ -302,7 +302,8 @@ where
 
 /// Parses a `stats` control message, rejecting an interval the rates cannot be normalised by.
 pub(crate) fn parse_stats_command(json: &str) -> Result<StatsCommand, String> {
-    let command: StatsCommand = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let mut command: StatsCommand =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
     if command.message_type != "stats" {
         return Err(format!(
             "unsupported control message type: {}",
@@ -315,6 +316,10 @@ pub(crate) fn parse_stats_command(json: &str) -> Result<StatsCommand, String> {
             command.interval_ms
         ));
     }
+    // Recovered packets are among those received: a count beyond them is bounded to them.
+    command.recovered = command
+        .recovered
+        .map(|recovered| recovered.min(command.packets_received));
     Ok(command)
 }
 
@@ -1161,6 +1166,39 @@ mod tests {
         assert_eq!(command.backlog_ms, Some(37.5));
         assert_eq!(command.recovered, Some(3));
         assert_eq!(command.packets_received, 200, "the counts as before");
+    }
+
+    /// The `stats` an Android phone sends after a delayed copy filled a gap, exactly as its test
+    /// builds it (`HoldPlayoutTest.STATS_AFTER_A_COPY_FILLED_A_GAP`, keep them equal): the copy's
+    /// packet was played, so it is among those received and recovered, and nothing was lost.
+    #[test]
+    fn the_stats_a_phone_sends_after_a_copy_filled_a_gap() {
+        const STATS_AFTER_A_COPY_FILLED_A_GAP: &str = r#"{"type":"stats","interval_ms":1000,"packets_received":4,"packets_lost":0,"underruns":0,"receive_timeouts":1,"recovered":1}"#;
+        let command = parse_stats_command(STATS_AFTER_A_COPY_FILLED_A_GAP).expect("parses");
+        assert_eq!(
+            command.packets_received, 4,
+            "the recovered packet was played"
+        );
+        assert_eq!(command.packets_lost, 0, "a recovered packet is never lost");
+        assert_eq!(command.recovered, Some(1));
+        assert_eq!(command.receive_timeouts, 1);
+    }
+
+    /// Recovered packets count in `packets_received`, so a report naming more than it received is
+    /// read as the packets it received: a broken or hostile phone never inflates the total.
+    #[test]
+    fn recovered_packets_are_never_more_than_the_packets_received() {
+        let command = parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"recovered":18446744073709551615}"#,
+        )
+        .expect("parses");
+        assert_eq!(command.recovered, Some(200));
+
+        let within = parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"recovered":200}"#,
+        )
+        .expect("parses");
+        assert_eq!(within.recovered, Some(200));
     }
 
     /// An extra the server cannot use is read as absent: the report itself still counts.

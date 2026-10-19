@@ -3600,6 +3600,23 @@ mod tests {
             5
         );
 
+        // A huge count is bounded by the packets the report received, and the total saturates
+        // instead of wrapping round to a small number.
+        let huge = u64::MAX;
+        for _ in 0..2 {
+            send_then_sync(
+                &mut phone,
+                &format!(
+                    r#"{{"type":"stats","interval_ms":1000,"packets_received":{huge},"packets_lost":0,"underruns":0,"receive_timeouts":0,"recovered":{huge}}}"#
+                ),
+            )
+            .await;
+        }
+        assert_eq!(
+            targets.read()[0].counters.recovered.load(Ordering::Relaxed),
+            u64::MAX
+        );
+
         stop_server(address, &stopped, server).await;
     }
 

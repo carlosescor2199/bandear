@@ -1411,10 +1411,12 @@ impl TargetRegistry {
     /// total. An IP with no target is a no-op.
     pub(crate) fn count_recovered(&self, ip: IpAddr, recovered: u64) {
         if let Some(entry) = self.read().iter().find(|entry| entry.address.ip() == ip) {
-            entry
-                .counters
-                .recovered
-                .fetch_add(recovered, std::sync::atomic::Ordering::Relaxed);
+            // Saturates rather than wraps: a running total never falls back to a small number.
+            let _ = entry.counters.recovered.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(recovered)),
+            );
         }
     }
 

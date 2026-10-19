@@ -4,17 +4,16 @@
 // frame, and turns the controls into console commands (see console-app.js), each outcome said in
 // words above the transport.
 //
-// The waveform lanes are drawn from the `meters` event: while a take records, each armed track
-// keeps a bounded history of its peaks (createPeakHistory), cleared when the next take starts; no
-// engine call is involved. Playback, the takes' Play and Soundcheck and the virtual soundcheck card
+// What the screen decides (the transport's busy guard, the lanes' peak histories, arming, the
+// folder field) lives in record-controller.js, tested without a DOM; this file only reads and
+// writes elements. The waveform lanes are drawn from the `meters` event; no engine call is
+// involved. Playback, the takes' Play and Soundcheck and the virtual soundcheck card
 // come with virtual soundcheck (T6): Play shows here, disabled.
 
 import "../components/meter.js";
 import "../components/record-track.js";
-import { stripLevel } from "../lib/mix-view.js";
+import { createRecordController } from "../lib/record-controller.js";
 import {
-  armChange,
-  createPeakHistory,
   diskView,
   localTrackRow,
   recordMessages,
@@ -25,9 +24,6 @@ import {
 } from "../lib/record-view.js";
 import { formatUnreadable } from "../lib/recording.js";
 import { recordingStatus } from "../lib/console-state.js";
-
-/** The peaks a lane keeps: about 20 seconds at the 30 meters a second the engine sends. */
-const LANE_CAPACITY = 600;
 
 const PLAYBACK_LATER = "Playback comes with virtual soundcheck";
 
@@ -264,32 +260,10 @@ export function mountRecordScreen(main, app) {
     includeLocal: $("[data-include-local]"),
   };
 
-  // The screen's own state: a command on its way (its buttons wait), Back to start pressed after a
-  // take, the folder last shown in the folder field, and each track's peak history.
-  const local = { busy: null, atStart: false, shownFolder: null, takesKey: null, markersKey: null };
-  const histories = new Map();
-  let take = null;
-
-  function historyOf(key) {
-    let history = histories.get(key);
-    if (!history) {
-      history = createPeakHistory(LANE_CAPACITY);
-      histories.set(key, history);
-    }
-    return history;
-  }
-
-  // A new take starts its lanes empty, and the position counts from it.
-  function followTake(state) {
-    const folder = recordingStatus(state).takeFolder;
-    if (folder && folder !== take) {
-      take = folder;
-      local.atStart = false;
-      for (const history of histories.values()) {
-        history.clear();
-      }
-    }
-  }
+  const controller = createRecordController(app, { onChange: () => render() });
+  const local = controller.local;
+  // What was last written into the takes table and the markers list.
+  const drawn = { takesKey: null, markersKey: null };
 
   function show(element, text) {
     element.hidden = !text;
@@ -318,8 +292,8 @@ export function mountRecordScreen(main, app) {
     parts.armed.textContent = view.armed;
     parts.format.textContent = view.format;
     const markersKey = JSON.stringify([view.markersOf, view.markers]);
-    if (markersKey !== local.markersKey) {
-      local.markersKey = markersKey;
+    if (markersKey !== drawn.markersKey) {
+      drawn.markersKey = markersKey;
       parts.markersBox.hidden = view.markers.length === 0;
       parts.markersTitle.textContent = view.markersOf ? `Markers · ${view.markersOf}` : "Markers";
       parts.markers.replaceChildren(
@@ -344,8 +318,7 @@ export function mountRecordScreen(main, app) {
 
   function renderTracks(state) {
     const recording = recordingStatus(state);
-    const live = recording.state === "recording" || recording.state === "stopping";
-    const locked = live;
+    const locked = recording.state === "recording" || recording.state === "stopping";
     const rows = trackRows(state);
     const localRow = localTrackRow(state);
     const all = localRow && rows.length > 0 ? [...rows, localRow] : rows;
@@ -353,11 +326,7 @@ export function mountRecordScreen(main, app) {
     keyedChildren(parts.tracks, all, () => document.createElement("ml-record-track")).forEach(
       (element, position) => {
         const row = all[position];
-        let lane = "off";
-        if (row.armed) {
-          lane = live || (histories.get(row.key)?.length ?? 0) > 0 ? "recording" : "armed";
-        }
-        element.data = { ...row, locked, lane };
+        element.data = { ...row, locked, lane: controller.laneOf(row, state) };
       },
     );
   }
@@ -378,8 +347,8 @@ export function mountRecordScreen(main, app) {
     }
     show(parts.noTakes, empty);
     const key = JSON.stringify(rows);
-    if (key !== local.takesKey) {
-      local.takesKey = key;
+    if (key !== drawn.takesKey) {
+      drawn.takesKey = key;
       parts.takes.replaceChildren(...rows.map(takeLine));
     }
   }
@@ -398,9 +367,9 @@ export function mountRecordScreen(main, app) {
     }
     parts.folderDefault.disabled = off || view.isDefault;
     // The field shows the desk's folder unless the engineer is typing in it.
-    if (view.folder !== local.shownFolder && document.activeElement !== parts.folder) {
-      local.shownFolder = view.folder;
-      parts.folder.value = view.folder;
+    const folder = controller.folderToShow(state, document.activeElement === parts.folder);
+    if (folder !== null) {
+      parts.folder.value = folder;
     }
     parts.folderNote.textContent = view.isDefault
       ? "This is the default folder."
@@ -419,7 +388,7 @@ export function mountRecordScreen(main, app) {
 
   function render() {
     const state = app.store.getState();
-    followTake(state);
+    controller.followTake(state);
     const messages = recordMessages(state);
     show(parts.outcome, messages.outcome?.ok ? messages.outcome.text : null);
     show(parts.outcomeError, messages.outcome && !messages.outcome.ok ? messages.outcome.text : null);
@@ -450,7 +419,7 @@ export function mountRecordScreen(main, app) {
     laneFrame = requestAnimationFrame(() => {
       laneFrame = 0;
       for (const element of parts.tracks.children) {
-        const history = histories.get(element.dataset.key);
+        const history = controller.history(element.dataset.key);
         if (history && element.data?.lane === "recording") {
           element.drawHistory(history);
         }
@@ -458,51 +427,26 @@ export function mountRecordScreen(main, app) {
     });
   }
 
-  function onMeters({ channels, local: localLevels }) {
-    const recording = recordingStatus(app.store.getState()).state === "recording";
-    for (const element of parts.tracks.children) {
-      const row = element.data;
-      if (!row) {
-        continue;
-      }
-      const level = row.local
-        ? Math.max(localLevels?.left ?? 0, localLevels?.right ?? 0)
-        : stripLevel(row.sides, channels ?? []);
-      element.setLevel(level);
-      if (recording && row.armed) {
-        historyOf(row.key).push(level);
-      }
-    }
-    if (recording) {
+  function onMeters(meters) {
+    const elements = [...parts.tracks.children].filter((element) => element.data);
+    const levels = controller.takeMeters(elements.map((element) => element.data), meters);
+    elements.forEach((element, position) => element.setLevel(levels[position]));
+    if (controller.taking()) {
       scheduleLanes();
     }
   }
 
-  // Runs a transport command: its buttons wait until it is answered; the outcome is the store's.
-  async function command(name, run) {
-    if (local.busy !== null) {
-      return;
-    }
-    local.busy = name;
-    render();
-    try {
-      await run();
-    } finally {
-      local.busy = null;
-      render();
-    }
-  }
-
+  // A transport command: its buttons wait until it is answered; the outcome is the store's.
   parts.record.addEventListener("click", () =>
-    command("start", () => app.startRecording(parts.takeName.value)),
+    controller.command("start", () => app.startRecording(parts.takeName.value)),
   );
   parts.stop.addEventListener("click", () =>
-    command("stop", async () => {
+    controller.command("stop", async () => {
       await app.stopRecording();
       await app.refreshEstimate();
     }),
   );
-  parts.mark.addEventListener("click", () => command("mark", () => app.addMarker("")));
+  parts.mark.addEventListener("click", () => controller.command("mark", () => app.addMarker("")));
   parts.rewind.addEventListener("click", () => {
     local.atStart = true;
     render();
@@ -517,32 +461,13 @@ export function mountRecordScreen(main, app) {
       app.openTakeFolder(button.dataset.open).then(render);
     }
   });
-  screen.addEventListener("track-arm", ({ detail: { key } }) => {
-    const state = app.store.getState();
-    const row = [...trackRows(state), localTrackRow(state)].find((item) => item?.key === key);
-    if (row) {
-      app.setRecordingSettings(armChange(state, row)).then(render);
-    }
-  });
+  screen.addEventListener("track-arm", ({ detail: { key } }) => controller.arm(key));
   parts.folderForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    // A refused folder stays in the field, so it can be corrected; a kept one shows as the desk has
-    // it and its takes are listed.
-    app.setRecordingSettings({ folder: parts.folder.value }).then(async (result) => {
-      if (result.ok) {
-        local.shownFolder = null;
-        await app.refreshTakes();
-      }
-      render();
-    });
+    // A refused folder stays in the field, so it can be corrected (see folderToShow).
+    controller.useFolder(parts.folder.value);
   });
-  parts.folderDefault.addEventListener("click", () => {
-    local.shownFolder = null;
-    app.setRecordingSettings({ folder: null }).then(async () => {
-      await app.refreshTakes();
-      render();
-    });
-  });
+  parts.folderDefault.addEventListener("click", () => controller.useDefaultFolder());
   parts.formatSelect.addEventListener("change", () =>
     app.setRecordingSettings({ format: parts.formatSelect.value }).then(render),
   );

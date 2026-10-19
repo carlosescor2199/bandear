@@ -885,8 +885,8 @@ export function createConsoleApp({
 
   // Settings changes go out one at a time, each built when its turn comes on the settings the desk
   // answered last, which hold every change before it that was kept, so a second toggle made before
-  // the first was answered keeps the first. A refused change is in no later request: those carry
-  // only the kept settings and their own fields.
+  // the first was answered keeps the first (an arm press is a delta, `arm`, for the same reason). A
+  // refused change is in no later request: those carry only the kept settings and their own fields.
   let settingsLane = Promise.resolve();
 
   function setRecordingSettings(change) {
@@ -1180,9 +1180,10 @@ export function createConsoleApp({
     /** Reads the recording settings again; resolves to null, or to the error of a failed read. */
     loadRecordingSettings,
     /**
-     * Changes the recording settings with `change`, `{ folder?, format?, includeLocal?, armed? }`
-     * (the folder null or blank for the default, the inputs 1-based; see armedAfter for arming a
-     * pair), on top of the last change asked for; answers `{ ok, message }`.
+     * Changes the recording settings with `change`, `{ folder?, format?, includeLocal?, armed?,
+     * arm? }` (the folder null or blank for the default, the inputs 1-based; `arm` `{ input, on,
+     * channels }` arms or disarms one input, a pair as one, on the armed inputs of the turn; see
+     * settingsRequest), on top of the last change kept; answers `{ ok, message }`.
      */
     setRecordingSettings,
     /** Starts a take called `name` with the kept settings; answers `{ ok, message }`. */

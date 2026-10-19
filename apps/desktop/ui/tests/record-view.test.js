@@ -26,7 +26,7 @@ import {
   trackRows,
   transportView,
 } from "../app/lib/record-view.js";
-import { IDLE_RECORDING } from "../app/lib/recording.js";
+import { IDLE_RECORDING, settingsRequest } from "../app/lib/recording.js";
 
 function reduce(list, state = initialState) {
   return list.reduce(consoleReducer, state);
@@ -124,10 +124,19 @@ test("arming a row changes the armed inputs, a pair as one, and the local row th
   const state = running({ status, settings: { ...SETTINGS, armed: [1, 4] } });
   const rows = trackRows(state);
 
-  assert.deepEqual(armChange(state, rows[1]), { armed: [1, 2, 4] }, "Snare armed");
-  assert.deepEqual(armChange(state, rows[0]), { armed: [4] }, "Kick disarmed");
-  assert.deepEqual(armChange(state, rows[2]), { armed: [1] }, "the pair disarmed whole");
+  // The change is applied when its request is built, on the settings answered last.
+  const armedAfterPress = (row, settings = state.recordingSettings) =>
+    settingsRequest(settings, armChange(state, row)).armed;
+
+  assert.deepEqual(armedAfterPress(rows[1]), [1, 2, 4], "Snare armed");
+  assert.deepEqual(armedAfterPress(rows[0]), [4], "Kick disarmed");
+  assert.deepEqual(armedAfterPress(rows[2]), [1], "the pair disarmed whole");
   assert.deepEqual(armChange(state, localTrackRow(state)), { includeLocal: true });
+  assert.deepEqual(
+    armedAfterPress(rows[1], { ...SETTINGS, armed: [1, 4, 6] }),
+    [1, 2, 4, 6],
+    "a press made before an earlier one was answered keeps the earlier one",
+  );
 });
 
 test("the local mix row records when the settings say so", () => {

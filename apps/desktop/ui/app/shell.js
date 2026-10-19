@@ -15,7 +15,7 @@ import "./components/rec-chip.js";
 import { createTauriBridge } from "./lib/bridge.js";
 import { createConsoleApp } from "./lib/console-app.js";
 import { createFakeBridge } from "./lib/fake-bridge.js";
-import { recChip } from "./lib/record-view.js";
+import { mountRecChip } from "./lib/record-controller.js";
 import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
 import { mountChannelsScreen } from "./screens/channels-screen.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
@@ -145,21 +145,6 @@ function connectEngine() {
   } catch {
     return { app: null, simulated: false };
   }
-}
-
-/**
- * Shows the REC chip in `strip` (holding an <ml-rec-chip>) while the console `app` reports a take
- * recording, being finished or stopped on an error; hidden otherwise. Returns the unsubscribe.
- */
-export function mountRecChip(strip, app) {
-  const chip = strip.querySelector("ml-rec-chip");
-  function render() {
-    const view = recChip(app.store.getState());
-    strip.hidden = view === null;
-    chip.data = view;
-  }
-  render();
-  return app.store.subscribe(render);
 }
 
 const nav = document.querySelector("[data-shell-nav]");

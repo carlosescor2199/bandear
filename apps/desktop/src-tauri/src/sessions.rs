@@ -455,6 +455,7 @@ mod tests {
                 }),
                 mirror: None,
                 buffer: None,
+                redundancy: None,
             },
         );
         musicians.insert(
@@ -469,6 +470,7 @@ mod tests {
                     follower_address: None,
                 }),
                 buffer: None,
+                redundancy: None,
             },
         );
         Session {

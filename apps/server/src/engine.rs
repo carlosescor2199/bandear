@@ -35,6 +35,7 @@ use crate::recorder::{
     DiskEstimate, FileOpener, RecordRequest, Recorder, RecordingStatus, TakeEnd, TakeMarker,
     TakeOptions, TakeSummary, TrackOpener, STOP_WAIT,
 };
+use crate::redundancy::{Redundancy, RedundancySetting};
 use crate::soundcheck::{
     PlaybackClock, Soundcheck, SoundcheckError, SoundcheckRequest, SoundcheckStatus,
 };
@@ -122,6 +123,12 @@ pub struct MusicianCounters {
     /// Why the last send to this musician failed (for example "network unreachable"); `None`
     /// while none has. Kept as it was after later sends succeed, beside [Self::packets_discarded].
     pub last_send_error: Option<&'static str>,
+    /// Copies of datagrams sent again while the desk has redundancy on for this musician (see
+    /// [EngineHandle::set_redundancy]); not counted in [Self::packets_sent].
+    pub duplicates_sent: u64,
+    /// The packets this musician's phone reported a redundant copy recovered, over this engine's
+    /// run: only a phone that announced [crate::CAPABILITY_REDUNDANCY_RECOVERED] reports them.
+    pub recovered: u64,
 }
 
 /// One musician: a UDP target joined with its control channel and its mix.
@@ -166,6 +173,9 @@ pub struct MusicianStatus {
     /// [EngineHandle::set_playback_buffer]); Auto when the desk set none. Only a phone that
     /// announced [crate::CAPABILITY_PLAYBACK_BUFFER] plays it.
     pub playback_buffer: PlaybackBuffer,
+    /// Whether this musician's audio is sent twice (see [EngineHandle::set_redundancy]); off when
+    /// the desk set nothing.
+    pub redundancy: Redundancy,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -761,6 +771,27 @@ pub(crate) fn announced_identities(entries: &[TargetEntry]) -> HashMap<IpAddr, A
         .collect()
 }
 
+/// Every target's send counters, by IP, as the status reports them.
+pub(crate) fn musician_counters(entries: &[TargetEntry]) -> HashMap<IpAddr, MusicianCounters> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.address.ip(),
+                MusicianCounters {
+                    packets_sent: entry.counters.sent.load(Ordering::Relaxed),
+                    packets_discarded: entry.counters.discarded.load(Ordering::Relaxed),
+                    last_send_error: crate::network::send_error_name(
+                        entry.counters.last_send_error.load(Ordering::Relaxed),
+                    ),
+                    duplicates_sent: entry.counters.duplicates.load(Ordering::Relaxed),
+                    recovered: entry.counters.recovered.load(Ordering::Relaxed),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Joins the per-target state into one row per musician.
 ///
 /// Rows are driven by the target list, so a target with no control connection is still reported.
@@ -774,6 +805,7 @@ pub(crate) fn join_musicians(
     links: &HashMap<IpAddr, LinkStatus>,
     mirrors: &HashMap<IpAddr, MirrorStatus>,
     buffers: &HashMap<IpAddr, PlaybackBuffer>,
+    redundancies: &HashMap<IpAddr, Redundancy>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -791,6 +823,7 @@ pub(crate) fn join_musicians(
                 capabilities: announced.capabilities,
                 mirror: mirrors.get(&ip).cloned(),
                 playback_buffer: buffers.get(&ip).copied().unwrap_or_default(),
+                redundancy: redundancies.get(&ip).copied().unwrap_or_default(),
             }
         })
         .collect()
@@ -1566,21 +1599,7 @@ impl EngineHandle {
             .collect();
         let entries = self.targets.read();
         let targets: Vec<SocketAddr> = entries.iter().map(|entry| entry.address).collect();
-        let counters: HashMap<IpAddr, MusicianCounters> = entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.address.ip(),
-                    MusicianCounters {
-                        packets_sent: entry.counters.sent.load(Ordering::Relaxed),
-                        packets_discarded: entry.counters.discarded.load(Ordering::Relaxed),
-                        last_send_error: crate::network::send_error_name(
-                            entry.counters.last_send_error.load(Ordering::Relaxed),
-                        ),
-                    },
-                )
-            })
-            .collect();
+        let counters = musician_counters(&entries);
         let mixes: HashMap<IpAddr, MixValues> = entries
             .iter()
             .map(|entry| (entry.address.ip(), entry.mix_state.current()))
@@ -1589,6 +1608,7 @@ impl EngineHandle {
         let links = link_statuses(&entries, &connected, Instant::now());
         let mirrors = self.targets.mirror_statuses(&entries);
         let buffers = self.targets.playback_buffers(&entries);
+        let redundancies = self.targets.redundancies(&entries);
         let config = self.config_state.snapshot();
         EngineStatus {
             device_name: self.device_name.clone(),
@@ -1606,7 +1626,15 @@ impl EngineHandle {
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed)
                 + self.capture_stats.dropped_blocks.load(Ordering::Relaxed),
             musicians: join_musicians(
-                &targets, &connected, &counters, &mixes, &announced, &links, &mirrors, &buffers,
+                &targets,
+                &connected,
+                &counters,
+                &mixes,
+                &announced,
+                &links,
+                &mirrors,
+                &buffers,
+                &redundancies,
             ),
             local_mix: self.local_mix.current(),
             local_output: self.local_output(),
@@ -2525,6 +2553,49 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Sets whether the audio of the musician `key` names (their phone's client id, or an address
+    /// by IP) is sent twice, each datagram again a few blocks later (see [crate::redundancy]).
+    ///
+    /// It takes effect from the next block and costs that musician's link double the bandwidth.
+    /// Every phone takes it: an older one drops the copies as duplicates, one that announced
+    /// [crate::CAPABILITY_REDUNDANCY_RECOVERED] plays a copy whose original was lost and reports it.
+    /// The engine keeps the setting for the musician (under their phone's client id when it
+    /// announced one, else their address: the key it returns) for as long as it runs, so it
+    /// survives a reconnect. The status reports it ([MusicianStatus::redundancy]) with the copies
+    /// sent ([MusicianCounters::duplicates_sent]).
+    ///
+    /// An engine that is stopping, or a key that names nobody here, is an error, and nothing
+    /// changes.
+    pub fn set_redundancy(
+        &self,
+        key: &MusicianKey,
+        redundancy: Redundancy,
+    ) -> Result<RedundancySetting, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let (kept_for, address) = self.targets.set_redundancy(key, redundancy)?;
+        Ok(RedundancySetting {
+            kept_for,
+            address,
+            redundancy,
+        })
+    }
+
+    /// Replaces every redundancy setting the engine keeps with `kept` (keys as
+    /// [Self::set_redundancy] keeps them), as a desk does when it starts an engine or loads a saved
+    /// session: one not in `kept` is forgotten (off), also for a musician who is not here.
+    pub fn replace_redundancies(
+        &self,
+        kept: &[(MusicianKey, Redundancy)],
+    ) -> Result<(), Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        self.targets.replace_redundancies(kept);
+        Ok(())
+    }
+
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
@@ -2790,6 +2861,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(musicians.len(), 1, "the row moved instead of doubling");
@@ -2814,6 +2886,7 @@ mod tests {
                 packets_sent: 10,
                 packets_discarded: 1,
                 last_send_error: None,
+                ..MusicianCounters::default()
             },
         );
         counters.insert(
@@ -2822,6 +2895,7 @@ mod tests {
                 packets_sent: 20,
                 packets_discarded: 2,
                 last_send_error: Some("network unreachable"),
+                ..MusicianCounters::default()
             },
         );
 
@@ -2864,6 +2938,7 @@ mod tests {
             &links,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(musicians.len(), 3);
@@ -2880,6 +2955,7 @@ mod tests {
                 packets_sent: 10,
                 packets_discarded: 1,
                 last_send_error: None,
+                ..MusicianCounters::default()
             }
         );
         assert_eq!(connected_with_mix.link, reporting);
@@ -2896,6 +2972,7 @@ mod tests {
                 packets_sent: 20,
                 packets_discarded: 2,
                 last_send_error: Some("network unreachable"),
+                ..MusicianCounters::default()
             }
         );
 
@@ -3269,9 +3346,47 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &registry.playback_buffers(&registry.read()),
+            &HashMap::new(),
         );
         assert_eq!(musicians[0].playback_buffer, PlaybackBuffer::Auto);
         assert_eq!(musicians[1].playback_buffer, forty);
+    }
+
+    /// Each row reports the redundancy kept for its musician, off when none is, with the copies
+    /// sent and the packets the phone reported recovered.
+    #[test]
+    fn the_status_reports_each_musicians_redundancy_and_its_counts() {
+        let rack: SocketAddr = "192.168.1.3:50000".parse().unwrap();
+        let phone: SocketAddr = "192.168.1.4:50000".parse().unwrap();
+        let registry =
+            TargetRegistry::new(&[rack, phone], &GroupLayout::default()).expect("registry");
+        let two = Redundancy::On { delay_blocks: 2 };
+        registry
+            .set_redundancy(&MusicianKey::Address(phone), two)
+            .expect("the phone is here");
+        registry.read()[1]
+            .counters
+            .duplicates
+            .store(12, Ordering::Relaxed);
+        registry.count_recovered(phone.ip(), 3);
+
+        let entries = registry.read();
+        let counters = musician_counters(&entries);
+        let musicians = join_musicians(
+            &[rack, phone],
+            &HashSet::new(),
+            &counters,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &registry.redundancies(&entries),
+        );
+        assert_eq!(musicians[0].redundancy, Redundancy::Off);
+        assert_eq!(musicians[1].redundancy, two);
+        assert_eq!(musicians[1].counters.duplicates_sent, 12);
+        assert_eq!(musicians[1].counters.recovered, 3);
     }
 
     #[test]

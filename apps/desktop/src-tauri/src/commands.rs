@@ -11,6 +11,7 @@ pub mod link_history;
 pub mod local;
 pub mod playback_buffer;
 pub mod recording;
+pub mod redundancy;
 pub mod soundcheck;
 
 use std::collections::{BTreeMap, HashSet};
@@ -24,7 +25,7 @@ use personal_monitoring::{
     check_channels, check_groups, log_info, log_warn, start, AudioHost, ChannelKind, ChannelMeta,
     EngineConfig, EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition,
     MirrorOutcome, MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
-    PlaybackBuffer, PresetChannel,
+    PlaybackBuffer, PresetChannel, Redundancy,
 };
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
@@ -463,6 +464,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_controls = session_engineer_controls(&state.session);
     let saved_mirrors = session_mirrors(&state.session);
     let saved_buffers = playback_buffer::buffers_of(&state.session.current());
+    let saved_redundancies = redundancy::redundancies_of(&state.session.current());
     // A local mix marked and not written yet is read with the session (it stays marked, and is
     // written later).
     let saved_local = kept_local(&state.session, &state.local_saver);
@@ -494,6 +496,12 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                 log_warn!(
                     "desk",
                     "start_engine: the saved playback buffers were not applied: {error}"
+                );
+            }
+            if let Err(error) = handle.replace_redundancies(&saved_redundancies) {
+                log_warn!(
+                    "desk",
+                    "start_engine: the saved redundancy settings were not applied: {error}"
                 );
             }
             let local = saved_local.map(|kept| apply_kept_local(&mut handle, &kept));
@@ -2037,6 +2045,8 @@ trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine {
         &self,
         kept: &[(MusicianKey, PlaybackBuffer)],
     ) -> Result<(), String>;
+    /// Replaces every redundancy setting the engine keeps ([EngineHandle::replace_redundancies]).
+    fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) -> Result<(), String>;
     /// Changes the mix of the musician at `address` from the desk ([EngineHandle::set_mix]).
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String>;
 }
@@ -2055,6 +2065,10 @@ impl SessionEngine for EngineHandle {
         kept: &[(MusicianKey, PlaybackBuffer)],
     ) -> Result<(), String> {
         EngineHandle::replace_playback_buffers(self, kept).map_err(|error| error.to_string())
+    }
+
+    fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) -> Result<(), String> {
+        EngineHandle::replace_redundancies(self, kept).map_err(|error| error.to_string())
     }
 
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
@@ -2205,7 +2219,9 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   ([EngineHandle::replace_kept]): one it no longer keeps is lifted from the musicians who are
 ///   here and forgotten for those who are not, so it never comes back when they register. Its
 ///   playback buffers replace the engine's the same way ([EngineHandle::replace_playback_buffers]),
-///   so a phone on a fixed buffer the loaded session does not keep goes back to Auto. A
+///   so a phone on a fixed buffer the loaded session does not keep goes back to Auto. Its redundancy
+///   settings too ([EngineHandle::replace_redundancies]): a musician it does not keep goes back to
+///   being sent once. A
 ///   mirror the engine refuses (on oneself, or closing a circle) is named in the answer; the
 ///   session keeps it, as a start would refuse it again.
 /// - With no engine running, the session is replaced and the saved mixes go to nobody (each is
@@ -2489,6 +2505,13 @@ fn apply_session<E: SessionEngine>(
             "the saved playback buffers were not applied: {error}"
         ));
     }
+    // And its redundancy settings, so a musician sent twice whom the session does not keep so goes
+    // back to once.
+    if let Err(error) = engine.replace_redundancies(&redundancy::redundancies_of(next)) {
+        refused.push(format!(
+            "the saved redundancy settings were not applied: {error}"
+        ));
+    }
     let desk = engine.desk();
     let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
     let local = local.map(|kept| apply_kept_local(engine, kept));
@@ -2644,6 +2667,10 @@ mod tests {
                     mirror: None,
                     buffer: crate::dto::BufferDto::from(personal_monitoring::PlaybackBuffer::Auto),
                     buffer_supported: false,
+                    redundancy: crate::dto::RedundancyDto::from(Redundancy::Off),
+                    duplicates_sent: 0,
+                    recovered: 0,
+                    redundancy_supported: false,
                 })
                 .collect(),
             local_mix: MixDto::from(&personal_monitoring::MixValues::default()),
@@ -2684,6 +2711,7 @@ mod tests {
             capabilities: Vec::new(),
             mirror: None,
             playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
+            redundancy: personal_monitoring::Redundancy::Off,
         }
     }
 
@@ -3104,6 +3132,8 @@ mod tests {
         refuses_kept: Option<String>,
         /// The playback buffers it took whole last.
         buffers: Mutex<Option<Vec<(MusicianKey, PlaybackBuffer)>>>,
+        /// The redundancy settings it took whole last.
+        redundancies: Mutex<Option<Vec<(MusicianKey, Redundancy)>>>,
         /// The musician whose mix it refuses to change, when it does.
         refuses_push_to: Option<String>,
         /// The engineer's local mix as a session save or load reads it.
@@ -3369,6 +3399,12 @@ mod tests {
         ) -> Result<(), String> {
             self.note("replace_playback_buffers".to_owned());
             *self.buffers.lock().expect("buffers lock") = Some(kept.to_vec());
+            Ok(())
+        }
+
+        fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) -> Result<(), String> {
+            self.note("replace_redundancies".to_owned());
+            *self.redundancies.lock().expect("redundancies lock") = Some(kept.to_vec());
             Ok(())
         }
 
@@ -5637,7 +5673,8 @@ mod tests {
     }
 
     #[test]
-    fn a_load_applies_groups_and_channels_then_controls_mirrors_and_buffers_then_the_mixes() {
+    fn a_load_applies_groups_and_channels_then_controls_mirrors_buffers_and_redundancy_then_the_mixes(
+    ) {
         let test = "session-load-order";
         let (session, snapshots, engine) = desk(
             test,
@@ -5661,6 +5698,9 @@ mod tests {
                     mode: "fixed".to_owned(),
                     ms: Some(40),
                 }),
+                redundancy: Some(crate::session::SessionRedundancy {
+                    delay_blocks: Some(3),
+                }),
             },
         );
         loaded.musicians.insert(
@@ -5670,6 +5710,7 @@ mod tests {
                 engineer: None,
                 mirror: Some(kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)),
                 buffer: None,
+                redundancy: None,
             },
         );
         saved_session(
@@ -5705,7 +5746,11 @@ mod tests {
             at("replace_kept") < at("replace_playback_buffers"),
             "{log:?}"
         );
-        assert!(at("replace_playback_buffers") < at("push_mix"), "{log:?}");
+        assert!(
+            at("replace_playback_buffers") < at("replace_redundancies"),
+            "{log:?}"
+        );
+        assert!(at("replace_redundancies") < at("push_mix"), "{log:?}");
         assert_eq!(
             engine
                 .lock()
@@ -5717,6 +5762,22 @@ mod tests {
                 PlaybackBuffer::Fixed { ms: 40 }
             )]),
             "the loaded buffers replace the engine's"
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .and_then(|engine| engine
+                    .redundancies
+                    .lock()
+                    .expect("redundancies lock")
+                    .clone()),
+            Some(vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                Redundancy::On { delay_blocks: 3 }
+            )]),
+            "the loaded redundancy settings replace the engine's"
         );
         let (controls, mirrors) = kept_books(&engine);
         assert_eq!(
@@ -6737,6 +6798,7 @@ mod tests {
                 // A hand-edited session: a mirror on oneself, which the engine refuses.
                 mirror: Some(kept_mirror(address_key(RACK), "Rack", None, None)),
                 buffer: None,
+                redundancy: None,
             },
         );
         saved_session(

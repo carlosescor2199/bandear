@@ -8,6 +8,7 @@ use crate::engine::OutputMeter;
 use crate::mix::{MixPlan, MixState, OUTPUT_CHANNELS};
 use crate::pipeline::{Block, Sink, SourceFormat};
 use crate::protocol::{encode_audio_packet, HEADER_SIZE};
+use crate::redundancy::HeldCopies;
 use crate::targets::TargetRegistry;
 
 /// How many musicians the sink has room for before its first block; more grow the list once.
@@ -31,6 +32,12 @@ pub(crate) struct TargetCounters {
     /// the engine thread records it with no allocation, lock or I/O, and the status reads it from
     /// outside the engine thread.
     pub(crate) last_send_error: AtomicU8,
+    /// Copies of datagrams sent again while redundancy is on (see [crate::redundancy]); not counted
+    /// in [Self::sent], which counts the blocks of audio sent.
+    pub(crate) duplicates: AtomicU64,
+    /// The packets the musician's phone reported a redundant copy recovered, summed over its
+    /// `stats` reports. The control server adds them; the network thread never touches it.
+    pub(crate) recovered: AtomicU64,
 }
 
 /// The kinds of send failure the status names, in code order from 1; 0 is "none".
@@ -73,12 +80,13 @@ pub(crate) fn send_error_name(code: u8) -> Option<&'static str> {
 }
 
 /// One musician a block goes to, copied out of the target table: shared handles only, so the
-/// copy is an address and three reference counts.
+/// copy is an address and a few reference counts.
 struct Destination {
     address: SocketAddr,
     mix: Arc<MixState>,
     counters: Arc<TargetCounters>,
     meter: OutputMeter,
+    held: Option<Arc<HeldCopies>>,
 }
 
 /// The phones' sink: every block is mixed for each musician and sent to their phone over UDP.
@@ -100,6 +108,8 @@ pub(crate) struct NetworkSink {
     destinations: Vec<Destination>,
     stereo: Vec<f32>,
     packet: Vec<u8>,
+    /// The copy of an earlier datagram sent again, for a musician with redundancy on.
+    copy: Vec<u8>,
     /// Runs right before each send, with the destination: lets a test act on the registry there.
     #[cfg(test)]
     before_send: Option<Box<dyn FnMut(SocketAddr) + Send>>,
@@ -117,6 +127,7 @@ impl NetworkSink {
             destinations: Vec::with_capacity(EXPECTED_TARGETS),
             stereo: Vec::new(),
             packet: Vec::new(),
+            copy: Vec::new(),
             #[cfg(test)]
             before_send: None,
         })
@@ -132,6 +143,7 @@ impl Sink for NetworkSink {
                 mix: Arc::clone(&entry.mix_state),
                 counters: Arc::clone(&entry.counters),
                 meter: entry.output_meter.clone(),
+                held: entry.held.clone(),
             });
         }
         // The table's guard is released: everything below works on the copies.
@@ -175,18 +187,47 @@ impl Sink for NetworkSink {
                         .store(send_error_code(error.kind()), Ordering::Relaxed);
                 }
             }
+            // With redundancy on, the datagram held a few blocks ago goes again right after this
+            // block's own, and this one is held in its place: bytes copied into room made before,
+            // nothing allocated. A failed copy keeps its kind like any send; the audio itself went.
+            if let Some(held) = &destination.held {
+                self.copy.clear();
+                self.copy.reserve(self.packet.len());
+                if held.exchange(&self.packet, &mut self.copy) {
+                    match self.socket.send_to(&self.copy, destination.address) {
+                        Ok(_) => {
+                            destination
+                                .counters
+                                .duplicates
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) => destination
+                            .counters
+                            .last_send_error
+                            .store(send_error_code(error.kind()), Ordering::Relaxed),
+                    }
+                }
+            }
         }
         // Let go of the shared handles now, so a musician removed meanwhile is not kept alive.
         self.destinations.clear();
     }
 
-    /// Sizes the mix and packet buffers for the new source's blocks, off the per-block path.
+    /// Sizes the mix, packet and copy buffers for the new source's blocks, off the per-block path,
+    /// and forgets the copies held from the old source's blocks.
     fn source_changed(&mut self, format: SourceFormat) {
         let samples = format.block_frames * usize::from(OUTPUT_CHANNELS);
         self.stereo
             .reserve(samples.saturating_sub(self.stereo.len()));
         self.packet
             .reserve((HEADER_SIZE + 2 * samples).saturating_sub(self.packet.len()));
+        self.copy
+            .reserve((HEADER_SIZE + 2 * samples).saturating_sub(self.copy.len()));
+        for entry in self.targets.read().iter() {
+            if let Some(held) = &entry.held {
+                held.clear();
+            }
+        }
     }
 
     /// Every musician's output meter falls with the silence, as the input meters do.
@@ -579,6 +620,120 @@ mod tests {
         assert!(send_error_name(code).is_some());
     }
 
+    fn sequence_of(datagram: &[u8]) -> u64 {
+        u64::from_le_bytes(datagram[10..18].try_into().expect("eight bytes"))
+    }
+
+    fn send_blocks(sink: &mut NetworkSink, sequences: std::ops::Range<u64>) {
+        for sequence in sequences {
+            let level = sequence as f32 / 100.0;
+            sink.process(&Block {
+                samples: &[level, -level, level, -level],
+                channels: 2,
+                sequence,
+            });
+        }
+    }
+
+    /// With redundancy on, each datagram goes again, byte for byte, right after the datagram of
+    /// the block `delay_blocks` later; the copies are counted apart from the blocks sent.
+    #[test]
+    fn a_musician_with_redundancy_gets_each_datagram_again_a_few_blocks_later() {
+        use crate::redundancy::Redundancy;
+        use crate::targets::MusicianKey;
+
+        let phone = bind("127.0.0.1:0");
+        let address = phone.local_addr().expect("phone address");
+        let targets = registry(&[address]);
+        targets
+            .set_redundancy(
+                &MusicianKey::Address(address),
+                Redundancy::On { delay_blocks: 2 },
+            )
+            .expect("the phone is here");
+        let counters = Arc::clone(&targets.read()[0].counters);
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+
+        send_blocks(&mut sink, 0..5);
+
+        let received: Vec<Vec<u8>> = (0..8).map(|_| datagram(&phone)).collect();
+        let sequences: Vec<u64> = received.iter().map(|packet| sequence_of(packet)).collect();
+        assert_eq!(sequences, [0, 1, 2, 0, 3, 1, 4, 2]);
+        assert_eq!(received[3], received[0], "the copy is the same datagram");
+        assert_eq!(received[5], received[1]);
+        assert_eq!(received[7], received[2]);
+        assert!(receive(&phone, Duration::from_millis(100)).is_none());
+        assert_eq!(counters.sent.load(Ordering::Relaxed), 5);
+        assert_eq!(counters.duplicates.load(Ordering::Relaxed), 3);
+    }
+
+    /// Redundancy is per musician: another phone gets each datagram once, and turning it off stops
+    /// the copies from the next block.
+    #[test]
+    fn redundancy_doubles_only_its_musicians_datagrams_and_stops_when_turned_off() {
+        use crate::redundancy::Redundancy;
+        use crate::targets::MusicianKey;
+
+        let first = bind("127.0.0.1:0");
+        let Some(second) = musician_phone(2) else {
+            return;
+        };
+        let first_address = first.local_addr().expect("first address");
+        let second_address = second.local_addr().expect("second address");
+        let targets = registry(&[first_address, second_address]);
+        let key = MusicianKey::Address(first_address);
+        targets
+            .set_redundancy(&key, Redundancy::On { delay_blocks: 1 })
+            .expect("the phone is here");
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+
+        send_blocks(&mut sink, 0..3);
+        let doubled: Vec<u64> = (0..5).map(|_| sequence_of(&datagram(&first))).collect();
+        assert_eq!(doubled, [0, 1, 0, 2, 1]);
+        let single: Vec<u64> = (0..3).map(|_| sequence_of(&datagram(&second))).collect();
+        assert_eq!(single, [0, 1, 2]);
+        assert!(receive(&second, Duration::from_millis(100)).is_none());
+
+        targets
+            .set_redundancy(&key, Redundancy::Off)
+            .expect("the phone is here");
+        send_blocks(&mut sink, 3..5);
+        let after: Vec<u64> = (0..2).map(|_| sequence_of(&datagram(&first))).collect();
+        assert_eq!(after, [3, 4]);
+        assert!(receive(&first, Duration::from_millis(100)).is_none());
+    }
+
+    /// A new source forgets the copies held from the old one's blocks.
+    #[test]
+    fn a_new_source_sends_none_of_the_old_sources_copies() {
+        use crate::redundancy::Redundancy;
+        use crate::targets::MusicianKey;
+
+        let phone = bind("127.0.0.1:0");
+        let address = phone.local_addr().expect("phone address");
+        let targets = registry(&[address]);
+        targets
+            .set_redundancy(
+                &MusicianKey::Address(address),
+                Redundancy::On { delay_blocks: 1 },
+            )
+            .expect("the phone is here");
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+        send_blocks(&mut sink, 0..1);
+        sink.source_changed(SourceFormat {
+            channels: 2,
+            block_frames: 2,
+        });
+        send_blocks(&mut sink, 1..2);
+        let sequences: Vec<u64> = (0..2).map(|_| sequence_of(&datagram(&phone))).collect();
+        assert_eq!(
+            sequences,
+            [0, 1],
+            "block 0 is not sent again after the change"
+        );
+        assert!(receive(&phone, Duration::from_millis(100)).is_none());
+    }
+
     #[test]
     fn send_error_codes_name_their_kind_and_zero_names_none() {
         assert_eq!(send_error_name(0), None);
@@ -599,8 +754,9 @@ mod tests {
 
     /// The whole per-block path after warm-up, as it runs live: a 24-bit, 96 kHz stereo callback
     /// converted, filtered, decimated and metered into the ring, then each block mixed for three
-    /// phones, metered, encoded and sent, and mixed and metered for the local mix, with no local
-    /// output and then with one playing. Not one heap allocation or free on the way.
+    /// phones, metered, encoded and sent (the first phone's twice, with redundancy on), and mixed
+    /// and metered for the local mix, with no local output and then with one playing. Not one heap
+    /// allocation or free on the way.
     #[test]
     fn the_capture_to_phone_path_never_allocates() {
         use crate::pipeline::tests::allocations;
@@ -623,6 +779,12 @@ mod tests {
                 ..MixUpdate::default()
             })
             .expect("a valid update applies");
+        targets
+            .set_redundancy(
+                &crate::targets::MusicianKey::Address(addresses[0]),
+                crate::redundancy::Redundancy::On { delay_blocks: 2 },
+            )
+            .expect("the first phone is here");
         // The phones drain their sockets on their own threads, which are not watched.
         let draining = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let drains: Vec<_> = phones

@@ -117,9 +117,11 @@ object PlaybackLatency {
     /**
      * What the link report due now ends its interval with, from the receive loop's track inputs.
      *
-     * - The cushion is the buffer asked of the track ([cushionMs]): [cushionPackets] packets of
-     *   [packetFrames] frames at the track's [playbackRate]; not measured (`NaN`) before the first
-     *   packet sized it or while no track set the rate (null).
+     * - The cushion is the buffer the track applied ([appliedBufferFrames], what it reports after the
+     *   size was set; the platform may round it up) at the track's [playbackRate], or while that is
+     *   unknown (0) the buffer asked of it ([cushionMs]: [cushionPackets] packets of [packetFrames]
+     *   frames); not measured (`NaN`) before the first packet sized it or while no track set the
+     *   rate (null).
      * - The backlog is the audio queued now ([backlogMs]): the [framesWritten] past the
      *   [presentedFrame] the track's timestamp read; not measured (`NaN`) when there is no track or
      *   its timestamp could not be read ([timestampRead] false). A track always has its rate, so a
@@ -132,12 +134,40 @@ object PlaybackLatency {
         timestampRead: Boolean,
         framesWritten: Long,
         presentedFrame: Long,
+        appliedBufferFrames: Int = 0,
     ): ReportExtras {
         val rate = playbackRate ?: 0
         return ReportExtras(
-            cushionMs = cushionMs(packetFrames, cushionPackets, rate),
+            cushionMs = if (appliedBufferFrames > 0 && packetFrames > 0 && rate > 0) {
+                appliedBufferFrames * 1000.0 / rate
+            } else {
+                cushionMs(packetFrames, cushionPackets, rate)
+            },
             backlogMs = if (timestampRead) backlogMs(framesWritten, presentedFrame, rate) else Double.NaN,
         )
+    }
+
+    /**
+     * How far above the wanted buffer the platform may round it and the track still count as
+     * shrunk: it sizes buffers in its own bursts (4 ms on a Galaxy S23).
+     */
+    const val SHRINK_TOLERANCE_MS = 5
+
+    /**
+     * Whether a track opened with room for the longest fixed buffer ([trackCapacityFrames]) keeps
+     * Auto's latency, once its buffer was set to [wantedFrames] and it reports [appliedFrames].
+     *
+     * The large capacity only costs no latency if the platform honours the size set: kept when the
+     * buffer came down to the wanted size within [SHRINK_TOLERANCE_MS] at [sampleRate], or at least
+     * as low as a track opened at the platform minimum would queue ([minimumFrames], how the track
+     * was opened before the desk could set a buffer), so it is never worse than before. Otherwise,
+     * and when the size could not be set or read (an error code, 0), the caller reopens the track
+     * at the minimum and lets fixed buffers go only as long as that track holds.
+     */
+    fun keepsLowLatency(wantedFrames: Int, appliedFrames: Int, minimumFrames: Int, sampleRate: Int): Boolean {
+        if (appliedFrames <= 0) return false
+        val tolerance = ceilDiv(SHRINK_TOLERANCE_MS.toLong() * sampleRate.coerceAtLeast(0), 1_000L)
+        return appliedFrames.toLong() <= maxOf(wantedFrames.toLong() + tolerance, minimumFrames.toLong())
     }
 
     /** One adjustment outcome: the cushion to use next, and the clean-interval count to carry. */

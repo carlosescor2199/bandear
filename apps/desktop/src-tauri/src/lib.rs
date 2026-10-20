@@ -480,6 +480,21 @@ async fn set_musician_buffer(
     commands::playback_buffer::set_musician_buffer(state.inner(), &musician_key, &mode, ms)
 }
 
+/// Turns redundancy on or off for the musician `musicianKey` names (`client:<id>` or
+/// `address:<ip:port>`): `on`, with the copies `delayBlocks` (1-4, 2 when absent) blocks late.
+/// Answers `{ musicianKey, outcome, redundancy, bandwidthFactor, saved, saveError, message,
+/// minDelayBlocks, maxDelayBlocks, defaultDelayBlocks }`, `outcome` `set` or `invalid` (see
+/// [commands::redundancy::set_musician_redundancy]).
+#[tauri::command]
+async fn set_musician_redundancy(
+    state: State<'_, DesktopState>,
+    musician_key: String,
+    on: bool,
+    delay_blocks: Option<u32>,
+) -> Result<dto::RedundancySetDto, String> {
+    commands::redundancy::set_musician_redundancy(state.inner(), &musician_key, on, delay_blocks)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -579,7 +594,8 @@ pub fn run() {
             list_mix_backups,
             restore_mix_backup,
             link_history,
-            set_musician_buffer
+            set_musician_buffer,
+            set_musician_redundancy
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")

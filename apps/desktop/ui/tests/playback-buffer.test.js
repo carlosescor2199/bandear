@@ -18,6 +18,7 @@ import {
   bufferView,
   formatBufferSet,
   nameForKey,
+  pendingBufferChoice,
 } from "../app/lib/playback-buffer.js";
 
 const NOW = Date.UTC(2026, 9, 19, 19, 4, 5, 250);
@@ -213,4 +214,39 @@ test("the console sets a buffer, reads the status after it and says the outcome"
   assert.equal(refused.ok, false);
   assert.ok(refused.message.startsWith("The buffer was not set: "), refused.message);
   app.dispose?.();
+});
+
+test("a pending Buffer choice settles once the row reports it, compared by value", () => {
+  const auto = bufferView(row());
+  const fixed40 = bufferView(row({ buffer: { mode: "fixed", ms: 40 } }));
+  const asked = { mode: "fixed", ms: "040" };
+  // "040" typed is 40 reported: settled. As strings they would never match and the choice would
+  // stay shown over what the engine reports.
+  assert.equal(pendingBufferChoice(asked, fixed40, null, null), null);
+  assert.equal(pendingBufferChoice({ mode: "fixed", ms: " 40 " }, fixed40, null, null), null);
+  assert.equal(pendingBufferChoice({ mode: "fixed", ms: 40 }, fixed40, null, null), null);
+  // Not reported yet: still pending, whether the row is on Auto or another length.
+  assert.deepEqual(pendingBufferChoice(asked, auto, null, null), asked);
+  assert.deepEqual(
+    pendingBufferChoice({ mode: "fixed", ms: "41" }, fixed40, null, null),
+    { mode: "fixed", ms: "41" },
+  );
+  // Auto settles on Auto whatever was in the length field.
+  assert.equal(pendingBufferChoice({ mode: "auto", ms: null }, auto, null, null), null);
+  assert.deepEqual(pendingBufferChoice({ mode: "auto", ms: null }, fixed40, null, null), {
+    mode: "auto",
+    ms: null,
+  });
+  // Nothing asked is nothing pending.
+  assert.equal(pendingBufferChoice(null, fixed40, null, null), null);
+});
+
+test("a pending Buffer choice settles when a new answer for the row came back", () => {
+  const auto = bufferView(row());
+  const asked = { mode: "fixed", ms: "abc" };
+  const refused = { address: "192.168.1.3:50000", ok: false, message: "Type the buffer ..." };
+  // A refused length is never reported: the answer settles it, so the row shows the engine's.
+  assert.equal(pendingBufferChoice(asked, auto, refused, null), null);
+  // The answer already seen before this choice does not.
+  assert.deepEqual(pendingBufferChoice(asked, auto, refused, refused), asked);
 });

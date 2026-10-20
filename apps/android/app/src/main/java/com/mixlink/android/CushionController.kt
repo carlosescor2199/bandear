@@ -29,6 +29,39 @@ internal class CushionController(start: Int = PlaybackLatency.START_CUSHION_PACK
     private var lastUnderruns = 0
     private var framesSinceAdjust = 0L
 
+    companion object {
+        /** [onPacket]: nothing to do. */
+        const val STEP_NONE = 0
+
+        /** [onPacket]: the cushion changed, so the caller asks the track for it. */
+        const val STEP_APPLY = 1
+
+        /** [onPacket]: a second of audio was played, so the caller reads the underruns for [adjust]. */
+        const val STEP_ADJUST = 2
+    }
+
+    /**
+     * The receive loop's step for one packet of [packetSamples] interleaved samples
+     * ([PlaybackLatency.CHANNELS] to a frame) in packets of [packetFrames]: follows the desk's buffer
+     * [deskBufferMs] (read once per packet) at the track's [playbackRate], or the packet's
+     * [packetRate] while no track set one, in a track of [capacityFrames], and counts the frames
+     * played. Answers [STEP_NONE] or the flags [STEP_APPLY] and [STEP_ADJUST]; no allocation.
+     */
+    fun onPacket(
+        deskBufferMs: Int,
+        packetFrames: Int,
+        packetSamples: Int,
+        playbackRate: Int?,
+        packetRate: Int,
+        capacityFrames: Int,
+    ): Int {
+        val rate = playbackRate ?: packetRate
+        var step = STEP_NONE
+        if (follow(deskBufferMs, packetFrames, rate, capacityFrames)) step = step or STEP_APPLY
+        if (onPlayed(packetSamples / PlaybackLatency.CHANNELS, rate)) step = step or STEP_ADJUST
+        return step
+    }
+
     /**
      * Follows the desk's buffer [requestMs] (Auto, or a fixed length in ms) with packets of
      * [packetFrames] at [sampleRate] in a track of [capacityFrames]. Answers whether the cushion

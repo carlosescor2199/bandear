@@ -109,6 +109,30 @@ export function formatBufferSet(answer, name) {
   return result;
 }
 
+/**
+ * The engineer's Buffer choice still to show over what the engine reports, or null. `asked` is the
+ * choice sent (`{ mode, ms }`, `ms` as typed), `buffer` the row's Buffer cell (`bufferView`),
+ * `said` the latest answer for this row and `seen` the one that was there before. A choice is
+ * settled once the row reports it, compared by value (a typed "040" is the 40 reported), or once an
+ * answer that was not there before came back (a refused length is never reported).
+ */
+export function pendingBufferChoice(asked, buffer, said, seen) {
+  if (asked === null || asked === undefined) {
+    return null;
+  }
+  if (said !== null && said !== undefined && said !== seen) {
+    return null;
+  }
+  if (buffer.mode !== asked.mode) {
+    return asked;
+  }
+  if (buffer.mode === "auto") {
+    return null;
+  }
+  const typed = String(asked.ms ?? "").trim();
+  return /^\d+$/.test(typed) && Number(typed) === buffer.ms ? null : asked;
+}
+
 /** The name the desk shows for the musician `key` names among `musicians`, else the key itself. */
 export function nameForKey(musicians, key) {
   const musician = musicians.find((candidate) => musicianKey(candidate) === key);

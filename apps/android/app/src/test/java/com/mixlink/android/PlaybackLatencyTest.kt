@@ -1,6 +1,7 @@
 package com.mixlink.android
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -129,6 +130,55 @@ class PlaybackLatencyTest {
         )
         assertTrue(extras.cushionMs.isNaN())
         assertTrue(extras.backlogMs.isNaN())
+    }
+
+    @Test
+    fun aReportCarriesTheBufferTheTrackAppliedWhenItIsKnown() {
+        // Asked for 2 packets of 256 frames (512), the platform kept 768: the phone plays 16 ms, not
+        // the 10.67 ms it asked for.
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 256,
+            cushionPackets = 2,
+            playbackRate = 48_000,
+            timestampRead = false,
+            framesWritten = 0L,
+            presentedFrame = 0L,
+            appliedBufferFrames = 768,
+        )
+        assertEquals(16.0, extras.cushionMs, 1e-9)
+        // Unknown (0) falls back to what was asked; before the first packet it is still not measured.
+        assertEquals(
+            512 * 1000.0 / 48_000,
+            PlaybackLatency.reportExtras(256, 2, 48_000, false, 0L, 0L, appliedBufferFrames = 0).cushionMs,
+            1e-9,
+        )
+        assertTrue(PlaybackLatency.reportExtras(0, 2, 48_000, false, 0L, 0L, appliedBufferFrames = 768).cushionMs.isNaN())
+    }
+
+    @Test
+    fun aLargeTrackThatShrinksToTheWantedBufferIsKept() {
+        // One packet of 256 frames wanted at 48 kHz; the minimum track would hold 1 920 frames.
+        assertTrue(PlaybackLatency.keepsLowLatency(256, 256, 1_920, 48_000))
+        // Rounded up by the platform within the tolerance (5 ms is 240 frames): still kept.
+        assertTrue(PlaybackLatency.keepsLowLatency(256, 256 + 240, 100, 48_000))
+        assertFalse(PlaybackLatency.keepsLowLatency(256, 256 + 241, 100, 48_000))
+    }
+
+    @Test
+    fun aLargeTrackThatQueuesNoMoreThanTheMinimumTrackIsKept() {
+        // Clamped up to the hardware minimum, but no more than a track opened at the platform
+        // minimum (as before the desk could set a buffer) would queue: no worse than before.
+        assertTrue(PlaybackLatency.keepsLowLatency(256, 1_920, 1_920, 48_000))
+        assertFalse(PlaybackLatency.keepsLowLatency(256, 1_921, 1_920, 48_000))
+    }
+
+    @Test
+    fun aLargeTrackThatWillNotShrinkIsReopened() {
+        // The platform ignored the size: the whole 500 ms capacity stays queued.
+        assertFalse(PlaybackLatency.keepsLowLatency(256, 94 * 256, 1_920, 48_000))
+        // A refused call (an error code) or a size it cannot read proves nothing: reopen.
+        assertFalse(PlaybackLatency.keepsLowLatency(256, -3, 1_920, 48_000))
+        assertFalse(PlaybackLatency.keepsLowLatency(256, 0, 1_920, 48_000))
     }
 
     @Test

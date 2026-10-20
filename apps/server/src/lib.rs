@@ -14,6 +14,7 @@ mod pipeline;
 mod playback;
 mod protocol;
 mod recorder;
+mod redundancy;
 mod soundcheck;
 mod targets;
 mod wav;
@@ -39,6 +40,10 @@ pub use protocol::{
 pub use recorder::{
     free_space, minutes_left, DiskEstimate, RecordRequest, RecordingState, RecordingStatus,
     TakeEnd, TakeMarker, TakeSummary, TakeTrack, TrackKind,
+};
+pub use redundancy::{
+    Redundancy, RedundancySetting, DEFAULT_REDUNDANCY_DELAY_BLOCKS, MAX_REDUNDANCY_DELAY_BLOCKS,
+    MIN_REDUNDANCY_DELAY_BLOCKS,
 };
 pub use soundcheck::{
     SoundcheckClock, SoundcheckError, SoundcheckRequest, SoundcheckState, SoundcheckStatus,

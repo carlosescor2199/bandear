@@ -27,7 +27,12 @@
 
 import "./link-state.js";
 import { CONFIRM_DELAY_MS, confirmReady } from "../lib/network-view.js";
-import { DEFAULT_FIXED_MS, MAX_BUFFER_MS, MIN_BUFFER_MS } from "../lib/playback-buffer.js";
+import {
+  DEFAULT_FIXED_MS,
+  MAX_BUFFER_MS,
+  MIN_BUFFER_MS,
+  pendingBufferChoice,
+} from "../lib/playback-buffer.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
 const CLIENT_NAME_TITLE =
@@ -537,13 +542,7 @@ class MlMusiciansTable extends HTMLElement {
     view.bufferLine.hidden = !buffer.supported;
     const said = this.#data.bufferSaid?.address === row.address ? this.#data.bufferSaid : null;
     // A choice is shown until the engine reports it, or until its outcome came back.
-    const reported =
-      view.asked !== null &&
-      buffer.mode === view.asked.mode &&
-      (buffer.mode === "auto" || String(buffer.ms) === String(view.asked.ms).trim());
-    if (reported || (said !== null && said !== view.said)) {
-      view.asked = null;
-    }
+    view.asked = pendingBufferChoice(view.asked, buffer, said, view.said);
     view.said = said;
     view.bufferMode.value = view.asked?.mode ?? buffer.mode;
     view.bufferFixed.hidden = view.bufferMode.value !== "fixed";

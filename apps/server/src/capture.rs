@@ -351,10 +351,15 @@ pub(crate) fn with_buffer_size(
 /// Some drivers only accept one buffer size (a Realtek ASIO driver reports `1024..=1024`, the Volt's
 /// accepts a range). Requesting outside that range fails the stream open, so clamping here turns a
 /// failed session into the size the driver actually allows.
+///
+/// The range comes straight from the driver, so it is not trusted: an inverted one (`min > max`)
+/// gives nothing sensible to narrow to, and `u32::clamp` would panic on it, on a start, a device
+/// switch or an ASIO local output. The request then goes to the driver unchanged, and a rejection
+/// falls back to the device default like any other.
 pub(crate) fn clamp_buffer_frames(requested: u32, supported: &SupportedBufferSize) -> u32 {
     match supported {
-        SupportedBufferSize::Range { min, max } => requested.clamp(*min, *max),
-        SupportedBufferSize::Unknown => requested,
+        SupportedBufferSize::Range { min, max } if min <= max => requested.clamp(*min, *max),
+        SupportedBufferSize::Range { .. } | SupportedBufferSize::Unknown => requested,
     }
 }
 
@@ -630,5 +635,14 @@ mod tests {
         assert_eq!(clamp_buffer_frames(64, &range), 128);
         assert_eq!(clamp_buffer_frames(4096, &range), 512);
         assert_eq!(clamp_buffer_frames(256, &SupportedBufferSize::Unknown), 256);
+    }
+
+    #[test]
+    fn an_inverted_driver_range_passes_the_request_on_instead_of_panicking() {
+        let inverted = SupportedBufferSize::Range { min: 512, max: 128 };
+
+        assert_eq!(clamp_buffer_frames(256, &inverted), 256);
+        assert_eq!(clamp_buffer_frames(64, &inverted), 64);
+        assert_eq!(clamp_buffer_frames(4096, &inverted), 4096);
     }
 }

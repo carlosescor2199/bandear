@@ -1,5 +1,6 @@
 //! Channel processing: the filters and dynamics of a console's channel strip, for one input or a
-//! linked stereo pair, at the engine's 48 kHz.
+//! linked stereo pair, at the engine's 48 kHz. [strip] puts them in order (high-pass, gate,
+//! equaliser, compressor); [dynamics] also holds the limiter for a mix's master.
 //!
 //! Every processor follows the engine thread's rules:
 //!
@@ -24,6 +25,7 @@ use crate::capture::TARGET_SAMPLE_RATE;
 pub(crate) mod biquad;
 pub(crate) mod dynamics;
 pub(crate) mod eq;
+pub(crate) mod strip;
 
 /// The rate every processor runs at.
 pub(crate) const SAMPLE_RATE: f64 = TARGET_SAMPLE_RATE as f64;

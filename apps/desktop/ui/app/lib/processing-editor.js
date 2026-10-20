@@ -26,8 +26,10 @@ import {
 /** How long the edits must pause before the desk is asked for the equaliser's curve. */
 export const CURVE_DEBOUNCE_MS = 120;
 
-// The channel the editor had open last, so opening it again from the sidebar comes back to it.
-let lastOpened = null;
+// The channel each console app's editor had open last, so opening the editor again from the sidebar
+// comes back to it. Kept per app (not one value for the module), so two apps, or two tests, never
+// see each other's.
+const lastOpenedBy = new WeakMap();
 
 /**
  * The editor's commands for the console `app`, opened on `channel` (1-based; null: the one open
@@ -41,7 +43,7 @@ export function processingEditor({
   timers = globalThis,
   debounceMs = CURVE_DEBOUNCE_MS,
 }) {
-  let open = channel ?? lastOpened ?? 1;
+  let open = channel ?? lastOpenedBy.get(app) ?? 1;
   let ab = {};
   let outcome = null;
   let curveTimer = 0;
@@ -68,7 +70,7 @@ export function processingEditor({
     const choice = choiceOf(open) ?? choices()[0] ?? null;
     if (choice) {
       open = choice.channel;
-      lastOpened = open;
+      lastOpenedBy.set(app, open);
     }
   }
   normalise();
@@ -138,7 +140,7 @@ export function processingEditor({
     open(number) {
       if (choiceOf(number)) {
         open = choiceOf(number).channel;
-        lastOpened = open;
+        lastOpenedBy.set(app, open);
         outcome = null;
       }
       return open;
@@ -159,11 +161,17 @@ export function processingEditor({
     async toggleBypass() {
       const channelOpen = open;
       if (bypassed()) {
+        // The kept strip stays here until the desk took it back: a send that fails leaves the
+        // channel bypassed with its strip still kept, to try again.
         const restored = abRestore(ab, channelOpen);
-        ab = restored.ab;
-        changed();
         const result = await app.editProcessing(channelOpen, restored.send);
-        return say(result.ok ? { ok: true, message: `CH ${channelOpen}'s processing is back on.` } : result);
+        if (!result.ok) {
+          return say(result);
+        }
+        if (ab[channelOpen] === restored.send) {
+          ab = abRestore(ab, channelOpen).ab;
+        }
+        return say({ ok: true, message: `CH ${channelOpen}'s processing is back on.` });
       }
       const strip = channelStrip(state(), channelOpen);
       if (!strip.active) {

@@ -783,6 +783,18 @@ export function channelStrip(state, channel) {
     : { channel, settings: defaultStrip(), active: false, pending: false };
 }
 
+/**
+ * Whether `channel`'s (1-based) processing does something: true or false once the strips were
+ * read (an edit on its way counts), null while they are not known yet, so a screen does not claim
+ * "Off" for a strip it has never read.
+ */
+export function processingActive(state, channel) {
+  if (state.processing === null && !state.processingPending[channel]) {
+    return null;
+  }
+  return channelStrip(state, channel).active;
+}
+
 export function musicianByAddress(state, address) {
   return state.musicians.find((musician) => musician.address === address) ?? null;
 }

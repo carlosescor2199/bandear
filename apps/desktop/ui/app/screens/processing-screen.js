@@ -37,6 +37,7 @@ import {
   transferPath,
 } from "../lib/processing-view.js";
 import { processingHash, routeChannel } from "../lib/router.js";
+import { frameScheduler } from "../lib/scheduling.js";
 
 const GRAPH = Object.freeze({ width: 600, height: 200 });
 const TRANSFER_SIZE = 60;
@@ -207,6 +208,12 @@ export function mountProcessingScreen(main, app) {
     transferCurve: $("[data-transfer-curve]"),
   };
 
+  // Draws at most once a frame, and never once the screen was left: an answer that settles after
+  // that (an edit, a bypass, the desk's curve) must not draw on a removed screen or change the
+  // address while another screen shows.
+  const frames = frameScheduler(() => render());
+  const scheduleRender = () => frames.schedule();
+
   const commands = processingEditor({
     app,
     channel: routeChannel(window.location.hash),
@@ -291,6 +298,9 @@ export function mountProcessingScreen(main, app) {
   }
 
   function render() {
+    if (frames.disposed) {
+      return;
+    }
     view = commands.view();
     const failure = view.outcome && !view.outcome.ok ? view.outcome.message : view.error ?? "";
     parts.outcome.textContent = view.outcome?.ok ? view.outcome.message : "";
@@ -379,16 +389,6 @@ export function mountProcessingScreen(main, app) {
       )}, knee ${formatDb(compressor.kneeDb)}, makeup ${formatDb(compressor.makeupDb)}`,
     );
     reflectLevels();
-  }
-
-  let frame = 0;
-  function scheduleRender() {
-    if (frame === 0) {
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        render();
-      });
-    }
   }
 
   // The meters of the open strip, from the last `meters` payload.
@@ -505,7 +505,7 @@ export function mountProcessingScreen(main, app) {
   return () => {
     unsubscribe();
     stopMeters();
-    cancelAnimationFrame(frame);
+    frames.dispose();
     commands.dispose();
     screen.remove();
   };

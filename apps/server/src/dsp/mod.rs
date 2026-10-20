@@ -98,6 +98,23 @@ pub(crate) fn channel_frames(
         .map(move |frame| &mut frame[first..first + channels])
 }
 
+/// Replaces every sample that is not a finite number (NaN or an infinity) in channels
+/// `first..first + channels` of each `stride`-wide frame of `block` with silence; returns how many
+/// it replaced. A processor fed one would otherwise carry it into its state for good.
+#[inline]
+pub(crate) fn sanitize(block: &mut [f32], stride: usize, first: usize, channels: usize) -> u64 {
+    let mut replaced = 0;
+    for frame in channel_frames(block, stride, first, channels) {
+        for sample in frame {
+            if !sample.is_finite() {
+                *sample = 0.0;
+                replaced += 1;
+            }
+        }
+    }
+    replaced
+}
+
 /// A value that moves to a new target in a straight line over a number of frames, then holds it
 /// exactly.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -118,11 +135,18 @@ impl Glide {
         }
     }
 
-    /// Starts moving from the current value to `target` over `frames` frames.
+    /// Starts moving from the current value to `target` over `frames` frames; nothing changes when
+    /// `target` is already the target.
     pub(crate) fn set(&mut self, target: f32, frames: u32) {
         if target == self.target {
             return;
         }
+        self.restart(target, frames);
+    }
+
+    /// Starts moving from the current value to `target` over `frames` frames, even when `target`
+    /// is already the target: values that move together restart together and end on one frame.
+    pub(crate) fn restart(&mut self, target: f32, frames: u32) {
         self.target = target;
         if frames == 0 {
             self.value = target;

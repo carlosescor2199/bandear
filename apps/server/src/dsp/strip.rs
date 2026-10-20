@@ -9,7 +9,10 @@
 //! [StripSettings::design] holds every number in its range (the ranges are listed in [super::eq]
 //! and [super::dynamics]) and works everything out off the engine thread; [StripProcessor::apply]
 //! takes the result on the engine thread, copying numbers only. A neutral strip
-//! ([StripSettings::is_neutral]) leaves the samples bit for bit, as each of its parts does.
+//! ([StripSettings::is_neutral]) leaves the samples bit for bit, as each of its parts does. A
+//! working strip takes a sample that is not a finite number (NaN or an infinity) as silence and
+//! counts it ([StripProcessor::non_finite_samples]), and a filter whose state still overflows starts
+//! again from silence, so one bad sample never stays in the strip.
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +72,8 @@ pub(crate) struct StripProcessor {
     gate: Gate,
     compressor: Compressor,
     channels: usize,
+    /// Samples that were not finite numbers, processed as silence.
+    non_finite: u64,
 }
 
 impl StripProcessor {
@@ -80,6 +85,7 @@ impl StripProcessor {
             gate: Gate::new(channels),
             compressor: Compressor::new(channels),
             channels,
+            non_finite: 0,
         }
     }
 
@@ -110,12 +116,19 @@ impl StripProcessor {
         self.compressor.gain_reduction_db()
     }
 
+    /// The samples that were not finite numbers (NaN or an infinity), processed as silence.
+    pub(crate) fn non_finite_samples(&self) -> u64 {
+        self.non_finite
+    }
+
     /// Processes channels `first..first + channels` of each `stride`-wide frame of `block`, in
     /// place, leaving the other channels alone.
     pub(crate) fn process(&mut self, block: &mut [f32], stride: usize, first: usize) {
         if !self.is_active() {
             return;
         }
+        // NaN or an infinity would stay in the filters and detectors for good.
+        self.non_finite += super::sanitize(block, stride, first, self.channels);
         self.eq.process_high_pass(block, stride, first);
         self.gate.process(block, stride, first);
         self.eq.process_bands(block, stride, first);
@@ -259,6 +272,32 @@ mod tests {
             (out_db - (-20.0 + 12.0 / 4.0)).abs() < 0.3,
             "out {out_db:.2} dBFS"
         );
+    }
+
+    /// NaN and infinities reaching a working strip go on as silence and are counted; nothing in
+    /// the strip keeps them, so the next block comes out as from a strip that never saw them.
+    #[test]
+    fn a_strip_fed_non_finite_samples_counts_them_and_recovers() {
+        let mut strip = StripProcessor::new(2);
+        strip.apply(&working().design());
+        let mut warm = sine(300.0, 0.7, 2 * 24_000);
+        strip.process_frames(&mut warm);
+        let mut poisoned = sine(300.0, 0.7, 2 * 1_024);
+        for (index, sample) in poisoned.iter_mut().enumerate().step_by(37) {
+            *sample = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY][index % 3];
+        }
+        let count = poisoned.iter().filter(|s| !s.is_finite()).count() as u64;
+        strip.process_frames(&mut poisoned);
+        assert!(poisoned.iter().all(|s| s.is_finite()));
+        assert_eq!(strip.non_finite_samples(), count);
+        assert!(strip.compressor_reduction_db().is_finite());
+        assert!(strip.gate_reduction_db().is_finite());
+        let mut after = sine(300.0, 0.7, 2 * 24_000);
+        strip.process_frames(&mut after);
+        assert!(after.iter().all(|s| s.is_finite()));
+        // Still the working strip: compressed and heard.
+        assert!(strip.compressor_reduction_db() > 1.0);
+        assert!(rms(&after[2 * 12_000..]) > 0.1);
     }
 
     #[test]

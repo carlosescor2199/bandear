@@ -19,6 +19,10 @@
 //! possible without lookahead) and recovers with the release. A final clip at the ceiling catches
 //! the last bit of rounding, so `|out| <= ceiling` always holds.
 //!
+//! **Not a number.** The limiter takes a sample that is not a finite number (NaN or an infinity)
+//! as silence and counts it, so its output always holds under the ceiling; a strip does the same
+//! at its input (see [super::strip]).
+//!
 //! Each reports its gain reduction in dB as a positive number (6.0 is 6 dB quieter), an f32 the
 //! engine can publish through an atomic as its bits. Turned off while working, each glides back to
 //! no reduction (a makeup gain glides back to 0 dB) before it stops touching the samples.
@@ -549,6 +553,8 @@ pub(crate) struct Limiter {
     /// not the gain: near 1, the last steps of the release are finer than an f32 can tell apart
     /// from 1, and the gain would stop short of it.
     attenuation: f32,
+    /// Samples that were not finite numbers, sent on as silence.
+    non_finite: u64,
     active: bool,
 }
 
@@ -559,6 +565,7 @@ impl Limiter {
             design: LimiterDesign::default(),
             channels: channels.clamp(1, super::MAX_CHANNELS),
             attenuation: 0.0,
+            non_finite: 0,
             active: false,
         }
     }
@@ -574,6 +581,11 @@ impl Limiter {
     /// False when the samples go through untouched.
     pub(crate) fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// The samples that were not finite numbers (NaN or an infinity), sent on as silence.
+    pub(crate) fn non_finite_samples(&self) -> u64 {
+        self.non_finite
     }
 
     /// How far the limiter turns the signal down now, in dB. Works out a logarithm: read it once
@@ -592,6 +604,14 @@ impl Limiter {
         }
         let design = self.design;
         for frame in channel_frames(block, stride, first, self.channels) {
+            // NaN would slip past the peak and the clip, and an infinity would turn the gain into
+            // NaN: either goes on as silence.
+            for sample in frame.iter_mut() {
+                if !sample.is_finite() {
+                    *sample = 0.0;
+                    self.non_finite += 1;
+                }
+            }
             // The release: the attenuation falls away, gone once below a millionth.
             let released = design.release * self.attenuation;
             self.attenuation = if released < 1e-6 { 0.0 } else { released };
@@ -865,6 +885,35 @@ mod tests {
         assert!(limiter.gain_reduction_db() > 6.0);
         // It works by gain, not by the clip: the tone comes out a tone, at the ceiling.
         assert!(peak(&signal[48_000..]) > ceiling * 0.95);
+    }
+
+    /// NaN or an infinity reaching the limiter goes out as silence, counted: the output stays a
+    /// number inside the ceiling, and the gain is not poisoned, so the signal after it is limited
+    /// as before.
+    #[test]
+    fn the_limiter_turns_non_finite_samples_into_silence_and_stays_under_its_ceiling() {
+        let settings = limiter_settings();
+        let ceiling = db_to_gain(settings.ceiling_db);
+        let mut limiter = Limiter::new(2);
+        limiter.apply(&settings.design());
+        let mut signal: Vec<f32> = sine(1_000.0, 2.0, 2 * 4_800);
+        for (index, sample) in signal.iter_mut().enumerate().step_by(101) {
+            *sample = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY][index % 3];
+        }
+        let poisoned = signal.iter().filter(|s| !s.is_finite()).count() as u64;
+        for block in signal.chunks_mut(2 * 256) {
+            limiter.process(block, 2, 0);
+            assert!(
+                block.iter().all(|s| s.is_finite() && s.abs() <= ceiling),
+                "{block:?}"
+            );
+        }
+        assert_eq!(limiter.non_finite_samples(), poisoned);
+        assert!(limiter.gain_reduction_db().is_finite());
+        let mut after = sine(1_000.0, 2.0, 2 * 4_800);
+        limiter.process(&mut after, 2, 0);
+        assert!(after.iter().all(|s| s.is_finite() && s.abs() <= ceiling));
+        assert!(peak(&after[4_800..]) > ceiling * 0.95);
     }
 
     #[test]

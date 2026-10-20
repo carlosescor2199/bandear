@@ -486,6 +486,7 @@ mod tests {
                 groups: self.groups.clone(),
                 musicians: Vec::new(),
                 local: self.local,
+                processing: Vec::new(),
             }
         }
     }

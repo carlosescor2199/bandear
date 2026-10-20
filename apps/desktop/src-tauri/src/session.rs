@@ -62,7 +62,16 @@
 //!     "format": "int24",
 //!     "includeLocal": false,
 //!     "armed": [1, 2, 5]
-//!   }
+//!   },
+//!   "processing": {
+//!     "1": {
+//!       "eq": { "highPass": { "enabled": true, "frequencyHz": 90.0, "q": 0.707 } },
+//!       "compressor": { "enabled": true, "thresholdDb": -20.0, "ratio": 3.0 }
+//!     }
+//!   },
+//!   "stripPresets": [
+//!     { "name": "Lead vocal", "settings": { "gate": { "enabled": true, "thresholdDb": -45.0 } } }
+//!   ]
 //! }
 //! ```
 //!
@@ -145,6 +154,21 @@
 //!   linked pair records the pair). Any field may be left out and then has its default. It belongs
 //!   to this desk: a named session never carries it, and loading one keeps the desk's own. Like
 //!   `audio`, the section was added within version 1 and is absent until something was kept.
+//! - `processing` is each input's channel strip (the high-pass filter, the four-band equaliser, the
+//!   gate and the compressor; see [personal_monitoring::StripSettings]) by its 1-based channel
+//!   number, as a string key. Only a strip that does something is kept: a neutral one is left out,
+//!   and the section is absent while every strip is neutral. A strip may leave out any field, which
+//!   then has its default, and a number out of its range is held in range when it applies. It is
+//!   given to every engine the desk starts and written off the engine lock as it changes, at most a
+//!   few times a second (see [crate::commands::processing]). A named session carries it: the
+//!   processing is part of a show, and loading one saved without it (before it existed, or with
+//!   every strip neutral) leaves every strip neutral. A section that cannot be read is set aside
+//!   like any other. It was added within version 1: an earlier build reads the file and drops it
+//!   when it saves.
+//! - `stripPresets` are the engineer's own strip presets, in the order they were saved, each a
+//!   name and the strip it keeps (the built-in ones are never written). Like `recording` they
+//!   belong to this desk: a named session never carries them, and loading one keeps the desk's
+//!   own. Added within version 1 the same way, and absent while there is none.
 //!
 //! Every save writes a temporary file next to the session, flushes it to disk and renames it over
 //! the session, so a crash or a full disk leaves the old file or the new one, never a torn one, and
@@ -174,7 +198,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use personal_monitoring::log_warn;
+use personal_monitoring::{log_warn, StripSettings};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -212,6 +236,16 @@ pub struct Session {
     /// How this desk records takes; absent until the engineer changed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<SessionRecording>,
+    /// Each input's channel strip by 1-based channel number; only strips that do something.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub processing: SessionProcessing,
+    /// The engineer's own strip presets, in the order they were saved; the desk's own.
+    #[serde(
+        default,
+        rename = "stripPresets",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub strip_presets: Vec<SessionStripPreset>,
 }
 
 impl Default for Session {
@@ -225,8 +259,22 @@ impl Default for Session {
             audio: None,
             local: None,
             recording: None,
+            processing: SessionProcessing::new(),
+            strip_presets: Vec::new(),
         }
     }
+}
+
+/// Each input's channel strip as the session keeps it, by 1-based channel number (written as a
+/// string key); a neutral strip is never kept.
+pub type SessionProcessing = BTreeMap<usize, StripSettings>;
+
+/// One of the engineer's own strip presets as the desk keeps it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionStripPreset {
+    pub name: String,
+    #[serde(default)]
+    pub settings: StripSettings,
 }
 
 impl Session {
@@ -717,9 +765,10 @@ impl SessionStore {
 
     /// Replaces the session with `session` (a named snapshot loaded, see
     /// [crate::commands::load_session]), at this build's version, all but how this desk records
-    /// takes: that is the desk's own, and it is taken as the session holds it when the file is
-    /// written, under the same lock [Self::set_recording] keeps it under, so a change kept while
-    /// the load ran is never undone by it (`session.recording` is not read). The file is written
+    /// takes and its strip presets: those are the desk's own, and they are taken as the session
+    /// holds them when the file is written, under the same lock [Self::set_recording] keeps them
+    /// under, so a change kept while the load ran is never undone by it (`session.recording` and
+    /// `session.strip_presets` are not read). The file is written
     /// before success is reported; a save that fails, or is refused over a session this build must
     /// not replace, changes nothing.
     pub fn replace(&self, session: Session) -> Result<(), String> {
@@ -730,6 +779,7 @@ impl SessionStore {
         let session = Session {
             version: SESSION_VERSION,
             recording: loaded.session.recording.clone(),
+            strip_presets: loaded.session.strip_presets.clone(),
             ..session
         };
         write_atomically(&self.path, &session)?;
@@ -1063,6 +1113,50 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Each input's channel strip the session keeps, by 1-based channel number; a channel it does
+    /// not name is neutral.
+    pub fn processing(&self) -> SessionProcessing {
+        self.lock().session.processing.clone()
+    }
+
+    /// Keeps `processing` as every input's channel strip: a neutral strip is left out. The file is
+    /// written before success is reported; a save that fails, or is refused over a session this
+    /// build must not replace, changes nothing.
+    pub fn set_processing(&self, mut processing: SessionProcessing) -> Result<(), String> {
+        processing.retain(|_, strip| !strip.is_neutral());
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            processing,
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
+    /// The engineer's own strip presets, in the order they were saved.
+    pub fn strip_presets(&self) -> Vec<SessionStripPreset> {
+        self.lock().session.strip_presets.clone()
+    }
+
+    /// Replaces the engineer's own strip presets. Saved as [Self::set_processing] is.
+    pub fn set_strip_presets(&self, strip_presets: Vec<SessionStripPreset>) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            strip_presets,
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     fn update_local(&self, change: impl FnOnce(&mut SessionLocal)) -> Result<(), String> {
         let mut loaded = self.lock();
         if let Some(refusal) = &loaded.refusal {
@@ -1186,6 +1280,8 @@ pub(crate) fn read_session(
     let audio = take_section(&mut fields, "audio", damaged);
     let local = take_section(&mut fields, "local", damaged);
     let recording = take_section(&mut fields, "recording", damaged);
+    let processing = take_section(&mut fields, "processing", damaged);
+    let strip_presets = take_section(&mut fields, "stripPresets", damaged);
     serde_json::from_value::<Session>(Value::Object(fields))
         .map(|session| Session {
             groups,
@@ -1194,6 +1290,8 @@ pub(crate) fn read_session(
             audio,
             local,
             recording,
+            processing,
+            strip_presets,
             ..session
         })
         .map_err(|error| format!("is not a session ({error})"))
@@ -2961,6 +3059,188 @@ mod tests {
             .set_recording(SessionRecording::default())
             .expect_err("the write cannot happen");
         assert_eq!(session.recording(), Some(recording_settings()));
+    }
+
+    /// A strip with its compressor on at `threshold_db`.
+    fn compressed(threshold_db: f32) -> StripSettings {
+        StripSettings {
+            compressor: personal_monitoring::CompressorSettings {
+                enabled: true,
+                threshold_db,
+                ..personal_monitoring::CompressorSettings::default()
+            },
+            ..StripSettings::default()
+        }
+    }
+
+    #[test]
+    fn only_the_strips_that_do_something_are_kept_by_channel_number_and_survive_a_reload() {
+        let directory = test_directory("processing");
+        let session = SessionStore::open(&directory);
+        session.set_label(None, ADDRESS, "Ana").expect("saved");
+        assert_eq!(session.processing(), SessionProcessing::new());
+
+        session
+            .set_processing(SessionProcessing::from([
+                (1, compressed(-20.0)),
+                (2, StripSettings::default()),
+                (12, compressed(-30.0)),
+            ]))
+            .expect("saved");
+
+        let kept = SessionProcessing::from([(1, compressed(-20.0)), (12, compressed(-30.0))]);
+        assert_eq!(session.processing(), kept, "the neutral strip is left out");
+        let file = read_json(&directory.join(SESSION_FILE));
+        let keys: Vec<&String> = file["processing"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect();
+        assert_eq!(keys, vec!["1", "12"], "1-based channel numbers as keys");
+        assert_eq!(file["processing"]["12"]["compressor"]["thresholdDb"], -30.0);
+        assert_eq!(file["processing"]["1"]["compressor"]["enabled"], true);
+        let reloaded = SessionStore::open(&directory);
+        assert_eq!(reloaded.processing(), kept);
+        assert_eq!(reloaded.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert_eq!(reloaded.notice(), None);
+
+        session
+            .set_processing(SessionProcessing::from([(1, StripSettings::default())]))
+            .expect("saved");
+        assert!(
+            read_json(&directory.join(SESSION_FILE))
+                .get("processing")
+                .is_none(),
+            "absent while every strip is neutral"
+        );
+    }
+
+    #[test]
+    fn a_strip_may_leave_out_what_it_does_not_change() {
+        let directory = test_directory("processing-short");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"processing":{"3":{"compressor":{"enabled":true,"thresholdDb":-12}}}}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.processing(),
+            SessionProcessing::from([(3, compressed(-12.0))]),
+            "every other field has its default"
+        );
+        assert_eq!(session.notice(), None);
+    }
+
+    #[test]
+    fn a_damaged_processing_section_is_set_aside_on_its_own_and_the_rest_is_kept() {
+        let directory = test_directory("processing-damaged");
+        fs::write(
+            directory.join(SESSION_FILE),
+            r#"{"version":1,"musicians":{"address:192.168.1.30:50000":{"label":"Ana"}},
+                "recording":{"armed":[1]},
+                "processing":{"1":{"compressor":{"enabled":"very"}},"two":{}},
+                "stripPresets":[{"name":"Mine","settings":{"gate":{"enabled":true}}}]}"#,
+        )
+        .expect("write");
+
+        let session = SessionStore::open(&directory);
+
+        assert_eq!(
+            session.processing(),
+            SessionProcessing::new(),
+            "starts empty"
+        );
+        assert_eq!(session.label_for(None, ADDRESS), Some("Ana".to_owned()));
+        assert!(
+            session.recording().is_some(),
+            "the readable sections are kept"
+        );
+        assert_eq!(session.strip_presets().len(), 1);
+        let aside = files_in(&directory)
+            .into_iter()
+            .find(|name| name.starts_with(&format!("{SESSION_FILE}.processing-damaged-")))
+            .expect("the damaged section is kept for recovery");
+        assert_eq!(
+            read_json(&directory.join(aside)),
+            serde_json::json!({ "1": { "compressor": { "enabled": "very" } }, "two": {} })
+        );
+        assert!(session.notice().expect("reported").contains("processing"));
+        assert!(
+            read_json(&directory.join(SESSION_FILE))
+                .get("processing")
+                .is_none(),
+            "saved without it at once"
+        );
+
+        let presets = test_directory("strip-presets-damaged");
+        fs::write(
+            presets.join(SESSION_FILE),
+            r#"{"version":1,"stripPresets":{"Mine":{}},"processing":{"2":{}}}"#,
+        )
+        .expect("write");
+        let session = SessionStore::open(&presets);
+        assert!(session.strip_presets().is_empty());
+        assert!(session.notice().expect("reported").contains("stripPresets"));
+    }
+
+    #[test]
+    fn strip_presets_are_kept_in_order_and_stay_with_the_desk_when_a_session_is_replaced() {
+        let directory = test_directory("strip-presets");
+        let session = SessionStore::open(&directory);
+        let mine = vec![
+            SessionStripPreset {
+                name: "Lead vocal".to_owned(),
+                settings: compressed(-18.0),
+            },
+            SessionStripPreset {
+                name: "Snare".to_owned(),
+                settings: compressed(-10.0),
+            },
+        ];
+
+        session.set_strip_presets(mine.clone()).expect("saved");
+        session
+            .set_processing(SessionProcessing::from([(4, compressed(-6.0))]))
+            .expect("saved");
+
+        assert_eq!(session.strip_presets(), mine);
+        assert_eq!(
+            read_json(&directory.join(SESSION_FILE))["stripPresets"][1]["name"],
+            "Snare"
+        );
+        assert_eq!(SessionStore::open(&directory).strip_presets(), mine);
+
+        session
+            .replace(Session {
+                processing: SessionProcessing::from([(9, compressed(-40.0))]),
+                strip_presets: Vec::new(),
+                ..Session::default()
+            })
+            .expect("replaced");
+        assert_eq!(
+            session.processing(),
+            SessionProcessing::from([(9, compressed(-40.0))]),
+            "the loaded session's processing"
+        );
+        assert_eq!(session.strip_presets(), mine, "the desk's own presets stay");
+        assert_eq!(SessionStore::open(&directory).strip_presets(), mine);
+    }
+
+    #[test]
+    fn saving_processing_or_presets_is_refused_over_a_newer_session() {
+        let directory = test_directory("processing-newer");
+        fs::write(directory.join(SESSION_FILE), r#"{"version":2}"#).expect("write");
+        let newer = SessionStore::open(&directory);
+
+        let error = newer
+            .set_processing(SessionProcessing::from([(1, compressed(-20.0))]))
+            .expect_err("refused");
+        assert!(error.contains("newer"), "{error}");
+        assert!(newer.set_strip_presets(Vec::new()).is_err());
+        assert_eq!(newer.processing(), SessionProcessing::new());
     }
 
     #[test]

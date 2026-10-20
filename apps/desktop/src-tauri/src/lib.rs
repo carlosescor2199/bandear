@@ -496,6 +496,59 @@ async fn set_musician_redundancy(
     commands::redundancy::set_musician_redundancy(state.inner(), &musician_key, on, delay_blocks)
 }
 
+/// Every channel's strip, CH 1 first: `[{ channel, settings, active }]`, `channel` 1-based and
+/// `settings` `{ eq: { highPass, bands }, gate, compressor }` (see
+/// [commands::processing::processing]): the running engine's, or with none what the session keeps.
+#[tauri::command]
+async fn processing(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<commands::processing::ChannelProcessingDto>, String> {
+    commands::processing::processing(state.inner())
+}
+
+/// The strip of `channel` (1-based): `{ channel, settings, active }` (see
+/// [commands::processing::channel_processing]).
+#[tauri::command]
+async fn channel_processing(
+    state: State<'_, DesktopState>,
+    channel: usize,
+) -> Result<commands::processing::ChannelProcessingDto, String> {
+    commands::processing::channel_processing(state.inner(), channel)
+}
+
+/// Sets the strip of `channel` (1-based) to `settings` (any field left out takes its default) and
+/// answers `{ outcome, channels: [{ channel, settings, active }], message }`, `outcome` `set` or
+/// `invalid`, `channels` every channel whose strip changed, a linked pair's other side included
+/// (see [commands::processing::set_channel_processing]).
+#[tauri::command]
+async fn set_channel_processing(
+    state: State<'_, DesktopState>,
+    channel: usize,
+    settings: personal_monitoring::StripSettings,
+) -> Result<commands::processing::ProcessingSetDto, String> {
+    commands::processing::set_channel_processing(state.inner(), channel, settings)
+}
+
+/// Takes every part of the strip of `channel` off; answers as `set_channel_processing` does.
+#[tauri::command]
+async fn reset_channel_processing(
+    state: State<'_, DesktopState>,
+    channel: usize,
+) -> Result<commands::processing::ProcessingSetDto, String> {
+    commands::processing::reset_channel_processing(state.inner(), channel)
+}
+
+/// Copies the strip of `from` onto every channel `to` names (1-based); answers as
+/// `set_channel_processing` does (see [commands::processing::copy_channel_processing]).
+#[tauri::command]
+async fn copy_channel_processing(
+    state: State<'_, DesktopState>,
+    from: usize,
+    to: Vec<usize>,
+) -> Result<commands::processing::ProcessingSetDto, String> {
+    commands::processing::copy_channel_processing(state.inner(), from, to)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -596,7 +649,12 @@ pub fn run() {
             restore_mix_backup,
             link_history,
             set_musician_buffer,
-            set_musician_redundancy
+            set_musician_redundancy,
+            processing,
+            channel_processing,
+            set_channel_processing,
+            reset_channel_processing,
+            copy_channel_processing
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")
@@ -606,14 +664,15 @@ pub fn run() {
         });
 }
 
-/// What the app does as it runs, given its state once managed: on exit, the local mix still
-/// waiting to be kept (it is kept off the engine lock, a few times a second at most) is written
-/// before the app goes, so is a backup of the musicians' mixes as the engine has them, and then
-/// the log is flushed so its last lines stay.
+/// What the app does as it runs, given its state once managed: on exit, the local mix and the
+/// channel processing still waiting to be kept (both are kept off the engine lock, a few times a
+/// second at most) are written before the app goes, so is a backup of the musicians' mixes as the
+/// engine has them, and then the log is flushed so its last lines stay.
 fn on_run_event(state: Option<&DesktopState>, event: &tauri::RunEvent) {
     if let tauri::RunEvent::Exit = event {
         if let Some(state) = state {
             commands::local::flush_local_mix(state);
+            commands::processing::flush_processing(state);
             commands::backups::flush_mix_backup(state);
         }
         log_info!("app", "exiting");

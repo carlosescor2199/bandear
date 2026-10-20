@@ -14,6 +14,10 @@
 //! Writes are one at a time: whoever takes the waiting mix writes it before anyone else can take
 //! the next, so an older mix never lands after a newer one. A start or a loaded session pauses
 //! the saver ([LocalMixSaver::pause]) to read or replace the session while no write is in flight.
+//!
+//! The saver keeps anything the desk changes many times a second the same way ([Saver], over what
+//! it keeps, [Kept]): the local mix, and each input's channel processing (see
+//! [crate::commands::processing]).
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -26,7 +30,23 @@ use crate::session::SessionMix;
 /// The most often the local mix is written while it keeps changing.
 pub(crate) const SAVE_INTERVAL: Duration = Duration::from_millis(400);
 
-type Write = dyn Fn(&SessionMix) -> Result<(), String> + Send + Sync;
+/// What a [Saver] keeps in the session: its name in the lines it logs, and its thread's name.
+pub(crate) trait Kept: Clone + Send + 'static {
+    /// What is kept, as a log line names it: "the local mix".
+    const WHAT: &'static str;
+    /// The name of the saver's thread.
+    const THREAD: &'static str;
+}
+
+impl Kept for SessionMix {
+    const WHAT: &'static str = "the local mix";
+    const THREAD: &'static str = "mixlink-local-mix-saver";
+}
+
+/// The saver of the engineer's local mix.
+pub(crate) type LocalMixSaver = Saver<SessionMix>;
+
+type Write<T> = dyn Fn(&T) -> Result<(), String> + Send + Sync;
 type Log = dyn Fn(&str) + Send + Sync;
 
 #[cfg(test)]
@@ -55,26 +75,25 @@ impl Drop for ManualSavers {
     }
 }
 
-/// Writes the latest local mix marked, off the engine lock (see the module documentation).
-pub(crate) struct LocalMixSaver {
-    inner: Arc<Inner>,
+/// Writes the latest value marked, off the engine lock (see the module documentation).
+pub(crate) struct Saver<T: Kept> {
+    inner: Arc<Inner<T>>,
     thread: Option<JoinHandle<()>>,
 }
 
-struct Inner {
-    write: Box<Write>,
+struct Inner<T> {
+    write: Box<Write<T>>,
     log: Box<Log>,
     interval: Duration,
-    state: Mutex<State>,
+    state: Mutex<State<T>>,
     wake: Condvar,
-    /// Held across taking the waiting mix and writing it, so writes land in the order taken.
+    /// Held across taking the waiting value and writing it, so writes land in the order taken.
     writing: Mutex<()>,
 }
 
-#[derive(Default)]
-struct State {
-    /// The latest local mix not written yet.
-    pending: Option<SessionMix>,
+struct State<T> {
+    /// The latest value not written yet.
+    pending: Option<T>,
     stop: bool,
     /// When the last write was tried, for the interval.
     last_write: Option<Instant>,
@@ -82,11 +101,22 @@ struct State {
     failure: Option<String>,
 }
 
-impl LocalMixSaver {
+impl<T> Default for State<T> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            stop: false,
+            last_write: None,
+            failure: None,
+        }
+    }
+}
+
+impl<T: Kept> Saver<T> {
     /// A saver that writes with `write` on a thread of its own, at most once per `interval`, and
     /// says what goes wrong with `log`.
     pub(crate) fn start(
-        write: impl Fn(&SessionMix) -> Result<(), String> + Send + Sync + 'static,
+        write: impl Fn(&T) -> Result<(), String> + Send + Sync + 'static,
         log: impl Fn(&str) + Send + Sync + 'static,
         interval: Duration,
     ) -> Self {
@@ -98,13 +128,14 @@ impl LocalMixSaver {
         let thread = {
             let inner = Arc::clone(&inner);
             thread::Builder::new()
-                .name("mixlink-local-mix-saver".to_owned())
+                .name(T::THREAD.to_owned())
                 .spawn(move || inner.run())
                 .map_err(|error| {
                     log_warn!(
                         "local",
-                        "the local mix saver did not start ({error}); the local \
-                         mix is kept when the engine stops"
+                        "the saver of {what} did not start ({error}); {what} is kept when the \
+                         engine stops",
+                        what = T::WHAT
                     )
                 })
                 .ok()
@@ -115,7 +146,7 @@ impl LocalMixSaver {
     /// A saver with no thread of its own: it writes only when flushed. For the tests.
     #[cfg(test)]
     pub(crate) fn manual(
-        write: impl Fn(&SessionMix) -> Result<(), String> + Send + Sync + 'static,
+        write: impl Fn(&T) -> Result<(), String> + Send + Sync + 'static,
         log: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -124,10 +155,10 @@ impl LocalMixSaver {
         }
     }
 
-    /// Keeps `mix` to be written: it replaces any mix still waiting. Never touches the disk, so it
-    /// may be called under the engine lock.
-    pub(crate) fn mark(&self, mix: SessionMix) {
-        self.inner.lock_state().pending = Some(mix);
+    /// Keeps `value` to be written: it replaces any value still waiting. Never touches the disk,
+    /// so it may be called under the engine lock.
+    pub(crate) fn mark(&self, value: T) {
+        self.inner.lock_state().pending = Some(value);
         self.inner.wake.notify_all();
     }
 
@@ -139,7 +170,7 @@ impl LocalMixSaver {
 
     /// Holds every write off until the pause is dropped, after any write in flight has landed, so
     /// the session and the mix still waiting can be read or replaced together.
-    pub(crate) fn pause(&self) -> Paused<'_> {
+    pub(crate) fn pause(&self) -> Paused<'_, T> {
         Paused {
             inner: &self.inner,
             _writing: self
@@ -151,39 +182,39 @@ impl LocalMixSaver {
     }
 }
 
-impl Drop for LocalMixSaver {
+impl<T: Kept> Drop for Saver<T> {
     fn drop(&mut self) {
         self.inner.lock_state().stop = true;
         self.inner.wake.notify_all();
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
-                log_error!("local", "the local mix saver panicked");
+                log_error!("local", "the saver of {} panicked", T::WHAT);
             }
         }
         self.inner.write_pending();
     }
 }
 
-/// The saver held still (see [LocalMixSaver::pause]).
-pub(crate) struct Paused<'a> {
-    inner: &'a Inner,
+/// The saver held still (see [Saver::pause]).
+pub(crate) struct Paused<'a, T: Kept> {
+    inner: &'a Inner<T>,
     _writing: MutexGuard<'a, ()>,
 }
 
-impl Paused<'_> {
-    /// The local mix marked and not written yet.
-    pub(crate) fn pending(&self) -> Option<SessionMix> {
+impl<T: Kept> Paused<'_, T> {
+    /// The value marked and not written yet.
+    pub(crate) fn pending(&self) -> Option<T> {
         self.inner.lock_state().pending.clone()
     }
 
-    /// Forgets the mix waiting: the session now holds it, or a loaded mix replaced it.
+    /// Forgets the value waiting: the session now holds it, or a loaded one replaced it.
     pub(crate) fn clear(&self) {
         self.inner.lock_state().pending = None;
     }
 }
 
-impl Inner {
-    fn new(write: Box<Write>, log: Box<Log>, interval: Duration) -> Self {
+impl<T: Kept> Inner<T> {
+    fn new(write: Box<Write<T>>, log: Box<Log>, interval: Duration) -> Self {
         Self {
             write,
             log,
@@ -195,7 +226,7 @@ impl Inner {
     }
 
     // Nothing in the state can be left half changed, so a poisoned lock is used as it is.
-    fn lock_state(&self) -> MutexGuard<'_, State> {
+    fn lock_state(&self) -> MutexGuard<'_, State<T>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -232,31 +263,32 @@ impl Inner {
         }
     }
 
-    /// Takes the mix waiting and writes it; a failed write keeps it waiting unless a newer one
+    /// Takes the value waiting and writes it; a failed write keeps it waiting unless a newer one
     /// came, and is said once until the failure changes.
     fn write_pending(&self) {
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(mix) = self.lock_state().pending.take() else {
+        let Some(value) = self.lock_state().pending.take() else {
             return;
         };
-        let result = (self.write)(&mix);
+        let result = (self.write)(&value);
         let mut state = self.lock_state();
         state.last_write = Some(Instant::now());
         match result {
             Ok(()) => {
                 if state.failure.take().is_some() {
-                    (self.log)("the local mix is kept in the session again");
+                    (self.log)(&format!("{} is kept in the session again", T::WHAT));
                 }
             }
             Err(error) => {
                 if state.failure.as_deref() != Some(error.as_str()) {
                     (self.log)(&format!(
-                        "the local mix plays but was not kept in the session: {error}"
+                        "{} plays but was not kept in the session: {error}",
+                        T::WHAT
                     ));
                     state.failure = Some(error);
                 }
                 if state.pending.is_none() {
-                    state.pending = Some(mix);
+                    state.pending = Some(value);
                 }
             }
         }

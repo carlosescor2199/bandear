@@ -16,7 +16,13 @@
 // "Cancel"). Delete asks first as a preset's does: "Keep" takes Delete's place and the confirming
 // Delete only works after a short pause. The rules live in createSessionPanel (sessions.js),
 // tested without a browser; this element renders what it answers.
+//
+// Mix backups: `data.backups` is mixBackupsView (mix-backups-view.js). Each backup is listed with
+// when it was taken and whose mixes it keeps, and a Restore that asks first ("Cancel" or the
+// confirming "Restore", which emits `mix-backup-restore` { stamp }); Refresh emits
+// `mix-backups-load` {}. The rules live in createMixBackupsPanel, tested without a browser.
 
+import { createMixBackupsPanel } from "../lib/mix-backups-view.js";
 import { createSessionPanel } from "../lib/sessions.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
@@ -136,6 +142,52 @@ const styles = sheet(`
     border: 0;
     border-top: 1px solid var(--ml-border-subtle);
   }
+  .backups {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .backups-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  h3 {
+    margin: 0;
+    font-size: var(--ml-text-md);
+  }
+  .backup-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 260px;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    list-style: none;
+  }
+  .backup-list li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 2px 8px;
+    align-items: center;
+    padding: 6px 8px;
+    border: 1px solid var(--ml-border-subtle);
+    border-radius: var(--ml-radius-md);
+  }
+  .backup-list .when {
+    font-size: var(--ml-text-md);
+    font-variant-numeric: tabular-nums;
+  }
+  .backup-list .detail {
+    grid-column: 1;
+    overflow-wrap: anywhere;
+  }
+  .backup-list button {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
   [hidden] {
     display: none !important;
   }
@@ -149,6 +201,7 @@ class MlSessionPanel extends HTMLElement {
     // A delete that became confirmable, or disarmed itself.
     changed: () => this.#renderDelete(),
   });
+  #backups = createMixBackupsPanel({ emit: (type, detail) => emit(this, type, detail) });
 
   constructor() {
     super();
@@ -193,6 +246,29 @@ class MlSessionPanel extends HTMLElement {
           sends each saved mix to the musicians who are connected. A phone that is not connected
           keeps its own mix. The saved audio input is used from the next start.
         </p>
+        <hr />
+        <div class="backups" role="group" aria-labelledby="backups-title">
+          <div class="backups-head">
+            <h3 id="backups-title">Mix backups</h3>
+            <button type="button" data-backups-list>Refresh</button>
+          </div>
+          <p class="empty" data-backups-unread hidden></p>
+          <p class="empty" data-backups-none hidden>No backup yet: the musicians' mixes are backed up a few seconds after one changes.</p>
+          <ul class="backup-list" data-backups aria-label="Mix backups, the newest first"></ul>
+          <div class="asking" role="alert" data-restore hidden>
+            <p data-restore-text></p>
+            <div class="actions">
+              <button type="button" data-restore-cancel>Cancel</button>
+              <button type="button" class="primary" data-restore-confirm>Restore</button>
+            </div>
+          </div>
+          <p class="hint" data-backups-idle hidden>Start the engine to restore a backup.</p>
+          <p class="hint">
+            The musicians' mixes are backed up a few seconds after they change, and the last 10 are
+            kept. Restore sends each backed-up mix to the musicians who are connected now; a phone
+            that is not connected keeps its own mix.
+          </p>
+        </div>
         <p class="outcome" role="status" data-said></p>
         <p class="outcome outcome--error" role="alert" data-failed></p>
       </section>`,
@@ -219,6 +295,13 @@ class MlSessionPanel extends HTMLElement {
       delete: $(".delete"),
       said: $("[data-said]"),
       failed: $("[data-failed]"),
+      backupsUnread: $("[data-backups-unread]"),
+      backupsNone: $("[data-backups-none]"),
+      backupList: $("[data-backups]"),
+      restore: $("[data-restore]"),
+      restoreText: $("[data-restore-text]"),
+      restoreCancel: $("[data-restore-cancel]"),
+      backupsIdle: $("[data-backups-idle]"),
     };
     const parts = this.#parts;
     const panel = this.#panel;
@@ -259,6 +342,35 @@ class MlSessionPanel extends HTMLElement {
         parts.load.focus();
       }
     });
+    // Mix backups: Restore asks first; the list's buttons are drawn again with the list.
+    const backups = this.#backups;
+    $("[data-backups-list]").addEventListener("click", () => emit(this, "mix-backups-load", {}));
+    parts.backupList.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-stamp]");
+      if (!button || button.getAttribute("aria-disabled") === "true") {
+        return;
+      }
+      backups.ask(button.dataset.stamp);
+      this.#renderBackups();
+      if (backups.asking()) {
+        parts.restoreCancel.focus();
+      }
+    });
+    const cancelRestore = () => {
+      backups.cancel();
+      this.#renderBackups();
+    };
+    parts.restoreCancel.addEventListener("click", cancelRestore);
+    $("[data-restore-confirm]").addEventListener("click", () => {
+      backups.confirm();
+      this.#renderBackups();
+    });
+    parts.restore.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        cancelRestore();
+      }
+    });
     const rename = () => panel.rename(parts.renameTo.value);
     parts.rename.addEventListener("click", rename);
     parts.renameTo.addEventListener("keydown", (event) => {
@@ -280,6 +392,7 @@ class MlSessionPanel extends HTMLElement {
   set data(data) {
     this.#data = data;
     this.#panel.setRows(data.rows);
+    this.#backups.setRows(data.backups?.rows ?? []);
     this.#render();
   }
 
@@ -310,6 +423,7 @@ class MlSessionPanel extends HTMLElement {
     }
     const parts = this.#parts;
     const panel = this.#panel;
+    this.#renderBackups();
     parts.notice.hidden = data.notice === null;
     setText(parts.notice, data.notice ?? "");
     parts.idle.hidden = data.engineRunning;
@@ -352,6 +466,58 @@ class MlSessionPanel extends HTMLElement {
     reflect(parts.rename, "aria-disabled", chosen?.loadable ? null : "true");
     reflect(parts.renameTo, "aria-label", `New name for ${chosen?.name ?? ""}`);
     this.#renderDelete();
+  }
+
+  #renderBackups() {
+    const view = this.#data?.backups;
+    if (!view) {
+      return;
+    }
+    const parts = this.#parts;
+    parts.backupsUnread.hidden = view.unread === null;
+    setText(
+      parts.backupsUnread,
+      view.unread ? `The mix backups could not be listed: ${view.unread}.` : "Listing the mix backups…",
+    );
+    parts.backupsNone.hidden = view.unread !== null || view.rows.length > 0;
+    parts.backupsIdle.hidden = view.engineRunning || view.rows.length === 0;
+    const key = [
+      view.engineRunning,
+      ...view.rows.map((row) => `${row.stamp}\u0000${row.label}\u0000${row.detail}`),
+    ].join("\u0001");
+    if (parts.backupList.dataset.rows !== key) {
+      parts.backupList.dataset.rows = key;
+      parts.backupList.replaceChildren(
+        ...view.rows.map((row) => {
+          const item = document.createElement("li");
+          const when = document.createElement("span");
+          when.className = "when";
+          when.textContent = row.label;
+          const detail = document.createElement("span");
+          detail.className = "detail";
+          detail.textContent = row.detail;
+          const restore = document.createElement("button");
+          restore.type = "button";
+          restore.textContent = "Restore";
+          restore.dataset.stamp = row.stamp;
+          restore.setAttribute("aria-label", `Restore the mixes backed up at ${row.label}`);
+          if (!row.restorable || !view.engineRunning) {
+            restore.setAttribute("aria-disabled", "true");
+          }
+          item.append(when, restore, detail);
+          return item;
+        }),
+      );
+    }
+    const asking = this.#backups.asking();
+    parts.restore.hidden = asking === null;
+    if (asking) {
+      setText(
+        parts.restoreText,
+        `Restore the mixes backed up at ${asking.label} (${asking.detail})? Each connected ` +
+          "musician's phone is sent their backed-up mix now.",
+      );
+    }
   }
 
   #renderDelete() {

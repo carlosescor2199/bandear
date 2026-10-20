@@ -113,6 +113,9 @@ pub struct CaptureFormat {
 pub struct MusicianCounters {
     pub packets_sent: u64,
     pub packets_discarded: u64,
+    /// Why the last send to this musician failed (for example "network unreachable"); `None`
+    /// while none has. Kept as it was after later sends succeed, beside [Self::packets_discarded].
+    pub last_send_error: Option<&'static str>,
 }
 
 /// One musician: a UDP target joined with its control channel and its mix.
@@ -1493,6 +1496,9 @@ impl EngineHandle {
                     MusicianCounters {
                         packets_sent: entry.counters.sent.load(Ordering::Relaxed),
                         packets_discarded: entry.counters.discarded.load(Ordering::Relaxed),
+                        last_send_error: crate::network::send_error_name(
+                            entry.counters.last_send_error.load(Ordering::Relaxed),
+                        ),
                     },
                 )
             })
@@ -2678,6 +2684,7 @@ mod tests {
             MusicianCounters {
                 packets_sent: 10,
                 packets_discarded: 1,
+                last_send_error: None,
             },
         );
         counters.insert(
@@ -2685,6 +2692,7 @@ mod tests {
             MusicianCounters {
                 packets_sent: 20,
                 packets_discarded: 2,
+                last_send_error: Some("network unreachable"),
             },
         );
 
@@ -2739,6 +2747,7 @@ mod tests {
             MusicianCounters {
                 packets_sent: 10,
                 packets_discarded: 1,
+                last_send_error: None,
             }
         );
         assert_eq!(connected_with_mix.link, reporting);
@@ -2754,6 +2763,7 @@ mod tests {
             MusicianCounters {
                 packets_sent: 20,
                 packets_discarded: 2,
+                last_send_error: Some("network unreachable"),
             }
         );
 

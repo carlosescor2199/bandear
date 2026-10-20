@@ -206,6 +206,9 @@ pub struct MusicianDto {
     pub mix: MixDto,
     pub packets_sent: u64,
     pub packets_discarded: u64,
+    /// Why the last send to this musician failed, for example "network unreachable"; null while
+    /// none has.
+    pub last_send_error: Option<&'static str>,
     /// The phone's link health as the server classified it: "unknown", "good", "warning" or "bad".
     pub link_health: &'static str,
     /// The rates the health was judged on. All four are absent when there is no fresh report: a
@@ -388,6 +391,17 @@ pub struct LoadedMixDto {
     pub follows: Option<String>,
     /// Their whole mix now stored.
     pub mix: MixDto,
+}
+
+/// What restoring a mix backup did (see [crate::commands::backups::restore_mix_backup]): the
+/// backup as listed, the mixes put back on the musicians who are connected, and the backed-up
+/// mixes that went to nobody, with why (`notConnected`, `notHere` or `refused`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixRestoredDto {
+    pub backup: crate::backups::MixBackupSummary,
+    pub restored: Vec<LoadedMixDto>,
+    pub skipped: Vec<SkippedMixDto>,
 }
 
 /// A saved mix a loaded session pushed to nobody.
@@ -808,6 +822,7 @@ impl From<&MusicianStatus> for MusicianDto {
             mix: MixDto::from(&musician.mix),
             packets_sent: musician.counters.packets_sent,
             packets_discarded: musician.counters.packets_discarded,
+            last_send_error: musician.counters.last_send_error,
             link_health: link_health_name(musician.link.health),
             packets_per_second: musician.link.packets_per_second,
             underruns_per_second: musician.link.underruns_per_second,
@@ -1404,6 +1419,27 @@ mod tests {
         assert_eq!(dto.client_name, None);
         assert_eq!(dto.name, None);
         assert!(!dto.name_is_local);
+    }
+
+    #[test]
+    fn the_last_send_error_reaches_the_window_and_is_null_without_one() {
+        let failing = MusicianStatus {
+            counters: personal_monitoring::MusicianCounters {
+                packets_discarded: 3,
+                last_send_error: Some("network unreachable"),
+                ..Default::default()
+            },
+            ..musician_with_link(LinkStatus::default())
+        };
+        let fine = musician_with_link(LinkStatus::default());
+
+        let failing_row =
+            serde_json::to_value(MusicianDto::from(&failing)).expect("a row serializes");
+        let fine_row = serde_json::to_value(MusicianDto::from(&fine)).expect("a row serializes");
+
+        assert_eq!(failing_row["lastSendError"], "network unreachable");
+        assert_eq!(failing_row["packetsDiscarded"], 3);
+        assert!(fine_row["lastSendError"].is_null(), "{fine_row}");
     }
 
     #[test]

@@ -1,5 +1,6 @@
+use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::capture::TARGET_SAMPLE_RATE;
@@ -26,6 +27,49 @@ pub(crate) struct PacketStats {
 pub(crate) struct TargetCounters {
     pub(crate) sent: AtomicU64,
     pub(crate) discarded: AtomicU64,
+    /// The kind of the last failed send as a [send_error_code], 0 while none failed: an atomic, so
+    /// the engine thread records it with no allocation, lock or I/O, and the status reads it from
+    /// outside the engine thread.
+    pub(crate) last_send_error: AtomicU8,
+}
+
+/// The kinds of send failure the status names, in code order from 1; 0 is "none".
+const SEND_ERRORS: [&str; 10] = [
+    "send failed",
+    "network unreachable",
+    "host unreachable",
+    "network down",
+    "not permitted",
+    "address not available",
+    "connection refused",
+    "connection reset",
+    "would block",
+    "invalid address",
+];
+
+/// A failed send's [ErrorKind] as a small code an atomic can hold (see [send_error_name]): a match,
+/// nothing allocated, so it may run on the engine thread.
+pub(crate) fn send_error_code(kind: ErrorKind) -> u8 {
+    match kind {
+        ErrorKind::NetworkUnreachable => 2,
+        ErrorKind::HostUnreachable => 3,
+        ErrorKind::NetworkDown => 4,
+        ErrorKind::PermissionDenied => 5,
+        ErrorKind::AddrNotAvailable => 6,
+        ErrorKind::ConnectionRefused => 7,
+        ErrorKind::ConnectionReset => 8,
+        ErrorKind::WouldBlock => 9,
+        ErrorKind::InvalidInput => 10,
+        _ => 1,
+    }
+}
+
+/// What a [send_error_code] stands for; `None` for 0, no failure.
+pub(crate) fn send_error_name(code: u8) -> Option<&'static str> {
+    usize::from(code)
+        .checked_sub(1)
+        .and_then(|index| SEND_ERRORS.get(index))
+        .copied()
 }
 
 /// One musician a block goes to, copied out of the target table: shared handles only, so the
@@ -116,14 +160,19 @@ impl Sink for NetworkSink {
                     self.stats.sent.fetch_add(1, Ordering::Relaxed);
                     destination.counters.sent.fetch_add(1, Ordering::Relaxed);
                 }
-                // Counted, never printed: this is the engine thread, where a line to stderr or
-                // the log is I/O. The status reports the discarded packets per musician.
-                Err(_) => {
+                // Counted and its kind kept in an atomic, never printed: this is the engine thread,
+                // where a line to stderr or the log is I/O. The status reports the discarded packets
+                // and the last failure's kind per musician.
+                Err(error) => {
                     self.stats.discarded.fetch_add(1, Ordering::Relaxed);
                     destination
                         .counters
                         .discarded
                         .fetch_add(1, Ordering::Relaxed);
+                    destination
+                        .counters
+                        .last_send_error
+                        .store(send_error_code(error.kind()), Ordering::Relaxed);
                 }
             }
         }
@@ -503,6 +552,49 @@ mod tests {
         );
         assert!(receive(&first, Duration::from_secs(2)).is_some());
         assert_eq!(targets.read().len(), 1);
+    }
+
+    /// A send that fails is counted and its kind kept on the musician's counters, for the status to
+    /// name from outside the engine thread; here the datagram is past the UDP limit, which every
+    /// system refuses.
+    #[test]
+    fn a_failed_send_is_remembered_per_musician() {
+        let phone = bind("127.0.0.1:0");
+        let targets = registry(&[phone.local_addr().expect("phone address")]);
+        let counters = Arc::clone(&targets.read()[0].counters);
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+        assert_eq!(counters.last_send_error.load(Ordering::Relaxed), 0);
+
+        // 20,000 stereo frames: 80,000 bytes of samples, more than a datagram can carry.
+        let samples = vec![0.0f32; 2 * 20_000];
+        sink.process(&Block {
+            samples: &samples,
+            channels: 2,
+            sequence: 0,
+        });
+
+        assert_eq!(counters.discarded.load(Ordering::Relaxed), 1);
+        let code = counters.last_send_error.load(Ordering::Relaxed);
+        assert_ne!(code, 0, "the failure's kind is kept");
+        assert!(send_error_name(code).is_some());
+    }
+
+    #[test]
+    fn send_error_codes_name_their_kind_and_zero_names_none() {
+        assert_eq!(send_error_name(0), None);
+        assert_eq!(
+            send_error_name(send_error_code(ErrorKind::NetworkUnreachable)),
+            Some("network unreachable")
+        );
+        assert_eq!(
+            send_error_name(send_error_code(ErrorKind::PermissionDenied)),
+            Some("not permitted")
+        );
+        assert_eq!(
+            send_error_name(send_error_code(ErrorKind::Other)),
+            Some("send failed")
+        );
+        assert_eq!(send_error_name(u8::MAX), None);
     }
 
     /// The whole per-block path after warm-up, as it runs live: a 24-bit, 96 kHz stereo callback

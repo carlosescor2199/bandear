@@ -19,6 +19,7 @@ import {
   musicianRows,
   validateAddress,
 } from "../lib/network-view.js";
+import { mixBackupsView } from "../lib/mix-backups-view.js";
 import { mixMessages } from "../lib/mix-view.js";
 import { sessionPanelCommands, sessionPanelView } from "../lib/sessions.js";
 
@@ -90,7 +91,11 @@ export function mountNetworkScreen(main, app) {
       devicesError: state.devices.error ? `Devices could not be listed: ${state.devices.error}` : null,
       localOutput: { ...localOutputView(state), said: local.outputSaid },
     };
-    parts.session.data = { ...sessionPanelView(state), unsaved: app.unsavedEdits };
+    parts.session.data = {
+      ...sessionPanelView(state),
+      backups: mixBackupsView(state),
+      unsaved: app.unsavedEdits,
+    };
   }
 
   let frame = 0;
@@ -243,6 +248,9 @@ export function mountNetworkScreen(main, app) {
   });
   render();
   app.loadDevices(app.store.getState().audio.host);
+  // The backups are taken as the musicians' mixes change: the screen lists them afresh each time
+  // it opens (and on Refresh).
+  app.loadMixBackups();
   followRun(app.store.getState());
 
   return () => {

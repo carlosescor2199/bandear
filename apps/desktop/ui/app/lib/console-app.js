@@ -52,6 +52,11 @@
 //   taken, the next start opens it (the engine is never restarted). `unsavedEdits()` counts the
 //   edits a load would drop, so the panel can ask first. Each answers `{ ok, message }` and reads
 //   the list again.
+// - Mix backups (the Session panel too; see mix-backups-view.js): the backups of the musicians'
+//   mixes the desk takes as they change (read once connected, `loadMixBackups` again), and
+//   `restoreMixBackup(stamp)`, which puts one back on the musicians who are connected now, in turn
+//   with the desk edits and loads. Both answer `{ ok, message }`; a restore reads the status and the
+//   backups after it.
 // - Recording takes (the Record screen; see recording.js): the recording settings (read once
 //   connected, `loadRecordingSettings` again) change with `setRecordingSettings(change)`, one change
 //   at a time and each built on the one before it, so two quick toggles both land; a refusal leaves
@@ -117,6 +122,7 @@ import {
 import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
+import { formatMixRestored } from "./mix-backups-view.js";
 import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
 
@@ -497,6 +503,10 @@ export function createConsoleApp({
       await loadSessions();
     }
     await readSessionNotice();
+    // So are the backups of the musicians' mixes.
+    if (store.getState().mixBackups.list === null) {
+      await loadMixBackups();
+    }
     // The recording settings are the desk's too; a failed read leaves them unknown until the Record
     // screen reads them again.
     if (store.getState().recordingSettings === null) {
@@ -831,6 +841,47 @@ export function createConsoleApp({
     }
     await loadSessions();
     return result;
+  }
+
+  // Reads the backups of the musicians' mixes into the store. Answers `{ ok, message }`; a failed
+  // read keeps the backups as they were known, or unknown, and the failure is kept to be said.
+  async function loadMixBackups() {
+    try {
+      const list = await api.mixBackups();
+      store.dispatch(actions.mixBackups(list));
+      return { ok: true, message: list.length === 1 ? "1 mix backup." : `${list.length} mix backups.` };
+    } catch (error) {
+      store.dispatch(actions.mixBackupsFailed(message(error)));
+      return {
+        ok: false,
+        message: sentenceWithReason("The mix backups could not be listed", message(error)),
+      };
+    }
+  }
+
+  // Puts the backup `stamp` back on the musicians who are connected, once every desk edit and load
+  // asked for before it was answered. Answers `{ ok, message }` (formatMixRestored), then reads the
+  // status and the backups again, whatever the answer.
+  function restoreMixBackup(stamp) {
+    return inTurn(async () => {
+      let result;
+      try {
+        const outcome = await api.restoreMixBackup(stamp);
+        await readStatus();
+        const musicians = store.getState().musicians;
+        result = {
+          ok: true,
+          message: formatMixRestored(outcome, {
+            labelAt,
+            nameOf: (skipped) => skippedName(skipped, musicians),
+          }),
+        };
+      } catch (error) {
+        result = { ok: false, message: sentenceWithReason("The mixes were not restored", message(error)) };
+      }
+      await loadMixBackups();
+      return result;
+    });
   }
 
   // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
@@ -1264,6 +1315,13 @@ export function createConsoleApp({
     loadSession,
     /** How many edits a load would drop now; see loadSession. */
     unsavedEdits,
+    /** Reads the backups of the musicians' mixes again; answers `{ ok, message }`. */
+    loadMixBackups,
+    /**
+     * Puts the mix backup `stamp` back on the musicians who are connected now; answers `{ ok,
+     * message }` (formatMixRestored).
+     */
+    restoreMixBackup,
     /** Reads the recording settings again; resolves to null, or to the error of a failed read. */
     loadRecordingSettings,
     /**

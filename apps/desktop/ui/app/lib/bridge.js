@@ -202,6 +202,18 @@ export function createEngineApi(bridge) {
      */
     loadSession: (id) => bridge.invoke("load_session", { id }),
     /**
+     * The backups of the musicians' mixes, the newest first: `[{ stamp, savedAt, musicians, names,
+     * problem }]` (see mix-backups-view.js); `problem` says why one cannot be restored.
+     */
+    mixBackups: () => bridge.invoke("list_mix_backups"),
+    /**
+     * Puts the mixes of the backup `stamp` back on the musicians who are connected now, each phone
+     * sent its mix at once. Resolves to `{ backup, restored: [{ address, follows, mix }], skipped:
+     * [{ key, label, reason, error }] }` (see formatMixRestored); with no engine, or a stamp that
+     * names no readable backup in the backups folder, it rejects and nothing changed.
+     */
+    restoreMixBackup: (stamp) => bridge.invoke("restore_mix_backup", { stamp }),
+    /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
      */

@@ -33,6 +33,9 @@
 //              were listed, and why the last listing failed. A run's end keeps them.
 //   sessionNotice what the desk said when it opened its session (a damaged part set aside, a newer
 //              session left alone, labels imported), or null.
+//   mixBackups { list, error }: the backups of the musicians' mixes (see mix-backups-view.js),
+//              the newest first, null until they were listed, and why the last listing failed. A
+//              run's end keeps them.
 //   localMix   the engineer's local mix (the status's `localMix`, see local-mix.js), or null while
 //              no engine runs. It is opened, edited and answered like a musician's mix under the
 //              id LOCAL_MIX, which no musician's address can be: `selected`, `pending` and
@@ -128,6 +131,7 @@ export const initialState = Object.freeze({
   presets: null,
   sessions: Object.freeze({ list: null, error: null }),
   sessionNotice: null,
+  mixBackups: Object.freeze({ list: null, error: null }),
   localMix: null,
   outputs: NO_OUTPUTS,
   recordingSettings: null,
@@ -201,6 +205,10 @@ export const actions = Object.freeze({
   sessions: (list) => ({ type: "sessions", sessions: { list, error: null } }),
   /** The saved sessions could not be listed, for `message`; the last list known stays. */
   sessionsFailed: (message) => ({ type: "sessions-failed", message }),
+  /** The backups of the musicians' mixes as the desk listed them (see mix-backups-view.js). */
+  mixBackups: (list) => ({ type: "mix-backups", mixBackups: { list, error: null } }),
+  /** The mix backups could not be listed, for `message`; the last list known stays. */
+  mixBackupsFailed: (message) => ({ type: "mix-backups-failed", message }),
   /** What the desk said when it opened its session, or null. */
   sessionNotice: (notice) => ({ type: "session-notice", notice }),
   /**
@@ -630,6 +638,10 @@ export function consoleReducer(state, action) {
       return { ...state, sessions: action.sessions };
     case "sessions-failed":
       return { ...state, sessions: { ...state.sessions, error: action.message } };
+    case "mix-backups":
+      return { ...state, mixBackups: action.mixBackups };
+    case "mix-backups-failed":
+      return { ...state, mixBackups: { ...state.mixBackups, error: action.message } };
     case "session-notice":
       return { ...state, sessionNotice: action.notice ?? null };
     case "session-loaded":

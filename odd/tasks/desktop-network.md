@@ -222,9 +222,79 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
     `node --test apps/desktop/ui/tests`: 477 passed.
   - Commits: 46876b9 `feat(server): keep the capabilities a phone announces` (+311/-1); 01aed61
-    `feat(server): keep a link history with round-trip time` (+1181/-7); this commit
+    `feat(server): keep a link history with round-trip time` (+1181/-7); 0d689e1
     `feat(desktop): serve a musician's link history`.
-- [ ] T4 (health chart): chart on the Network and system screen. Route: delegated writer.
+- [x] T3-fix (review-6419b655bb738c08 findings). Route: delegated writer (trigger: findings across
+  the history, the registry, the control server, the desktop command, DTO, bridge and fake; done
+  with T4).
+  - WARNING fixed: gaps, order and the read cursor ran on the wall clock, so a clock stepped back
+    starved `sinceMs` readers and one stepped forward filled the ring with gaps. The history now
+    runs on the monotonic clock (`LinkMoment { at: Instant, wall_ms }`): each sample has `seq`
+    (1, 2, ... per history, never reused) and `mono_ms` (since the history began); `at_ms` is for
+    display only, a gap's read back from the wall clock in force. A tick adds at most the seconds
+    that really passed (and at most the ring). Each history has a process-unique `history_id`
+    (`LinkHistoryRead { history_id, samples }`), so a reader tells an engine restart or another
+    phone on the row from the history it follows. Command `link_history(musicianKey, sinceSeq?)`
+    answers `{ musicianKey, historyId, samples, maxSamples, periodMs }`, each sample with `seq` and
+    `monoMs` first; bridge `linkHistory(musicianKey, sinceSeq = null)`; the fake numbers a sample by
+    its second, uses the clock as `monoMs` and gives each musician a `historyId` that an engine
+    start replaces. `EngineHandle::link_history(key, since_seq)`.
+  - SUGGESTION fixed: a report outside a session (a configured-target phone that never registers)
+    starts one, marked as a reconnect after earlier samples; a closed connection
+    (`end_session`) drops the round trip, so the old one is never carried into the next session
+    while a pong measured on the new connection before its first report is kept.
+  - SUGGESTION fixed: control tests `a_connected_phone_that_stops_reporting_gets_gaps_from_the_
+    accept_loop` and `a_closed_connection_stops_the_gaps` (they cover the tick and the PeerGuard
+    path; green on their first run).
+  - RED: link history 3 of 19 failed with the old wall-clock gap logic, the old implicit session
+    and the old end of session (step forward, real seconds only, configured-target reconnect); the
+    step-back test already passed there, the `seq` cursor being in place. UI link-history suite 4 of
+    8 failed before the bridge and fake changes (`sinceSeq`, `seq`/`monoMs`, `historyId`).
+  - Commit: e04e0b1 `fix(server): order the link history on a monotonic clock` (+607/-177).
+- [x] T4 (health chart): chart on the Network and system screen. Route: delegated writer
+  (trigger: 2+ non-trivial files, the view logic, a new chart element, the table and the screen).
+  - Pick a musician (History in the Link cell, or a click on their row outside its fields) to open
+    `<ml-link-health>` below the table; again, or Close, closes it, and it goes when the musician
+    leaves the list. Range buttons 1 / 5 / 10 min (10 by default) in one row above the chart; a
+    summary line with the level (`ml-link-state`, mark and word, as the table), the loss over the
+    window, the round trip now and on average, the underruns, and when any the timeouts, seconds
+    without reports and reconnects.
+  - Chart (SVG, no package): small multiples on one time axis, each with its own scale: Loss (%),
+    Round trip (ms), then Jitter and Cushion (ms) for a phone that announces `stats.v2` or reports
+    them ("Jitter and cushion: not reported by this phone (it needs a newer app)." otherwise).
+    Lines (2px, 1.25px past a second every two pixels) break at gaps, missing values, missing
+    seconds and reconnects; a second alone is a dot. Gaps are shaded bands; reconnects a dashed
+    vertical marker labelled "Reconnected" (turned leftwards near the edge, not labelled twice
+    within 90px); underruns and timeouts tick marks in their own lanes. The axis counts back
+    (−10 min ... or −60 s ...) and ends at the newest second's local time. One series colour
+    (`--ml-blue`, contrast >= 3:1 on the surface by the dataviz validator); status colours only on
+    the level mark, with its word. Dark only, as the app.
+  - Hover and keyboard (arrows, Page, Home/End, Escape): crosshair on the nearest second and a
+    readout (values first, its local time, a note for a gap or a reconnect). Text alternative: the
+    summary as the chart's description, and "Show as table" (newest first, every value).
+  - Polling: `createHistoryFollower` reads the whole history once, then every second only after the
+    newest `seq` held, appended up to the ring (600); a new `historyId` reads it whole again; a
+    failed read is said and retried; an answer for a musician no longer followed is dropped. Console
+    app `linkHistory(musicianKey, sinceSeq)`.
+  - Logic in `lib/link-health-view.js`; RED: the suite failed to load (module missing), then 23 of
+    23 passed; one more test (the level's word from `linkState`) came with a change found in the
+    browser.
+  - Browser check (`desktop-ui`, `?fake#/network`): Bass (10 min) showed four panels, the
+    reconnect marker and its label, the underrun ticks; hover showed the crosshair and the readout
+    ("Warning 23:36:40, Loss 0.50%, Round trip 20.1 ms, ..."); Drums (1 min) showed the last 20 s
+    shaded with the line broken before them and the extras note; Lead vocal (5 min) opened by a
+    row click, the table showed 300 rows newest first; arrows moved the readout, Close closed the
+    panel and unpressed History. Fixed from the screenshots: the range group stretched full width,
+    the crosshair looked like the reconnect line, dense lines, the level word ("Poor" vs the
+    table's "Link lost"). No console errors.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 474 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 284 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 502 passed.
+  - Commits: 95f1769 `feat(desktop-ui): link health view logic` (+1114); this commit
+    `feat(desktop-ui): link health chart on the network screen`.
+  - Not built from the design board: the phone buffer and redundancy columns (T6, T7), demo mode
+    (T8), log viewer and export/restore of mixes from a file.
 - [ ] T5 (Android): announce capabilities, report jitter and cushion in `stats`. Route: delegated
   writer.
 - [ ] T6 (buffer from the desk): server message, desk control per musician, Android applies Auto
@@ -256,7 +326,13 @@ per reviewed slice, only with the user's approval.
   WARNING: a prune failure counted the backup as failed, so identical backups piled up (fixed in
   T2-fix). Next review base 81155c8.
 - T2-fix and T3 done (health history), four commits.
+- review-6419b655bb738c08 (81155c8..0d689e1, T2-fix and T3) approved and acknowledged, with three
+  findings: the history's gaps, order and cursor on the wall clock (WARNING), a configured-target
+  phone's reconnect never marked and its old round trip kept (SUGGESTION), and no control-level
+  tests for the tick's gaps and a closed connection (SUGGESTION); all fixed in T3-fix. Next review
+  base 0d689e1.
+- T3-fix and T4 done (health chart), three commits.
 
 ## Next step
 
-T4 (health chart).
+T5 (Android: announce capabilities, report jitter and cushion).

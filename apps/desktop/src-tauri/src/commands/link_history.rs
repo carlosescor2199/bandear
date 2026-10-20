@@ -3,12 +3,13 @@
 //!
 //! The status event never carries a history (it goes out four times a second); each row carries
 //! only its newest sample and round trip (`linkLatest`, `rttMs`, `rttLastMs`). A window that charts
-//! a musician reads the whole history once, then only what is newer by passing the newest `atMs`
-//! it has as `sinceMs`.
+//! a musician reads the whole history once, then only what is newer by passing the newest `seq` it
+//! has as `sinceSeq`; a `historyId` it has not seen means a new history (the engine restarted, or
+//! another phone took the row over), read whole again.
 
 use std::sync::Mutex;
 
-use personal_monitoring::{EngineHandle, LinkSample, MusicianKey, HISTORY_SAMPLES};
+use personal_monitoring::{EngineHandle, LinkHistoryRead, MusicianKey, HISTORY_SAMPLES};
 
 use super::{musician_key_of, DesktopState};
 use crate::dto::{LinkHistoryDto, LinkSampleDto};
@@ -18,31 +19,32 @@ const SAMPLE_PERIOD_MS: u64 = 1_000;
 
 /// What the command reads from an engine: its history of the musician a key names.
 pub(crate) trait LinkHistoryEngine {
-    fn link_history(&self, key: &MusicianKey, since_ms: Option<u64>) -> Option<Vec<LinkSample>>;
+    fn link_history(&self, key: &MusicianKey, since_seq: Option<u64>) -> Option<LinkHistoryRead>;
 }
 
 impl LinkHistoryEngine for EngineHandle {
-    fn link_history(&self, key: &MusicianKey, since_ms: Option<u64>) -> Option<Vec<LinkSample>> {
-        EngineHandle::link_history(self, key, since_ms)
+    fn link_history(&self, key: &MusicianKey, since_seq: Option<u64>) -> Option<LinkHistoryRead> {
+        EngineHandle::link_history(self, key, since_seq)
     }
 }
 
 /// The link history of the musician `musician_key` names (`client:<id>` or `address:<ip:port>`,
-/// the keys the desk keeps musicians by), the samples after `since_ms` or all of them. A key this
-/// build cannot read, one that names nobody, and no engine running are errors.
+/// the keys the desk keeps musicians by): its history id and the samples numbered after
+/// `since_seq`, or all of them. A key this build cannot read, one that names nobody, and no engine
+/// running are errors.
 pub fn link_history(
     state: &DesktopState,
     musician_key: &str,
-    since_ms: Option<u64>,
+    since_seq: Option<u64>,
 ) -> Result<LinkHistoryDto, String> {
-    link_history_with(&state.engine, musician_key, since_ms)
+    link_history_with(&state.engine, musician_key, since_seq)
 }
 
 /// [link_history] over any engine slot.
 pub(crate) fn link_history_with<E: LinkHistoryEngine>(
     engine: &Mutex<Option<E>>,
     musician_key: &str,
-    since_ms: Option<u64>,
+    since_seq: Option<u64>,
 ) -> Result<LinkHistoryDto, String> {
     let key = musician_key_of(musician_key)
         .ok_or_else(|| format!("`{musician_key}` names no phone or address"))?;
@@ -52,12 +54,13 @@ pub(crate) fn link_history_with<E: LinkHistoryEngine>(
     let engine = guard
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
-    let samples = engine
-        .link_history(&key, since_ms)
+    let read = engine
+        .link_history(&key, since_seq)
         .ok_or_else(|| format!("`{musician_key}` names no musician"))?;
     Ok(LinkHistoryDto {
         musician_key: musician_key.to_owned(),
-        samples: samples.iter().map(LinkSampleDto::from).collect(),
+        history_id: read.history_id,
+        samples: read.samples.iter().map(LinkSampleDto::from).collect(),
         max_samples: HISTORY_SAMPLES,
         period_ms: SAMPLE_PERIOD_MS,
     })
@@ -66,15 +69,17 @@ pub(crate) fn link_history_with<E: LinkHistoryEngine>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personal_monitoring::LinkHealth;
+    use personal_monitoring::{LinkHealth, LinkSample};
 
     const PHONE: &str = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b";
 
     /// An engine with one phone's history: a report and a gap.
     struct StandIn;
 
-    fn sample(at_ms: u64) -> LinkSample {
+    fn sample(seq: u64, at_ms: u64) -> LinkSample {
         LinkSample {
+            seq,
+            mono_ms: seq * 1_000,
             at_ms,
             gap: false,
             reconnected: false,
@@ -93,7 +98,7 @@ mod tests {
         }
     }
 
-    fn gap(at_ms: u64) -> LinkSample {
+    fn gap(seq: u64, at_ms: u64) -> LinkSample {
         LinkSample {
             gap: true,
             reconnected: true,
@@ -106,7 +111,7 @@ mod tests {
             receive_timeouts: None,
             jitter_ms: None,
             cushion_ms: None,
-            ..sample(at_ms)
+            ..sample(seq, at_ms)
         }
     }
 
@@ -114,17 +119,18 @@ mod tests {
         fn link_history(
             &self,
             key: &MusicianKey,
-            since_ms: Option<u64>,
-        ) -> Option<Vec<LinkSample>> {
+            since_seq: Option<u64>,
+        ) -> Option<LinkHistoryRead> {
             let named = match key {
                 MusicianKey::Client(id) => id == PHONE,
                 MusicianKey::Address(address) => address.to_string() == "192.168.1.30:50000",
             };
-            named.then(|| {
-                [sample(1_000), gap(2_000)]
+            named.then(|| LinkHistoryRead {
+                history_id: 7,
+                samples: [sample(1, 1_000), gap(2, 2_000)]
                     .into_iter()
-                    .filter(|sample| since_ms.is_none_or(|since| sample.at_ms > since))
-                    .collect()
+                    .filter(|sample| since_seq.is_none_or(|since| sample.seq > since))
+                    .collect(),
             })
         }
     }
@@ -143,15 +149,18 @@ mod tests {
             json,
             serde_json::json!({
                 "musicianKey": format!("client:{PHONE}"),
+                "historyId": 7,
                 "samples": [
                     {
-                        "atMs": 1000, "gap": false, "reconnected": false, "health": "good",
+                        "seq": 1, "monoMs": 1000, "atMs": 1000, "gap": false,
+                        "reconnected": false, "health": "good",
                         "intervalMs": 1000, "packetsReceived": 200, "packetsLost": 0,
                         "lossPercent": 0.0, "underruns": 0, "receiveTimeouts": 0, "rttMs": 4.5,
                         "jitterMs": 1.25, "cushionMs": 40.0, "backlogMs": null, "recovered": null
                     },
                     {
-                        "atMs": 2000, "gap": true, "reconnected": true, "health": "unknown",
+                        "seq": 2, "monoMs": 2000, "atMs": 2000, "gap": true,
+                        "reconnected": true, "health": "unknown",
                         "intervalMs": null, "packetsReceived": null, "packetsLost": null,
                         "lossPercent": null, "underruns": null, "receiveTimeouts": null,
                         "rttMs": 4.5, "jitterMs": null, "cushionMs": null, "backlogMs": null,
@@ -166,17 +175,18 @@ mod tests {
 
     #[test]
     fn since_answers_only_the_newer_samples_and_an_address_key_works_too() {
-        let history = link_history_with(&running(), "address:192.168.1.30:50000", Some(1_000))
+        let history = link_history_with(&running(), "address:192.168.1.30:50000", Some(1))
             .expect("a musician's history");
 
         assert_eq!(history.musician_key, "address:192.168.1.30:50000");
+        assert_eq!(history.history_id, 7);
         assert_eq!(
             history
                 .samples
                 .iter()
-                .map(|sample| sample.at_ms)
+                .map(|sample| sample.seq)
                 .collect::<Vec<_>>(),
-            vec![2_000]
+            vec![2]
         );
     }
 

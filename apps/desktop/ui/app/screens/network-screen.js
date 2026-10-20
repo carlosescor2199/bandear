@@ -5,11 +5,19 @@
 // error) and turns events into engine calls (the Session panel's through sessionPanelCommands).
 // The audio setup also chooses where the engineer's local mix plays ("Local mix out", see
 // local-mix.js): the outputs are listed again for every engine run, since they depend on its
-// driver.
+// driver. Picking a musician in the table opens their link health (link-health-view.js): the panel
+// follows their history once a second while it is open, with the range and the table its own.
 
 import "../components/audio-setup.js";
+import "../components/link-health.js";
 import "../components/musicians-table.js";
 import "../components/session-panel.js";
+import {
+  DEFAULT_RANGE_MS,
+  createHistoryFollower,
+  linkHealthView,
+  musicianKey,
+} from "../lib/link-health-view.js";
 import { followOutputs, localOutputChoice, localOutputView } from "../lib/local-mix.js";
 import {
   BUFFER_OPTIONS,
@@ -37,6 +45,7 @@ const LAYOUT = `
   <div class="network-body">
     <section class="network-musicians" aria-label="Musicians">
       <ml-musicians-table></ml-musicians-table>
+      <ml-link-health hidden></ml-link-health>
     </section>
     <aside class="network-side" aria-label="Audio input and session">
       <ml-audio-setup></ml-audio-setup>
@@ -56,6 +65,7 @@ export function mountNetworkScreen(main, app) {
     command: screen.querySelector("[data-command]"),
     audioMessage: screen.querySelector("[data-audio]"),
     table: screen.querySelector("ml-musicians-table"),
+    health: screen.querySelector("ml-link-health"),
     audio: screen.querySelector("ml-audio-setup"),
     session: screen.querySelector("ml-session-panel"),
   };
@@ -69,7 +79,34 @@ export function mountNetworkScreen(main, app) {
     tableError: null,
     // The last change of the local mix's output, `{ ok, message }`, said until the next one.
     outputSaid: null,
+    // The musician whose link health is open (their key, see musicianKey), its range and whether
+    // its table shows; the history held for them and why the last read failed.
+    healthKey: null,
+    healthRange: DEFAULT_RANGE_MS,
+    healthTable: false,
+    healthBuffer: null,
+    healthError: null,
   };
+  const follower = createHistoryFollower({
+    read: (key, sinceSeq) => app.linkHistory(key, sinceSeq),
+    onChange: (buffer, error) => {
+      local.healthBuffer = buffer;
+      local.healthError = error;
+      scheduleRender();
+    },
+  });
+
+  // The musician whose link health is open, while they are listed.
+  function healthMusician(state) {
+    return local.healthKey === null
+      ? null
+      : (state.musicians.find((musician) => musicianKey(musician) === local.healthKey) ?? null);
+  }
+
+  function closeHealth() {
+    follower.stop();
+    Object.assign(local, { healthKey: null, healthBuffer: null, healthError: null, healthTable: false });
+  }
 
   function render() {
     const state = app.store.getState();
@@ -79,11 +116,26 @@ export function mountNetworkScreen(main, app) {
     parts.command.textContent = command ?? "";
     parts.audioMessage.hidden = audio === null;
     parts.audioMessage.textContent = audio ?? "";
+    const health = healthMusician(state);
+    if (local.healthKey !== null && health === null) {
+      // Gone from the list (removed, or the engine stopped): the panel goes with them.
+      closeHealth();
+    }
     parts.table.data = {
       rows: musicianRows(state),
       addError: local.addError,
       tableError: local.tableError,
+      selected: health?.address ?? null,
     };
+    parts.health.data = health
+      ? linkHealthView({
+          musician: health,
+          buffer: local.healthBuffer,
+          rangeMs: local.healthRange,
+          error: local.healthError,
+          showTable: local.healthTable,
+        })
+      : null;
     parts.audio.data = {
       ...audioSetupView(state, local),
       hosts: HOST_OPTIONS,
@@ -196,6 +248,19 @@ export function mountNetworkScreen(main, app) {
     }
   }
 
+  function onSelect({ detail: { address } }) {
+    const musician = app.store.getState().musicians.find((candidate) => candidate.address === address);
+    if (!musician || musicianKey(musician) === local.healthKey) {
+      closeHealth();
+      render();
+      return;
+    }
+    closeHealth();
+    local.healthKey = musicianKey(musician);
+    render();
+    follower.follow(local.healthKey);
+  }
+
   async function onRemove({ detail: { address } }) {
     const result = await app.removeTarget(address);
     update({ tableError: result.ok ? null : `Could not remove ${address}: ${result.message}` });
@@ -225,6 +290,13 @@ export function mountNetworkScreen(main, app) {
   screen.addEventListener("musician-add", onAdd);
   screen.addEventListener("musician-remove", onRemove);
   screen.addEventListener("musician-rename", onRename);
+  screen.addEventListener("musician-select", onSelect);
+  screen.addEventListener("link-range", ({ detail: { rangeMs } }) => update({ healthRange: rangeMs }));
+  screen.addEventListener("link-table", ({ detail: { shown } }) => update({ healthTable: shown }));
+  screen.addEventListener("link-close", () => {
+    closeHealth();
+    render();
+  });
   screen.addEventListener("local-output", ({ detail: { value } }) => chooseOutput(value));
   // The Session panel's commands: each outcome is said in the panel at once, with the store's data.
   const sessions = sessionPanelCommands({
@@ -255,6 +327,7 @@ export function mountNetworkScreen(main, app) {
 
   return () => {
     unsubscribe();
+    follower.stop();
     cancelAnimationFrame(frame);
     screen.remove();
   };

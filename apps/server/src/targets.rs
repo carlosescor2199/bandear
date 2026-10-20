@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::OutputMeter;
 use crate::health::{LatestLinkReport, LinkReport};
-use crate::link_history::{LinkHistory, LinkSample, SharedLinkHistory};
+use crate::link_history::{LinkHistory, LinkHistoryRead, LinkMoment, SharedLinkHistory};
 use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixState, MixValues};
 use crate::network::TargetCounters;
 use crate::protocol::StatsCommand;
@@ -1111,16 +1111,16 @@ impl TargetRegistry {
     }
 
     /// Takes the history sample for the `stats` report `report`, read from `command`, that the
-    /// musician at `ip` sent at `at_ms` (Unix milliseconds).
+    /// musician at `ip` sent at `now`.
     pub(crate) fn record_link_report(
         &self,
         ip: IpAddr,
         report: &LinkReport,
         command: &StatsCommand,
-        at_ms: u64,
+        now: LinkMoment,
     ) {
         if let Some(history) = self.history_at(ip) {
-            lock_history(&history).record_report(report, command, at_ms);
+            lock_history(&history).record_report(report, command, now);
         }
     }
 
@@ -1131,22 +1131,22 @@ impl TargetRegistry {
         }
     }
 
-    /// Keeps every second with no report up to `now_ms` (Unix milliseconds) as a gap, in every
-    /// musician's history; the control server's tick.
-    pub(crate) fn fill_link_gaps(&self, now_ms: u64) {
+    /// Keeps every second with no report up to `now` as a gap, in every musician's history; the
+    /// control server's tick.
+    pub(crate) fn fill_link_gaps(&self, now: LinkMoment) {
         for entry in self.read().iter() {
-            lock_history(&entry.link_history).fill_gaps(now_ms);
+            lock_history(&entry.link_history).fill_gaps(now);
         }
     }
 
-    /// The history samples of the musician `key` names taken after `since_ms` (Unix milliseconds;
-    /// all of them with none), the oldest first. A phone whose row was removed is still found by
+    /// The history of the musician `key` names: its id and its samples numbered after `since_seq`
+    /// (all of them with none), the oldest first. A phone whose row was removed is still found by
     /// its client id while its history is kept. `None` when `key` names nobody.
     pub(crate) fn link_history(
         &self,
         key: &MusicianKey,
-        since_ms: Option<u64>,
-    ) -> Option<Vec<LinkSample>> {
+        since_seq: Option<u64>,
+    ) -> Option<LinkHistoryRead> {
         let history = self
             .read()
             .iter()
@@ -1160,8 +1160,8 @@ impl TargetRegistry {
                     .map(|(_, history)| Arc::clone(history)),
                 MusicianKey::Address(_) => None,
             })?;
-        let samples = lock_history(&history).samples_since(since_ms);
-        Some(samples)
+        let read = lock_history(&history).read(since_seq);
+        Some(read)
     }
 
     /// Keeps the history of the phone `client_id` whose row is going, in place of one kept for it
@@ -2098,12 +2098,17 @@ mod tests {
             r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":1,"underruns":0,"receive_timeouts":0}"#,
         )
         .expect("a stats report");
-        registry.record_link_report(ip(peer), &stored_report(Instant::now()), &command, at_ms);
+        registry.record_link_report(
+            ip(peer),
+            &stored_report(Instant::now()),
+            &command,
+            crate::link_history::test_moment(at_ms),
+        );
     }
 
     fn history_times(registry: &TargetRegistry, key: &MusicianKey) -> Option<Vec<(u64, bool)>> {
-        registry.link_history(key, None).map(|samples| {
-            samples
+        registry.link_history(key, None).map(|read| {
+            read.samples
                 .iter()
                 .map(|sample| (sample.at_ms, sample.reconnected))
                 .collect()

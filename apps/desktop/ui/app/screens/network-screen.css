@@ -1,6 +1,7 @@
 /*
- * The Network and system screen: the musicians table beside the audio input and the Session panel,
- * which drop below the table in a narrower window.
+ * The Network and system screen: the musicians table, with the link health of the musician picked
+ * below it, beside the audio input and the Session panel, which drop below them in a narrower
+ * window.
  */
 
 .network-screen {
@@ -22,7 +23,10 @@
 }
 
 .network-musicians {
+  display: flex;
   flex: 999 1 560px;
+  flex-direction: column;
+  gap: var(--ml-space-4);
   min-width: 0;
 }
 

@@ -12,20 +12,30 @@
 //!   closed there are no gaps: a phone that never reports (an older build) has no history at all.
 //! - The history follows the musician, not the control session: a reconnect (back within the grace
 //!   period, from a new IP with its client id, or after the grace period with its client id) keeps
-//!   it, and the first sample of the new session is marked [LinkSample::reconnected]. It is gone
-//!   when the engine stops: a new engine starts every history empty.
+//!   it, and the first sample of the new session is marked [LinkSample::reconnected]. A phone that
+//!   reports without registering (on a configured target) starts its session with its first
+//!   report. It is gone when the engine stops: a new engine starts every history empty, each with
+//!   a new [LinkHistoryRead::history_id].
 //! - At most [HISTORY_SAMPLES] samples are kept, in a ring allocated once with the history; the
 //!   oldest goes first.
+//!
+//! Time: the samples are ordered, spaced and found on the monotonic clock ([LinkMoment::at]), never
+//! on the wall clock, which the system may step back or forward at any time (a time sync, the user
+//! changing the clock). Each sample has a sequence number ([LinkSample::seq], the cursor a reader
+//! passes to get only what is new) and its monotonic time since the history began
+//! ([LinkSample::mono_ms], the axis a chart draws on); its wall clock time ([LinkSample::at_ms]) is
+//! for display only. A gap only ever stands for a second that really passed.
 //!
 //! The round trip is the control channel's: each heartbeat ping carries a number and the pong that
 //! answers it gives the time between the two (see [PingClock]). The phone's WebSocket library
 //! answers pings on its own, so every phone has one, an older build too. It is kept as the last
-//! value and a smoothed one ([RoundTrip]).
+//! value and a smoothed one ([RoundTrip]) while a control connection is open.
 //!
 //! The audio path never touches this module: only the control server writes a history and only the
 //! status and the history read take a copy, each under the history's own short lock.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +56,10 @@ pub(crate) const GAP_AFTER_MS: u64 = 2 * SAMPLE_PERIOD_MS;
 /// 6298), so one slow pong moves it a little and a lasting change moves it within seconds.
 const ROUND_TRIP_SMOOTHING: f64 = 0.125;
 
+/// The id the next history gets: unique in the process, so a reader can tell a new history (an
+/// engine restart, another phone taking the row over) from the one it was following.
+static NEXT_HISTORY_ID: AtomicU64 = AtomicU64::new(1);
+
 /// The control channel's round trip, in milliseconds: the last one measured and a smoothed one.
 /// Both are `None` until the session's first pong.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -54,11 +68,44 @@ pub struct RoundTrip {
     pub smoothed_ms: Option<f64>,
 }
 
+/// A moment as a history reads it: the monotonic clock that orders and spaces the samples and the
+/// wall clock shown beside them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkMoment {
+    pub(crate) at: Instant,
+    /// Unix milliseconds (UTC), for display only.
+    pub(crate) wall_ms: u64,
+}
+
+impl LinkMoment {
+    pub(crate) fn now() -> Self {
+        Self {
+            at: Instant::now(),
+            wall_ms: unix_millis_now(),
+        }
+    }
+
+    /// The wall clock time of the earlier moment `at`, read back from this one's wall clock, so a
+    /// gap is shown on the wall clock in force now.
+    fn wall_ms_of(self, at: Instant) -> u64 {
+        let before =
+            u64::try_from(self.at.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX);
+        self.wall_ms.saturating_sub(before)
+    }
+}
+
 /// One second of a musician's link.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkSample {
-    /// When it was taken, in Unix milliseconds (UTC): when its report arrived, or for a gap the
-    /// second it stands for.
+    /// The sample's number in its history: 1 for the first, one more for each after it. A reader
+    /// passes the newest it has to get only what is new.
+    pub seq: u64,
+    /// When it was taken on the monotonic clock, in milliseconds since the history began: it only
+    /// ever grows, by the time that really passed. The axis a chart draws on.
+    pub mono_ms: u64,
+    /// When it was taken on the wall clock, in Unix milliseconds (UTC): when its report arrived,
+    /// or for a gap the second it stands for. For display only: the wall clock may be stepped, so
+    /// two samples need not be in this order.
     pub at_ms: u64,
     /// No report arrived for this second while the session ran: every number but the round trip is
     /// `None` and the level is [LinkHealth::Unknown] (the status itself calls the link lost once
@@ -87,9 +134,12 @@ pub struct LinkSample {
 }
 
 impl LinkSample {
-    /// The gap sample for the second at `at_ms`, with the round trip measured last.
-    fn gap(at_ms: u64, rtt_ms: Option<f64>) -> Self {
+    /// The gap sample at `mono_ms` and `at_ms`, with the round trip measured last; numbered when
+    /// it is kept.
+    fn gap(mono_ms: u64, at_ms: u64, rtt_ms: Option<f64>) -> Self {
         Self {
+            seq: 0,
+            mono_ms,
             at_ms,
             gap: true,
             reconnected: false,
@@ -109,6 +159,16 @@ impl LinkSample {
     }
 }
 
+/// What a read of a history answers: which history it is and its samples after the cursor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkHistoryRead {
+    /// Unique in the process: a reader that sees another one drops what it had and reads it whole
+    /// (the engine restarted, or another phone took the row over).
+    pub history_id: u64,
+    /// The samples after the cursor, the oldest first.
+    pub samples: Vec<LinkSample>,
+}
+
 /// One musician's history, shared between the control server that writes it and the status that
 /// reads it. The lock is only ever held for a short copy, never across an `.await`.
 pub(crate) type SharedLinkHistory = Arc<Mutex<LinkHistory>>;
@@ -116,12 +176,17 @@ pub(crate) type SharedLinkHistory = Arc<Mutex<LinkHistory>>;
 /// One musician's samples and round trip (see the module documentation).
 #[derive(Debug)]
 pub(crate) struct LinkHistory {
+    id: u64,
+    /// When the history began, on the monotonic clock: [LinkSample::mono_ms] counts from here.
+    epoch: Instant,
+    /// The number the next sample gets.
+    next_seq: u64,
     samples: VecDeque<LinkSample>,
     /// Whether a control session runs: only then is a missing second a gap.
     in_session: bool,
-    /// When the last sample of this session stands for; `None` before its first report, so a
-    /// session that never reports leaves no gaps.
-    last_at_ms: Option<u64>,
+    /// When the last sample of this session stands for, on the monotonic clock; `None` before its
+    /// first report, so a session that never reports leaves no gaps.
+    last_at: Option<Instant>,
     /// The next sample is the first of a session that followed earlier samples.
     reconnect_pending: bool,
     round_trip: RoundTrip,
@@ -130,9 +195,12 @@ pub(crate) struct LinkHistory {
 impl Default for LinkHistory {
     fn default() -> Self {
         Self {
+            id: NEXT_HISTORY_ID.fetch_add(1, Ordering::Relaxed),
+            epoch: Instant::now(),
+            next_seq: 1,
             samples: VecDeque::with_capacity(HISTORY_SAMPLES),
             in_session: false,
-            last_at_ms: None,
+            last_at: None,
             reconnect_pending: false,
             round_trip: RoundTrip::default(),
         }
@@ -149,34 +217,39 @@ impl LinkHistory {
     /// the next one is marked as a reconnect when there are earlier ones. The round trip starts
     /// over: the last session's no longer describes this connection.
     pub(crate) fn begin_session(&mut self) {
-        self.in_session = true;
-        self.last_at_ms = None;
-        self.reconnect_pending = !self.samples.is_empty();
+        self.round_trip = RoundTrip::default();
+        self.start_session();
+    }
+
+    /// The control session ended (its last connection closed): no more gaps until the next one,
+    /// and no round trip, as there is no connection to measure.
+    pub(crate) fn end_session(&mut self) {
+        self.in_session = false;
+        self.last_at = None;
         self.round_trip = RoundTrip::default();
     }
 
-    /// The control session ended (its last connection closed): no more gaps until the next one.
-    pub(crate) fn end_session(&mut self) {
-        self.in_session = false;
-        self.last_at_ms = None;
-    }
-
     /// Takes the sample for `report`, the `stats` message `command` it was read from, arriving at
-    /// `at_ms` (Unix milliseconds); the seconds missing since the last sample are kept as gaps
-    /// first. A report also starts a session for a phone that reports without registering (on a
-    /// configured target).
+    /// `now`; the seconds missing since the last sample are kept as gaps first. A report outside a
+    /// session starts one, for a phone that reports without registering (on a configured target):
+    /// marked as a reconnect after earlier samples, keeping the round trip its connection measured
+    /// (the last connection's went when it closed).
     pub(crate) fn record_report(
         &mut self,
         report: &LinkReport,
         command: &StatsCommand,
-        at_ms: u64,
+        now: LinkMoment,
     ) {
-        self.in_session = true;
-        self.fill_gaps(at_ms);
+        if !self.in_session {
+            self.start_session();
+        }
+        self.fill_gaps(now);
         // Judged on its own numbers, as if it had just arrived.
         let judged = link_status(Some(report), true, report.received_at);
         self.push(LinkSample {
-            at_ms,
+            seq: 0,
+            mono_ms: self.mono_ms_of(now.at),
+            at_ms: now.wall_ms,
             gap: false,
             reconnected: false,
             health: judged.health,
@@ -192,25 +265,38 @@ impl LinkHistory {
             backlog_ms: command.backlog_ms,
             recovered: command.recovered,
         });
-        self.last_at_ms = Some(at_ms);
+        self.last_at = Some(now.at);
     }
 
-    /// Keeps the seconds with no report up to `now_ms` (Unix milliseconds) as gaps; the control
-    /// server's tick. Nothing outside a session or before its first report.
-    pub(crate) fn fill_gaps(&mut self, now_ms: u64) {
-        let Some(mut last) = self.last_at_ms.filter(|_| self.in_session) else {
+    /// Keeps the seconds with no report up to `now` as gaps; the control server's tick. Nothing
+    /// outside a session or before its first report. Only the monotonic clock counts the seconds,
+    /// so a tick never adds more gaps than seconds really passed (and never more than the ring),
+    /// whatever the wall clock did.
+    pub(crate) fn fill_gaps(&mut self, now: LinkMoment) {
+        let Some(mut last) = self.last_at.filter(|_| self.in_session) else {
             return;
         };
+        let period = Duration::from_millis(SAMPLE_PERIOD_MS);
+        let silent = now.at.saturating_duration_since(last);
+        let Some(overdue) = silent.checked_sub(Duration::from_millis(GAP_AFTER_MS)) else {
+            return;
+        };
+        // Every whole second from the last sample up to `GAP_AFTER_MS` before now is missing.
+        let overdue_ms = u64::try_from(overdue.as_millis()).unwrap_or(u64::MAX);
+        let missing = overdue_ms / SAMPLE_PERIOD_MS + 1;
         // A silence longer than the ring keeps only its last ring's worth of gaps.
-        let longest = HISTORY_SAMPLES as u64 * SAMPLE_PERIOD_MS;
-        if now_ms.saturating_sub(last) > longest + GAP_AFTER_MS {
-            last = now_ms - GAP_AFTER_MS - longest;
+        let kept = missing.min(HISTORY_SAMPLES as u64);
+        last += Duration::from_millis((missing - kept).saturating_mul(SAMPLE_PERIOD_MS));
+        for _ in 0..kept {
+            last += period;
+            let gap = LinkSample::gap(
+                self.mono_ms_of(last),
+                now.wall_ms_of(last),
+                self.round_trip.last_ms,
+            );
+            self.push(gap);
         }
-        while now_ms.saturating_sub(last) >= GAP_AFTER_MS {
-            last += SAMPLE_PERIOD_MS;
-            self.push(LinkSample::gap(last, self.round_trip.last_ms));
-        }
-        self.last_at_ms = Some(last);
+        self.last_at = Some(last);
     }
 
     /// A pong answered a ping after `round_trip`.
@@ -235,21 +321,43 @@ impl LinkHistory {
         self.samples.back().copied()
     }
 
-    /// The samples taken after `since_ms` (Unix milliseconds), the oldest first; all of them with
-    /// no `since_ms`. A reader that passes the newest `at_ms` it has gets only what is new.
-    pub(crate) fn samples_since(&self, since_ms: Option<u64>) -> Vec<LinkSample> {
+    /// The samples numbered after `since_seq`, the oldest first; all of them with no `since_seq`.
+    /// A reader that passes the newest [LinkSample::seq] it has gets only what is new.
+    pub(crate) fn samples_since(&self, since_seq: Option<u64>) -> Vec<LinkSample> {
         self.samples
             .iter()
-            .filter(|sample| since_ms.is_none_or(|since| sample.at_ms > since))
+            .filter(|sample| since_seq.is_none_or(|since| sample.seq > since))
             .copied()
             .collect()
     }
 
-    /// Adds `sample` as the newest, dropping the oldest when the ring is full.
+    /// The history's id and its samples after `since_seq` (see [Self::samples_since]).
+    pub(crate) fn read(&self, since_seq: Option<u64>) -> LinkHistoryRead {
+        LinkHistoryRead {
+            history_id: self.id,
+            samples: self.samples_since(since_seq),
+        }
+    }
+
+    /// Starts a session without touching the round trip (see [Self::begin_session]).
+    fn start_session(&mut self) {
+        self.in_session = true;
+        self.last_at = None;
+        self.reconnect_pending = !self.samples.is_empty();
+    }
+
+    /// `at` in milliseconds since the history began.
+    fn mono_ms_of(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Adds `sample` as the newest, numbered, dropping the oldest when the ring is full.
     fn push(&mut self, mut sample: LinkSample) {
         if self.samples.len() == HISTORY_SAMPLES {
             self.samples.pop_front();
         }
+        sample.seq = self.next_seq;
+        self.next_seq += 1;
         sample.reconnected = std::mem::take(&mut self.reconnect_pending);
         self.samples.push_back(sample);
     }
@@ -296,6 +404,21 @@ pub(crate) fn unix_millis_now() -> u64 {
         })
 }
 
+/// A test moment `ms` milliseconds after one fixed instant of the test run, its wall clock showing
+/// the same number: tests that never step the wall clock read their times as before. The instant
+/// lies a day ahead, so it is after every history a test makes (a history counts from when it
+/// began).
+#[cfg(test)]
+pub(crate) fn test_moment(ms: u64) -> LinkMoment {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let base = *BASE.get_or_init(|| Instant::now() + Duration::from_secs(86_400));
+    LinkMoment {
+        at: base + Duration::from_millis(ms),
+        wall_ms: ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,16 +434,44 @@ mod tests {
         (LinkReport::from_command(&command, Instant::now()), command)
     }
 
-    fn record(history: &mut LinkHistory, at_ms: u64) {
-        let (report, command) = report(200, 0, "");
-        history.record_report(&report, &command, at_ms);
+    /// The moment `ms` after the test's start, its wall clock at `START` plus `ms`.
+    fn at(ms: u64) -> LinkMoment {
+        LinkMoment {
+            wall_ms: START + ms,
+            ..test_moment(ms)
+        }
     }
 
+    /// The moment `ms` after the test's start with its wall clock at `wall_ms`.
+    fn at_wall(ms: u64, wall_ms: u64) -> LinkMoment {
+        LinkMoment { wall_ms, ..at(ms) }
+    }
+
+    fn record_at(history: &mut LinkHistory, now: LinkMoment) {
+        let (report, command) = report(200, 0, "");
+        history.record_report(&report, &command, now);
+    }
+
+    fn record(history: &mut LinkHistory, ms: u64) {
+        record_at(history, at(ms));
+    }
+
+    /// Each sample's wall clock time, relative to `START`, and whether it is a gap.
     fn times(history: &LinkHistory) -> Vec<(u64, bool)> {
         history
             .samples_since(None)
             .iter()
-            .map(|sample| (sample.at_ms, sample.gap))
+            .map(|sample| (sample.at_ms - START, sample.gap))
+            .collect()
+    }
+
+    /// Each sample's number and its monotonic time since the first one's.
+    fn steps(history: &LinkHistory) -> Vec<(u64, u64, bool)> {
+        let samples = history.samples_since(None);
+        let first = samples.first().map_or(0, |sample| sample.mono_ms);
+        samples
+            .iter()
+            .map(|sample| (sample.seq, sample.mono_ms - first, sample.gap))
             .collect()
     }
 
@@ -337,9 +488,10 @@ mod tests {
             r#","jitter_ms":2.5,"cushion_ms":40,"backlog_ms":35,"recovered":2"#,
         );
 
-        history.record_report(&report, &command, START);
+        history.record_report(&report, &command, at(0));
 
         let sample = history.latest().expect("a sample");
+        assert_eq!(sample.seq, 1, "the first sample");
         assert_eq!(sample.at_ms, START);
         assert!(!sample.gap);
         assert!(!sample.reconnected, "the first session is no reconnect");
@@ -361,7 +513,7 @@ mod tests {
     fn an_older_phones_report_has_no_extras_and_no_round_trip_before_the_first_pong() {
         let mut history = LinkHistory::default();
         history.begin_session();
-        record(&mut history, START);
+        record(&mut history, 0);
 
         let sample = history.latest().expect("a sample");
         assert_eq!(sample.health, LinkHealth::Warning, "one underrun");
@@ -376,17 +528,14 @@ mod tests {
     fn a_second_with_no_report_is_kept_as_a_gap_and_a_late_report_is_not_one() {
         let mut history = LinkHistory::default();
         history.begin_session();
-        record(&mut history, START);
+        record(&mut history, 0);
         // Merely late: no gap.
-        history.fill_gaps(START + 1_999);
-        record(&mut history, START + 1_900);
-        assert_eq!(
-            times(&history),
-            vec![(START, false), (START + 1_900, false)]
-        );
+        history.fill_gaps(at(1_999));
+        record(&mut history, 1_900);
+        assert_eq!(times(&history), vec![(0, false), (1_900, false)]);
 
         // Two seconds with nothing: the second after the last sample is a gap.
-        history.fill_gaps(START + 3_900);
+        history.fill_gaps(at(3_900));
         assert_eq!(history.latest().map(|sample| sample.gap), Some(true));
         assert_eq!(
             history.latest().map(|sample| sample.at_ms),
@@ -394,18 +543,31 @@ mod tests {
         );
 
         // A report long after fills every second before it, then is a sample of its own.
-        record(&mut history, START + 6_900);
+        record(&mut history, 6_900);
         assert_eq!(
             times(&history),
             vec![
-                (START, false),
-                (START + 1_900, false),
-                (START + 2_900, true),
-                (START + 3_900, true),
-                (START + 4_900, true),
-                (START + 5_900, true),
-                (START + 6_900, false),
+                (0, false),
+                (1_900, false),
+                (2_900, true),
+                (3_900, true),
+                (4_900, true),
+                (5_900, true),
+                (6_900, false),
             ]
+        );
+        assert_eq!(
+            steps(&history),
+            vec![
+                (1, 0, false),
+                (2, 1_900, false),
+                (3, 2_900, true),
+                (4, 3_900, true),
+                (5, 4_900, true),
+                (6, 5_900, true),
+                (7, 6_900, false),
+            ],
+            "numbered in order, on the monotonic clock"
         );
     }
 
@@ -413,35 +575,35 @@ mod tests {
     fn a_gap_carries_no_numbers_but_the_round_trip() {
         let mut history = LinkHistory::default();
         history.begin_session();
-        record(&mut history, START);
+        record(&mut history, 0);
         history.record_round_trip(Duration::from_millis(8));
 
-        history.fill_gaps(START + 2_000);
+        history.fill_gaps(at(2_000));
 
         let gap = history.latest().expect("a gap");
-        assert_eq!(gap, LinkSample::gap(START + 1_000, Some(8.0)));
+        assert!(gap.gap);
+        assert_eq!(gap.seq, 2);
+        assert_eq!(gap.at_ms, START + 1_000);
+        assert_eq!(gap.rtt_ms, Some(8.0));
         assert_eq!(gap.health, LinkHealth::Unknown);
         assert_eq!(gap.loss_percent, None);
+        assert_eq!(gap.packets_received, None);
     }
 
     #[test]
     fn no_gaps_before_a_sessions_first_report_or_after_it_ends() {
         let mut history = LinkHistory::default();
         history.begin_session();
-        history.fill_gaps(START + 60_000);
+        history.fill_gaps(at(60_000));
         assert!(
             history.samples_since(None).is_empty(),
             "a phone that never reports has no history"
         );
 
-        record(&mut history, START + 60_000);
+        record(&mut history, 60_000);
         history.end_session();
-        history.fill_gaps(START + 120_000);
-        assert_eq!(
-            times(&history),
-            vec![(START + 60_000, false)],
-            "gone: no gaps"
-        );
+        history.fill_gaps(at(120_000));
+        assert_eq!(times(&history), vec![(60_000, false)], "gone: no gaps");
     }
 
     #[test]
@@ -451,7 +613,7 @@ mod tests {
         assert!(capacity >= HISTORY_SAMPLES, "allocated once, up front");
         history.begin_session();
         for second in 0..(HISTORY_SAMPLES as u64 + 50) {
-            record(&mut history, START + second * SAMPLE_PERIOD_MS);
+            record(&mut history, second * SAMPLE_PERIOD_MS);
         }
 
         let samples = history.samples_since(None);
@@ -461,6 +623,7 @@ mod tests {
             START + 50 * SAMPLE_PERIOD_MS,
             "the oldest went"
         );
+        assert_eq!(samples[0].seq, 51, "numbers are never reused");
         assert_eq!(history.samples.capacity(), capacity);
     }
 
@@ -468,20 +631,105 @@ mod tests {
     fn a_very_long_silence_fills_at_most_the_ring() {
         let mut history = LinkHistory::default();
         history.begin_session();
-        record(&mut history, START);
+        record(&mut history, 0);
 
-        history.fill_gaps(START + 100 * 24 * 3_600 * 1_000);
+        history.fill_gaps(at(100 * 24 * 3_600 * 1_000));
 
         let samples = history.samples_since(None);
         assert_eq!(samples.len(), HISTORY_SAMPLES);
         assert!(samples.iter().all(|sample| sample.gap));
     }
 
+    /// The wall clock stepped back an hour (a time sync): the samples stay in order and spaced by
+    /// the time that really passed, and the cursor still finds what is new.
+    #[test]
+    fn a_wall_clock_stepped_back_keeps_the_order_and_the_cursor() {
+        let mut history = LinkHistory::default();
+        history.begin_session();
+        record(&mut history, 0);
+        record(&mut history, 1_000);
+        let hour = 3_600_000;
+        let cursor = history.latest().expect("a sample").seq;
+
+        record_at(&mut history, at_wall(2_000, START + 2_000 - hour));
+        history.fill_gaps(at_wall(2_500, START + 2_500 - hour));
+        record_at(&mut history, at_wall(3_000, START + 3_000 - hour));
+
+        assert_eq!(
+            steps(&history),
+            vec![
+                (1, 0, false),
+                (2, 1_000, false),
+                (3, 2_000, false),
+                (4, 3_000, false)
+            ],
+            "no gaps, in order"
+        );
+        let newer = history.samples_since(Some(cursor));
+        assert_eq!(
+            newer.iter().map(|sample| sample.seq).collect::<Vec<_>>(),
+            vec![3, 4],
+            "the reader gets what came after the step"
+        );
+        assert_eq!(
+            newer[0].at_ms,
+            START + 2_000 - hour,
+            "shown on the wall clock"
+        );
+    }
+
+    /// The wall clock jumped forward twenty minutes: no gap stands for time that never passed, so
+    /// the ring keeps its ten minutes of real samples.
+    #[test]
+    fn a_wall_clock_stepped_forward_adds_no_gaps() {
+        let mut history = LinkHistory::default();
+        history.begin_session();
+        record(&mut history, 0);
+        let jump = 20 * 60_000;
+
+        history.fill_gaps(at_wall(500, START + 500 + jump));
+        record_at(&mut history, at_wall(1_000, START + 1_000 + jump));
+        history.fill_gaps(at_wall(1_500, START + 1_500 + jump));
+
+        assert_eq!(
+            steps(&history),
+            vec![(1, 0, false), (2, 1_000, false)],
+            "two samples, no gaps"
+        );
+    }
+
+    /// A silence of five real seconds while the wall clock jumps: four gaps, one for each second
+    /// that really passed up to the gap delay, shown on the wall clock in force now.
+    #[test]
+    fn gaps_count_only_the_seconds_that_really_passed() {
+        let mut history = LinkHistory::default();
+        history.begin_session();
+        record(&mut history, 0);
+        let jump = 30 * 60_000;
+
+        history.fill_gaps(at_wall(5_000, START + 5_000 + jump));
+
+        assert_eq!(
+            steps(&history),
+            vec![
+                (1, 0, false),
+                (2, 1_000, true),
+                (3, 2_000, true),
+                (4, 3_000, true),
+                (5, 4_000, true)
+            ]
+        );
+        assert_eq!(
+            history.latest().map(|sample| sample.at_ms),
+            Some(START + 4_000 + jump)
+        );
+    }
+
     #[test]
     fn a_reconnect_keeps_the_samples_and_marks_the_first_of_the_new_session() {
         let mut history = LinkHistory::default();
         history.begin_session();
-        record(&mut history, START);
+        record(&mut history, 0);
         history.record_round_trip(Duration::from_millis(30));
         history.end_session();
 
@@ -492,31 +740,63 @@ mod tests {
             "the round trip starts over"
         );
         // The time away is no gap: the session had ended.
-        history.fill_gaps(START + 20_000);
-        record(&mut history, START + 20_000);
-        record(&mut history, START + 21_000);
+        history.fill_gaps(at(20_000));
+        record(&mut history, 20_000);
+        record(&mut history, 21_000);
 
         let samples = history.samples_since(None);
         assert_eq!(
             samples
                 .iter()
-                .map(|sample| (sample.at_ms, sample.reconnected))
+                .map(|sample| (sample.at_ms - START, sample.reconnected))
                 .collect::<Vec<_>>(),
-            vec![
-                (START, false),
-                (START + 20_000, true),
-                (START + 21_000, false)
-            ]
+            vec![(0, false), (20_000, true), (21_000, false)]
         );
     }
 
     #[test]
     fn a_report_without_a_registration_starts_a_session() {
         let mut history = LinkHistory::default();
-        record(&mut history, START);
-        history.fill_gaps(START + 2_000);
+        record(&mut history, 0);
+        history.fill_gaps(at(2_000));
 
-        assert_eq!(times(&history), vec![(START, false), (START + 1_000, true)]);
+        assert_eq!(times(&history), vec![(0, false), (1_000, true)]);
+    }
+
+    /// A phone on a configured target never registers: when it comes back on a new connection, its
+    /// first report starts the new session, marked as a reconnect, with no gaps for the time away
+    /// and no round trip left from the connection that closed.
+    #[test]
+    fn a_report_after_the_session_ended_starts_a_new_one_marked_as_a_reconnect() {
+        let mut history = LinkHistory::default();
+        record(&mut history, 0);
+        history.record_round_trip(Duration::from_millis(30));
+        history.end_session();
+        assert_eq!(
+            history.round_trip(),
+            RoundTrip::default(),
+            "no connection, no round trip"
+        );
+
+        // The new connection measures its own before its first report.
+        history.record_round_trip(Duration::from_millis(5));
+        record(&mut history, 20_000);
+        history.fill_gaps(at(22_000));
+
+        let samples = history.samples_since(None);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| (sample.at_ms - START, sample.gap, sample.reconnected))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, false, false),
+                (20_000, false, true),
+                (21_000, true, false)
+            ],
+            "a reconnect, then gaps again in the new session"
+        );
+        assert_eq!(samples[1].rtt_ms, Some(5.0), "the new connection's");
     }
 
     #[test]
@@ -524,16 +804,25 @@ mod tests {
         let mut history = LinkHistory::default();
         history.begin_session();
         for second in 0..5 {
-            record(&mut history, START + second * SAMPLE_PERIOD_MS);
+            record(&mut history, second * SAMPLE_PERIOD_MS);
         }
 
-        let newer = history.samples_since(Some(START + 2_000));
+        let newer = history.samples_since(Some(3));
 
         assert_eq!(
-            newer.iter().map(|sample| sample.at_ms).collect::<Vec<_>>(),
-            vec![START + 3_000, START + 4_000]
+            newer.iter().map(|sample| sample.seq).collect::<Vec<_>>(),
+            vec![4, 5]
         );
-        assert_eq!(history.samples_since(Some(START + 4_000)), Vec::new());
+        assert_eq!(history.samples_since(Some(5)), Vec::new());
+    }
+
+    #[test]
+    fn each_history_has_its_own_id() {
+        let first = LinkHistory::default();
+        let second = LinkHistory::default();
+
+        assert_ne!(first.read(None).history_id, second.read(None).history_id);
+        assert_eq!(first.read(None).history_id, first.read(Some(1)).history_id);
     }
 
     #[test]

@@ -98,6 +98,43 @@ class ControlChannelTest {
         assertTrue(events.errors.single(), events.errors.single().startsWith("Invalid control response"))
     }
 
+    // The playback buffer the desk sets.
+
+    @Test
+    fun aPlaybackMessageHandsOnTheDesksBufferWithNothingSentBack() {
+        val socket = openChannel()
+        val sent = socket.sent.size
+
+        socket.receive("""{"type":"playback","buffer":{"mode":"fixed","ms":40}}""")
+        socket.receive("""{"type":"playback","buffer":{"mode":"auto"}}""")
+        socket.receive("""{"type":"playback","buffer":{"mode":"fixed","ms":5,"floor":2},"later":true}""")
+
+        assertEquals(listOf(40, PlaybackLatency.DESK_BUFFER_AUTO, 5), events.buffers)
+        assertEquals(sent, socket.sent.size)
+        assertTrue(events.errors.isEmpty())
+    }
+
+    @Test
+    fun aPlaybackMessageThePhoneCannotUseIsIgnored() {
+        val socket = openChannel()
+
+        for (unusable in listOf(
+            """{"type":"playback"}""",
+            """{"type":"playback","buffer":"auto"}""",
+            """{"type":"playback","buffer":{"mode":"elastic","ms":40}}""",
+            """{"type":"playback","buffer":{"mode":"fixed"}}""",
+            """{"type":"playback","buffer":{"mode":"fixed","ms":4}}""",
+            """{"type":"playback","buffer":{"mode":"fixed","ms":501}}""",
+            """{"type":"playback","buffer":{"mode":"fixed","ms":40.5}}""",
+            """{"type":"playback","buffer":{"mode":"fixed","ms":"40"}}""",
+        )) {
+            socket.receive(unusable)
+        }
+
+        assertTrue(events.buffers.toString(), events.buffers.isEmpty())
+        assertTrue(events.errors.isEmpty())
+    }
+
     // The channel details a `config` carries.
 
     @Test
@@ -416,6 +453,7 @@ class ControlChannelTest {
         val engineer = mutableListOf<EngineerControls>()
         val errors = mutableListOf<String>()
         val details = mutableListOf<List<ChannelInfo>?>()
+        val buffers = mutableListOf<Int>()
         var acknowledged = 0
 
         override fun onOpened() = Unit
@@ -436,6 +474,10 @@ class ControlChannelTest {
         override fun onMixAnswered(seq: Long, applied: MixReport?) {
             answers += seq to applied?.mix
             applied?.let { engineer += it.engineer }
+        }
+
+        override fun onPlaybackBuffer(fixedMs: Int) {
+            buffers += fixedMs
         }
 
         override fun onClosed() = Unit

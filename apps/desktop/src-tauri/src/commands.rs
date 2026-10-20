@@ -9,6 +9,7 @@
 pub mod backups;
 pub mod link_history;
 pub mod local;
+pub mod playback_buffer;
 pub mod recording;
 pub mod soundcheck;
 
@@ -23,7 +24,7 @@ use personal_monitoring::{
     check_channels, check_groups, log_info, log_warn, start, AudioHost, ChannelKind, ChannelMeta,
     EngineConfig, EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition,
     MirrorOutcome, MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
-    PresetChannel,
+    PlaybackBuffer, PresetChannel,
 };
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
@@ -461,6 +462,7 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_channels = session_channels(&state.session);
     let saved_controls = session_engineer_controls(&state.session);
     let saved_mirrors = session_mirrors(&state.session);
+    let saved_buffers = playback_buffer::buffers_of(&state.session.current());
     // A local mix marked and not written yet is read with the session (it stays marked, and is
     // written later).
     let saved_local = kept_local(&state.session, &state.local_saver);
@@ -487,6 +489,12 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
             }
             for refused in hand_kept_mirrors(&handle, saved_mirrors) {
                 log_warn!("desk", "start_engine: {refused}");
+            }
+            if let Err(error) = handle.replace_playback_buffers(&saved_buffers) {
+                log_warn!(
+                    "desk",
+                    "start_engine: the saved playback buffers were not applied: {error}"
+                );
             }
             let local = saved_local.map(|kept| apply_kept_local(&mut handle, &kept));
             let notice = local.and_then(|applied| {
@@ -2024,6 +2032,11 @@ trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine {
         controls: &[(MusicianKey, EngineerControls)],
         mirrors: &[(MusicianKey, MusicianKey, String)],
     ) -> Result<Vec<String>, String>;
+    /// Replaces every playback buffer the engine keeps ([EngineHandle::replace_playback_buffers]).
+    fn replace_playback_buffers(
+        &self,
+        kept: &[(MusicianKey, PlaybackBuffer)],
+    ) -> Result<(), String>;
     /// Changes the mix of the musician at `address` from the desk ([EngineHandle::set_mix]).
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String>;
 }
@@ -2035,6 +2048,13 @@ impl SessionEngine for EngineHandle {
         mirrors: &[(MusicianKey, MusicianKey, String)],
     ) -> Result<Vec<String>, String> {
         EngineHandle::replace_kept(self, controls, mirrors).map_err(|error| error.to_string())
+    }
+
+    fn replace_playback_buffers(
+        &self,
+        kept: &[(MusicianKey, PlaybackBuffer)],
+    ) -> Result<(), String> {
+        EngineHandle::replace_playback_buffers(self, kept).map_err(|error| error.to_string())
     }
 
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
@@ -2183,7 +2203,9 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   another's mix gets only their master volume and mute (their channels and groups follow the
 ///   leader's). The loaded session's controls and mirrors replace every one the engine keeps
 ///   ([EngineHandle::replace_kept]): one it no longer keeps is lifted from the musicians who are
-///   here and forgotten for those who are not, so it never comes back when they register. A
+///   here and forgotten for those who are not, so it never comes back when they register. Its
+///   playback buffers replace the engine's the same way ([EngineHandle::replace_playback_buffers]),
+///   so a phone on a fixed buffer the loaded session does not keep goes back to Auto. A
 ///   mirror the engine refuses (on oneself, or closing a circle) is named in the answer; the
 ///   session keeps it, as a start would refuse it again.
 /// - With no engine running, the session is replaced and the saved mixes go to nobody (each is
@@ -2460,6 +2482,13 @@ fn apply_session<E: SessionEngine>(
             "the saved limits, locks and mirrors were not applied: {error}"
         )],
     };
+    // The loaded session's buffers replace the engine's whole too, so a phone set to a fixed
+    // buffer the session does not keep goes back to Auto.
+    if let Err(error) = engine.replace_playback_buffers(&playback_buffer::buffers_of(next)) {
+        refused.push(format!(
+            "the saved playback buffers were not applied: {error}"
+        ));
+    }
     let desk = engine.desk();
     let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
     let local = local.map(|kept| apply_kept_local(engine, kept));
@@ -2613,6 +2642,8 @@ mod tests {
                     rtt_last_ms: None,
                     link_latest: None,
                     mirror: None,
+                    buffer: crate::dto::BufferDto::from(personal_monitoring::PlaybackBuffer::Auto),
+                    buffer_supported: false,
                 })
                 .collect(),
             local_mix: MixDto::from(&personal_monitoring::MixValues::default()),
@@ -3071,6 +3102,8 @@ mod tests {
         kept: KeptBooks,
         /// Why it refuses to take controls and mirrors whole, when it does.
         refuses_kept: Option<String>,
+        /// The playback buffers it took whole last.
+        buffers: Mutex<Option<Vec<(MusicianKey, PlaybackBuffer)>>>,
         /// The musician whose mix it refuses to change, when it does.
         refuses_push_to: Option<String>,
         /// The engineer's local mix as a session save or load reads it.
@@ -3330,6 +3363,15 @@ mod tests {
     }
 
     impl SessionEngine for StandInEngine {
+        fn replace_playback_buffers(
+            &self,
+            kept: &[(MusicianKey, PlaybackBuffer)],
+        ) -> Result<(), String> {
+            self.note("replace_playback_buffers".to_owned());
+            *self.buffers.lock().expect("buffers lock") = Some(kept.to_vec());
+            Ok(())
+        }
+
         /// Takes the controls and mirrors whole, as the engine does: every musician here follows the
         /// mirror kept for them now, or none; a mirror on oneself is refused and named.
         fn replace_kept(
@@ -5595,7 +5637,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_applies_groups_and_channels_then_controls_and_mirrors_then_the_mixes() {
+    fn a_load_applies_groups_and_channels_then_controls_mirrors_and_buffers_then_the_mixes() {
         let test = "session-load-order";
         let (session, snapshots, engine) = desk(
             test,
@@ -5615,6 +5657,10 @@ mod tests {
                 label: Some("Ana".to_owned()),
                 engineer: Some(kept_controls(70, &[2])),
                 mirror: None,
+                buffer: Some(crate::session::SessionBuffer {
+                    mode: "fixed".to_owned(),
+                    ms: Some(40),
+                }),
             },
         );
         loaded.musicians.insert(
@@ -5623,6 +5669,7 @@ mod tests {
                 label: Some("Rack".to_owned()),
                 engineer: None,
                 mirror: Some(kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)),
+                buffer: None,
             },
         );
         saved_session(
@@ -5654,7 +5701,23 @@ mod tests {
         };
         assert!(at("set_groups") < at("set_channels"), "{log:?}");
         assert!(at("set_channels") < at("replace_kept"), "{log:?}");
-        assert!(at("replace_kept") < at("push_mix"), "{log:?}");
+        assert!(
+            at("replace_kept") < at("replace_playback_buffers"),
+            "{log:?}"
+        );
+        assert!(at("replace_playback_buffers") < at("push_mix"), "{log:?}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .and_then(|engine| engine.buffers.lock().expect("buffers lock").clone()),
+            Some(vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                PlaybackBuffer::Fixed { ms: 40 }
+            )]),
+            "the loaded buffers replace the engine's"
+        );
         let (controls, mirrors) = kept_books(&engine);
         assert_eq!(
             controls,
@@ -6673,6 +6736,7 @@ mod tests {
                 engineer: None,
                 // A hand-edited session: a mirror on oneself, which the engine refuses.
                 mirror: Some(kept_mirror(address_key(RACK), "Rack", None, None)),
+                buffer: None,
             },
         );
         saved_session(

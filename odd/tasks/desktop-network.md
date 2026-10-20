@@ -358,8 +358,87 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     (not installed).
   - Commit: this commit `feat(android): announce capabilities and report jitter, cushion and
     backlog`.
-- [ ] T6 (buffer from the desk): server message, desk control per musician, Android applies Auto
-  or fixed. Route: delegated writer.
+- [x] T5-fix (review-d62775e702018934 SUGGESTION): the receive loop's wiring of the stats extras
+  (backlog from the track timestamp, NaN without a track or a timestamp; rate 0 while unset; cushion
+  from packet frames times cushion packets) was untested. It is now the pure
+  `PlaybackLatency.reportExtras(packetFrames, cushionPackets, playbackRate, timestampRead,
+  framesWritten, presentedFrame)` the loop calls; 5 tests, distinct packet frames and cushion
+  packets, and the asymmetric cases that catch a swap (before the first packet: no cushion; frames
+  written behind the presented frame: 0 ms). Route: delegated writer (with T6).
+  - RED: with the function stubbed to NaN, 3 of 19 PlaybackLatency tests failed (the 2 no-measure
+    guards passed). GREEN: 472 tests.
+  - Commit: eac9cac `test(android): cover the stats extras taken from the track` (+114/-8).
+- [x] T6 (buffer from the desk): server message, desk control per musician, Android applies Auto
+  or fixed. Route: delegated writer (trigger: 2+ non-trivial files on every layer: protocol,
+  registry, control server, engine, desktop session, command, DTO, console, fake bridge, table,
+  screen, Android control channel, player and controller).
+  - Wire (documented in `protocol.rs`, `playback_message`): server to phone
+    `{"type":"playback","buffer":{"mode":"auto"}}` or `{"type":"playback","buffer":{"mode":"fixed",
+    "ms":40}}` (`ms` integer 5-500, `crate::playback::MIN/MAX_FIXED_BUFFER_MS`). Sent only to a phone
+    that announced `playback.buffer`: on every registration (Auto included, so the choice survives a
+    reconnect and a phone never keeps one an earlier server set) and on every change. No ack: the
+    phone's next `stats.cushion_ms` says what it plays. Older phones never see it.
+  - Server: `PlaybackBuffer { Auto, Fixed { ms } }` (`playback.rs`, `PlaybackBuffer::fixed` checks
+    the range). The registry keeps a buffer book by client id, else IP (Auto kept as nothing; a
+    client-id buffer drops the IP's), for the engine's run, whether the musician is here or not.
+    `EngineHandle::set_playback_buffer(key, buffer) -> BufferSetting { kept_for, address, outcome }`
+    with `BufferOutcome::{Sent, NotConnected, Unsupported}` (an engine stopping or a key naming
+    nobody is an error); `replace_playback_buffers(kept)`; event
+    `EngineEvent::PlaybackBufferChanged { address }`; the connection's push feed answers `Push::{Mix,
+    Buffer, Everything}` (a lag pushes both). `MusicianStatus.playback_buffer`.
+  - Desktop: the session keeps an entry's `buffer` (`{ "mode": "fixed", "ms": 40 }`, absent for
+    Auto, read leniently, a mode it does not know kept as written; within version 1 like `engineer`
+    and `mirror`); every start and every session load hands the readable ones to the engine
+    (`replace_playback_buffers`; one it cannot use is logged and skipped). Command
+    `set_musician_buffer(musicianKey, mode, ms?)` answers `{ musicianKey, outcome, buffer, saved,
+    saveError, message, minMs, maxMs }`, outcome `sent` / `notConnected` (kept, sent when it is back)
+    / `unsupported` (needs a newer app, nothing kept) / `invalid` (nothing changed); a key it cannot
+    read, nobody and no engine are errors. Saved under the key the engine kept it under. The DTO row
+    gains `buffer` and `bufferSupported`. The mix backups do not carry it (they restore mixes; the
+    session keeps the setting).
+  - UI: a Buffer column on the Network and system musicians table: Auto / Fixed with a ms field
+    (Enter or leaving sends, Escape reverts), "plays 42.7 ms" from `linkLatest.cushionMs`, "needs a
+    newer app" with no control for a phone that takes none, the outcome said on the row. Logic in
+    `lib/playback-buffer.js` (`bufferView`, `bufferRequest`, `formatBufferSet`, `nameForKey`);
+    console `setMusicianBuffer(musicianKey, mode, ms)` in turn with desk edits and loads; the fake
+    bridge keeps buffers per key across starts and in named sessions and makes the phone's reported
+    cushion the fixed length rounded up to 256-frame packets from the second it was set.
+  - Android: `playback.buffer` in `CLIENT_CAPABILITIES`; `parsePlaybackBuffer` (anything unusable
+    ignored) to `ClientMixState.deskBufferMs` (Auto = 0; reset to Auto at every session start,
+    nothing stored). The receive loop's `CushionController` follows it per packet (one volatile
+    read): fixed is `ceil(ms * rate / (1000 * packetFrames))` packets, at least 1, at most the whole
+    packets the track holds, and the controller stops adapting (underruns are still noted, so they
+    never count against Auto); Auto resumes from the cushion played clamped to 1-4 packets with its
+    clean seconds counted anew. The track is opened with room for 500 ms in whole packets
+    (`trackCapacityFrames`, about 94 KB at 48 kHz) and the working size set down at once, as before.
+  - Interval fix: the adaptive cushion was adjusted every 100 packets, which is one second only for
+    480-frame blocks (256-frame blocks are about 187 a second, so it adjusted every ~0.53 s). It is
+    now time-based: every 1 s of audio played, counted in frames with the remainder carried
+    (`adjustIntervalFrames`, `CushionController.onPlayed`).
+  - RED: server, with stubs (no range check, empty message, the registry keeping and finding
+    nothing, no buffer push), 10 of 486 failed (the in-range check, the mode names and the older
+    phone test passed). Desktop, with the session, DTO and command stubbed, 11 of 294 failed. UI: 4
+    of 519 failed (the pure `playback-buffer.js` logic was written before its tests ran, so its 3
+    suites passed at once). Android, with compile-only stubs, 10 of 482 failed (the "unusable
+    message is ignored" guard passed). GREEN below.
+  - Browser check (`desktop-ui`, `?fake#/network`): Lead vocal set to Fixed 40 ms showed "plays
+    42.7 ms" and "Sent Lead vocal's phone a fixed 40 ms buffer."; 501 ms said "A fixed buffer is from
+    5 to 500 ms, not 501 ms." and stayed; back to Auto said "Lead vocal's phone is back on Auto." with
+    "plays 40.0 ms"; Bass, Keys and Drums showed "needs a newer app" and no control. No console
+    errors.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 486 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 294 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 519 passed; `gradle -p apps/android :app:testDebugUnitTest
+    --max-workers=2 --no-daemon`: 482 tests, 0 failures; `:app:assembleDebug`: BUILD SUCCESSFUL, APK
+    `apps/android/app/build/outputs/apk/debug/app-debug.apk` (not installed).
+  - To confirm in the live test (T9): the latency of the larger track capacity on the S23 (the
+    working size is set right after `play()` as before; if the platform refused it, the track could
+    queue more than before).
+  - Commits: 6afc117 `feat(server): set a phone's playback buffer from the desk` (+939/-44);
+    280837e `feat(desktop): keep and send each musician's buffer` (+775/-10); f363377
+    `feat(desktop-ui): buffer control per musician` (+664/-12); this commit `feat(android): follow
+    the buffer the desk sets`.
 - [ ] T7 (redundancy): delayed duplicate send per musician, desk toggle, recovered count. Route:
   delegated writer.
 - [ ] T8 (demo source): generator reader, engine start without a capture device, audio-setup
@@ -399,8 +478,11 @@ per reviewed slice, only with the user's approval.
   (SUGGESTION); all fixed in T4-fix. Next review base e26e4f3.
 - The user approved Android builds with `--max-workers=2`.
 - T4-fix and T5 done (Android capabilities and stats extras), three commits.
+- review-d62775e702018934 (e26e4f3..88ecaff, T4-fix and T5) approved and acknowledged, with one
+  SUGGESTION: the receive loop's stats extras wiring untested (fixed in T5-fix). Next review base
+  88ecaff.
+- T5-fix and T6 done (buffer from the desk), five commits.
 
 ## Next step
 
-T6 (buffer from the desk: server message, desk control per musician, Android applies Auto or
-fixed).
+T7 (redundancy: delayed duplicate send per musician, desk toggle, recovered count).

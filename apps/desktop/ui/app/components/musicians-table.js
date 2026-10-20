@@ -1,25 +1,33 @@
 // <ml-musicians-table>: the musicians the engine sends to, with their names, links and counts, a
 // guarded Remove, and a form to add a phone by address.
 //
-// Property: `data` = { rows, addError, tableError, selected }: rows from musicianRows
+// Property: `data` = { rows, addError, tableError, selected, bufferSaid }: rows from musicianRows
 //   (network-view.js); the two errors are sentences to show, or null; `selected` the address of the
-//   musician whose link history is open, or null.
+//   musician whose link history is open, or null; `bufferSaid` `{ address, ok, message }`, what the
+//   last buffer change of that row did, or null.
 // Method: `clearAddress()` empties the address field after a phone was added.
 // Events (bubbling, composed): `musician-rename` { address, name } when an editable name is
 //   committed, `musician-remove` { address } when a removal is confirmed, `musician-add`
 //   { address } when the form is sent, `musician-select` { address } when a musician's History is
 //   pressed or their row is clicked outside its fields and buttons (again on the open one closes it).
+//   `musician-buffer` { address, key, mode, ms } when a Buffer is chosen: "auto", or "fixed" with
+//   the length typed (a string, checked by the screen); see playback-buffer.js.
 //
 // A name commits on Enter or when the field loses focus; Escape puts the saved name back. A name
 // the phone announced is the phone's, so its field is read-only; a local label is marked as such,
 // and its field's title says whether the desk keeps it for the phone (it follows the phone to a new
 // IP) or for the address.
+// The Buffer cell: Auto or Fixed and, for Fixed, its length in ms (Enter or leaving the field sends
+// it, Escape puts the last one back), with the cushion the phone reports under it; a phone that
+// takes no buffer from the desk shows "needs a newer app" and no control. A choice waiting for its
+// answer stays shown until the row's buffer or its outcome says otherwise.
 // A field being typed in is never overwritten by new data. Remove asks first: the row shows
 // "Keep" where Remove was, and the confirming Remove only works after a short pause, so a double
 // click or a stray click cannot remove anyone.
 
 import "./link-state.js";
 import { CONFIRM_DELAY_MS, confirmReady } from "../lib/network-view.js";
+import { DEFAULT_FIXED_MS, MAX_BUFFER_MS, MIN_BUFFER_MS } from "../lib/playback-buffer.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
 const CLIENT_NAME_TITLE =
@@ -95,6 +103,37 @@ const styles = sheet(`
   }
   .warn {
     color: var(--ml-accent);
+  }
+  .buffer-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .buffer-mode,
+  .buffer-ms {
+    min-height: 26px;
+    padding: 0 6px;
+    border: 1px solid var(--ml-border);
+    border-radius: var(--ml-radius-sm);
+    background: var(--ml-ground);
+    font-size: var(--ml-text-sm);
+  }
+  .buffer-ms {
+    width: 4.5em;
+    font-family: var(--ml-font-mono);
+  }
+  .unit {
+    color: var(--ml-text-muted);
+    font-size: var(--ml-text-xs);
+  }
+  .buffer-said {
+    max-width: 16em;
+    color: var(--ml-text-secondary);
+    font-size: var(--ml-text-xs);
+  }
+  .buffer-said[data-error] {
+    color: var(--ml-danger-text);
   }
   .name-line {
     display: flex;
@@ -248,6 +287,7 @@ class MlMusiciansTable extends HTMLElement {
               <th scope="col">Musician</th>
               <th scope="col">Control</th>
               <th scope="col" title="What the musician's phone reports about the audio it receives">Link</th>
+              <th scope="col" title="The phone's playback buffer: Auto lets the phone adapt it; Fixed keeps the length set here. Under it, the cushion the phone reports it plays">Buffer</th>
               <th scope="col">Mix</th>
               <th scope="col" class="num">Sent</th>
               <th scope="col" class="num">Discarded</th>
@@ -348,6 +388,21 @@ class MlMusiciansTable extends HTMLElement {
         </div>
         <div class="detail"></div>
       </td>
+      <td class="buffer">
+        <div class="buffer-line">
+          <select class="buffer-mode">
+            <option value="auto">Auto</option>
+            <option value="fixed">Fixed</option>
+          </select>
+          <span class="buffer-fixed">
+            <input class="buffer-ms" type="number" min="${MIN_BUFFER_MS}" max="${MAX_BUFFER_MS}"
+              step="1" inputmode="numeric" />
+            <span class="unit">ms</span>
+          </span>
+        </div>
+        <div class="detail buffer-detail"></div>
+        <div class="buffer-said" role="status"></div>
+      </td>
       <td class="mix"></td>
       <td class="num sent"></td>
       <td class="num discarded"></td>
@@ -364,6 +419,18 @@ class MlMusiciansTable extends HTMLElement {
       link: row.querySelector("ml-link-state"),
       history: row.querySelector(".history"),
       detail: row.querySelector(".detail"),
+      bufferLine: row.querySelector(".buffer-line"),
+      bufferMode: row.querySelector(".buffer-mode"),
+      bufferFixed: row.querySelector(".buffer-fixed"),
+      bufferMs: row.querySelector(".buffer-ms"),
+      bufferDetail: row.querySelector(".buffer-detail"),
+      bufferSaid: row.querySelector(".buffer-said"),
+      // The buffer the engine reports for the row, the key it is set by, a choice sent and not
+      // answered yet, and the outcome last shown.
+      buffer: null,
+      key: null,
+      asked: null,
+      said: null,
       mix: row.querySelector(".mix"),
       sent: row.querySelector(".sent"),
       discarded: row.querySelector(".discarded"),
@@ -387,10 +454,29 @@ class MlMusiciansTable extends HTMLElement {
       }
     });
     view.history.addEventListener("click", () => emit(this, "musician-select", { address }));
+    view.bufferMode.addEventListener("change", () => {
+      const mode = view.bufferMode.value;
+      view.bufferFixed.hidden = mode !== "fixed";
+      this.#askBuffer(view, mode);
+    });
+    view.bufferMs.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        view.bufferMs.blur();
+      } else if (event.key === "Escape") {
+        view.bufferMs.value = String(view.buffer?.ms ?? DEFAULT_FIXED_MS);
+        view.bufferMs.blur();
+      }
+    });
+    view.bufferMs.addEventListener("change", () => {
+      if (view.bufferMode.value === "fixed") {
+        this.#askBuffer(view, "fixed");
+      }
+    });
     row.addEventListener("click", (event) => {
       // A click on the row's own fields and buttons does what they do; anywhere else opens the
       // musician's link history, as History does.
-      if (!event.composedPath().some((node) => node.matches?.("input, button, a"))) {
+      if (!event.composedPath().some((node) => node.matches?.("input, button, select, a"))) {
         emit(this, "musician-select", { address });
       }
     });
@@ -423,6 +509,7 @@ class MlMusiciansTable extends HTMLElement {
     reflect(view.link, "label", row.link.label);
     reflect(view.link, "detail", row.link.detail);
     setText(view.detail, row.link.detail);
+    this.#updateBuffer(view, row);
     setText(view.mix, row.mix);
     setText(view.sent, row.sent);
     setText(view.discarded, row.discarded);
@@ -434,6 +521,44 @@ class MlMusiciansTable extends HTMLElement {
     reflect(view.history, "aria-pressed", selected ? "true" : "false");
     reflect(view.history, "aria-label", `Link history of ${view.label}`);
     this.#renderActions(view);
+  }
+
+  // Sends the Buffer chosen in `view`'s row: Auto, or Fixed with the length in its field.
+  #askBuffer(view, mode) {
+    const ms = mode === "fixed" ? view.bufferMs.value : null;
+    view.asked = { mode, ms };
+    emit(this, "musician-buffer", { address: view.address, key: view.key, mode, ms });
+  }
+
+  #updateBuffer(view, row) {
+    const { buffer } = row;
+    view.buffer = buffer;
+    view.key = buffer.key;
+    view.bufferLine.hidden = !buffer.supported;
+    const said = this.#data.bufferSaid?.address === row.address ? this.#data.bufferSaid : null;
+    // A choice is shown until the engine reports it, or until its outcome came back.
+    const reported =
+      view.asked !== null &&
+      buffer.mode === view.asked.mode &&
+      (buffer.mode === "auto" || String(buffer.ms) === String(view.asked.ms).trim());
+    if (reported || (said !== null && said !== view.said)) {
+      view.asked = null;
+    }
+    view.said = said;
+    view.bufferMode.value = view.asked?.mode ?? buffer.mode;
+    view.bufferFixed.hidden = view.bufferMode.value !== "fixed";
+    if (this.shadowRoot.activeElement !== view.bufferMs && view.asked === null) {
+      view.bufferMs.value = String(buffer.ms ?? (view.bufferMs.value || DEFAULT_FIXED_MS));
+    }
+    const label = row.name || row.address;
+    reflect(view.bufferMode, "aria-label", `Playback buffer of ${label}`);
+    reflect(view.bufferMs, "aria-label", `Fixed playback buffer of ${label}, in milliseconds`);
+    setText(view.bufferDetail, buffer.supported ? (buffer.playing ?? "") : buffer.note);
+    view.bufferDetail.title = buffer.supported
+      ? "The cushion the phone reports it plays"
+      : "This phone's app does not take its playback buffer from the desk; update MixLink on it";
+    setText(view.bufferSaid, said?.message ?? "");
+    reflect(view.bufferSaid, "data-error", said ? !said.ok : false);
   }
 
   #renderActions(view) {

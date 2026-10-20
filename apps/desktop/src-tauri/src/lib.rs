@@ -465,6 +465,21 @@ async fn link_history(
     commands::link_history::link_history(state.inner(), &musician_key, since_seq)
 }
 
+/// Sets the playback buffer of the musician `musicianKey` names (`client:<id>` or
+/// `address:<ip:port>`): `mode` `auto`, or `fixed` with `ms` (5-500). Answers `{ musicianKey, outcome,
+/// buffer, saved, saveError, message, minMs, maxMs }`, `outcome` one of `sent`, `notConnected`,
+/// `unsupported` (the phone needs a newer app) and `invalid` (see
+/// [commands::playback_buffer::set_musician_buffer]).
+#[tauri::command]
+async fn set_musician_buffer(
+    state: State<'_, DesktopState>,
+    musician_key: String,
+    mode: String,
+    ms: Option<u32>,
+) -> Result<dto::BufferSetDto, String> {
+    commands::playback_buffer::set_musician_buffer(state.inner(), &musician_key, &mode, ms)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -563,7 +578,8 @@ pub fn run() {
             log_location,
             list_mix_backups,
             restore_mix_backup,
-            link_history
+            link_history,
+            set_musician_buffer
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")

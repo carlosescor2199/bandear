@@ -454,6 +454,7 @@ mod tests {
                     locked_channels: vec![1],
                 }),
                 mirror: None,
+                buffer: None,
             },
         );
         musicians.insert(
@@ -467,6 +468,7 @@ mod tests {
                     leader_address: Some("192.168.1.30:50000".to_owned()),
                     follower_address: None,
                 }),
+                buffer: None,
             },
         );
         Session {

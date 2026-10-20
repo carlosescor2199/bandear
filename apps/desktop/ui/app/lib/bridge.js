@@ -214,6 +214,17 @@ export function createEngineApi(bridge) {
      */
     restoreMixBackup: (stamp) => bridge.invoke("restore_mix_backup", { stamp }),
     /**
+     * The link history of the musician `musicianKey` names (`client:<id>` or `address:<ip:port>`):
+     * `{ musicianKey, samples, maxSamples, periodMs }`, one sample a second, the oldest first,
+     * only those after `sinceMs` (Unix milliseconds) when given. A sample is `{ atMs, gap,
+     * reconnected, health, intervalMs, packetsReceived, packetsLost, lossPercent, underruns,
+     * receiveTimeouts, rttMs, jitterMs, cushionMs, backlogMs, recovered }`; a gap has only `rttMs`.
+     * A key that names nobody, or no engine, rejects. Status rows carry only the newest sample
+     * (`linkLatest`) and the round trip (`rttMs`, `rttLastMs`).
+     */
+    linkHistory: (musicianKey, sinceMs = null) =>
+      bridge.invoke("link_history", { musicianKey, sinceMs }),
+    /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
      */

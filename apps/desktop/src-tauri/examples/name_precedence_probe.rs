@@ -63,6 +63,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            capabilities: Vec::new(),
             mirror: None,
         }],
         local_mix: Default::default(),

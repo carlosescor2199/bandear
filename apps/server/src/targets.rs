@@ -1,12 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use crate::engine::OutputMeter;
-use crate::health::LatestLinkReport;
+use crate::health::{LatestLinkReport, LinkReport};
+use crate::link_history::{LinkHistory, LinkSample, SharedLinkHistory};
 use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixState, MixValues};
 use crate::network::TargetCounters;
+use crate::protocol::StatsCommand;
 
 /// Whom the engineer's controls for a musician are kept for: the stable client id their phone
 /// announced, or, for a configured target and a phone that announced none, their address (joined
@@ -219,6 +221,9 @@ pub(crate) enum TargetOrigin {
         /// The stable id the client announced, if it sent one the server keeps. It is what lets a
         /// phone that comes back from a new IP keep this entry instead of starting a second one.
         client_id: Option<String>,
+        /// What the client announced it supports (see [crate::protocol::RegisterCommand]); empty
+        /// for an older phone. Each registration replaces it.
+        capabilities: Vec<String>,
         /// When the last control channel for this target closed; `None` while connected or while
         /// the grace period has not started.
         disconnected_at: Option<Instant>,
@@ -237,6 +242,14 @@ impl TargetOrigin {
         match self {
             TargetOrigin::Configured => None,
             TargetOrigin::Registered { client_id, .. } => client_id.as_deref(),
+        }
+    }
+
+    /// What the client announced it supports; nothing for a configured target.
+    pub(crate) fn capabilities(&self) -> &[String] {
+        match self {
+            TargetOrigin::Configured => &[],
+            TargetOrigin::Registered { capabilities, .. } => capabilities,
         }
     }
 }
@@ -266,6 +279,11 @@ pub(crate) struct TargetEntry {
     /// The latest link report the musician's phone sent. Only the control connection writes it and
     /// only the status snapshot reads it; the network thread never touches it.
     pub(crate) link_report: LatestLinkReport,
+    /// The musician's link over the last minutes and the round trip of their control channel (see
+    /// [crate::link_history]). Only the control server writes it and only the status and the
+    /// history read take a copy; the network thread never touches it. It moves with the row, and a
+    /// phone with a client id that comes back after its row was removed gets it back.
+    pub(crate) link_history: SharedLinkHistory,
     /// The peak of the stereo mix this musician is sent. Only the network thread raises it, with
     /// lock-free atomics, and the meter read decays it.
     pub(crate) output_meter: OutputMeter,
@@ -301,6 +319,10 @@ pub(crate) struct TargetRegistry {
     controls: Mutex<HashMap<BookKey, EngineerControls>>,
     mirrors: Mutex<HashMap<BookKey, Mirror>>,
     propagation: Mutex<()>,
+    /// The link histories of phones whose rows were removed (the grace period ran out, or the
+    /// engineer removed them), by client id, the most recent last; at most
+    /// [KEPT_DEPARTED_HISTORIES]. A phone that comes back with its id takes its history back.
+    departed_histories: Mutex<Vec<(String, SharedLinkHistory)>>,
     /// Runs once, in the next propagation, between its read of a leader's mix and the followers
     /// taking it: lets a test hold a propagation there while another one runs.
     #[cfg(test)]
@@ -332,6 +354,7 @@ impl TargetRegistry {
                 mix_state: Arc::new(MixState::new(layout)),
                 counters: Arc::new(TargetCounters::default()),
                 link_report: LatestLinkReport::default(),
+                link_history: LinkHistory::shared(),
                 output_meter: OutputMeter::default(),
                 origin: TargetOrigin::Configured,
             });
@@ -341,6 +364,7 @@ impl TargetRegistry {
             controls: Mutex::new(HashMap::new()),
             mirrors: Mutex::new(HashMap::new()),
             propagation: Mutex::new(()),
+            departed_histories: Mutex::new(Vec::new()),
             #[cfg(test)]
             after_leader_read: Mutex::new(None),
             #[cfg(test)]
@@ -817,6 +841,7 @@ impl TargetRegistry {
         let origin = TargetOrigin::Registered {
             name,
             client_id: client_id.map(str::to_owned),
+            capabilities: Vec::new(),
             disconnected_at: None,
         };
         let mut entries = self.entries.write().expect("target registry lock poisoned");
@@ -852,6 +877,17 @@ impl TargetRegistry {
             // there now, or none.
             let existing = &mut entries[index];
             let same_musician = existing.origin.client_id() == client_id;
+            if !same_musician {
+                // The link history is the musician's: the previous occupant's is kept for them,
+                // and whoever registers now gets theirs, or a new one.
+                let previous = std::mem::replace(
+                    &mut existing.link_history,
+                    self.take_departed_history(client_id),
+                );
+                if let Some(id) = existing.origin.client_id() {
+                    self.keep_departed_history(id, previous);
+                }
+            }
             existing.address = address;
             existing.origin = origin;
             let controls_changed = if same_musician {
@@ -874,6 +910,7 @@ impl TargetRegistry {
             mix_state: Arc::new(membership.new_mix()),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
+            link_history: self.take_departed_history(client_id),
             output_meter: OutputMeter::default(),
             origin,
         };
@@ -923,6 +960,9 @@ impl TargetRegistry {
             {
                 if now.duration_since(at) >= REGISTRATION_GRACE_PERIOD {
                     removed.push(entry.address);
+                    if let Some(id) = entry.origin.client_id() {
+                        self.keep_departed_history(id, Arc::clone(&entry.link_history));
+                    }
                     return false;
                 }
             }
@@ -965,6 +1005,7 @@ impl TargetRegistry {
             mix_state: Arc::new(membership.new_mix()),
             counters: Arc::new(TargetCounters::default()),
             link_report: LatestLinkReport::default(),
+            link_history: LinkHistory::shared(),
             output_meter: OutputMeter::default(),
             origin: TargetOrigin::Configured,
         };
@@ -990,7 +1031,11 @@ impl TargetRegistry {
         else {
             return Err(format!("target `{value}` is not configured"));
         };
-        Ok(entries.remove(index).address)
+        let removed = entries.remove(index);
+        if let Some(id) = removed.origin.client_id() {
+            self.keep_departed_history(id, removed.link_history);
+        }
+        Ok(removed.address)
     }
 
     /// The mix state for a control peer's IP, or `None` when that IP is no longer a target.
@@ -1028,6 +1073,136 @@ impl TargetRegistry {
             *slot.lock().expect("link report lock poisoned") = None;
         }
     }
+
+    /// Records what the registered client at `ip` announced it supports, in place of what it
+    /// announced before. A configured target, or an IP with no target, is left alone.
+    pub(crate) fn set_capabilities(&self, ip: IpAddr, announced: Vec<String>) {
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        if let Some(TargetOrigin::Registered { capabilities, .. }) = entries
+            .iter_mut()
+            .find(|entry| entry.address.ip() == ip)
+            .map(|entry| &mut entry.origin)
+        {
+            *capabilities = announced;
+        }
+    }
+
+    /// The link history of the target at `ip`, if there is one.
+    fn history_at(&self, ip: IpAddr) -> Option<SharedLinkHistory> {
+        self.read()
+            .iter()
+            .find(|entry| entry.address.ip() == ip)
+            .map(|entry| Arc::clone(&entry.link_history))
+    }
+
+    /// A control session starts for the musician at `ip`: their phone registered on a new
+    /// connection (see [LinkHistory::begin_session]). An IP with no target is a no-op.
+    pub(crate) fn begin_link_session(&self, ip: IpAddr) {
+        if let Some(history) = self.history_at(ip) {
+            lock_history(&history).begin_session();
+        }
+    }
+
+    /// The last control connection from `ip` closed (see [LinkHistory::end_session]).
+    pub(crate) fn end_link_session(&self, ip: IpAddr) {
+        if let Some(history) = self.history_at(ip) {
+            lock_history(&history).end_session();
+        }
+    }
+
+    /// Takes the history sample for the `stats` report `report`, read from `command`, that the
+    /// musician at `ip` sent at `at_ms` (Unix milliseconds).
+    pub(crate) fn record_link_report(
+        &self,
+        ip: IpAddr,
+        report: &LinkReport,
+        command: &StatsCommand,
+        at_ms: u64,
+    ) {
+        if let Some(history) = self.history_at(ip) {
+            lock_history(&history).record_report(report, command, at_ms);
+        }
+    }
+
+    /// A pong from `ip` answered the heartbeat ping after `round_trip`.
+    pub(crate) fn record_round_trip(&self, ip: IpAddr, round_trip: Duration) {
+        if let Some(history) = self.history_at(ip) {
+            lock_history(&history).record_round_trip(round_trip);
+        }
+    }
+
+    /// Keeps every second with no report up to `now_ms` (Unix milliseconds) as a gap, in every
+    /// musician's history; the control server's tick.
+    pub(crate) fn fill_link_gaps(&self, now_ms: u64) {
+        for entry in self.read().iter() {
+            lock_history(&entry.link_history).fill_gaps(now_ms);
+        }
+    }
+
+    /// The history samples of the musician `key` names taken after `since_ms` (Unix milliseconds;
+    /// all of them with none), the oldest first. A phone whose row was removed is still found by
+    /// its client id while its history is kept. `None` when `key` names nobody.
+    pub(crate) fn link_history(
+        &self,
+        key: &MusicianKey,
+        since_ms: Option<u64>,
+    ) -> Option<Vec<LinkSample>> {
+        let history = self
+            .read()
+            .iter()
+            .find(|entry| names(key, entry))
+            .map(|entry| Arc::clone(&entry.link_history))
+            .or_else(|| match key {
+                MusicianKey::Client(id) => self
+                    .lock_departed()
+                    .iter()
+                    .find(|(kept, _)| kept == id)
+                    .map(|(_, history)| Arc::clone(history)),
+                MusicianKey::Address(_) => None,
+            })?;
+        let samples = lock_history(&history).samples_since(since_ms);
+        Some(samples)
+    }
+
+    /// Keeps the history of the phone `client_id` whose row is going, in place of one kept for it
+    /// before; the oldest kept goes once more than [KEPT_DEPARTED_HISTORIES] are.
+    fn keep_departed_history(&self, client_id: &str, history: SharedLinkHistory) {
+        let mut departed = self.lock_departed();
+        departed.retain(|(kept, _)| kept != client_id);
+        departed.push((client_id.to_owned(), history));
+        if departed.len() > KEPT_DEPARTED_HISTORIES {
+            departed.remove(0);
+        }
+    }
+
+    /// The history kept for the phone `client_id` when its row went, taken back; a new one for a
+    /// phone with no id or none kept.
+    fn take_departed_history(&self, client_id: Option<&str>) -> SharedLinkHistory {
+        let Some(id) = client_id else {
+            return LinkHistory::shared();
+        };
+        let mut departed = self.lock_departed();
+        match departed.iter().position(|(kept, _)| kept == id) {
+            Some(index) => departed.remove(index).1,
+            None => LinkHistory::shared(),
+        }
+    }
+
+    // Taken after the table's lock, never before it; nothing is left half changed under it.
+    fn lock_departed(&self) -> MutexGuard<'_, Vec<(String, SharedLinkHistory)>> {
+        self.departed_histories
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How many departed phones' link histories are kept for their return (see
+/// [TargetRegistry::link_history]).
+pub(crate) const KEPT_DEPARTED_HISTORIES: usize = 32;
+
+/// A history's lock. Every change to a history is whole under it, so a poisoned one is used as is.
+fn lock_history(history: &SharedLinkHistory) -> MutexGuard<'_, LinkHistory> {
+    history.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Resolves one target value to a socket address, naming the value in every error.
@@ -1911,6 +2086,180 @@ mod tests {
         assert_eq!(
             registered_name(&registry, ip("192.168.1.10")).as_deref(),
             Some("Eva")
+        );
+    }
+
+    /// Capabilities belong to the registration that announced them: a re-registration replaces
+    /// them (an older build that takes the row over announces none), and a configured target has
+    /// none to set.
+    /// One clean report from `peer` at `at_ms`, as the control connection records it.
+    fn report_link(registry: &TargetRegistry, peer: &str, at_ms: u64) {
+        let command = crate::protocol::parse_stats_command(
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":1,"underruns":0,"receive_timeouts":0}"#,
+        )
+        .expect("a stats report");
+        registry.record_link_report(ip(peer), &stored_report(Instant::now()), &command, at_ms);
+    }
+
+    fn history_times(registry: &TargetRegistry, key: &MusicianKey) -> Option<Vec<(u64, bool)>> {
+        registry.link_history(key, None).map(|samples| {
+            samples
+                .iter()
+                .map(|sample| (sample.at_ms, sample.reconnected))
+                .collect()
+        })
+    }
+
+    /// The history is the musician's: it is found by their key, follows their row to a new IP, and
+    /// a phone with a client id gets it back when it returns after its row was removed.
+    #[test]
+    fn a_link_history_follows_the_phone_by_its_client_id() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        let ana = MusicianKey::Client(PHONE_A.to_owned());
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry.begin_link_session(ip("192.168.1.10"));
+        report_link(&registry, "192.168.1.10", 1_000);
+        assert_eq!(history_times(&registry, &ana), Some(vec![(1_000, false)]));
+        assert_eq!(
+            history_times(
+                &registry,
+                &MusicianKey::Address(address("192.168.1.10:50000"))
+            ),
+            Some(vec![(1_000, false)]),
+            "by the address too"
+        );
+
+        // Back from a new IP: the row moves, with its history.
+        register_phone(&registry, "192.168.1.11", 50000, "Ana", Some(PHONE_A));
+        registry.begin_link_session(ip("192.168.1.11"));
+        report_link(&registry, "192.168.1.11", 2_000);
+        assert_eq!(
+            history_times(&registry, &ana),
+            Some(vec![(1_000, false), (2_000, true)])
+        );
+
+        // Gone past the grace period: the row goes, the history is still read by the client id
+        // and comes back with the phone.
+        let now = Instant::now();
+        registry.mark_disconnected(ip("192.168.1.11"), now);
+        registry.end_link_session(ip("192.168.1.11"));
+        assert_eq!(
+            registry
+                .sweep_expired(now + REGISTRATION_GRACE_PERIOD)
+                .len(),
+            1
+        );
+        assert_eq!(
+            history_times(&registry, &ana).map(|times| times.len()),
+            Some(2),
+            "kept for the phone's return"
+        );
+        register_phone(&registry, "192.168.1.12", 50000, "Ana", Some(PHONE_A));
+        registry.begin_link_session(ip("192.168.1.12"));
+        report_link(&registry, "192.168.1.12", 30_000);
+        assert_eq!(
+            history_times(&registry, &ana),
+            Some(vec![(1_000, false), (2_000, true), (30_000, true)])
+        );
+
+        assert_eq!(
+            registry.link_history(&MusicianKey::Client(PHONE_B.to_owned()), None),
+            None,
+            "a key that names nobody"
+        );
+    }
+
+    /// Another phone that takes a row over starts its own history; the one it replaced keeps
+    /// theirs. A phone with no client id keeps nothing once its row is gone.
+    #[test]
+    fn a_phone_that_takes_a_row_over_gets_its_own_history() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        report_link(&registry, "192.168.1.10", 1_000);
+
+        register_phone(&registry, "192.168.1.10", 50000, "Eva", Some(PHONE_B));
+        report_link(&registry, "192.168.1.10", 2_000);
+
+        assert_eq!(
+            history_times(&registry, &MusicianKey::Client(PHONE_B.to_owned())),
+            Some(vec![(2_000, false)])
+        );
+        assert_eq!(
+            history_times(&registry, &MusicianKey::Client(PHONE_A.to_owned())),
+            Some(vec![(1_000, false)]),
+            "Ana's is kept for her"
+        );
+
+        let rack = registry
+            .add("192.168.1.20:50000", &GroupLayout::default())
+            .expect("added");
+        report_link(&registry, "192.168.1.20", 3_000);
+        registry.remove(&rack.to_string()).expect("removed");
+        assert_eq!(
+            registry.link_history(&MusicianKey::Address(rack), None),
+            None,
+            "no client id: nothing to keep it by"
+        );
+    }
+
+    #[test]
+    fn at_most_the_newest_departed_histories_are_kept() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        let ids: Vec<String> = (0..=KEPT_DEPARTED_HISTORIES)
+            .map(|index| format!("phone-{index}"))
+            .collect();
+        for id in &ids {
+            register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(id));
+            report_link(&registry, "192.168.1.10", 1_000);
+            registry.remove("192.168.1.10:50000").expect("removed");
+        }
+
+        assert_eq!(
+            registry.link_history(&MusicianKey::Client(ids[0].clone()), None),
+            None,
+            "the oldest went"
+        );
+        assert!(registry
+            .link_history(&MusicianKey::Client(ids[1].clone()), None)
+            .is_some());
+        assert_eq!(registry.lock_departed().len(), KEPT_DEPARTED_HISTORIES);
+    }
+
+    #[test]
+    fn a_registration_keeps_the_capabilities_it_announced_until_the_next_one() {
+        let registry =
+            TargetRegistry::new(&[address("192.168.1.3:50000")], &GroupLayout::default())
+                .expect("registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry.set_capabilities(
+            ip("192.168.1.10"),
+            vec!["stats.v2".to_owned(), "playback.buffer".to_owned()],
+        );
+        let capabilities_at = |at: &str| {
+            registry
+                .read()
+                .iter()
+                .find(|entry| entry.address.ip() == ip(at))
+                .map(|entry| entry.origin.capabilities().to_vec())
+        };
+        assert_eq!(
+            capabilities_at("192.168.1.10"),
+            Some(vec!["stats.v2".to_owned(), "playback.buffer".to_owned()])
+        );
+
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", None);
+        assert_eq!(
+            capabilities_at("192.168.1.10"),
+            Some(Vec::new()),
+            "a registration that announces nothing has nothing"
+        );
+
+        registry.set_capabilities(ip("192.168.1.3"), vec!["stats.v2".to_owned()]);
+        registry.set_capabilities(ip("192.168.1.99"), vec!["stats.v2".to_owned()]);
+        assert_eq!(
+            capabilities_at("192.168.1.3"),
+            Some(Vec::new()),
+            "configured: none"
         );
     }
 

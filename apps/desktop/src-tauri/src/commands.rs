@@ -7,6 +7,7 @@
 //! [soundcheck].
 
 pub mod backups;
+pub mod link_history;
 pub mod local;
 pub mod recording;
 pub mod soundcheck;
@@ -2607,6 +2608,10 @@ mod tests {
                     underruns_per_second: None,
                     loss_percent: None,
                     receive_timeouts_per_second: None,
+                    capabilities: Vec::new(),
+                    rtt_ms: None,
+                    rtt_last_ms: None,
+                    link_latest: None,
                     mirror: None,
                 })
                 .collect(),
@@ -2645,6 +2650,7 @@ mod tests {
             mix: Default::default(),
             counters: Default::default(),
             link: Default::default(),
+            capabilities: Vec::new(),
             mirror: None,
         }
     }
@@ -6577,6 +6583,7 @@ mod tests {
             test,
             Some(StandInEngine {
                 here: Mutex::new(vec![MusicianStatus {
+                    capabilities: Vec::new(),
                     mirror: Some(personal_monitoring::MirrorStatus {
                         leader: MusicianKey::Address(RACK.parse().expect("an address")),
                         name: "Rack".to_owned(),

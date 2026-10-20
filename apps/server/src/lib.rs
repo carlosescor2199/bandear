@@ -5,6 +5,7 @@ mod decimate;
 mod discovery;
 mod engine;
 mod health;
+mod link_history;
 pub mod logging;
 mod mix;
 mod network;
@@ -24,8 +25,13 @@ pub use engine::{
     MusicianCounters, MusicianMeters, MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
 };
 pub use health::{LinkHealth, LinkStatus};
+pub use link_history::{LinkSample, RoundTrip, HISTORY_SAMPLES};
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
+pub use protocol::{
+    CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_RECOVERED, CAPABILITY_STATS_V2,
+    KNOWN_CAPABILITIES,
+};
 pub use recorder::{
     free_space, minutes_left, DiskEstimate, RecordRequest, RecordingState, RecordingStatus,
     TakeEnd, TakeMarker, TakeSummary, TakeTrack, TrackKind,

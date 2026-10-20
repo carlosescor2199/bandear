@@ -16,6 +16,7 @@ use crate::engine::{
     channel_flags, fit_channels, ChannelMeta, EngineEvent, EventBus, GroupStatus, MixOrigin,
 };
 use crate::health::LinkReport;
+use crate::link_history::{unix_millis_now, PingClock};
 use crate::mix::{GroupLayout, Membership, MixState};
 use crate::protocol::{
     control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
@@ -52,6 +53,10 @@ const CONTROL_DEAD_AFTER: Duration = Duration::from_secs(10);
 /// A phone that drops off Wi-Fi never closes its socket, so without this its half-open connection
 /// would stay counted as a live control peer forever. Closing it drops the connection's
 /// [PeerGuard], which is what starts the grace period and shows the musician as gone.
+///
+/// Each ping carries an 8-byte number, and the pong that brings it back measures the control
+/// channel's round trip for the musician's link history (see [crate::link_history]): a client only
+/// has to answer pings as WebSocket requires, echoing their payload.
 #[derive(Clone, Copy, Debug)]
 struct Heartbeat {
     ping_interval: Duration,
@@ -408,6 +413,9 @@ async fn run_control_server(
         }
         // The accept loop already ticks a few times a second, so it is also the clock that removes
         // registered targets whose control channel stayed gone past the grace period.
+        // And the clock that keeps a second with no link report as a gap in the musicians' link
+        // histories (see [crate::link_history]).
+        targets.fill_link_gaps(unix_millis_now());
         for address in targets.sweep_expired(Instant::now()) {
             crate::log_info!(
                 "control",
@@ -470,6 +478,7 @@ impl Drop for PeerGuard {
                 peers.remove(&ip);
                 drop(peers);
                 self.targets.mark_disconnected(ip, Instant::now());
+                self.targets.end_link_session(ip);
                 self.events.emit(EngineEvent::ClientDisconnected {
                     address: self.address,
                 });
@@ -646,6 +655,9 @@ async fn handle_control_connection(
         heartbeat.ping_interval,
     );
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Each ping carries a number, and the pong that brings it back measures the control channel's
+    // round trip for the musician's link history. Only the control channel: never the audio.
+    let mut ping_clock = PingClock::default();
     loop {
         // Safety net for a runtime that does not drive the watcher's timer while this task is parked
         // on a read: re-check the configuration before parking again, so the next client message
@@ -686,7 +698,8 @@ async fn handle_control_connection(
             }
             _ = ping_timer.tick() => {
                 // A ping that cannot be sent in time is as good as no answer.
-                match send_by(&writer, &config, Message::Ping(Default::default()), dead_at).await {
+                let payload = ping_clock.ping(Instant::now());
+                match send_by(&writer, &config, Message::Ping(payload.to_vec().into()), dead_at).await {
                     BoundedSend::Sent => continue,
                     BoundedSend::Failed => break,
                     BoundedSend::TimedOut => {
@@ -726,6 +739,9 @@ async fn handle_control_connection(
                                 &*config_state,
                             );
                             let address = registration.address;
+                            // What the phone supports belongs to this registration: an older build
+                            // announces nothing, which leaves nothing.
+                            targets.set_capabilities(peer.ip(), command.capabilities);
                             // The registration put the engineer's limit, locks and mirror for this
                             // musician in force (or took a previous occupant's away): announced as a
                             // change through the engine, so this phone is sent its mix with them
@@ -745,8 +761,11 @@ async fn handle_control_connection(
                             // session describes a link that is gone, and kept it would turn stale
                             // while this session is connected and read as a lost link. A rename on
                             // this same session re-registers too, and keeps the current report.
+                            // The link history is kept across sessions, its next sample marked as
+                            // a reconnect.
                             if !session_registered {
                                 targets.clear_link_report(peer.ip());
+                                targets.begin_link_session(peer.ip());
                                 session_registered = true;
                             }
                             let moved = registration
@@ -778,6 +797,12 @@ async fn handle_control_connection(
                             Ok(command) => {
                                 let report = LinkReport::from_command(&command, Instant::now());
                                 *latest.lock().expect("link report lock poisoned") = Some(report);
+                                targets.record_link_report(
+                                    peer.ip(),
+                                    &report,
+                                    &command,
+                                    unix_millis_now(),
+                                );
                                 None
                             }
                             Err(error) => Some(control_error(error)?),
@@ -831,6 +856,11 @@ async fn handle_control_connection(
                 }
             }
             Message::Close(_) => break,
+            Message::Pong(payload) => {
+                if let Some(round_trip) = ping_clock.pong(&payload, Instant::now()) {
+                    targets.record_round_trip(peer.ip(), round_trip);
+                }
+            }
             Message::Ping(payload) => {
                 if writer
                     .lock()
@@ -2621,6 +2651,105 @@ mod tests {
             status.underruns_per_second.is_some(),
             "a fresh report has rates"
         );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// A registration's capabilities are kept on the musician's row; one from an older phone (no
+    /// list) leaves none, and either way the registration is answered with nothing, as before.
+    #[tokio::test]
+    async fn a_registration_records_the_capabilities_the_phone_announced() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+        let capabilities = |targets: &TargetRegistry| {
+            targets
+                .read()
+                .iter()
+                .find(|entry| entry.address.ip() == target_ip)
+                .map(|entry| entry.origin.capabilities().to_vec())
+        };
+
+        let mut client = connect_client(address).await;
+        send_then_sync(
+            &mut client,
+            r#"{"type":"register","name":"Ana","udp_port":50123,"capabilities":["stats.v2","playback.buffer",3]}"#,
+        )
+        .await;
+        assert_eq!(
+            capabilities(&targets),
+            Some(vec!["stats.v2".to_owned(), "playback.buffer".to_owned()])
+        );
+
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        assert_eq!(
+            capabilities(&targets),
+            Some(Vec::new()),
+            "a registration that announces none has none"
+        );
+
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The heartbeat's pongs measure the control channel's round trip, and each report becomes a
+    /// sample of the musician's link history carrying it, with the phone's extras when it sends
+    /// them. A client answers pings on its own just by reading, as the phone's library does.
+    #[tokio::test]
+    async fn the_heartbeat_measures_the_round_trip_and_reports_fill_the_link_history() {
+        use crate::targets::MusicianKey;
+
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let peers = ControlPeers::default();
+        let (address, stopped, server) =
+            start_server(Arc::clone(&targets), Arc::clone(&peers), TEST_HEARTBEAT);
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+        let round_trip = || {
+            targets
+                .read()
+                .iter()
+                .find(|entry| entry.address.ip() == target_ip)
+                .and_then(|entry| {
+                    entry
+                        .link_history
+                        .lock()
+                        .expect("history lock")
+                        .round_trip()
+                        .last_ms
+                })
+        };
+
+        let mut client = connect_client(address).await;
+        send_then_sync(&mut client, REGISTER_ANA).await;
+        answer_pings_until(&mut client, Duration::from_secs(5), || {
+            round_trip().is_some()
+        })
+        .await;
+        let measured = round_trip().expect("a pong measured the round trip");
+        assert!(
+            (0.0..1_000.0).contains(&measured),
+            "a loopback round trip: {measured} ms"
+        );
+
+        send_then_sync(
+            &mut client,
+            r#"{"type":"stats","interval_ms":1000,"packets_received":200,"packets_lost":0,"underruns":0,"receive_timeouts":0,"jitter_ms":1.5,"cushion_ms":40}"#,
+        )
+        .await;
+        let samples = targets
+            .link_history(
+                &MusicianKey::Address("127.0.0.1:50123".parse().unwrap()),
+                None,
+            )
+            .expect("the musician has a history");
+        let sample = samples.last().expect("the report is a sample");
+        assert!(!sample.gap);
+        assert_eq!(sample.packets_received, Some(200));
+        assert!(sample.rtt_ms.is_some(), "with the round trip measured last");
+        assert_eq!(sample.jitter_ms, Some(1.5));
+        assert_eq!(sample.cushion_ms, Some(40.0));
+        assert_eq!(sample.backlog_ms, None, "not sent");
 
         stop_server(address, &stopped, server).await;
     }

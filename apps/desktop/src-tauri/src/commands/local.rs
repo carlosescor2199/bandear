@@ -22,8 +22,8 @@ pub(crate) mod saver;
 use std::sync::Mutex;
 
 use personal_monitoring::{
-    EngineHandle, LocalOutputRequest, LocalOutputState, LocalOutputStatus, MixUpdate, MixValues,
-    OutputDevice,
+    log_info, log_warn, EngineHandle, LocalOutputRequest, LocalOutputState, LocalOutputStatus,
+    MixUpdate, MixValues, OutputDevice,
 };
 
 use self::saver::LocalMixSaver;
@@ -184,8 +184,9 @@ pub fn set_local_output(
     output: Option<LocalOutputRequestDto>,
 ) -> Result<LocalOutputSetDto, String> {
     let outcome = choose_output(&state.engine, &state.session, &state.local_notice, output)?;
-    println!(
-        "[mixlink-desktop] set_local_output: {} applied={} saved={}",
+    log_info!(
+        "local",
+        "set_local_output: {} applied={} saved={}",
         outcome
             .output
             .as_ref()
@@ -313,7 +314,7 @@ fn apply_output<E: LocalEngine>(engine: &mut E, output: Option<&SessionOutput>) 
     if engine.local_output().output.is_some() {
         // Never another device in its place.
         if let Err(error) = engine.set_local_output(None) {
-            eprintln!("[mixlink-desktop] the local output could not be turned off: {error}");
+            log_warn!("local", "the local output could not be turned off: {error}");
         }
     }
     Some(format!(

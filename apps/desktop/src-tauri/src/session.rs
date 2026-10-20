@@ -162,6 +162,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use personal_monitoring::log_warn;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -579,7 +581,7 @@ impl SessionStore {
         let path = directory.join(SESSION_FILE);
         let loaded = load(&path, &directory.join(LEGACY_LABELS_FILE));
         if let Some(notice) = &loaded.notice {
-            eprintln!("[mixlink-desktop] {notice}");
+            log_warn!("session", "{notice}");
         }
         Self {
             path,

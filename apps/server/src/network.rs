@@ -116,13 +116,14 @@ impl Sink for NetworkSink {
                     self.stats.sent.fetch_add(1, Ordering::Relaxed);
                     destination.counters.sent.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(error) => {
+                // Counted, never printed: this is the engine thread, where a line to stderr or
+                // the log is I/O. The status reports the discarded packets per musician.
+                Err(_) => {
                     self.stats.discarded.fetch_add(1, Ordering::Relaxed);
                     destination
                         .counters
                         .discarded
                         .fetch_add(1, Ordering::Relaxed);
-                    eprintln!("UDP send error to {}: {error}", destination.address);
                 }
             }
         }

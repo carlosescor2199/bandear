@@ -47,6 +47,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use personal_monitoring::{log_error, log_warn};
+
 use personal_monitoring::{EngineEvent, MixValues};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -219,7 +221,7 @@ impl EventPump {
         self.running.store(false, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
-                eprintln!("[mixlink-desktop] the event pump panicked");
+                log_error!("events", "the event pump panicked");
             }
         }
     }
@@ -302,7 +304,7 @@ impl<R: Runtime> PumpSource for AppHandle<R> {
 impl<R: Runtime> PumpSink for AppHandle<R> {
     fn emit<P: Serialize + Clone>(&self, event: &str, payload: P) {
         if let Err(error) = Emitter::emit(self, event, payload) {
-            eprintln!("[mixlink-desktop] could not emit `{event}`: {error}");
+            log_warn!("events", "could not emit `{event}`: {error}");
         }
     }
 }

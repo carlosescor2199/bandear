@@ -2435,13 +2435,13 @@ impl EngineHandle {
 /// `None` is not an error: the CLI prints a friendly line and exits cleanly for a machine with no
 /// audio interface, and a UI can treat it the same way. Every other startup failure is an error.
 ///
-/// The narrative the CLI prints travels with the engine, so the command-line output is unchanged
-/// even though the binary no longer owns the wiring.
+/// The narrative (targets, devices, the selected input and its format) travels with the engine as
+/// `engine` log lines: on stderr for the CLI, in the desktop's log file for the app.
 pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error>> {
     let targets = resolve_targets(&config.targets)?;
-    println!("UDP targets:");
+    crate::log_info!("engine", "UDP targets:");
     for target in &targets {
-        println!("  {target}");
+        crate::log_info!("engine", "  {target}");
     }
     let host = input_host(config.host);
     let devices = host
@@ -2450,14 +2450,17 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         .collect::<Vec<_>>();
 
     if devices.is_empty() {
-        println!("No input device is available. Connect an audio interface and try again.");
+        crate::log_info!(
+            "engine",
+            "No input device is available. Connect an audio interface and try again."
+        );
         return Ok(None);
     }
 
-    println!("Available input devices:");
+    crate::log_info!("engine", "Available input devices:");
     for (index, device) in devices.iter().enumerate() {
         let name = device.to_string();
-        println!("  {}. {name}", index + 1);
+        crate::log_info!("engine", "  {}. {name}", index + 1);
     }
 
     let device = select_device(devices, config.device_filter.as_deref())?;
@@ -2465,8 +2468,9 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let supported_config = select_input_config(&device)?;
     let buffer_frames = config.buffer_frames.or(Some(DEFAULT_BUFFER_FRAMES));
 
-    println!("Selected input: {device_name}");
-    println!(
+    crate::log_info!("engine", "Selected input: {device_name}");
+    crate::log_info!(
+        "engine",
         "Capture format: channels={}, sample rate={} Hz, buffer={}, sample format={:?}",
         supported_config.channels(),
         supported_config.sample_rate(),
@@ -2474,7 +2478,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         supported_config.sample_format()
     );
     if supported_config.sample_rate() != TARGET_SAMPLE_RATE {
-        println!(
+        crate::log_info!(
+            "engine",
             "Input is {} Hz; low-pass filtering and decimating to {TARGET_SAMPLE_RATE} Hz before packaging.",
             supported_config.sample_rate()
         );

@@ -7,6 +7,7 @@
 pub mod commands;
 pub mod dto;
 pub mod events;
+pub mod logfile;
 pub mod session;
 pub mod sessions;
 
@@ -20,6 +21,8 @@ use dto::{
     SessionSavedDto, SoundcheckDto, StartRequest, StartSummary, TakeMarkerDto, TakesDto,
 };
 use events::EventPump;
+use logfile::LogLocation;
+use personal_monitoring::{log_info, log_warn};
 use session::{SessionAudio, SessionChannel, SessionPreset, SessionStore};
 use sessions::SnapshotSummary;
 use tauri::{Manager, State};
@@ -422,10 +425,33 @@ async fn stop_soundcheck(state: State<'_, DesktopState>) -> Result<SoundcheckDto
     commands::soundcheck::stop_soundcheck(state.inner())
 }
 
+/// Where the log is: `{ directory, file }`, the folder and the current `mixlink.log` (see
+/// [logfile]); an error when the app could not set its log file up and logs to stderr only.
+#[tauri::command]
+async fn log_location() -> Result<LogLocation, String> {
+    logfile::location().ok_or_else(|| "the log file is not set up: lines go to stderr".to_owned())
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // First, so every later line (the engine's too) reaches the log file: a release build
+            // has no console. Without a log folder the lines stay on stderr.
+            match app.path().app_log_dir() {
+                Ok(log_directory) => {
+                    let log_file = logfile::install(log_directory);
+                    log_info!(
+                        "app",
+                        "MixLink desktop {} on {} {}; log file \"{}\"",
+                        app.package_info().version,
+                        std::env::consts::OS,
+                        std::env::consts::ARCH,
+                        log_file.display()
+                    );
+                }
+                Err(error) => log_warn!("app", "no log folder ({error}); logging to stderr only"),
+            }
             // The session (musician labels, the engineer's channel details, groups and controls,
             // the audio input, and the local mix and its output) is a desktop-app concern and
             // lives in the app's config directory, so it survives a restart without touching the
@@ -441,7 +467,7 @@ pub fn run() {
                 &directory,
             );
             if let Some(notice) = &recordings.notice {
-                eprintln!("[mixlink-desktop] {notice}");
+                log_warn!("app", "{notice}");
             }
             // Every engine the window starts streams its meters, status and mix changes as events
             // (see [events]); the app handle is both where the pump reads and where it emits.
@@ -500,7 +526,8 @@ pub fn run() {
             resume_soundcheck,
             seek_soundcheck,
             set_soundcheck_loop,
-            stop_soundcheck
+            stop_soundcheck,
+            log_location
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")
@@ -512,10 +539,14 @@ pub fn run() {
 
 /// What the app does as it runs, given its state once managed: on exit, the local mix still
 /// waiting to be kept (it is kept off the engine lock, a few times a second at most) is written
-/// before the app goes.
+/// before the app goes, and then the log is flushed so its last lines stay.
 fn on_run_event(state: Option<&DesktopState>, event: &tauri::RunEvent) {
-    if let (tauri::RunEvent::Exit, Some(state)) = (event, state) {
-        commands::local::flush_local_mix(state);
+    if let tauri::RunEvent::Exit = event {
+        if let Some(state) = state {
+            commands::local::flush_local_mix(state);
+        }
+        log_info!("app", "exiting");
+        personal_monitoring::logging::flush();
     }
 }
 

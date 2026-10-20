@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
@@ -1071,11 +1071,96 @@ struct Voice {
 /// same `sample * gain * weight` order, the same channel order), on samples scaled by 2^-15. A
 /// power-of-two scale is exact in floating point, so for 16-bit capture every output is exactly
 /// the 16-bit mixer's divided by 32768, and the phones receive the same packets.
+///
+/// That holds for every block whose mix is the one of the block before. A block where something
+/// moved is mixed by [MixPlan::mix_ramped] instead, which glides from the previous block's weights
+/// to these across the block so that a fader move does not click: see [MixRamp].
 pub(crate) struct MixPlan {
     voices: [Voice; MAX_MIX_CHANNELS],
     count: usize,
     channels: usize,
     ceiling: f32,
+    /// Every source channel's weights in this mix, heard or not (a channel not heard has a gain
+    /// of 0), for [MixPlan::mix_ramped] to compare with the previous block's.
+    weights: [Weights; MAX_MIX_CHANNELS],
+    active: usize,
+}
+
+/// What one source channel is weighted with in a mix: its gain, 0 when it is not heard (muted,
+/// hidden, soloed out, at 0 or under the master mute), and its pan weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Weights {
+    gain: f32,
+    left: f32,
+    right: f32,
+}
+
+/// One channel of a block being ramped: its weights in the previous block and how far they move
+/// to this block's.
+#[derive(Clone, Copy, Default)]
+struct Moving {
+    channel: usize,
+    from: Weights,
+    step: Weights,
+}
+
+/// What one mix weighted its channels with in the previous block, so that the next block can
+/// glide from there: one per mix that is mixed every block (each musician's, the local output's
+/// and the recorder's local mix each have their own, since each is mixed on its own).
+///
+/// When a channel's gain or pan, the master volume, a mute, a solo or a hidden channel changed
+/// since the previous block, [MixPlan::mix_ramped] moves each changed channel's weights linearly
+/// across the block, from the previous block's at the start to the new ones at its last frame
+/// (frame `i` of `n` is at `(i + 1) / n` of the way). A channel that falls silent fades to 0 on its
+/// last pan; one that comes in fades up from 0 on its new pan. When nothing changed, the block is
+/// mixed by [MixPlan::mix_into], bit for bit as without ramps, so the golden contract with the
+/// 16-bit mixer holds for every steady block and only a block where a gain moved differs, on
+/// purpose. The ceiling clamp is never ramped: it applies to every frame as before.
+///
+/// Before the first block, and when the source's channel count changes, there is nothing to glide
+/// from: that block is mixed as it is, unramped.
+///
+/// Only the engine thread uses it once it is made; its atomics are never contended. They let a
+/// target entry share it with that thread without a lock, as [crate::redundancy::HeldCopies] is
+/// shared. Made off the engine thread, sized for [MAX_MIX_CHANNELS]; mixing never allocates.
+pub(crate) struct MixRamp {
+    /// The channel count of the previous block's source; 0 before the first block.
+    channels: AtomicUsize,
+    /// Each channel's gain, left and right weights in the previous block, as `f32` bits.
+    weights: [[AtomicU32; 3]; MAX_MIX_CHANNELS],
+}
+
+impl Default for MixRamp {
+    fn default() -> Self {
+        Self {
+            channels: AtomicUsize::new(0),
+            weights: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
+        }
+    }
+}
+
+impl MixRamp {
+    /// Forgets the previous block: the next one is mixed unramped, as a first block is.
+    pub(crate) fn reset(&self) {
+        self.channels.store(0, Ordering::Relaxed);
+    }
+
+    fn load(&self, channel: usize) -> Weights {
+        let [gain, left, right] = &self.weights[channel];
+        let read = |value: &AtomicU32| f32::from_bits(value.load(Ordering::Relaxed));
+        Weights {
+            gain: read(gain),
+            left: read(left),
+            right: read(right),
+        }
+    }
+
+    fn store(&self, channel: usize, weights: Weights) {
+        let [gain, left, right] = &self.weights[channel];
+        gain.store(weights.gain.to_bits(), Ordering::Relaxed);
+        left.store(weights.left.to_bits(), Ordering::Relaxed);
+        right.store(weights.right.to_bits(), Ordering::Relaxed);
+    }
 }
 
 impl MixPlan {
@@ -1091,9 +1176,17 @@ impl MixPlan {
             count: 0,
             channels: channels.max(1),
             ceiling,
+            weights: [Weights::default(); MAX_MIX_CHANNELS],
+            active,
         };
 
         for channel in 0..active {
+            let (left, right) = pan_gains(values.pans[channel]);
+            plan.weights[channel] = Weights {
+                gain: 0.0,
+                left,
+                right,
+            };
             if !audible(channel) || values.channel_muted[channel] {
                 continue;
             }
@@ -1111,7 +1204,7 @@ impl MixPlan {
             if gain == 0.0 || values.muted {
                 continue;
             }
-            let (left, right) = pan_gains(values.pans[channel]);
+            plan.weights[channel].gain = gain;
             plan.voices[plan.count] = Voice {
                 channel,
                 gain,
@@ -1142,6 +1235,70 @@ impl MixPlan {
             output[0] = left.clamp(-self.ceiling, self.ceiling);
             output[1] = right.clamp(-self.ceiling, self.ceiling);
             frames += 1;
+        }
+        frames
+    }
+
+    /// Mixes like [Self::mix_into], gliding from the weights `ramp` kept of the previous block to
+    /// this plan's wherever they differ (see [MixRamp]), and keeps this plan's in `ramp` for the
+    /// next block. Allocation-free.
+    pub(crate) fn mix_ramped(&self, ramp: &MixRamp, source: &[f32], stereo: &mut [f32]) -> usize {
+        let continued = ramp.channels.swap(self.channels, Ordering::Relaxed) == self.channels;
+        let mut moving = [Moving::default(); MAX_MIX_CHANNELS];
+        let mut count = 0;
+        let mut changed = false;
+        for channel in 0..self.active {
+            let mut to = self.weights[channel];
+            let mut from = if continued { ramp.load(channel) } else { to };
+            ramp.store(channel, to);
+            if from.gain == 0.0 && to.gain == 0.0 {
+                continue;
+            }
+            // Only the level of a channel coming in or going out moves: it comes in on its new
+            // pan and goes out on its last one.
+            if from.gain == 0.0 {
+                (from.left, from.right) = (to.left, to.right);
+            }
+            if to.gain == 0.0 {
+                (to.left, to.right) = (from.left, from.right);
+            }
+            changed |= from != to;
+            moving[count] = Moving {
+                channel,
+                from,
+                step: Weights {
+                    gain: to.gain - from.gain,
+                    left: to.left - from.left,
+                    right: to.right - from.right,
+                },
+            };
+            count += 1;
+        }
+        if !changed {
+            // The same voices with the same weights: the steady mix, bit for bit.
+            return self.mix_into(source, stereo);
+        }
+
+        let moving = &moving[..count];
+        let frames =
+            (source.len() / self.channels).min(stereo.len() / usize::from(OUTPUT_CHANNELS));
+        for (index, (frame, output)) in source
+            .chunks_exact(self.channels)
+            .zip(stereo.chunks_exact_mut(usize::from(OUTPUT_CHANNELS)))
+            .enumerate()
+        {
+            // At the last frame the way is covered: the block ends on the new weights.
+            let way = (index + 1) as f32 / frames as f32;
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+            for voice in moving {
+                let sample = frame[voice.channel];
+                let gain = voice.from.gain + voice.step.gain * way;
+                left += sample * gain * (voice.from.left + voice.step.left * way);
+                right += sample * gain * (voice.from.right + voice.step.right * way);
+            }
+            output[0] = left.clamp(-self.ceiling, self.ceiling);
+            output[1] = right.clamp(-self.ceiling, self.ceiling);
         }
         frames
     }
@@ -1317,6 +1474,225 @@ mod tests {
         assert_eq!(frames, 1);
         assert_eq!(stereo[0], step);
         assert!(stereo[1].abs() < step);
+    }
+
+    /// One block of `source` (`channels` inputs) mixed with `values` after the blocks `ramp` saw.
+    fn ramped(ramp: &MixRamp, values: &MixValues, source: &[f32], channels: usize) -> Vec<f32> {
+        let mut stereo = vec![0.0; source.len() / channels * usize::from(OUTPUT_CHANNELS)];
+        MixPlan::new(values, channels).mix_ramped(ramp, source, &mut stereo);
+        stereo
+    }
+
+    /// The same block mixed with no ramp, as every steady block must be.
+    fn unramped(values: &MixValues, source: &[f32], channels: usize) -> Vec<f32> {
+        let mut stereo = vec![0.0; source.len() / channels * usize::from(OUTPUT_CHANNELS)];
+        MixPlan::new(values, channels).mix_into(source, &mut stereo);
+        stereo
+    }
+
+    fn side(stereo: &[f32], index: usize) -> Vec<f32> {
+        stereo.iter().skip(index).step_by(2).copied().collect()
+    }
+
+    fn falls(samples: &[f32]) -> bool {
+        samples.windows(2).all(|pair| pair[1] < pair[0])
+    }
+
+    fn rises(samples: &[f32]) -> bool {
+        samples.windows(2).all(|pair| pair[1] > pair[0])
+    }
+
+    /// Two inputs at 0.5, the first hard left and the second hard right (the default pans).
+    fn two_inputs(frames: usize) -> Vec<f32> {
+        vec![0.5; frames * 2]
+    }
+
+    /// A fader pulled from 100 to 50 between two blocks glides across the next one: its first
+    /// frame is a 64th of the way from the old gain, its last at the new gain, falling steadily.
+    /// The channel nobody touched is mixed exactly as without a ramp, and the block after is
+    /// steady again, bit for bit the unramped mix.
+    #[test]
+    fn a_fader_move_glides_across_the_next_block_then_holds() {
+        let ramp = MixRamp::default();
+        let source = two_inputs(64);
+        let mut values = MixValues::default();
+        assert_eq!(
+            ramped(&ramp, &values, &source, 2),
+            unramped(&values, &source, 2),
+            "the first block has nothing to glide from"
+        );
+
+        values.channel_gains[0] = 50;
+        let moved = ramped(&ramp, &values, &source, 2);
+
+        let left = side(&moved, 0);
+        assert!(
+            (left[0] - 0.5 * (1.0 - 0.5 / 64.0)).abs() < 1e-6,
+            "{}",
+            left[0]
+        );
+        assert!((left[63] - 0.25).abs() < 1e-6, "{}", left[63]);
+        assert!(falls(&left), "{left:?}");
+        assert_eq!(side(&moved, 1), side(&unramped(&values, &source, 2), 1));
+        assert_eq!(
+            ramped(&ramp, &values, &source, 2),
+            unramped(&values, &source, 2)
+        );
+    }
+
+    /// A mute fades the channel out over one block, ending silent, and stays silent; unmuted, it
+    /// fades back in from silence.
+    #[test]
+    fn a_mute_fades_out_and_back_in_instead_of_clicking() {
+        let ramp = MixRamp::default();
+        let source = two_inputs(32);
+        let mut values = MixValues::default();
+        ramped(&ramp, &values, &source, 2);
+
+        values.channel_muted[0] = true;
+        let out = side(&ramped(&ramp, &values, &source, 2), 0);
+        assert!(
+            out[0] > 0.45 && out[31].abs() < 1e-6 && falls(&out),
+            "{out:?}"
+        );
+        let silent = ramped(&ramp, &values, &source, 2);
+        assert_eq!(silent, unramped(&values, &source, 2));
+        assert!(side(&silent, 0).iter().all(|sample| sample.abs() < 1e-6));
+
+        values.channel_muted[0] = false;
+        let back = side(&ramped(&ramp, &values, &source, 2), 0);
+        assert!(
+            back[0] < 0.05 && (back[31] - 0.5).abs() < 1e-6 && rises(&back),
+            "{back:?}"
+        );
+    }
+
+    /// Soloing another channel, hiding this one, the master volume and the master mute all take
+    /// the channel out over a block, as a mute does.
+    #[test]
+    fn a_solo_a_hidden_channel_and_the_master_glide_too() {
+        let changes: [fn(&mut MixValues); 4] = [
+            |values| values.channel_solo[1] = true,
+            |values| values.hidden_channels = 1,
+            |values| values.volume_percent = 0,
+            |values| values.muted = true,
+        ];
+        for (index, change) in changes.iter().enumerate() {
+            let ramp = MixRamp::default();
+            let source = two_inputs(32);
+            let mut values = MixValues::default();
+            ramped(&ramp, &values, &source, 2);
+
+            change(&mut values);
+            let out = side(&ramped(&ramp, &values, &source, 2), 0);
+
+            assert!(
+                out[0] > 0.45 && out[31].abs() < 1e-6 && falls(&out),
+                "change {index}: {out:?}"
+            );
+        }
+    }
+
+    /// A pan move glides from one side to the other: the left falls as the right rises.
+    #[test]
+    fn a_pan_move_glides_between_the_sides() {
+        let ramp = MixRamp::default();
+        let source = vec![0.5, 0.0].repeat(48);
+        let mut values = MixValues::default();
+        ramped(&ramp, &values, &source, 2);
+
+        values.pans[0] = 100;
+        let moved = ramped(&ramp, &values, &source, 2);
+
+        let (left, right) = (side(&moved, 0), side(&moved, 1));
+        assert!(
+            left[0] > 0.48 && left[47].abs() < 1e-6 && falls(&left),
+            "{left:?}"
+        );
+        assert!(right[0] < 0.02 && (right[47] - 0.5).abs() < 1e-6 && rises(&right));
+        assert_eq!(
+            ramped(&ramp, &values, &source, 2),
+            unramped(&values, &source, 2)
+        );
+    }
+
+    /// The golden contract holds for every steady block: thousands of drawn mixes, each mixed
+    /// over three blocks of drawn input, give exactly the unramped mixer's output (which is the
+    /// 16-bit mixer's, see above) on every block once the mix stops moving; a mix that moved is
+    /// exact again from the block after.
+    #[test]
+    fn a_steady_mix_is_the_unramped_mix_bit_for_bit() {
+        let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
+        for case in 0..1_000 {
+            let channels = 1 + noise.below(34) as usize;
+            let frames = 1 + noise.below(32) as usize;
+            let ramp = MixRamp::default();
+            let draw = |noise: &mut Noise| -> Vec<f32> {
+                (0..channels * frames)
+                    .map(|_| f32::from(noise.sample()) / 32_768.0)
+                    .collect()
+            };
+            let values = noise.mix();
+            for block in 0..3 {
+                let input = draw(&mut noise);
+                assert_eq!(
+                    ramped(&ramp, &values, &input, channels),
+                    unramped(&values, &input, channels),
+                    "case {case}, block {block}"
+                );
+            }
+            let moved = noise.mix();
+            ramped(&ramp, &moved, &draw(&mut noise), channels);
+            let input = draw(&mut noise);
+            assert_eq!(
+                ramped(&ramp, &moved, &input, channels),
+                unramped(&moved, &input, channels),
+                "case {case}, after the move"
+            );
+        }
+    }
+
+    /// With another channel count there is nothing to glide from, and after a reset neither:
+    /// those blocks are mixed as they are.
+    #[test]
+    fn a_new_layout_or_a_reset_starts_unramped() {
+        let ramp = MixRamp::default();
+        let mut values = MixValues::default();
+        ramped(&ramp, &values, &two_inputs(16), 2);
+
+        values.channel_gains[0] = 40;
+        let four = vec![0.5; 4 * 16];
+        assert_eq!(
+            ramped(&ramp, &values, &four, 4),
+            unramped(&values, &four, 4)
+        );
+
+        ramp.reset();
+        values.channel_gains[0] = 90;
+        assert_eq!(
+            ramped(&ramp, &values, &four, 4),
+            unramped(&values, &four, 4)
+        );
+    }
+
+    /// Ramping every block, on 32 inputs, allocates and frees nothing.
+    #[test]
+    fn ramping_never_allocates() {
+        let ramp = MixRamp::default();
+        let source = vec![0.25f32; 256 * 32];
+        let mut stereo = vec![0.0f32; 256 * 2];
+        let mut values = MixValues::default();
+
+        let (allocations, frees) = crate::pipeline::tests::allocations::count(|| {
+            for block in 0..300 {
+                values.channel_gains[block % 32] = (block % 101) as u8;
+                values.pans[(block + 7) % 32] = (block * 3 % 101) as u8;
+                values.channel_muted[(block + 3) % 32] = block % 2 == 0;
+                MixPlan::new(&values, 32).mix_ramped(&ramp, &source, &mut stereo);
+            }
+        });
+
+        assert_eq!((allocations, frees), (0, 0));
     }
     use crate::targets::TargetRegistry;
     use std::net::IpAddr;

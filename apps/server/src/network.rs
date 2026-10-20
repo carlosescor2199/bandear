@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::engine::OutputMeter;
-use crate::mix::{MixPlan, MixState, OUTPUT_CHANNELS};
+use crate::mix::{MixPlan, MixRamp, MixState, OUTPUT_CHANNELS};
 use crate::pipeline::{Block, Sink, SourceFormat};
 use crate::protocol::{encode_audio_packet, HEADER_SIZE};
 use crate::redundancy::HeldCopies;
@@ -87,6 +87,7 @@ struct Destination {
     counters: Arc<TargetCounters>,
     meter: OutputMeter,
     held: Option<Arc<HeldCopies>>,
+    ramp: Arc<MixRamp>,
 }
 
 /// The phones' sink: every block is mixed for each musician and sent to their phone over UDP.
@@ -99,7 +100,9 @@ struct Destination {
 /// Per block, the table's read guard is held only to copy the destinations into a reused list;
 /// the mixing and the UDP sends run after it is released, so a slow send never holds up the engine
 /// adding or removing a musician. Each mix is worked out once per block ([MixPlan]), mixed in float
-/// into a reused stereo buffer and converted to 16 bits only as the packet is written into a reused
+/// (gliding from the musician's previous block where their mix moved, see [MixRamp], with the
+/// state each target entry keeps) into a reused stereo buffer and converted to 16 bits only as the
+/// packet is written into a reused
 /// byte buffer: after the first block of a source, nothing here allocates.
 pub(crate) struct NetworkSink {
     socket: UdpSocket,
@@ -144,6 +147,7 @@ impl Sink for NetworkSink {
                 counters: Arc::clone(&entry.counters),
                 meter: entry.output_meter.clone(),
                 held: entry.held.clone(),
+                ramp: Arc::clone(&entry.ramp),
             });
         }
         // The table's guard is released: everything below works on the copies.
@@ -153,7 +157,7 @@ impl Sink for NetworkSink {
             .resize(frames * usize::from(OUTPUT_CHANNELS), 0.0);
         for destination in &self.destinations {
             let plan = MixPlan::new(&destination.mix.snapshot(), block.channels);
-            plan.mix_into(block.samples, &mut self.stereo);
+            plan.mix_ramped(&destination.ramp, block.samples, &mut self.stereo);
             // Two atomic updates on the buffer just mixed: no allocation, lock or clock.
             destination.meter.observe(&self.stereo);
             encode_audio_packet(
@@ -505,8 +509,10 @@ mod tests {
     }
 
     /// The phones are sent what they were sent before the float path, byte for byte: for 16-bit
-    /// capture, each packet equals the previous 16-bit mixer's output serialized the previous way,
-    /// header and sequence included, across hundreds of drawn mixes and inputs.
+    /// capture, each packet of a steady mix equals the previous 16-bit mixer's output serialized
+    /// the previous way, header and sequence included, across hundreds of drawn mixes and inputs.
+    /// Each drawn mix is first sent for one block, where it glides from the mix before (see
+    /// [MixRamp]) and differs on purpose, then compared on the next, where it holds.
     #[test]
     fn phones_receive_the_same_packets_as_from_the_16_bit_mixer() {
         use crate::mix::golden::{legacy_mix_channels, Noise};
@@ -519,7 +525,7 @@ mod tests {
         let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
         let mut largest_difference = 0;
 
-        for sequence in 0..400u64 {
+        for sequence in (1..800u64).step_by(2) {
             let channels = [1, 2, 3, 4, 8, 32, 33][noise.below(7) as usize];
             let frames = 1 + noise.below(64) as usize;
             let values = noise.mix();
@@ -528,6 +534,15 @@ mod tests {
                 hidden: values.hidden_channels,
                 linked: 0,
             });
+            let gliding: Vec<f32> = (0..channels * frames)
+                .map(|_| noise.sample().to_f32())
+                .collect();
+            sink.process(&Block {
+                samples: &gliding,
+                channels,
+                sequence: sequence - 1,
+            });
+            datagram(&phone);
             let input: Vec<i16> = (0..channels * frames).map(|_| noise.sample()).collect();
             let block: Vec<f32> = input.iter().map(|sample| sample.to_f32()).collect();
 
@@ -565,6 +580,40 @@ mod tests {
             );
             assert_eq!(received, expected, "packet {sequence} differs");
         }
+    }
+
+    /// A fader the musician pulls down between two blocks reaches their phone as a glide over the
+    /// next block, never as a step, and then holds.
+    #[test]
+    fn a_fader_move_reaches_the_phone_as_a_glide() {
+        let phone = bind("127.0.0.1:0");
+        let targets = registry(&[phone.local_addr().expect("phone address")]);
+        let mix = Arc::clone(&targets.read()[0].mix_state);
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+        let block = vec![0.5f32; 2 * 64];
+        let mut send = |sequence: u64| {
+            sink.process(&Block {
+                samples: &block,
+                channels: 2,
+                sequence,
+            });
+            let packet = datagram(&phone);
+            packet[HEADER_SIZE..]
+                .chunks_exact(4)
+                .map(|frame| i16::from_le_bytes([frame[0], frame[1]]))
+                .collect::<Vec<i16>>()
+        };
+        assert!(send(0).iter().all(|left| *left == 16_384));
+
+        let mut values = mix.snapshot();
+        values.channel_gains[0] = 50;
+        mix.update(values);
+        let glide = send(1);
+        let steady = send(2);
+
+        assert!(glide[0] > 16_000 && glide[63] == 8_192, "{glide:?}");
+        assert!(glide.windows(2).all(|pair| pair[1] < pair[0]), "{glide:?}");
+        assert!(steady.iter().all(|left| *left == 8_192), "{steady:?}");
     }
 
     /// The send happens after the target table's guard is released, so the engine can add or remove

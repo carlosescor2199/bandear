@@ -50,6 +50,20 @@ of v1; this phase brings it in and updates the PRD.
   not path latency. Documented and re-measured live at the end.
 - **Gain smoothing**: a per-block linear ramp when a gain changes; steady state stays
   bit-identical, so the golden contract only changes for blocks where a gain moved, on purpose.
+  Rule (`MixRamp`, `mix.rs`): each mix keeps last block's per-channel weights (gain, 0 when not
+  heard, and the pan weights); a channel whose weights differ moves linearly to the new ones,
+  frame `i` of `n` at `(i + 1) / n` of the way, so the block ends on the new values; a channel
+  going silent keeps its last pan, one coming in takes its new pan. Nothing changed: the block is
+  mixed by `mix_into`, bit for bit. First block and a channel-count change: unramped. The ceiling
+  clamp is not ramped. Each musician's state lives on their target entry; the local output and the
+  recorder's local mix have their own (the recorder's resets per take).
+- **Engine load**: each block timed on the engine thread with `Instant` from the pop (or the
+  demo's or take's fill) to the return of the last sink, as a percentage of the block's period;
+  published by atomics as `EngineStatus.load` (`EngineLoadStatus { percent, average_percent,
+  peak_percent, late_blocks }`; desktop DTO `load { percent, averagePercent, peakPercent,
+  lateBlocks }`): last block, an exponential average with a one-second audio-time constant, the
+  peak of the last two to four seconds (max of the current and previous 2 s windows), and blocks
+  over 100%. The desk shows "Engine load 8% (peak 15%)" (average and peak), warning above 70%.
 
 ## Constraints
 
@@ -79,10 +93,34 @@ test.
 
 ## Tasks
 
-- [ ] T1 (load): engine load measurement in the status, release benchmark example. Route:
-  delegated writer.
-- [ ] T2 (smoothing): gain ramp in MixPlan with the golden contract adjusted for moving gains.
-  Route: delegated writer.
+- [x] T1 (load): engine load measurement in the status, release benchmark example. Route:
+  delegated writer (trigger: 2+ non-trivial files across the server, the desktop DTO and the UI).
+  Commits d7ffef8 `feat(engine): measure how long each block takes` (+655/-8) and 0b27bf3
+  `feat(desktop-ui): show the engine's load` (+66). RED: the six `load::tests` meter tests
+  (injected durations) and `pipeline::tests::the_engine_thread_times_every_block_and_counts_the_late_ones`
+  failed against a stubbed `LoadMeter::block` (5 of 6 meter tests and the pipeline test, all
+  reading zeros), then passed. The UI view tests were written with the view, not observed red.
+  No allocation with the measurement on: the existing engine-thread no-allocation tests
+  (capture, demo, network, recorder) pass with it. Benchmark `engine_load` (32 inputs, 16
+  musicians, 256-frame blocks, 10 s paced, loopback phones), debug build only, pessimistic:
+  1876 blocks, mean 1973 µs (37.0% of 5333 µs), p99 3125 µs (58.6%), max 3956 µs (74.2%); the
+  engine's own meter: average 36.9%, peak 74.1%, 0 late blocks; 30016 packets sent, 0 discarded.
+  The release run is pending the user's approval.
+- [x] T2 (smoothing): gain ramp in MixPlan with the golden contract adjusted for moving gains.
+  Route: delegated writer (trigger: mixer, three sinks and the target table). Commit: this commit.
+  RED: `a_fader_move_glides_across_the_next_block_then_holds`, `a_mute_fades_out_and_back_in_instead_of_clicking`,
+  `a_solo_a_hidden_channel_and_the_master_glide_too` and `a_pan_move_glides_between_the_sides`
+  failed against a `mix_ramped` that did not ramp, then passed; once the sinks ramped,
+  `network::tests::phones_receive_the_same_packets_as_from_the_16_bit_mixer` failed (it moved the
+  mix every block) and now compares each drawn mix on its second, steady block, after a gliding
+  one. The steady golden (`a_steady_mix_is_the_unramped_mix_bit_for_bit`, 1000 drawn mixes over
+  three blocks and after a move), the reset and layout test, `ramping_never_allocates` and
+  `a_fader_move_reaches_the_phone_as_a_glide` pass; the 3000-mix float/16-bit golden is unchanged.
+- Verification after T1 and T2: `cargo test -p personal-monitoring` 533 passed;
+  `cargo test -p mixlink-desktop` 307 passed; `cargo check -p mixlink-desktop --all-targets`
+  clean; UI `node --test apps/desktop/ui/tests` 542 passed. Builds ran with `CARGO_BUILD_JOBS=2`;
+  the F: drive filled up (25 MB free), so `target/debug/incremental` (a regenerable cache, not a
+  `cargo clean`) was removed and later builds used `CARGO_INCREMENTAL=0`.
 - [ ] T3 (dsp module): biquad EQ and HPF, gate, compressor, limiter; allocation-free, exact bypass,
   tests. Route: delegated writer.
 - [ ] T4 (per-input stage): the stage in `Pipeline`, engine API, command ring, raw block to the
@@ -109,4 +147,4 @@ per reviewed slice, only with the user's approval.
 
 ## Next step
 
-T1 (load measurement).
+T3 (dsp module). Before it: the user's approval for a release run of `engine_load`.

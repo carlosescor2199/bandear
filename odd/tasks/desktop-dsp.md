@@ -310,8 +310,61 @@ test.
     registry entry included, can still be picked).
   - Not exercised on real hardware yet: needs a live test with the Volt under ASIO, with the user's
     go-ahead.
-- [ ] T5 (desk): session, commands and strip presets for channel processing. Route: delegated
-  writer.
+- [x] T5 (desk): session, commands and strip presets for channel processing. Route: delegated
+  writer (trigger: session, sessions, a new command module, the saver, lib.rs and the console's
+  store, actions and fake bridge). Commits dac564b `feat(desktop): keep each channel's processing
+  in the session` (+1553/-72), ae49ddc `feat(desktop): strip presets and the equaliser's response`
+  (+662/-9) and this commit `feat(desktop-ui): channel processing in the console`.
+  - Session (`session.rs`): `processing` is each input's strip (`StripSettings`, camelCase) by its
+    1-based channel number as a string key (`{"1": {...}}`), only strips that do something; absent
+    while every strip is neutral; read on its own like every other section (one that cannot be read
+    is set aside in `session.json.processing-damaged-<ms>`); a strip may leave out any field. Version
+    unchanged (added within version 1). `stripPresets` (`[{ name, settings }]`) is the desk's own,
+    like `recording`: a named session never carries it and `SessionStore::replace` keeps the desk's.
+  - Named sessions carry the processing (it is part of a show): a save takes the engine's strips
+    (`DeskView.processing`) when one runs, else the session's; a load replaces every strip through
+    `replace_processing` right after the channel layout (engine lock first, session inside), and a
+    show saved without processing loads with every strip neutral. A start hands the new engine the
+    session's processing (a change not written yet included) after `hand_session_layout`.
+  - Saving: a change is marked on a `ProcessingSaver` and written off the engine lock at most every
+    400 ms (`local::saver::Saver<T: Kept>`, now generic; the local mix saver is `Saver<SessionMix>`).
+    Stop and quit flush it; a start reads it paused; a load pauses it and drops the change waiting.
+  - Commands (`commands/processing.rs`, channels 1-based): `processing` (all 32 `{ channel,
+    settings, active }`), `channel_processing(channel)`, `set_channel_processing(channel, settings)`,
+    `reset_channel_processing(channel)`, `copy_channel_processing(from, to[])`, `strip_presets`,
+    `save_strip_preset(name, settings)`, `delete_strip_preset(name)`, `apply_strip_preset(name,
+    channel)` and `eq_response(settings: EqSettings, points?)` (`[{ freqHz, db }]`, 128 points by
+    default, held to 2-1,024, log grid 20 Hz-20 kHz, `EqSettings::magnitude_db` on the command's
+    thread). Changes answer `{ outcome: set | invalid | notFound, channels, message }`, `channels`
+    every strip that changed (a linked pair's other side included); presets `{ outcome: saved |
+    replaced | deleted | invalid | factory | notFound, preset, presets, message }`. Changes need a
+    running engine (an error otherwise); reads fall back to the session. Stand-in trait
+    `ProcessingEngine`.
+  - Presets: built-in "Vocal", "Kick", "Bass DI", "Acoustic guitar", "Gentle compression"
+    (clean-room values of our own, all in range and not neutral), listed first, never written, never
+    deleted. Decision: a user preset can never take a built-in name (any case; `invalid`), so a
+    built-in name always means the built-in strip; saving under one of the engineer's own names
+    replaces it in place (`replaced`). Names 1-40 characters, trimmed, matched in any case.
+  - Console (`ui/app/lib`): `processing.js` (defaults, ranges and `clampStrip`, `isNeutralStrip`,
+    `eqMagnitudeDb`/`eqResponseOf` with the same RBJ biquads, `formatProcessingSet`,
+    `formatStripPresetsSet`); store slices `processing`, `processingPending`, `processingError`,
+    `stripPresets`, `eqCurves` and the selector `channelStrip(state, channel)`; console actions
+    `loadProcessing`, `editProcessing(channel, settings)` (a per-channel coalescer, the latest edit
+    always sent, resolves `{ ok, message }`), `resetChannelProcessing`, `copyChannelProcessing`,
+    `applyStripPreset` (in turn with desk edits and loads), `loadStripPresets`, `saveStripPreset`,
+    `deleteStripPreset`, `loadEqResponse(channel, eq, points)`; a load drops the strip edits waiting
+    and reads the strips again. The fake bridge mirrors every command (pairs from its channel
+    table, the built-in presets as `factoryStripPresets()`, the processing in its saved sessions)
+    and its meters carry `processed`, `gateReductionDb` and `compressorReductionDb`.
+  - RED: against stubs (the store's processing and preset methods doing nothing, `read_session` not
+    taking the sections, `replace` not keeping the presets, `session_processing` empty,
+    `processing_list` neutral, `eq_response` at 0 dB) 16 of the 18 new Rust tests failed (the
+    out-of-range channel and built-in preset data tests passed), then all passed. UI: against stubs
+    (`eqMagnitudeDb` at 0, the fake's pairs ignored, the console never sending a strip edit) 3 of the
+    11 new tests failed, then passed; the other UI tests were written with the code.
+  - Counts: `cargo test -p mixlink-desktop` 325 passed (307 before); `cargo check -p
+    mixlink-desktop --all-targets` clean; UI `node --test apps/desktop/ui/tests` 553 passed (542
+    before). Server untouched. Commit: this commit.
 - [ ] T6 (editor): the channel processing editor (EQ curve, dynamics, meters), opened from the
   Channels screen and the strip. Route: delegated writer.
 - [ ] T7 (master limiter): per mix, engine, desk and master strip. Route: delegated writer.
@@ -345,8 +398,22 @@ per reviewed slice, only with the user's approval.
   the two unmerged ASIO branches (see the task). Not reviewed yet; next review base stays 06bdde6.
 - Disk: the F: drive is nearly full (2.4 GB free before T3, 1.4 GB after; each test build of the
   server takes a few hundred MB). Keep builds to debug, one at a time, and stop on "no space".
+- Review review-1e6e24e2a5907a8b (06bdde6..814e164, T3-fix + T4): correction_required, corrected
+  in 89eccbb (a stale strip layout; the claimed panic was not real, `channel_frames` already
+  guards), validated and acknowledged.
+- Release benchmark (user-approved once): `engine_load --strips` with 32 strips and 16 musicians,
+  17.6% mean / 25.9% p99 / 47.2% max of the block period, 0 late blocks. The PC bugchecked
+  (0x20001) about 3.5 minutes after that release run, so every release build needs a fresh yes.
+- TA reviews: review-6e3fc7b9772bc0ad (the cpal patch) and review-bb3f74843543721d
+  (e1f36b8..d4fe007) approved; the two old ASIO branches deleted with the user's OK. Next review
+  base: d4fe007.
+- T5 done (dac564b, ae49ddc and the console commit): processing in the session and named
+  sessions, the commands, strip presets and the equaliser's response; free disk after its builds
+  about 13 GB.
 
 ## Next step
 
-T5 (desk: session, commands and strip presets for channel processing, on the T4 engine API). The
-release runs of `engine_load` (with and without `--strips`) still wait for the user's approval.
+T6 (editor: the channel processing editor with the EQ curve, dynamics and gain-reduction meters,
+opened from the Channels screen and the strip), on T5's console API (`channelStrip`,
+`editProcessing`, `loadEqResponse`, the preset actions and the meters' `processed`,
+`gateReductionDb`, `compressorReductionDb`). Review of d4fe007..T5 pending.

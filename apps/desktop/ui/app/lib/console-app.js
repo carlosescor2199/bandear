@@ -65,6 +65,15 @@
 //   `setMusicianRedundancy(musicianKey, on, delayBlocks)` turns it on or off, in turn with the desk
 //   edits and loads (a load replaces the settings), answers `{ ok, message }` (formatRedundancySet)
 //   and reads the status after it.
+// - Each input's channel processing (see processing.js): every channel's strip (read once
+//   connected and after a loaded session, `loadProcessing` again), `editProcessing(channel,
+//   settings)` through a per-channel coalescer (one request in flight per channel, the latest edit
+//   always sent, the edit shown until its answer settles it), and `resetChannelProcessing`,
+//   `copyChannelProcessing` and `applyStripPreset`, in turn with the desk edits and loads and after
+//   the strip edits of the channels they touch. The strip presets (read once connected,
+//   `loadStripPresets` again) change with `saveStripPreset` and `deleteStripPreset`, and
+//   `loadEqResponse(channel, eq)` keeps the equaliser's curve for a channel. Each answers `{ ok,
+//   message }`. A load holds the strip edits back like the mix edits, and drops them once loaded.
 // - Recording takes (the Record screen; see recording.js): the recording settings (read once
 //   connected, `loadRecordingSettings` again) change with `setRecordingSettings(change)`, one change
 //   at a time and each built on the one before it, so two quick toggles both land; a refusal leaves
@@ -132,6 +141,7 @@ import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
 import { formatBufferSet, nameForKey } from "./playback-buffer.js";
+import { formatProcessingSet, formatStripPresetsSet } from "./processing.js";
 import { blockMsOf, formatRedundancySet } from "./redundancy.js";
 import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
@@ -220,6 +230,37 @@ export function createConsoleApp({
 
   const sender = createCoalescer(sendMix);
   const engineerSender = createCoalescer(sendEngineer);
+
+  // The last answer to a strip edit of each channel, in words, for editProcessing's promise.
+  const processingSaid = new Map();
+
+  // Sends `channel`'s strip edit still waiting with `set_channel_processing`, as sendMix sends a
+  // mix: at most one at a time per channel, the latest edit always sent.
+  async function sendProcessing(channel) {
+    const sent = store.getState().processingPending[channel];
+    if (loading || !sent) {
+      return;
+    }
+    try {
+      const answer = await api.setChannelProcessing(channel, sent);
+      const said = formatProcessingSet(answer);
+      processingSaid.set(channel, said);
+      if (said.ok) {
+        store.dispatch(actions.processingApplied(channel, sent, answer));
+      } else {
+        store.dispatch(actions.processingFailed(channel, sent, said.message));
+      }
+    } catch (error) {
+      const said = {
+        ok: false,
+        message: sentenceWithReason(`CH ${channel}'s processing was not changed`, message(error)),
+      };
+      processingSaid.set(channel, said);
+      store.dispatch(actions.processingFailed(channel, sent, said.message));
+    }
+  }
+
+  const processingSender = createCoalescer(sendProcessing);
 
   // Puts the engine's answer to `engine_status` in the store: its status when it runs, idle when
   // it says no engine runs.
@@ -508,6 +549,13 @@ export function createConsoleApp({
     // session, which the Session panel shows.
     if (store.getState().presets === null) {
       await loadPresets();
+    }
+    // So are each channel's processing and the strip presets.
+    if (store.getState().processing === null) {
+      await loadProcessing();
+    }
+    if (store.getState().stripPresets === null) {
+      await loadStripPresets();
     }
     if (store.getState().sessions.list === null) {
       await loadSessions();
@@ -931,6 +979,9 @@ export function createConsoleApp({
 
   // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
   function sendWaiting() {
+    for (const channel of Object.keys(store.getState().processingPending)) {
+      processingSender.push(Number(channel), null);
+    }
     for (const [address, edits] of Object.entries(store.getState().pending)) {
       const { mix, engineer } = splitEdits(edits);
       if (Object.keys(mix).length > 0) {
@@ -962,6 +1013,8 @@ export function createConsoleApp({
           }
           store.dispatch(actions.sessionLoaded(outcome));
           await readStatus();
+          // The loaded session's processing replaced every strip.
+          await loadProcessing();
           const musicians = store.getState().musicians;
           return formatSessionLoaded(outcome, {
             labelAt,
@@ -977,15 +1030,96 @@ export function createConsoleApp({
     });
   }
 
-  // The edits a load would drop: every mix edit still waiting and every channel or group edit not
-  // answered yet.
+  // The edits a load would drop: every mix and strip edit still waiting and every channel or group
+  // edit not answered yet.
   function unsavedEdits() {
-    const { pending } = store.getState();
+    const { pending, processingPending } = store.getState();
     const mixEdits = Object.values(pending).reduce(
       (count, edits) => count + Object.keys(edits).length,
       0,
     );
-    return mixEdits + editsOnTheirWay;
+    return mixEdits + Object.keys(processingPending).length + editsOnTheirWay;
+  }
+
+  // Reads every channel's strip into the store. Resolves to null, or to the error of a failed read
+  // (the strips stay as they were known, or unknown).
+  async function loadProcessing() {
+    try {
+      store.dispatch(actions.processing(await api.processing()));
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Reads the strip presets into the store, as loadProcessing reads the strips.
+  async function loadStripPresets() {
+    try {
+      store.dispatch(actions.stripPresets(await api.stripPresets()));
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Edits `channel`'s strip to `settings`, the whole strip: shown at once (channelStrip) and sent
+  // through the channel's coalescer, so a knob dragged sends only its latest value after the one in
+  // flight. Resolves to the last answer in words once the channel has nothing left to send.
+  function editProcessing(channel, settings) {
+    store.dispatch(actions.processingEdit(channel, settings));
+    processingSender.push(channel, null);
+    return processingSender
+      .idle(channel)
+      .then(() => processingSaid.get(channel) ?? { ok: true, message: "" });
+  }
+
+  // Runs a processing change that is not an edit (a reset, a copy, a preset) once every desk edit
+  // and load asked for before it was answered and the strip edits of `channels` went out, so it
+  // lands after them. Answers `{ ok, message }` (formatProcessingSet).
+  function processingCommand(channels, send, refused) {
+    return inTurn(async () => {
+      await Promise.all(channels.map((channel) => processingSender.idle(channel)));
+      try {
+        const answer = await send();
+        const said = formatProcessingSet(answer);
+        if (said.ok) {
+          store.dispatch(actions.processingApplied(null, null, answer));
+        }
+        return said;
+      } catch (error) {
+        return { ok: false, message: sentenceWithReason(refused, message(error)) };
+      }
+    });
+  }
+
+  // Runs a strip preset change: `send` resolves to the desk's answer, whose presets the store
+  // takes. Answers `{ ok, message }` (formatStripPresetsSet).
+  async function stripPresetCommand(send, refused) {
+    try {
+      const answer = await send();
+      if (answer?.presets) {
+        store.dispatch(actions.stripPresets(answer.presets));
+      }
+      return formatStripPresetsSet(answer);
+    } catch (error) {
+      return { ok: false, message: sentenceWithReason(refused, message(error)) };
+    }
+  }
+
+  // Works out the response of the equaliser `eq` for `channel`'s curve and keeps it in the store.
+  // Answers `{ ok, message, points }`.
+  async function loadEqResponse(channel, eq, points = null) {
+    try {
+      const curve = await api.eqResponse(eq, points);
+      store.dispatch(actions.eqCurve(channel, curve));
+      return { ok: true, message: "", points: curve };
+    } catch (error) {
+      return {
+        ok: false,
+        message: sentenceWithReason("The equaliser's curve could not be drawn", message(error)),
+        points: null,
+      };
+    }
   }
 
   // Reads the recording settings into the store. Resolves to null, or to the error of a failed
@@ -1379,6 +1513,54 @@ export function createConsoleApp({
      * }` (formatRedundancySet).
      */
     setMusicianRedundancy,
+    /** Reads every channel's strip again; resolves to null, or to the error of a failed read. */
+    loadProcessing,
+    /**
+     * Edits the strip of `channel` (1-based) to `settings`, the whole strip (see processing.js):
+     * shown at once over the kept one (channelStrip in console-state.js) and sent through the
+     * channel's own lane, the latest edit winning. Resolves to `{ ok, message }`, the last answer
+     * (formatProcessingSet), once the channel has nothing left to send; a refusal is also kept as
+     * the store's `processingError`.
+     */
+    editProcessing,
+    /** Takes every part of `channel`'s strip off; answers `{ ok, message }`. */
+    resetChannelProcessing: (channel) =>
+      processingCommand(
+        [channel],
+        () => api.resetChannelProcessing(channel),
+        `CH ${channel}'s processing was not reset`,
+      ),
+    /** Copies the strip of `from` onto every channel in `to` (1-based); answers `{ ok, message }`. */
+    copyChannelProcessing: (from, to) =>
+      processingCommand(
+        [from, ...to],
+        () => api.copyChannelProcessing(from, to),
+        `CH ${from}'s processing was not copied`,
+      ),
+    /** Reads the strip presets again; resolves to null, or to the error of a failed read. */
+    loadStripPresets,
+    /** Saves `settings` as the strip preset `name`; answers `{ ok, message }`. */
+    saveStripPreset: (name, settings) =>
+      stripPresetCommand(
+        () => api.saveStripPreset(name, settings),
+        "The strip preset was not saved",
+      ),
+    /** Deletes the strip preset `name`; answers `{ ok, message }`. */
+    deleteStripPreset: (name) =>
+      stripPresetCommand(() => api.deleteStripPreset(name), "The strip preset was not deleted"),
+    /** Puts the strip preset `name` on `channel` (1-based); answers `{ ok, message }`. */
+    applyStripPreset: (name, channel) =>
+      processingCommand(
+        [channel],
+        () => api.applyStripPreset(name, channel),
+        `"${name}" was not applied to CH ${channel}`,
+      ),
+    /**
+     * Works out the response of the equaliser `eq` for `channel`'s curve (`points` of them, 128
+     * when null) and keeps it as the store's `eqCurves[channel]`; answers `{ ok, message, points
+     * }`.
+     */
+    loadEqResponse,
     /**
      * Puts the mix backup `stamp` back on the musicians who are connected now; answers `{ ok,
      * message }` (formatMixRestored).

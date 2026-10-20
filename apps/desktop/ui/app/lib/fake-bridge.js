@@ -25,7 +25,105 @@ import { IDLE_RECORDING, RECORD_FORMATS } from "./recording.js";
 import { IDLE_SOUNDCHECK } from "./soundcheck.js";
 import { BACKUP_MAX_WAIT_MS, BACKUP_QUIET_MS, KEPT_BACKUPS } from "./mix-backups-view.js";
 import { checkSessionName } from "./sessions.js";
+import {
+  STRIP_CHANNELS,
+  channelList,
+  clampStrip,
+  defaultStrip,
+  eqResponseOf,
+  isNeutralStrip,
+} from "./processing.js";
 import { clampLevel } from "./values.js";
+
+/**
+ * The desk's built-in strip presets, as `strip_presets` lists them first: the same names and
+ * strips (see factory_presets in apps/desktop/src-tauri/src/commands/processing.rs).
+ */
+export function factoryStripPresets() {
+  const strip = ({ highPass = null, bands = [], gate = null, compressor = null }) => {
+    const settings = defaultStrip();
+    if (highPass !== null) {
+      settings.eq.highPass = { enabled: true, frequencyHz: highPass, q: Math.SQRT1_2 };
+    }
+    bands.forEach(([frequencyHz, gainDb, q], index) => {
+      settings.eq.bands[index] = { enabled: true, frequencyHz, gainDb, q };
+    });
+    if (gate) {
+      settings.gate = { enabled: true, ...gate };
+    }
+    if (compressor) {
+      const [thresholdDb, ratio, kneeDb, attackMs, releaseMs, makeupDb] = compressor;
+      settings.compressor = {
+        enabled: true,
+        thresholdDb,
+        ratio,
+        kneeDb,
+        attackMs,
+        releaseMs,
+        makeupDb,
+      };
+    }
+    return settings;
+  };
+  return [
+    {
+      name: "Vocal",
+      settings: strip({
+        highPass: 100,
+        bands: [[150, -2, 0.7], [350, -2, 1.2], [3000, 2.5, 1], [10000, 2, 0.7]],
+        compressor: [-20, 3, 6, 8, 120, 3],
+      }),
+    },
+    {
+      name: "Kick",
+      settings: strip({
+        highPass: 35,
+        bands: [[60, 3, 0.7], [380, -5, 1.5], [3500, 3, 1.4], [9000, 0, 0.7]],
+        gate: { thresholdDb: -40, rangeDb: 30, attackMs: 0.3, holdMs: 40, releaseMs: 120 },
+        compressor: [-14, 4, 3, 15, 90, 2],
+      }),
+    },
+    {
+      name: "Bass DI",
+      settings: strip({
+        highPass: 30,
+        bands: [[80, 2, 0.7], [250, -3, 1], [900, 2, 1.2], [6000, -3, 0.7]],
+        compressor: [-22, 4, 6, 20, 200, 3],
+      }),
+    },
+    {
+      name: "Acoustic guitar",
+      settings: strip({
+        highPass: 90,
+        bands: [[180, -3, 0.7], [800, -2, 1.5], [4500, 2, 1], [11000, 2, 0.7]],
+        compressor: [-18, 2.5, 8, 12, 150, 2],
+      }),
+    },
+    { name: "Gentle compression", settings: strip({ compressor: [-24, 2, 10, 20, 250, 2] }) },
+  ].map((preset) => ({ ...preset, factory: true }));
+}
+
+// What one input at `level` (0-100) comes out of `strip` as, roughly as the engine's strip turns
+// it down: the gate closed by its range below its threshold, the compressor by its ratio above its
+// threshold (no knee, no time constants), then the makeup gain. `{ level, gateDb, compressorDb }`.
+function stripped(level, strip) {
+  if (!strip || isNeutralStrip(strip)) {
+    return { level, gateDb: 0, compressorDb: 0 };
+  }
+  const kept = clampStrip(strip);
+  const db = level > 0 ? 20 * Math.log10(level / 100) : -120;
+  const gateDb = kept.gate.enabled && db < kept.gate.thresholdDb ? kept.gate.rangeDb : 0;
+  const over = db - kept.compressor.thresholdDb;
+  const compressorDb =
+    kept.compressor.enabled && over > 0 ? over * (1 - 1 / kept.compressor.ratio) : 0;
+  const makeup = kept.compressor.enabled ? kept.compressor.makeupDb : 0;
+  const out = level > 0 ? 100 * 10 ** ((db - gateDb - compressorDb + makeup) / 20) : 0;
+  return {
+    level: clampLevel(Math.round(out)),
+    gateDb: Math.round(gateDb * 10) / 10,
+    compressorDb: Math.round(compressorDb * 10) / 10,
+  };
+}
 
 const DEFAULT_PORT = 50000;
 
@@ -482,21 +580,34 @@ function heardLevels(musician, hidden, levels) {
 
 /**
  * A `meters` payload for `status` at `time` milliseconds; the same time gives the same levels.
- * Each musician's output, and the engineer's local mix (`local`), is mixed from the inputs as the
- * engine mixes them, so a hidden input is heard in no one's meter.
+ * Each input goes through its strip in `strips` (CH 1 first; none, or a neutral one, leaves it as
+ * it is): `processed` is its level after it, `gateReductionDb` and `compressorReductionDb` what
+ * the gate and the compressor take off. Each musician's output, and the engineer's local mix
+ * (`local`), is mixed from the processed inputs as the engine mixes them, so a hidden input is
+ * heard in no one's meter.
  */
-export function syntheticMeters(status, time) {
+export function syntheticMeters(status, time, strips = []) {
   const seconds = time / 1000;
   const channels = Array.from({ length: status.sourceChannels }, (_, index) => wave(seconds, index));
+  const through = channels.map((level, index) => stripped(level, strips[index]));
+  const processed = through.map((strip) => strip.level);
   const hidden = channels.map((_, index) => Boolean(status.channels?.[index]?.hidden));
   const musicians = {};
   for (const musician of status.musicians) {
-    musicians[musician.address] = heardLevels(musician, hidden, channels);
+    musicians[musician.address] = heardLevels(musician, hidden, processed);
   }
   const local = status.localMix
-    ? heardLevels(status.localMix, hidden, channels)
+    ? heardLevels(status.localMix, hidden, processed)
     : { left: 0, right: 0 };
-  return { run: status.run, channels, musicians, local };
+  return {
+    run: status.run,
+    channels,
+    processed,
+    gateReductionDb: through.map((strip) => strip.gateDb),
+    compressorReductionDb: through.map((strip) => strip.compressorDb),
+    musicians,
+    local,
+  };
 }
 
 /** How many one-second samples a link history keeps, as the desktop's does: ten minutes. */
@@ -857,6 +968,8 @@ export function createFakeBridge({
   savedAudio = null,
   savedLocal = null,
   presets = [],
+  savedProcessing = null,
+  stripPresets = [],
   savedSessions = [],
   sessionNotice = null,
   mixBackups = [],
@@ -929,6 +1042,11 @@ export function createFakeBridge({
   // The engineer's mix presets as the desk's session keeps them, in the order they were saved.
   let keptPresets = clone(presets);
   let lastPresetId = 0;
+  // Every channel's strip, CH 1 first, as the running engine and the desk's session keep it (a
+  // `processing` section, `{ "1": strip }`, on creation), and the engineer's own strip presets,
+  // `{ name, settings }` in the order they were saved.
+  let keptProcessing = stripsOf(savedProcessing);
+  let keptStripPresets = clone(stripPresets);
   // The mirrors as the desk's session keeps them, `{ leader, name }` by the follower's labelKey
   // (the leader by theirs): every start and `set_mirror` put them in force.
   const mirrorBook = new Map();
@@ -1642,6 +1760,9 @@ export function createFakeBridge({
       presets: keptPresets,
       audio: keptAudio,
       ...(local ? { local } : {}),
+      ...(Object.keys(keptProcessingSection()).length > 0
+        ? { processing: keptProcessingSection() }
+        : {}),
     });
   }
 
@@ -2028,8 +2149,87 @@ export function createFakeBridge({
 
   function emitMeters() {
     if (isRunning) {
-      emit("meters", syntheticMeters(engine, performance.now()));
+      emit("meters", syntheticMeters(engine, performance.now(), keptProcessing));
     }
+  }
+
+  // The strip of `channel` (1-based) as the desk answers it.
+  function stripAt(channel) {
+    const settings = clone(keptProcessing[channel - 1]);
+    return { channel, settings, active: !isNeutralStrip(settings) };
+  }
+
+  // The channels one strip covers from `channel` (1-based): a linked pair's two sides, from either.
+  function stripChannels(channel) {
+    const index = channel - 1;
+    if (runningChannels[index]?.link && channel < STRIP_CHANNELS) {
+      return [channel, channel + 1];
+    }
+    if (index > 0 && runningChannels[index - 1]?.link) {
+      return [channel - 1, channel];
+    }
+    return [channel];
+  }
+
+  // Why `channel` is not a mixer channel, as the desk words it, or null when it is.
+  function outsideMixer(channel) {
+    return Number.isInteger(channel) && channel >= 1 && channel <= STRIP_CHANNELS
+      ? null
+      : `CH ${channel} is not one of the mixer's channels (CH 1-${STRIP_CHANNELS})`;
+  }
+
+  // Sets every channel of `targets` (1-based, checked) to `settings`, held in range, on the running
+  // engine, and answers every strip that changed (a target always), as the desk does.
+  function setStrips(targets, settings) {
+    if (!isRunning) {
+      throw "the engine is not running";
+    }
+    const before = clone(keptProcessing);
+    const kept = clampStrip(settings);
+    for (const target of targets) {
+      for (const channel of stripChannels(target)) {
+        keptProcessing[channel - 1] = clone(kept);
+      }
+    }
+    return keptProcessing
+      .map((_, index) => index + 1)
+      .filter(
+        (channel) =>
+          targets.includes(channel) ||
+          JSON.stringify(before[channel - 1]) !== JSON.stringify(keptProcessing[channel - 1]),
+      )
+      .map(stripAt);
+  }
+
+  function refusedProcessing(outcome, message) {
+    return { outcome, channels: [], message };
+  }
+
+  // Every strip preset, the built-in ones first.
+  function stripPresetList() {
+    const mine = clone(keptStripPresets).map((preset) => ({ ...preset, factory: false }));
+    return [...factoryStripPresets(), ...mine];
+  }
+
+  function samePresetName(one, other) {
+    return String(one).toLowerCase() === String(other).toLowerCase();
+  }
+
+  // The processing as the desk's session keeps it: the strips that do something, by channel
+  // number.
+  function keptProcessingSection() {
+    return Object.fromEntries(
+      keptProcessing
+        .map((settings, index) => [String(index + 1), settings])
+        .filter(([, settings]) => !isNeutralStrip(settings)),
+    );
+  }
+
+  // Every strip from a session's `processing` section: the channels it names, the rest neutral.
+  function stripsOf(section) {
+    return Array.from({ length: STRIP_CHANNELS }, (_, index) =>
+      section?.[String(index + 1)] ? clampStrip(section[String(index + 1)]) : defaultStrip(),
+    );
   }
 
   // Merges `update` into `row`'s mix as the engine does; a phone's change leaves every channel the
@@ -2668,6 +2868,9 @@ export function createFakeBridge({
         redundancySince.set(key, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
       }
       keptPresets = session.presets ?? [];
+      // As the desktop does: the loaded processing replaces every strip, a channel it keeps none
+      // for going back to no processing; the desk's own strip presets stay.
+      keptProcessing = stripsOf(session.processing);
       keptAudio = audio.audio;
       // As the desktop does: a saved session from before the local mix leaves the desk's own.
       const localLoaded = Boolean(session.local);
@@ -2717,6 +2920,142 @@ export function createFakeBridge({
         localMix,
         localOutputNotice,
       };
+    },
+    processing() {
+      return keptProcessing.map((_, index) => stripAt(index + 1));
+    },
+    channel_processing({ channel } = {}) {
+      const outside = outsideMixer(channel);
+      if (outside) {
+        throw `${outside}.`;
+      }
+      return stripAt(channel);
+    },
+    set_channel_processing({ channel, settings = {} } = {}) {
+      const outside = outsideMixer(channel);
+      if (outside) {
+        return refusedProcessing("invalid", `${outside}; nothing changed.`);
+      }
+      const channels = setStrips([channel], settings);
+      const names = channelList(channels.map((strip) => strip.channel));
+      const verb = channels.length === 1 ? "is" : "are";
+      return { outcome: "set", channels, message: `${names} ${verb} set to the new processing.` };
+    },
+    reset_channel_processing({ channel } = {}) {
+      const outside = outsideMixer(channel);
+      if (outside) {
+        return refusedProcessing("invalid", `${outside}; nothing changed.`);
+      }
+      const channels = setStrips([channel], defaultStrip());
+      const names = channelList(channels.map((strip) => strip.channel));
+      const verb = channels.length === 1 ? "is" : "are";
+      return { outcome: "set", channels, message: `${names} ${verb} back to no processing.` };
+    },
+    copy_channel_processing({ from, to = [] } = {}) {
+      for (const channel of [from, ...to]) {
+        const outside = outsideMixer(channel);
+        if (outside) {
+          return refusedProcessing("invalid", `${outside}; nothing changed.`);
+        }
+      }
+      const targets = [...new Set(to.filter((channel) => channel !== from))].sort((a, b) => a - b);
+      if (targets.length === 0) {
+        return refusedProcessing(
+          "invalid",
+          `There is no channel to copy CH ${from}'s processing to; nothing changed.`,
+        );
+      }
+      const channels = setStrips(targets, keptProcessing[from - 1]);
+      return {
+        outcome: "set",
+        channels,
+        message: `CH ${from}'s processing is on ${channelList(channels.map((strip) => strip.channel))} now.`,
+      };
+    },
+    strip_presets() {
+      return stripPresetList();
+    },
+    save_strip_preset({ name = "", settings = {} } = {}) {
+      const trimmed = String(name).trim();
+      const refused = (message) => ({
+        outcome: "invalid",
+        preset: null,
+        presets: stripPresetList(),
+        message,
+      });
+      if (trimmed === "") {
+        return refused("A strip preset needs a name; nothing was saved.");
+      }
+      if ([...trimmed].length > 40) {
+        return refused("A strip preset's name is at most 40 characters; nothing was saved.");
+      }
+      const factory = factoryStripPresets().find((preset) => samePresetName(preset.name, trimmed));
+      if (factory) {
+        return refused(
+          `"${factory.name}" is a built-in preset; save under another name. Nothing was saved.`,
+        );
+      }
+      const preset = { name: trimmed, settings: clampStrip(settings) };
+      const at = keptStripPresets.findIndex((kept) => samePresetName(kept.name, trimmed));
+      if (at >= 0) {
+        keptStripPresets[at] = preset;
+      } else {
+        keptStripPresets.push(preset);
+      }
+      return {
+        outcome: at >= 0 ? "replaced" : "saved",
+        preset: { ...clone(preset), factory: false },
+        presets: stripPresetList(),
+        message:
+          at >= 0
+            ? `The strip preset "${trimmed}" was replaced.`
+            : `Saved the strip preset "${trimmed}".`,
+      };
+    },
+    delete_strip_preset({ name = "" } = {}) {
+      const trimmed = String(name).trim();
+      const answer = (outcome, message) => ({
+        outcome,
+        preset: null,
+        presets: stripPresetList(),
+        message,
+      });
+      const factory = factoryStripPresets().find((preset) => samePresetName(preset.name, trimmed));
+      if (factory) {
+        return answer("factory", `"${factory.name}" is a built-in preset and cannot be deleted.`);
+      }
+      const at = keptStripPresets.findIndex((kept) => samePresetName(kept.name, trimmed));
+      if (at < 0) {
+        return answer(
+          "notFound",
+          `There is no strip preset called "${trimmed}"; nothing was deleted.`,
+        );
+      }
+      const [removed] = keptStripPresets.splice(at, 1);
+      return answer("deleted", `Deleted the strip preset "${removed.name}".`);
+    },
+    apply_strip_preset({ name = "", channel } = {}) {
+      const outside = outsideMixer(channel);
+      if (outside) {
+        return refusedProcessing("invalid", `${outside}; nothing changed.`);
+      }
+      const trimmed = String(name).trim();
+      const preset = stripPresetList().find((kept) => samePresetName(kept.name, trimmed));
+      if (!preset) {
+        return refusedProcessing(
+          "notFound",
+          `There is no strip preset called "${trimmed}"; nothing changed.`,
+        );
+      }
+      const channels = setStrips([channel], preset.settings);
+      return {
+        outcome: "set",
+        channels,
+        message: `"${preset.name}" is on ${channelList(channels.map((strip) => strip.channel))} now.`,
+      };
+    },
+    eq_response({ settings = {}, points = null } = {}) {
+      return eqResponseOf(settings, points ?? undefined);
     },
     link_history({ musicianKey, sinceSeq = null } = {}) {
       // As the desktop answers: a key of the desk's forms, then a running engine, then a musician.
@@ -3287,6 +3626,14 @@ export function createFakeBridge({
     /** The local mix and output the session keeps, `{ mix, output }`: null before either. */
     savedLocal() {
       return keptLocal ? clone(keptLocal) : null;
+    },
+    /** The processing the session keeps, `{ "1": strip }`: only the strips that do something. */
+    savedProcessing() {
+      return clone(keptProcessingSection());
+    },
+    /** The engineer's own strip presets the session keeps, `{ name, settings }`, in order. */
+    savedStripPresets() {
+      return clone(keptStripPresets);
     },
     /** The mix backups taken, `{ stamp, savedAt, musicians, problem }`, the oldest first. */
     mixBackups() {

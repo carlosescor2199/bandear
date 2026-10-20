@@ -35,4 +35,5 @@ import "./soundcheck.test.js";
 import "./soundcheck-view.test.js";
 import "./playback-buffer.test.js";
 import "./redundancy.test.js";
+import "./processing.test.js";
 import "./demo-source.test.js";

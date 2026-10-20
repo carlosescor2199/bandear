@@ -13,8 +13,11 @@
  */
 export const EVENTS = Object.freeze({
   /**
-   * About 30 a second: `{ run, channels: [peak], musicians: { address: { left, right } }, local:
-   * { left, right } }`, `local` the peak of the engineer's local mix.
+   * About 30 a second: `{ run, channels: [peak], processed: [peak], gateReductionDb: [dB],
+   * compressorReductionDb: [dB], musicians: { address: { left, right } }, local: { left, right }
+   * }`: `processed` each input's peak after its strip (its input peak while the strip does
+   * nothing), the reductions what the gate and the compressor take off now (0 when open or off),
+   * and `local` the peak of the engineer's local mix.
    */
   meters: "meters",
   /** About 4 a second: the `engine_status` snapshot, with its `run`. */
@@ -306,6 +309,60 @@ export function createEngineApi(bridge) {
     setSoundcheckLoop: (looping) => bridge.invoke("set_soundcheck_loop", { looping }),
     /** Stops the soundcheck and goes back to the live inputs. */
     stopSoundcheck: () => bridge.invoke("stop_soundcheck"),
+    /**
+     * Every channel's strip, CH 1 first: `[{ channel, settings, active }]`, `channel` 1-based,
+     * `settings` the strip (see processing.js) and `active` whether it does anything. The running
+     * engine's, or with none what the desk keeps for the next start.
+     */
+    processing: () => bridge.invoke("processing"),
+    /** The strip of `channel` (1-based): `{ channel, settings, active }`; one outside 1-32 rejects. */
+    channelProcessing: (channel) => bridge.invoke("channel_processing", { channel }),
+    /**
+     * Sets the strip of `channel` (1-based) to `settings` (a field left out takes its default) on
+     * the running engine. Resolves to `{ outcome, channels: [{ channel, settings, active }], message
+     * }`: `outcome` "set", with every channel whose strip changed (a linked pair's other side too)
+     * and the settings as the desk holds them, in range; or "invalid" (a channel outside 1-32) and
+     * nothing changed. The desk keeps it for the next start. No engine rejects. See
+     * formatProcessingSet.
+     */
+    setChannelProcessing: (channel, settings) =>
+      bridge.invoke("set_channel_processing", { channel, settings }),
+    /** Takes every part of the strip of `channel` off; resolves as setChannelProcessing does. */
+    resetChannelProcessing: (channel) => bridge.invoke("reset_channel_processing", { channel }),
+    /**
+     * Copies the strip of `from` onto every channel `to` names (all 1-based; `from` itself is left
+     * out); resolves as setChannelProcessing does, "invalid" also when nothing is left to copy to.
+     */
+    copyChannelProcessing: (from, to) => bridge.invoke("copy_channel_processing", { from, to }),
+    /**
+     * Every strip preset, the built-in ones first: `[{ name, settings, factory }]`. The built-in
+     * ones ("Vocal", "Kick", "Bass DI", "Acoustic guitar", "Gentle compression") cannot be deleted
+     * and no preset of the engineer's can take their names.
+     */
+    stripPresets: () => bridge.invoke("strip_presets"),
+    /**
+     * Saves `settings` as the engineer's strip preset `name` (1-40 characters once trimmed); one of
+     * theirs with that name in any case is replaced. Resolves to `{ outcome, preset, presets,
+     * message }`, `outcome` "saved", "replaced" or "invalid" (an empty, too long or built-in name;
+     * nothing changed). Needs no engine. See formatStripPresetsSet.
+     */
+    saveStripPreset: (name, settings) => bridge.invoke("save_strip_preset", { name, settings }),
+    /**
+     * Deletes the engineer's strip preset `name` (in any case); resolves as saveStripPreset does,
+     * `outcome` "deleted", "factory" (built in, never deleted) or "notFound".
+     */
+    deleteStripPreset: (name) => bridge.invoke("delete_strip_preset", { name }),
+    /**
+     * Puts the strip preset `name` (in any case) on `channel` (1-based); resolves as
+     * setChannelProcessing does, `outcome` also "notFound".
+     */
+    applyStripPreset: (name, channel) => bridge.invoke("apply_strip_preset", { name, channel }),
+    /**
+     * The response of the equaliser `eq` (a strip's `eq`), the high-pass filter included: `[{
+     * freqHz, db }]`, `points` of them (128 when null) on a log grid from 20 Hz to 20 kHz. Needs
+     * no engine.
+     */
+    eqResponse: (eq, points = null) => bridge.invoke("eq_response", { settings: eq, points }),
     onMeters: (handler) => bridge.listen(EVENTS.meters, handler),
     onStatus: (handler) => bridge.listen(EVENTS.status, handler),
     onMixChanged: (handler) => bridge.listen(EVENTS.mixChanged, handler),

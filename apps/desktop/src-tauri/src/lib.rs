@@ -549,6 +549,59 @@ async fn copy_channel_processing(
     commands::processing::copy_channel_processing(state.inner(), from, to)
 }
 
+/// Every strip preset, the built-in ones first: `[{ name, settings, factory }]` (see
+/// [commands::processing::strip_presets]).
+#[tauri::command]
+async fn strip_presets(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<commands::processing::StripPresetDto>, String> {
+    Ok(commands::processing::strip_presets(state.inner()))
+}
+
+/// Saves `settings` as the engineer's strip preset `name`; answers `{ outcome, preset, presets,
+/// message }`, `outcome` `saved`, `replaced` or `invalid` (see
+/// [commands::processing::save_strip_preset]).
+#[tauri::command]
+async fn save_strip_preset(
+    state: State<'_, DesktopState>,
+    name: String,
+    settings: personal_monitoring::StripSettings,
+) -> Result<commands::processing::StripPresetsSetDto, String> {
+    commands::processing::save_strip_preset(state.inner(), name, settings)
+}
+
+/// Deletes the engineer's strip preset `name`; answers as `save_strip_preset` does, `outcome`
+/// `deleted`, `factory` (built in, never deleted) or `notFound`.
+#[tauri::command]
+async fn delete_strip_preset(
+    state: State<'_, DesktopState>,
+    name: String,
+) -> Result<commands::processing::StripPresetsSetDto, String> {
+    commands::processing::delete_strip_preset(state.inner(), name)
+}
+
+/// Puts the strip preset `name` on `channel` (1-based); answers as `set_channel_processing` does,
+/// `outcome` also `notFound` (see [commands::processing::apply_strip_preset]).
+#[tauri::command]
+async fn apply_strip_preset(
+    state: State<'_, DesktopState>,
+    name: String,
+    channel: usize,
+) -> Result<commands::processing::ProcessingSetDto, String> {
+    commands::processing::apply_strip_preset(state.inner(), name, channel)
+}
+
+/// The response of the equaliser `settings` (`{ highPass, bands }`), the high-pass filter
+/// included: `[{ freqHz, db }]`, `points` of them (128 when null, held to 2-1,024) on a log grid
+/// from 20 Hz to 20 kHz (see [commands::processing::eq_response]). Needs no engine.
+#[tauri::command]
+async fn eq_response(
+    settings: personal_monitoring::EqSettings,
+    points: Option<usize>,
+) -> Result<Vec<commands::processing::EqPointDto>, String> {
+    Ok(commands::processing::eq_response(&settings, points))
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -654,7 +707,12 @@ pub fn run() {
             channel_processing,
             set_channel_processing,
             reset_channel_processing,
-            copy_channel_processing
+            copy_channel_processing,
+            strip_presets,
+            save_strip_preset,
+            delete_strip_preset,
+            apply_strip_preset,
+            eq_response
         ])
         .build(tauri::generate_context!())
         .expect("error while building the MixLink desktop shell")

@@ -1,6 +1,7 @@
 //! Each input's channel processing set from the desk: the commands that read and change a channel's
 //! strip (the high-pass filter, the four-band equaliser, the gate and the compressor; see
-//! [personal_monitoring::StripSettings]).
+//! [personal_monitoring::StripSettings]), the strip presets, and the equaliser's response curve the
+//! editor draws.
 //!
 //! - Channels are numbered from 1 here, as the desk numbers them everywhere it keeps them: CH 1 is
 //!   `1`. The mixer has 32 ([MIXER_CHANNELS]); a number outside 1-32 is an `invalid` outcome and
@@ -16,18 +17,41 @@
 //!   engine the desk starts takes the processing the session keeps (a change still waiting
 //!   included), and a loaded session replaces it whole.
 //! - With no engine running the reads answer what the session keeps, which the next start applies.
+//! - Strip presets: a few built-in ones ([factory_presets]: "Vocal", "Kick", "Bass DI", "Acoustic
+//!   guitar" and "Gentle compression"), which are never written and cannot be deleted or replaced,
+//!   and the engineer's own, kept by name in the session in the order they were saved
+//!   (`stripPresets`). A name is 1-40 characters once trimmed and matched in any case. Saving
+//!   under a built-in preset's name is refused (`invalid`), so a built-in name always means the
+//!   built-in strip; saving under the name of one of the engineer's own replaces it in place
+//!   (`replaced`). Presets need no engine; applying one sets a channel as
+//!   [set_channel_processing] does.
+//! - [eq_response] works out the equaliser's gain on a logarithmic grid from 20 Hz to 20 kHz for
+//!   any settings, the high-pass filter included, on the command's thread: never the engine's.
 
 use std::sync::Mutex;
 
-use personal_monitoring::{log_info, log_warn, EngineHandle, StripSettings};
+use personal_monitoring::{
+    log_info, log_warn, CompressorSettings, EngineHandle, EqBandSettings, EqSettings, GateSettings,
+    HighPassSettings, StripSettings,
+};
 use serde::Serialize;
 
 use super::local::saver::{Kept, Saver};
 use super::DesktopState;
-use crate::session::{SessionProcessing, SessionStore};
+use crate::session::{SessionProcessing, SessionStore, SessionStripPreset};
 
 /// The mixer's channels, each with its strip.
 pub const MIXER_CHANNELS: usize = 32;
+/// The longest name of a strip preset, in characters.
+pub const MAX_STRIP_PRESET_NAME_LENGTH: usize = 40;
+/// The points of an equaliser response when the window asks for no number.
+pub const EQ_RESPONSE_POINTS: usize = 128;
+/// The fewest and the most points an equaliser response has.
+pub const MIN_EQ_RESPONSE_POINTS: usize = 2;
+pub const MAX_EQ_RESPONSE_POINTS: usize = 1024;
+/// The lowest and the highest frequency of an equaliser response, in Hz.
+pub const EQ_RESPONSE_LOW_HZ: f64 = 20.0;
+pub const EQ_RESPONSE_HIGH_HZ: f64 = 20_000.0;
 
 /// What the commands need from a running engine (channels 0-based there: 0 is CH 1).
 pub(crate) trait ProcessingEngine {
@@ -96,8 +120,8 @@ impl ChannelProcessingDto {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessingSetDto {
-    /// `set`, or `invalid` (a channel outside 1-32, or nothing to copy to) and then nothing
-    /// changed.
+    /// `set`; `invalid` (a channel outside 1-32, or nothing to copy to) or `notFound` (no strip
+    /// preset by that name), and then nothing changed.
     pub outcome: &'static str,
     /// Every channel whose strip changed, in channel order, a linked pair's other side included;
     /// empty when nothing changed.
@@ -116,8 +140,149 @@ impl ProcessingSetDto {
     }
 }
 
-/// Every channel's strip, CH 1 first, for the engine to take ([ProcessingEngine::replace_processing]):
-/// `kept`'s by channel number and the rest neutral. A number outside 1-32 (a hand-edited session)
+/// One strip preset as the desk lists it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StripPresetDto {
+    pub name: String,
+    pub settings: StripSettings,
+    /// Built in: it cannot be deleted, and no preset of the engineer's can take its name.
+    pub factory: bool,
+}
+
+/// What a change of the strip presets did.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StripPresetsSetDto {
+    /// `saved`, `replaced` (one of the engineer's own with that name was replaced) or `deleted`;
+    /// `invalid` (a name that is empty, too long or a built-in preset's), `factory` (a built-in
+    /// preset cannot be deleted) or `notFound`, and then nothing changed.
+    pub outcome: &'static str,
+    /// The preset saved; null when none was.
+    pub preset: Option<StripPresetDto>,
+    /// Every preset now, the built-in ones first.
+    pub presets: Vec<StripPresetDto>,
+    /// The outcome in words.
+    pub message: String,
+}
+
+/// One point of the equaliser's response.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EqPointDto {
+    pub freq_hz: f64,
+    /// The gain there, in dB.
+    pub db: f64,
+}
+
+/// The built-in strip presets, in the order they are listed. Starting points, not recipes: each
+/// value is held well inside its range so any of them can be pushed either way by ear.
+pub fn factory_presets() -> Vec<(&'static str, StripSettings)> {
+    let high_pass = |frequency_hz| HighPassSettings {
+        enabled: true,
+        frequency_hz,
+        q: std::f32::consts::FRAC_1_SQRT_2,
+    };
+    let band = |frequency_hz, gain_db, q| EqBandSettings {
+        enabled: true,
+        frequency_hz,
+        gain_db,
+        q,
+    };
+    let compressor =
+        |threshold_db, ratio, knee_db, attack_ms, release_ms, makeup_db| CompressorSettings {
+            enabled: true,
+            threshold_db,
+            ratio,
+            knee_db,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        };
+    vec![
+        (
+            "Vocal",
+            StripSettings {
+                eq: EqSettings {
+                    high_pass: high_pass(100.0),
+                    bands: [
+                        band(150.0, -2.0, 0.7),
+                        band(350.0, -2.0, 1.2),
+                        band(3_000.0, 2.5, 1.0),
+                        band(10_000.0, 2.0, 0.7),
+                    ],
+                },
+                gate: GateSettings::default(),
+                compressor: compressor(-20.0, 3.0, 6.0, 8.0, 120.0, 3.0),
+            },
+        ),
+        (
+            "Kick",
+            StripSettings {
+                eq: EqSettings {
+                    high_pass: high_pass(35.0),
+                    bands: [
+                        band(60.0, 3.0, 0.7),
+                        band(380.0, -5.0, 1.5),
+                        band(3_500.0, 3.0, 1.4),
+                        band(9_000.0, 0.0, 0.7),
+                    ],
+                },
+                gate: GateSettings {
+                    enabled: true,
+                    threshold_db: -40.0,
+                    range_db: 30.0,
+                    attack_ms: 0.3,
+                    hold_ms: 40.0,
+                    release_ms: 120.0,
+                },
+                compressor: compressor(-14.0, 4.0, 3.0, 15.0, 90.0, 2.0),
+            },
+        ),
+        (
+            "Bass DI",
+            StripSettings {
+                eq: EqSettings {
+                    high_pass: high_pass(30.0),
+                    bands: [
+                        band(80.0, 2.0, 0.7),
+                        band(250.0, -3.0, 1.0),
+                        band(900.0, 2.0, 1.2),
+                        band(6_000.0, -3.0, 0.7),
+                    ],
+                },
+                gate: GateSettings::default(),
+                compressor: compressor(-22.0, 4.0, 6.0, 20.0, 200.0, 3.0),
+            },
+        ),
+        (
+            "Acoustic guitar",
+            StripSettings {
+                eq: EqSettings {
+                    high_pass: high_pass(90.0),
+                    bands: [
+                        band(180.0, -3.0, 0.7),
+                        band(800.0, -2.0, 1.5),
+                        band(4_500.0, 2.0, 1.0),
+                        band(11_000.0, 2.0, 0.7),
+                    ],
+                },
+                gate: GateSettings::default(),
+                compressor: compressor(-18.0, 2.5, 8.0, 12.0, 150.0, 2.0),
+            },
+        ),
+        (
+            "Gentle compression",
+            StripSettings {
+                compressor: compressor(-24.0, 2.0, 10.0, 20.0, 250.0, 2.0),
+                ..StripSettings::default()
+            },
+        ),
+    ]
+}
+
+/// Every channel's strip, CH 1 first, for the engine to take
+/// ([ProcessingEngine::replace_processing]): `kept`'s by channel number and the rest neutral. A number outside 1-32 (a hand-edited session)
 /// is skipped and logged.
 pub(crate) fn processing_list(kept: &SessionProcessing) -> Vec<StripSettings> {
     let mut list = vec![StripSettings::default(); MIXER_CHANNELS];
@@ -246,6 +411,89 @@ pub fn copy_channel_processing(
     );
     Ok(outcome)
 }
+
+/// Every strip preset: the built-in ones, then the engineer's own in the order they were saved.
+pub fn strip_presets(state: &DesktopState) -> Vec<StripPresetDto> {
+    presets_of(&state.session)
+}
+
+/// Saves `settings` (every number held in range) as the engineer's strip preset `name` and answers
+/// what was done ([StripPresetsSetDto]). Needs no engine. A save that fails is an error, and
+/// nothing changed.
+pub fn save_strip_preset(
+    state: &DesktopState,
+    name: String,
+    settings: StripSettings,
+) -> Result<StripPresetsSetDto, String> {
+    let outcome = save_preset_with(&state.session, &name, settings)?;
+    log_info!(
+        "desk",
+        "save_strip_preset: \"{}\" -> {}",
+        name.trim(),
+        outcome.outcome
+    );
+    Ok(outcome)
+}
+
+/// Deletes the engineer's strip preset `name` (in any case) and answers what was done; a built-in
+/// one is never deleted.
+pub fn delete_strip_preset(
+    state: &DesktopState,
+    name: String,
+) -> Result<StripPresetsSetDto, String> {
+    let outcome = delete_preset_with(&state.session, &name)?;
+    log_info!(
+        "desk",
+        "delete_strip_preset: \"{}\" -> {}",
+        name.trim(),
+        outcome.outcome
+    );
+    Ok(outcome)
+}
+
+/// Puts the strip preset `name` (in any case) on `channel` (1-based), as [set_channel_processing]
+/// sets it.
+pub fn apply_strip_preset(
+    state: &DesktopState,
+    name: String,
+    channel: usize,
+) -> Result<ProcessingSetDto, String> {
+    let outcome = apply_preset_with(
+        &state.engine,
+        &state.session,
+        &state.processing_saver,
+        &name,
+        channel,
+    )?;
+    log_info!(
+        "desk",
+        "apply_strip_preset: \"{}\" on CH {channel} -> {}",
+        name.trim(),
+        outcome.outcome
+    );
+    Ok(outcome)
+}
+
+/// The response of the equaliser `settings` describes, the high-pass filter included: `points`
+/// gains (128 when none is asked for, held to 2-1,024) at frequencies spaced evenly on a
+/// logarithmic scale from 20 Hz to 20 kHz, both ends included. Worked out here, never on the
+/// engine's thread.
+pub fn eq_response(settings: &EqSettings, points: Option<usize>) -> Vec<EqPointDto> {
+    let count = points
+        .unwrap_or(EQ_RESPONSE_POINTS)
+        .clamp(MIN_EQ_RESPONSE_POINTS, MAX_EQ_RESPONSE_POINTS);
+    let span = EQ_RESPONSE_HIGH_HZ / EQ_RESPONSE_LOW_HZ;
+    (0..count)
+        .map(|index| {
+            let freq_hz = EQ_RESPONSE_LOW_HZ * span.powf(index as f64 / (count - 1) as f64);
+            EqPointDto {
+                freq_hz,
+                db: settings.magnitude_db(freq_hz),
+            }
+        })
+        .collect()
+}
+
 /// `Ok` for a channel the mixer has (1-32), else why not.
 fn check_channel(channel: usize) -> Result<(), String> {
     if (1..=MIXER_CHANNELS).contains(&channel) {
@@ -439,10 +687,164 @@ fn copy_with<E: ProcessingEngine>(
     })
 }
 
+/// Every strip preset `session` gives: the built-in ones first.
+fn presets_of(session: &SessionStore) -> Vec<StripPresetDto> {
+    factory_presets()
+        .into_iter()
+        .map(|(name, settings)| StripPresetDto {
+            name: name.to_owned(),
+            settings,
+            factory: true,
+        })
+        .chain(
+            session
+                .strip_presets()
+                .into_iter()
+                .map(|kept| StripPresetDto {
+                    name: kept.name,
+                    settings: kept.settings.clamped(),
+                    factory: false,
+                }),
+        )
+        .collect()
+}
+
+/// Whether `one` and `other` name the same preset: the same name in any case.
+fn same_name(one: &str, other: &str) -> bool {
+    one.to_lowercase() == other.to_lowercase()
+}
+
+/// [save_strip_preset] over any session.
+fn save_preset_with(
+    session: &SessionStore,
+    name: &str,
+    settings: StripSettings,
+) -> Result<StripPresetsSetDto, String> {
+    let name = name.trim();
+    let refused = |message: String| StripPresetsSetDto {
+        outcome: "invalid",
+        preset: None,
+        presets: presets_of(session),
+        message,
+    };
+    if name.is_empty() {
+        return Ok(refused(
+            "A strip preset needs a name; nothing was saved.".to_owned(),
+        ));
+    }
+    if name.chars().count() > MAX_STRIP_PRESET_NAME_LENGTH {
+        return Ok(refused(format!(
+            "A strip preset's name is at most {MAX_STRIP_PRESET_NAME_LENGTH} characters; nothing \
+             was saved."
+        )));
+    }
+    if let Some((factory, _)) = factory_presets()
+        .into_iter()
+        .find(|(factory, _)| same_name(factory, name))
+    {
+        return Ok(refused(format!(
+            "\"{factory}\" is a built-in preset; save under another name. Nothing was saved."
+        )));
+    }
+    let preset = SessionStripPreset {
+        name: name.to_owned(),
+        settings: settings.clamped(),
+    };
+    let mut presets = session.strip_presets();
+    let replaced = match presets.iter_mut().find(|kept| same_name(&kept.name, name)) {
+        Some(kept) => {
+            *kept = preset.clone();
+            true
+        }
+        None => {
+            presets.push(preset.clone());
+            false
+        }
+    };
+    session.set_strip_presets(presets)?;
+    Ok(StripPresetsSetDto {
+        outcome: if replaced { "replaced" } else { "saved" },
+        preset: Some(StripPresetDto {
+            name: preset.name.clone(),
+            settings: preset.settings,
+            factory: false,
+        }),
+        presets: presets_of(session),
+        message: if replaced {
+            format!("The strip preset \"{name}\" was replaced.")
+        } else {
+            format!("Saved the strip preset \"{name}\".")
+        },
+    })
+}
+
+/// [delete_strip_preset] over any session.
+fn delete_preset_with(session: &SessionStore, name: &str) -> Result<StripPresetsSetDto, String> {
+    let name = name.trim();
+    let answer = |outcome: &'static str, message: String| StripPresetsSetDto {
+        outcome,
+        preset: None,
+        presets: presets_of(session),
+        message,
+    };
+    if let Some((factory, _)) = factory_presets()
+        .into_iter()
+        .find(|(factory, _)| same_name(factory, name))
+    {
+        return Ok(answer(
+            "factory",
+            format!("\"{factory}\" is a built-in preset and cannot be deleted."),
+        ));
+    }
+    let mut presets = session.strip_presets();
+    let Some(position) = presets.iter().position(|kept| same_name(&kept.name, name)) else {
+        return Ok(answer(
+            "notFound",
+            format!("There is no strip preset called \"{name}\"; nothing was deleted."),
+        ));
+    };
+    let removed = presets.remove(position);
+    session.set_strip_presets(presets)?;
+    Ok(answer(
+        "deleted",
+        format!("Deleted the strip preset \"{}\".", removed.name),
+    ))
+}
+
+/// [apply_strip_preset] over any engine slot, session and saver. The presets are read before the
+/// engine lock is taken, so the session's lock is never held inside it here.
+fn apply_preset_with<E: ProcessingEngine>(
+    engine: &Mutex<Option<E>>,
+    session: &SessionStore,
+    saver: &ProcessingSaver,
+    name: &str,
+    channel: usize,
+) -> Result<ProcessingSetDto, String> {
+    if let Some(invalid) = invalid_channel(channel) {
+        return Ok(invalid);
+    }
+    let name = name.trim();
+    let Some(preset) = presets_of(session)
+        .into_iter()
+        .find(|preset| same_name(&preset.name, name))
+    else {
+        return Ok(ProcessingSetDto::refused(
+            "notFound",
+            format!("There is no strip preset called \"{name}\"; nothing changed."),
+        ));
+    };
+    let channels = apply_to(engine, saver, &[channel], preset.settings)?;
+    let message = format!("\"{}\" is on {} now.", preset.name, channel_list(&channels));
+    Ok(ProcessingSetDto {
+        outcome: "set",
+        channels,
+        message,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personal_monitoring::CompressorSettings;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -813,5 +1215,198 @@ mod tests {
             "by channel number, the neutral strips left out"
         );
         assert_eq!(processing_list(&kept), list);
+    }
+
+    #[test]
+    fn the_built_in_presets_come_first_are_in_range_and_each_does_something() {
+        let session = SessionStore::open(&test_directory("factory"));
+        let listed = presets_of(&session);
+        let names: Vec<&str> = listed.iter().map(|preset| preset.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Vocal",
+                "Kick",
+                "Bass DI",
+                "Acoustic guitar",
+                "Gentle compression"
+            ]
+        );
+        for preset in &listed {
+            assert!(preset.factory, "{}", preset.name);
+            assert_eq!(
+                preset.settings.clamped(),
+                preset.settings,
+                "{} is in range",
+                preset.name
+            );
+            assert!(
+                !preset.settings.is_neutral(),
+                "{} does something",
+                preset.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_engineers_presets_are_saved_replaced_by_name_and_deleted_but_never_the_built_in_ones() {
+        let directory = test_directory("presets");
+        let session = SessionStore::open(&directory);
+
+        let saved = save_preset_with(&session, "  Lead vocal ", boosted(30.0)).expect("saved");
+        assert_eq!(saved.outcome, "saved");
+        let preset = saved.preset.expect("the preset");
+        assert_eq!(preset.name, "Lead vocal", "trimmed");
+        assert_eq!(preset.settings, boosted(18.0), "held in range");
+        assert!(!preset.factory);
+        assert_eq!(saved.presets.len(), 6);
+        assert_eq!(
+            saved.presets[5].name, "Lead vocal",
+            "after the built-in ones"
+        );
+        save_preset_with(&session, "Snare", compressed(-12.0)).expect("saved");
+
+        let replaced = save_preset_with(&session, "LEAD VOCAL", compressed(-30.0)).expect("saved");
+        assert_eq!(replaced.outcome, "replaced");
+        let mine: Vec<(String, StripSettings)> = replaced
+            .presets
+            .iter()
+            .filter(|preset| !preset.factory)
+            .map(|preset| (preset.name.clone(), preset.settings))
+            .collect();
+        assert_eq!(
+            mine,
+            vec![
+                ("LEAD VOCAL".to_owned(), compressed(-30.0)),
+                ("Snare".to_owned(), compressed(-12.0)),
+            ],
+            "replaced in place, under the name as written now"
+        );
+        assert_eq!(
+            SessionStore::open(&directory).strip_presets().len(),
+            2,
+            "kept in the session file"
+        );
+
+        for name in ["vocal", "Kick", "  gentle COMPRESSION "] {
+            let refused = save_preset_with(&session, name, boosted(1.0)).expect("answered");
+            assert_eq!(refused.outcome, "invalid", "{name}");
+            assert!(refused.message.contains("built-in"), "{}", refused.message);
+            let kept = delete_preset_with(&session, name).expect("answered");
+            assert_eq!(kept.outcome, "factory", "{name}");
+        }
+        assert_eq!(
+            save_preset_with(&session, "  ", boosted(1.0))
+                .expect("answered")
+                .outcome,
+            "invalid"
+        );
+        let long = "x".repeat(MAX_STRIP_PRESET_NAME_LENGTH + 1);
+        assert_eq!(
+            save_preset_with(&session, &long, boosted(1.0))
+                .expect("answered")
+                .outcome,
+            "invalid"
+        );
+
+        let deleted = delete_preset_with(&session, "snare").expect("deleted");
+        assert_eq!(deleted.outcome, "deleted");
+        assert_eq!(deleted.message, "Deleted the strip preset \"Snare\".");
+        assert_eq!(deleted.presets.len(), 6);
+        assert_eq!(
+            delete_preset_with(&session, "snare")
+                .expect("answered")
+                .outcome,
+            "notFound"
+        );
+        assert_eq!(
+            presets_of(&session).len(),
+            6,
+            "the built-in ones are all still there"
+        );
+    }
+
+    #[test]
+    fn a_preset_is_applied_to_a_channel_as_a_change_is() {
+        let session = Arc::new(SessionStore::open(&test_directory("apply")));
+        let saver = saver_into(&session);
+        let engine = running();
+        save_preset_with(&session, "Snare", compressed(-12.0)).expect("saved");
+
+        let vocal = apply_preset_with(&engine, &session, &saver, "vocal", 2).expect("applied");
+        assert_eq!(vocal.outcome, "set");
+        assert_eq!(vocal.message, "\"Vocal\" is on CH 2 now.");
+        assert_eq!(strips_of(&engine)[1], factory_presets()[0].1);
+
+        let snare = apply_preset_with(&engine, &session, &saver, "Snare", 3).expect("applied");
+        assert_eq!(snare.channels.len(), 2, "on the whole pair");
+        saver.flush();
+        assert_eq!(session.processing().get(&4), Some(&compressed(-12.0)));
+
+        let missing = apply_preset_with(&engine, &session, &saver, "Tuba", 1).expect("answered");
+        assert_eq!(missing.outcome, "notFound");
+        let outside = apply_preset_with(&engine, &session, &saver, "Vocal", 0).expect("answered");
+        assert_eq!(outside.outcome, "invalid");
+        assert_eq!(strips_of(&engine)[0], StripSettings::default());
+    }
+
+    #[test]
+    fn the_equaliser_response_is_a_log_grid_with_the_filters_gains() {
+        let flat = eq_response(&EqSettings::default(), None);
+        assert_eq!(flat.len(), 128);
+        assert_eq!(flat[0].freq_hz, 20.0);
+        assert!((flat[127].freq_hz - 20_000.0).abs() < 1e-6);
+        let ratio = flat[1].freq_hz / flat[0].freq_hz;
+        assert!(flat
+            .windows(2)
+            .all(|pair| (pair[1].freq_hz / pair[0].freq_hz - ratio).abs() < 1e-9));
+        assert!(
+            flat.iter().all(|point| point.db == 0.0),
+            "a flat equaliser is 0 dB"
+        );
+
+        let mut peak = EqSettings::default();
+        peak.bands[2] = EqBandSettings {
+            enabled: true,
+            frequency_hz: 2_000.0,
+            gain_db: 6.0,
+            q: 1.0,
+        };
+        let points = eq_response(&peak, Some(4));
+        let freqs: Vec<f64> = points.iter().map(|point| point.freq_hz).collect();
+        assert!((freqs[2] - 2_000.0).abs() < 1e-6, "{freqs:?}");
+        assert!(
+            (points[2].db - 6.0).abs() < 0.01,
+            "the peak's gain at its centre: {points:?}"
+        );
+        assert!(points[0].db.abs() < 0.1, "far below it nothing: {points:?}");
+
+        let mut shelf = EqSettings::default();
+        shelf.bands[0].gain_db = 6.0;
+        let points = eq_response(&shelf, Some(2));
+        assert!(
+            (points[0].db - 6.0).abs() < 0.5,
+            "under the low shelf: {points:?}"
+        );
+        assert!(points[1].db.abs() < 0.1, "far above it: {points:?}");
+
+        let mut high_pass = EqSettings::default();
+        high_pass.high_pass = HighPassSettings {
+            enabled: true,
+            frequency_hz: 200.0,
+            q: std::f32::consts::FRAC_1_SQRT_2,
+        };
+        let points = eq_response(&high_pass, Some(4));
+        assert!(
+            (points[1].db + 3.01).abs() < 0.05,
+            "-3 dB at the corner: {points:?}"
+        );
+        assert!(points[0].db < -30.0, "a decade below: {points:?}");
+
+        assert_eq!(eq_response(&peak, Some(1)).len(), 2);
+        assert_eq!(eq_response(&peak, Some(50_000)).len(), 1024);
+        let json = serde_json::to_value(eq_response(&peak, Some(2))).expect("serializes");
+        assert_eq!(json[0]["freqHz"], 20.0);
+        assert!(json[0]["db"].is_number());
     }
 }

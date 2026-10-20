@@ -553,7 +553,7 @@ pub(crate) fn check_request(
 
 /// The system host's output devices, with their output channel counts at 48 kHz.
 pub(crate) fn system_output_devices() -> Result<Vec<OutputDevice>, String> {
-    let host = input_host(AudioHost::Auto);
+    let host = input_host(AudioHost::Auto)?;
     let devices = host
         .output_devices()
         .map_err(|error| format!("could not enumerate output devices: {error}"))?;
@@ -585,7 +585,7 @@ pub(crate) fn output_channels(device: &Device) -> u16 {
 
 /// Finds a system output device by its exact name.
 pub(crate) fn system_output_device(name: &str) -> Result<Device, String> {
-    input_host(AudioHost::Auto)
+    input_host(AudioHost::Auto)?
         .output_devices()
         .map_err(|error| format!("could not enumerate output devices: {error}"))?
         .find(|device| device.to_string() == name)

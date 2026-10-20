@@ -70,26 +70,42 @@ impl AudioHost {
     }
 }
 
-/// The ASIO host, created once and shared.
+/// The ASIO host, created once and shared, or why it could not be created.
 ///
 /// ASIO can only have one driver loaded at a time, and building a second host re-loads a driver,
 /// which fails as soon as the device list has already touched a different one - exactly what a UI
-/// that lists devices and then starts the engine does.
+/// that lists devices and then starts the engine does. A failure is kept for the session too, so
+/// every later ASIO request reports the same reason.
 #[cfg(all(target_os = "windows", feature = "asio"))]
-fn asio_host() -> &'static cpal::Host {
+fn asio_host() -> Result<&'static cpal::Host, String> {
     use std::sync::OnceLock;
 
-    static HOST: OnceLock<cpal::Host> = OnceLock::new();
-    HOST.get_or_init(|| match cpal::host_from_id(cpal::HostId::Asio) {
-        Ok(host) => host,
-        Err(error) => {
-            crate::log_warn!(
-                "capture",
-                "ASIO host unavailable ({error}); falling back to the default host"
-            );
-            cpal::default_host()
-        }
-    })
+    static HOST: OnceLock<Result<cpal::Host, String>> = OnceLock::new();
+    resolve_asio_host(
+        HOST.get_or_init(|| {
+            cpal::host_from_id(cpal::HostId::Asio).map_err(|error| error.to_string())
+        }),
+    )
+}
+
+/// A build without the `asio` feature, or off Windows, has no ASIO host to offer.
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+fn asio_host() -> Result<&'static cpal::Host, String> {
+    Err(asio_unavailable("this build has no ASIO support"))
+}
+
+/// Turns the outcome of creating the ASIO host into the host to capture from, or the error to show.
+///
+/// There is deliberately no fallback to the platform host. The window lists ASIO drivers from the
+/// registry, so a silent fallback would make a picked driver fail as "no longer available", or match
+/// a system device by substring and capture from something nobody chose.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn resolve_asio_host<H>(created: &Result<H, String>) -> Result<&H, String> {
+    created.as_ref().map_err(|reason| asio_unavailable(reason))
+}
+
+fn asio_unavailable(reason: &str) -> String {
+    format!("ASIO is unavailable ({reason}); choose another driver")
 }
 
 /// The platform default host, created once so it can be returned by reference like [asio_host].
@@ -104,16 +120,33 @@ fn default_host() -> &'static cpal::Host {
 ///
 /// Only an explicit [AudioHost::Asio] loads the ASIO driver. `Auto` resolves to the platform's own
 /// host: ASIO is a kernel-mode driver and an unstable one can restart the machine, so it is never
-/// entered by default. When ASIO is asked for and cannot load, the default host is used instead of
-/// failing the session.
-pub(crate) fn input_host(host: AudioHost) -> &'static cpal::Host {
-    let want_asio = matches!(host, AudioHost::Asio);
-    #[cfg(all(target_os = "windows", feature = "asio"))]
-    if want_asio {
-        return asio_host();
+/// entered by default. When ASIO is asked for and cannot load, the request fails with the reason
+/// instead of capturing from a host the engineer did not choose. The demo source never captures
+/// from a host (its start and switch return before asking for one); it maps to the platform host
+/// only so the match stays exhaustive.
+pub(crate) fn input_host(host: AudioHost) -> Result<&'static cpal::Host, String> {
+    match host {
+        AudioHost::Asio => asio_host(),
+        AudioHost::Auto | AudioHost::Wasapi | AudioHost::Demo => Ok(default_host()),
     }
-    let _ = want_asio;
-    default_host()
+}
+
+/// Refuses an ASIO session that does not name its driver.
+///
+/// With no name the engine would open the first ASIO driver installed, which on the machine this was
+/// built on is the Realtek driver that bugchecked it. Choosing ASIO is already explicit; choosing the
+/// driver has to be too, so a missing or blank name is an error for ASIO and the usual "first device"
+/// for every other host. Checked before any device is touched, at a start and on a live switch, so
+/// neither the window nor the CLI (`--host asio` without `--device`) can open a driver nobody picked.
+pub(crate) fn require_asio_device(host: AudioHost, filter: Option<&str>) -> Result<(), String> {
+    let named = filter.is_some_and(|name| !name.trim().is_empty());
+    if host == AudioHost::Asio && !named {
+        return Err(
+            "ASIO needs a named driver: the engine never opens the first installed one on its own"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Enumerates the default host's input devices with the channel count a switch would capture.
@@ -146,7 +179,7 @@ pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<d
         }
     }
 
-    let host = input_host(host);
+    let host = input_host(host)?;
     let devices = host
         .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?;
@@ -612,6 +645,46 @@ mod tests {
                 "X-USB ASIO Driver".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn an_asio_session_must_name_its_driver() {
+        let error = require_asio_device(AudioHost::Asio, None).unwrap_err();
+        assert!(error.contains("ASIO"), "{error}");
+        assert!(require_asio_device(AudioHost::Asio, Some("")).is_err());
+        assert!(require_asio_device(AudioHost::Asio, Some("   ")).is_err());
+        assert_eq!(
+            require_asio_device(AudioHost::Asio, Some("Universal Audio Volt")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn other_hosts_may_open_their_first_device() {
+        for host in [AudioHost::Auto, AudioHost::Wasapi, AudioHost::Demo] {
+            assert_eq!(require_asio_device(host, None), Ok(()));
+            assert_eq!(require_asio_device(host, Some("")), Ok(()));
+        }
+    }
+
+    #[test]
+    fn an_asio_host_that_cannot_load_is_reported_instead_of_replaced() {
+        let failed: Result<u8, String> = Err("no ASIO driver could be loaded".to_owned());
+        let error = resolve_asio_host(&failed).unwrap_err();
+        assert!(error.starts_with("ASIO is unavailable"), "{error}");
+        assert!(error.contains("no ASIO driver could be loaded"), "{error}");
+
+        let loaded: Result<u8, String> = Ok(7);
+        assert_eq!(resolve_asio_host(&loaded), Ok(&7));
+    }
+
+    /// Only ASIO can fail to give a host: every other backend is the platform's own, which always
+    /// exists, so no failure path there ever loads or falls back to anything.
+    #[test]
+    fn the_platform_host_is_always_available() {
+        for host in [AudioHost::Auto, AudioHost::Wasapi] {
+            assert!(input_host(host).is_ok());
+        }
     }
 
     #[test]

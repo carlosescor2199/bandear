@@ -406,9 +406,10 @@ mod tests {
         let mut filter = Biquad::new(1);
         filter.set(Some(&shelf(-18.0)));
         let mut signal = sine(100.0, 0.1, 48_000);
-        filter.process(&mut signal[..24_000], 1, 0);
+        // The change lands on a crest of the tone, where a jump would be largest.
+        filter.process(&mut signal[..24_120], 1, 0);
         filter.set(Some(&shelf(18.0)));
-        filter.process(&mut signal[24_000..], 1, 0);
+        filter.process(&mut signal[24_120..], 1, 0);
         let largest_step = |samples: &[f32]| {
             samples
                 .windows(2)

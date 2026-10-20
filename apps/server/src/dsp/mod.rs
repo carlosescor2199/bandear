@@ -22,6 +22,7 @@ use std::ops::RangeInclusive;
 use crate::capture::TARGET_SAMPLE_RATE;
 
 pub(crate) mod biquad;
+pub(crate) mod dynamics;
 pub(crate) mod eq;
 
 /// The rate every processor runs at.

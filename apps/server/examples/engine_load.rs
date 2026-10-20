@@ -4,8 +4,11 @@
 //! from its pop to the return of the last sink.
 //!
 //! Run with `cargo run -p personal-monitoring --example engine_load`, optionally with
-//! `--inputs 32 --targets 16 --seconds 10 --block 256` (the defaults). The phones are sockets on
-//! the loopback interface, so nothing leaves the machine. A debug build's numbers are pessimistic,
+//! `--inputs 32 --targets 16 --seconds 10 --block 256` (the defaults; inputs 1 to 32, musicians at
+//! most 64, seconds at most 600). The phones are sockets on the loopback interface, so nothing
+//! leaves the machine. Each musician needs its own loopback address (127.0.0.1, 127.0.0.2, ...):
+//! on a host that only answers on 127.0.0.1 (macOS by default) run with `--targets 1`, or add the
+//! addresses as loopback aliases. A debug build's numbers are pessimistic,
 //! often several times a release build's: measure the cost of a session with `--release`.
 
 use std::time::Duration;
@@ -74,20 +77,24 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<LoadBenchOptions, Str
     let mut options = LoadBenchOptions::default();
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
-        let number = |value: &str| {
+        let whole = |value: &str| {
             value
-                .parse::<f64>()
-                .ok()
-                .filter(|number| number.is_finite() && *number > 0.0)
-                .ok_or_else(|| format!("{flag} takes a positive number, not {value}"))
+                .parse::<usize>()
+                .map_err(|_| format!("{flag} takes a whole number, not {value}"))
         };
         match flag.as_str() {
-            "--inputs" => options.inputs = number(&value)? as usize,
-            "--targets" => options.targets = number(&value)? as usize,
-            "--seconds" => options.seconds = number(&value)?,
-            "--block" => options.block_frames = number(&value)? as usize,
+            "--inputs" => options.inputs = whole(&value)?,
+            "--targets" => options.targets = whole(&value)?,
+            "--seconds" => {
+                options.seconds = value
+                    .parse::<f64>()
+                    .map_err(|_| format!("{flag} takes a number of seconds, not {value}"))?;
+            }
+            "--block" => options.block_frames = whole(&value)?,
             _ => return Err(format!("unknown option {flag}")),
         }
     }
+    // 1 to 32 inputs, at most 64 musicians, at most 600 s: a usage error past them.
+    options.validate()?;
     Ok(options)
 }

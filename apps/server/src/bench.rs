@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::engine::{LevelMeter, OutputMeter};
 use crate::load::EngineLoadStatus;
-use crate::mix::{GroupLayout, MixState};
+use crate::mix::{GroupLayout, MixState, MAX_MIX_CHANNELS};
 use crate::network::{NetworkSink, PacketStats};
 use crate::output::local_output_sink;
-use crate::pipeline::{CaptureLinks, CaptureStats, CaptureWriter, Pipeline, SourceFormat};
+use crate::pipeline::{
+    CaptureLinks, CaptureStats, CaptureWriter, Pipeline, SourceFormat, MAX_BLOCK_FRAMES,
+};
 use crate::recorder::recorder_sink;
 use crate::targets::TargetRegistry;
 
@@ -30,6 +32,44 @@ pub struct LoadBenchOptions {
     pub seconds: f64,
     /// Frames per block at 48 kHz.
     pub block_frames: usize,
+}
+
+/// The most musicians the bench runs: each is a socket on its own loopback address.
+pub const MAX_BENCH_TARGETS: usize = 64;
+/// The most audio time the bench runs, paced in real time.
+pub const MAX_BENCH_SECONDS: f64 = 600.0;
+
+impl LoadBenchOptions {
+    /// Checks the options against the bench's bounds: 1 to 32 inputs (the mixer's channels), 0 to
+    /// [MAX_BENCH_TARGETS] musicians, more than 0 and at most [MAX_BENCH_SECONDS] seconds, and 1 to
+    /// the engine's largest block of frames. The message names the option out of bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.inputs == 0 || self.inputs > MAX_MIX_CHANNELS {
+            return Err(format!(
+                "--inputs takes 1 to {MAX_MIX_CHANNELS} channels, not {}",
+                self.inputs
+            ));
+        }
+        if self.targets > MAX_BENCH_TARGETS {
+            return Err(format!(
+                "--targets takes at most {MAX_BENCH_TARGETS} musicians, not {}",
+                self.targets
+            ));
+        }
+        if !(self.seconds > 0.0 && self.seconds <= MAX_BENCH_SECONDS) {
+            return Err(format!(
+                "--seconds takes more than 0 and at most {MAX_BENCH_SECONDS} seconds, not {}",
+                self.seconds
+            ));
+        }
+        if self.block_frames == 0 || self.block_frames > MAX_BLOCK_FRAMES {
+            return Err(format!(
+                "--block takes 1 to {MAX_BLOCK_FRAMES} frames, not {}",
+                self.block_frames
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for LoadBenchOptions {
@@ -60,18 +100,32 @@ pub struct LoadBenchReport {
 }
 
 /// Runs the engine's sinks on a generated source for `options.seconds` of audio, paced in real
-/// time, and times every block. The phones are sockets bound on the loopback interface, one
-/// address each (127.0.0.1, 127.0.0.2, ...): nothing leaves the machine.
+/// time, and times every block. Options outside [LoadBenchOptions::validate]'s bounds are an error.
+///
+/// The phones are sockets bound on the loopback interface, one address each (127.0.0.1,
+/// 127.0.0.2, ...): nothing leaves the machine. Musicians are told apart by their IP, one target
+/// per IP as on a real network, so they cannot share 127.0.0.1 on different ports: on a host that
+/// only answers on 127.0.0.1 (macOS by default) a second musician is an error that says so, and a
+/// single musician still runs.
 pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, String> {
-    let inputs = options.inputs.max(1);
-    let block_frames = options
-        .block_frames
-        .clamp(1, crate::pipeline::MAX_BLOCK_FRAMES);
+    options.validate()?;
+    let inputs = options.inputs;
+    let block_frames = options.block_frames;
     let phones = (0..options.targets)
         .map(|index| {
-            let address = Ipv4Addr::new(127, 0, (index / 250) as u8, (index % 250 + 1) as u8);
-            UdpSocket::bind((address, 0))
-                .map_err(|error| format!("could not bind a phone on {address}: {error}"))
+            // At most MAX_BENCH_TARGETS (64) musicians: 127.0.0.1 to 127.0.0.64.
+            let address = Ipv4Addr::new(127, 0, 0, index as u8 + 1);
+            UdpSocket::bind((address, 0)).map_err(|error| {
+                if index == 0 {
+                    format!("could not bind a phone on {address}: {error}")
+                } else {
+                    format!(
+                        "could not bind a phone on {address}: {error}. Each musician needs its \
+                         own loopback address; on a host that only answers on 127.0.0.1 run with \
+                         --targets 1, or add the address (macOS: ifconfig lo0 alias {address})"
+                    )
+                }
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let addresses = phones
@@ -112,7 +166,7 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
     pipeline.set_source(reader);
 
     let period = Duration::from_secs_f64(block_frames as f64 / f64::from(TARGET_SAMPLE_RATE));
-    let blocks = ((options.seconds.max(0.0) / period.as_secs_f64()).ceil() as usize).max(1);
+    let blocks = ((options.seconds / period.as_secs_f64()).ceil() as usize).max(1);
     let mut source = vec![0.0f32; block_frames * inputs];
     let mut times = Vec::with_capacity(blocks);
     let mut phase = 0u64;
@@ -152,4 +206,60 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
         packets_sent: packet_stats.sent.load(Ordering::Relaxed),
         packets_discarded: packet_stats.discarded.load(Ordering::Relaxed),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(change: fn(&mut LoadBenchOptions)) -> Result<(), String> {
+        let mut options = LoadBenchOptions::default();
+        change(&mut options);
+        options.validate()
+    }
+
+    #[test]
+    fn the_bench_refuses_options_outside_its_bounds() {
+        assert_eq!(LoadBenchOptions::default().validate(), Ok(()));
+        assert!(with(|o| o.inputs = 0).unwrap_err().contains("--inputs"));
+        assert_eq!(with(|o| o.inputs = MAX_MIX_CHANNELS), Ok(()));
+        assert!(with(|o| o.inputs = MAX_MIX_CHANNELS + 1)
+            .unwrap_err()
+            .contains("--inputs"));
+        assert_eq!(with(|o| o.targets = 0), Ok(()));
+        assert_eq!(with(|o| o.targets = MAX_BENCH_TARGETS), Ok(()));
+        assert!(with(|o| o.targets = usize::MAX)
+            .unwrap_err()
+            .contains("--targets"));
+        assert_eq!(with(|o| o.seconds = MAX_BENCH_SECONDS), Ok(()));
+        assert!(with(|o| o.seconds = 1e300)
+            .unwrap_err()
+            .contains("--seconds"));
+        assert!(with(|o| o.seconds = f64::NAN).is_err());
+        assert!(with(|o| o.seconds = f64::INFINITY).is_err());
+        assert!(with(|o| o.seconds = 0.0).is_err());
+        assert!(with(|o| o.block_frames = 0)
+            .unwrap_err()
+            .contains("--block"));
+        assert!(with(|o| o.block_frames = MAX_BLOCK_FRAMES + 1)
+            .unwrap_err()
+            .contains("--block"));
+    }
+
+    #[test]
+    fn a_run_out_of_bounds_is_an_error_before_it_allocates() {
+        // Before the bounds, these sizes overflowed a buffer's capacity and aborted the process.
+        for options in [
+            LoadBenchOptions {
+                inputs: usize::MAX,
+                ..LoadBenchOptions::default()
+            },
+            LoadBenchOptions {
+                seconds: 1e300,
+                ..LoadBenchOptions::default()
+            },
+        ] {
+            assert!(run_engine_load(&options).is_err());
+        }
+    }
 }

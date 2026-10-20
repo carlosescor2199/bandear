@@ -10,8 +10,9 @@ use std::time::Instant;
 use cpal::traits::{HostTrait, StreamTrait};
 
 use crate::capture::{
-    build_input_stream, describe_buffer, input_host, require_asio_device, select_device,
-    select_device_by_name, select_input_config, AudioHost, TARGET_SAMPLE_RATE,
+    build_input_stream, describe_buffer, device_lookup, input_host, open_asio_device,
+    require_asio_device, select_device, select_device_by_name, select_input_config, AudioHost,
+    DeviceLookup, TARGET_SAMPLE_RATE,
 };
 use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
@@ -1783,13 +1784,23 @@ impl EngineHandle {
         require_asio_device(self.host, filter)?;
         let device = {
             let host = input_host(self.host)?;
-            let devices = host
-                .input_devices()
-                .map_err(|error| format!("could not enumerate input devices: {error}"))?
-                .collect::<Vec<_>>();
-            match filter {
-                Some(name) => select_device_by_name(devices, name)?,
-                None => select_device(devices, None)?,
+            match device_lookup(self.host) {
+                // Opened by name: listing ASIO through cpal would load every installed driver.
+                DeviceLookup::AsioByName => open_asio_device(host, filter.unwrap_or_default())?,
+                DeviceLookup::Enumerate => {
+                    let devices = host
+                        .input_devices()
+                        .map_err(|error| format!("could not enumerate input devices: {error}"))?
+                        .collect::<Vec<_>>();
+                    match filter {
+                        Some(name) => select_device_by_name(devices, name)?,
+                        None => select_device(devices, None)?,
+                    }
+                }
+                // The demo source returned above, before any host was asked for.
+                DeviceLookup::NoDevice => {
+                    return Err("the demo source opens no input device".into())
+                }
             }
         };
         let supported_config = select_input_config(&device)?;
@@ -2847,26 +2858,37 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         return launch(config, &targets, StartCapture::Demo).map(Some);
     }
     let host = input_host(config.host)?;
-    let devices = host
-        .input_devices()
-        .map_err(|error| format!("could not enumerate input devices: {error}"))?
-        .collect::<Vec<_>>();
+    let device = match device_lookup(config.host) {
+        // Opened by name: listing ASIO through cpal would load every installed driver, and a bad
+        // name fails listing the installed ones, read from the registry.
+        DeviceLookup::AsioByName => {
+            open_asio_device(host, config.device_filter.as_deref().unwrap_or_default())?
+        }
+        DeviceLookup::Enumerate => {
+            let devices = host
+                .input_devices()
+                .map_err(|error| format!("could not enumerate input devices: {error}"))?
+                .collect::<Vec<_>>();
 
-    if devices.is_empty() {
-        crate::log_info!(
-            "engine",
-            "No input device is available. Connect an audio interface and try again."
-        );
-        return Ok(None);
-    }
+            if devices.is_empty() {
+                crate::log_info!(
+                    "engine",
+                    "No input device is available. Connect an audio interface and try again."
+                );
+                return Ok(None);
+            }
 
-    crate::log_info!("engine", "Available input devices:");
-    for (index, device) in devices.iter().enumerate() {
-        let name = device.to_string();
-        crate::log_info!("engine", "  {}. {name}", index + 1);
-    }
+            crate::log_info!("engine", "Available input devices:");
+            for (index, device) in devices.iter().enumerate() {
+                let name = device.to_string();
+                crate::log_info!("engine", "  {}. {name}", index + 1);
+            }
 
-    let device = select_device(devices, config.device_filter.as_deref())?;
+            select_device(devices, config.device_filter.as_deref())?
+        }
+        // The demo source returned above, before any host was asked for.
+        DeviceLookup::NoDevice => return Err("the demo source opens no input device".into()),
+    };
     let device_name = device.to_string();
     let supported_config = select_input_config(&device)?;
     let buffer_frames = config.buffer_frames.or(Some(DEFAULT_BUFFER_FRAMES));

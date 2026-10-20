@@ -234,6 +234,82 @@ test.
     about 4.1 ms per block in debug (about 128 µs each); a release run is needed for a real figure.
   - Counts: 591 server tests, 307 desktop tests, `cargo check -p mixlink-desktop --all-targets`
     clean.
+- [x] TA (ASIO safety port): the still-relevant server fixes from the two unmerged local branches
+  `fix/audio-panel-review-findings` (e67d8ec) and `fix/asio-switch-waits-for-pick` (d0d1fc7),
+  hand-ported onto the rewritten `engine.rs` and `capture.rs`. Route: delegated writer (trigger:
+  a vendored crate plus capture, engine, output and CLI changes).
+  - Commits: e1f36b8 `build: vendor cpal 0.18.2 with ASIO open-by-name` (third-party, 80 files,
+    +29,932 vendored lines plus the workspace wiring), 08d632d `fix(server): do not panic on an
+    inverted driver buffer range` (+16/-2, from a8c2483), a3c7657 `fix(server): refuse ASIO without
+    a picked driver and never fall back silently` (+152/-32, from aae3ca3 + 26574e7) and this commit
+    `fix(server): open an ASIO driver by its registry name` (from 545df12 + c63246f + 4daf017 +
+    ee613c7).
+  - Ported: `clamp_buffer_frames` leaves the request unchanged on an inverted driver range
+    (`min > max`) instead of panicking in `u32::clamp` (start, switch and the ASIO local output).
+    `require_asio_device` refuses a start or a live switch under ASIO with a missing or blank driver,
+    first thing in `start` and right after the demo check in `switch_device`, so `--host asio`
+    without `--device` no longer opens the first installed driver. `input_host` returns a `Result`:
+    a failed ASIO host is the error `ASIO is unavailable (...)` (kept for the session in a
+    `OnceLock<Result<..>>`, `resolve_asio_host`), with no fallback to `cpal::default_host()`, and a
+    build without ASIO says so. Under ASIO the engine never calls `input_devices()`:
+    `device_lookup(host)` (`AsioByName`, `Enumerate`, `NoDevice` for the demo) is the one decision
+    `start` and `switch_device` share; `open_asio_device` resolves the filter against the registry
+    (`resolve_asio_driver_name`: an exact case-insensitive name wins, otherwise exactly one
+    substring match, an ambiguous or unknown filter is an error naming the candidates) and opens that
+    one driver through cpal's `device_by_id` (`open_named_asio_driver`, testable with a fake
+    opener). The ASIO device list is the registry only: the fallback to cpal's enumeration when the
+    registry read gave no names is gone. Unchanged: ASIO is never the default or enumerated
+    implicitly, the desktop's T7b start-request builder (`apps/desktop/ui/app/lib/engine-config.js`)
+    stays the only UI start path, and the demo source path is untouched (its own early returns run
+    before any of this).
+  - Dropped: 15ae80d (one `planned_buffer_frames` so the startup log shows the clamped buffer;
+    cosmetic, and the current engine already defaults a missing request to 256 in `start`),
+    fe9a72a, edcec27, 2bdefaa and a01dfc4 (the old window's audio selects and driver pick, replaced
+    by the T7b builder). The branches' `vendor/README.md` and
+    `.gitattributes` (`vendor/cpal/** -text`) were not ported (outside this task's edit surface); the
+    vendored blobs were copied from the branch as-is, so they are byte-identical to it.
+  - Vendored cpal: `vendor/cpal` is the crates.io package cpal 0.18.2 (the version in `Cargo.lock`)
+    plus a patch of +71/-40 lines in `src/host/asio/device.rs` and `src/host/asio/mod.rs`, each
+    change marked `MixLink patch`: the per-driver description moved unchanged into
+    `Device::from_driver`, a new `device_by_name` loads and describes one driver, and the ASIO
+    `HostTrait` overrides `device_by_id` to call it instead of the trait default that walks
+    `devices()`. Why: cpal 0.18.2 lists ASIO devices by loading every installed driver in registry
+    order, and the first one here, Realtek ASIO, has bugchecked this PC. Wired in with
+    `[patch.crates-io] cpal = { path = "vendor/cpal" }` and `exclude = ["vendor/cpal"]` in the root
+    `Cargo.toml`; the lock entry lost its registry source and checksum. Verify the copy with
+    `diff -r ~/.cargo/registry/src/index.crates.io-*/cpal-0.18.2 vendor/cpal` (only `.cargo-ok`
+    missing plus the two patched files). Drop it, and bump `cpal`, once a cpal release opens one
+    ASIO driver by name; offering the `device_by_id` override upstream is an open follow-up. As a
+    path dependency its lints are no longer capped: a build without the `asio` feature shows one
+    upstream `frames_to_duration` dead-code warning.
+  - RED: `an_inverted_driver_range_passes_the_request_on_instead_of_panicking` panicked
+    (`min > max. min = 512, max = 128`), then passed. The ASIO guard tests
+    (`an_asio_session_must_name_its_driver`, `other_hosts_may_open_their_first_device`,
+    `an_asio_host_that_cannot_load_is_reported_instead_of_replaced`,
+    `the_platform_host_is_always_available`) failed to compile (9 errors: no `require_asio_device`,
+    no `resolve_asio_host`, `input_host` not a `Result`), then passed;
+    `an_asio_start_without_a_driver_is_refused_before_anything_opens` failed with the start guard
+    removed (`invalid --target`), then passed. `under_asio_a_switch_without_a_driver_is_refused_and_the_capture_kept`
+    was not run red on purpose: without the guard that switch would enumerate the real ASIO
+    drivers. The open-by-name tests (`asio_is_opened_by_name_and_never_enumerated` for ASIO, Auto,
+    WASAPI and Demo; the five `resolve_asio_driver_name` cases: exact, single substring, ambiguous,
+    unknown or none installed, blank; `only_the_resolved_asio_driver_is_opened`,
+    `an_unresolved_asio_filter_opens_no_driver_at_all` and
+    `an_asio_driver_that_does_not_open_is_named_in_the_error` with a fake opener) failed to compile
+    (18 errors), then passed. Every test is a pure helper or uses the device-less test engine; no
+    test touches an ASIO host.
+  - Checks: `cargo test -p personal-monitoring` 608 passed; `cargo test -p mixlink-desktop` 307
+    passed; `cargo check -p mixlink-desktop --all-targets` clean; `cargo check -p
+    personal-monitoring --no-default-features` builds (only the pre-existing
+    `parse_asio_driver_names` and the vendored `frames_to_duration` dead-code warnings).
+  - Open follow-ups: `R3-asio-load-error-discarded` (`device_by_name` turns every load failure into
+    `None`, so "failed to load", "no channels" and "another driver is loaded" read the same; telling
+    them apart needs a wider cpal patch); `R3-registry-failure-misreported` (a failed `reg query` and
+    a machine with no ASIO drivers both read as "no ASIO drivers are installed"); offering the cpal
+    patch upstream; `R3-zero-channel-devices-selectable` (devices listed with 0 channels, every ASIO
+    registry entry included, can still be picked).
+  - Not exercised on real hardware yet: needs a live test with the Volt under ASIO, with the user's
+    go-ahead.
 - [ ] T5 (desk): session, commands and strip presets for channel processing. Route: delegated
   writer.
 - [ ] T6 (editor): the channel processing editor (EQ curve, dynamics, meters), opened from the
@@ -265,6 +341,8 @@ per reviewed slice, only with the user's approval.
 - Verification after T3-fix and T4: `cargo test -p personal-monitoring` 591 passed;
   `cargo test -p mixlink-desktop` 307 passed; `cargo check -p mixlink-desktop --all-targets`
   clean; the debug `engine_load --strips` run above. UI tests not run (no UI change).
+- TA (ASIO safety port) done between T4 and T5: the vendored cpal and three server fixes from
+  the two unmerged ASIO branches (see the task). Not reviewed yet; next review base stays 06bdde6.
 - Disk: the F: drive is nearly full (2.4 GB free before T3, 1.4 GB after; each test build of the
   server takes a few hundred MB). Keep builds to debug, one at a time, and stop on "no space".
 

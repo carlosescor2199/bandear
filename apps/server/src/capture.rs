@@ -163,20 +163,18 @@ pub fn list_input_devices_for(host: AudioHost) -> Result<Vec<InputDevice>, Box<d
             channels: crate::demo::DEMO_CHANNELS,
         }]);
     }
-    // ASIO is listed from the registry instead of from cpal. cpal describes a device by loading its
-    // driver, and ASIO only holds one driver at a time, so a running session hides every driver but
-    // its own. The installed names are exactly what a DAW lists, and they are the names cpal uses.
-    // Only an explicit ASIO request lists them: `Auto` is the safe host and must not offer drivers
-    // that load a kernel-mode driver.
+    // ASIO is listed from the registry only, never from cpal. cpal describes a device by loading its
+    // driver, one installed driver after another, and ASIO only holds one driver at a time, so a
+    // running session would also hide every driver but its own. The installed names are exactly
+    // what a DAW lists, and they are the names cpal uses. Only an explicit ASIO request lists them:
+    // `Auto` is the safe host and must not offer drivers that load a kernel-mode driver. A build
+    // without ASIO support goes on to `input_host`, which refuses ASIO without listing anything.
     #[cfg(all(target_os = "windows", feature = "asio"))]
     if matches!(host, AudioHost::Asio) {
-        let names = installed_asio_driver_names();
-        if !names.is_empty() {
-            return Ok(names
-                .into_iter()
-                .map(|name| InputDevice { name, channels: 0 })
-                .collect());
-        }
+        return Ok(installed_asio_driver_names()
+            .into_iter()
+            .map(|name| InputDevice { name, channels: 0 })
+            .collect());
     }
 
     let host = input_host(host)?;
@@ -226,6 +224,109 @@ fn installed_asio_driver_names() -> Vec<String> {
         return Vec::new();
     }
     parse_asio_driver_names(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// How a session finds its input device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceLookup {
+    /// Resolve the name against the registry and open only that driver ([open_asio_device]).
+    AsioByName,
+    /// List the host's devices through cpal and pick one of them.
+    Enumerate,
+    /// The demo source: no device, no host and no driver.
+    NoDevice,
+}
+
+/// The one decision of how a backend finds its device, shared by the engine start and a live switch.
+///
+/// Listing ASIO through cpal loads every installed kernel-mode driver in turn, so ASIO is never
+/// enumerated. The match is exhaustive on purpose: a new backend has to choose.
+pub(crate) fn device_lookup(host: AudioHost) -> DeviceLookup {
+    match host {
+        AudioHost::Asio => DeviceLookup::AsioByName,
+        AudioHost::Auto | AudioHost::Wasapi => DeviceLookup::Enumerate,
+        AudioHost::Demo => DeviceLookup::NoDevice,
+    }
+}
+
+/// Picks the installed ASIO driver a filter names, from the registry list, without loading any.
+///
+/// The window sends a full registry name and the CLI may pass part of one (`--device Volt`), so an
+/// exact, case-insensitive name wins, and otherwise the filter must match exactly one driver. An
+/// ambiguous filter is an error naming the candidates rather than a guess, because under ASIO a
+/// guess loads a kernel-mode driver.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn resolve_asio_driver_name(installed: &[String], filter: &str) -> Result<String, String> {
+    let filter = filter.trim();
+    let wanted = filter.to_lowercase();
+    if wanted.is_empty() {
+        return Err("ASIO needs a named driver".to_owned());
+    }
+    if installed.is_empty() {
+        return Err("no ASIO drivers are installed".to_owned());
+    }
+    if let Some(exact) = installed.iter().find(|name| name.to_lowercase() == wanted) {
+        return Ok(exact.clone());
+    }
+    let matches: Vec<&str> = installed
+        .iter()
+        .map(String::as_str)
+        .filter(|name| name.to_lowercase().contains(&wanted))
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok((*only).to_owned()),
+        [] => Err(format!(
+            "no installed ASIO driver name contains \"{filter}\"; installed: {}",
+            installed.join(", ")
+        )),
+        several => Err(format!(
+            "\"{filter}\" matches several ASIO drivers ({}); name one exactly",
+            several.join(", ")
+        )),
+    }
+}
+
+/// Resolves `filter` against the `installed` driver names and opens that one driver with `open`.
+///
+/// `open` is only called once, with the resolved registry name, and never when the name does not
+/// resolve; it stands for cpal's `device_by_id`, so the decision is testable with a fake opener
+/// and without loading any driver.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn open_named_asio_driver<D>(
+    installed: &[String],
+    filter: &str,
+    open: impl FnOnce(&str) -> Option<D>,
+) -> Result<D, String> {
+    let name = resolve_asio_driver_name(installed, filter)?;
+    open(&name).ok_or_else(|| {
+        format!(
+            "ASIO driver \"{name}\" could not be opened: it failed to load, reports no channels, \
+             or another ASIO driver is still loaded"
+        )
+    })
+}
+
+/// Opens the ASIO driver a filter names, loading that driver and no other.
+///
+/// The name is resolved against the registry, and the vendored cpal's `device_by_id` describes only
+/// that driver. Going through cpal's device list instead would load every installed driver in turn,
+/// including an unstable one nobody asked for (see `vendor/cpal`, patched in the ASIO host).
+#[cfg(all(target_os = "windows", feature = "asio"))]
+pub(crate) fn open_asio_device(host: &cpal::Host, filter: &str) -> Result<Device, Box<dyn Error>> {
+    Ok(open_named_asio_driver(
+        &installed_asio_driver_names(),
+        filter,
+        |name| host.device_by_id(&cpal::DeviceId::new(cpal::HostId::Asio, name)),
+    )?)
+}
+
+/// A build without ASIO support never reaches this: [input_host] already refused ASIO.
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+pub(crate) fn open_asio_device(
+    _host: &cpal::Host,
+    _filter: &str,
+) -> Result<Device, Box<dyn Error>> {
+    Err(asio_unavailable("this build has no ASIO support").into())
 }
 
 /// Joins a device name with its configuration selection into a reportable [InputDevice].
@@ -676,6 +777,110 @@ mod tests {
 
         let loaded: Result<u8, String> = Ok(7);
         assert_eq!(resolve_asio_host(&loaded), Ok(&7));
+    }
+
+    /// The one decision start and a live switch share: ASIO is opened by name and never
+    /// enumerated, the platform hosts list their devices, and the demo source has none at all.
+    #[test]
+    fn asio_is_opened_by_name_and_never_enumerated() {
+        assert_eq!(device_lookup(AudioHost::Asio), DeviceLookup::AsioByName);
+        assert_eq!(device_lookup(AudioHost::Auto), DeviceLookup::Enumerate);
+        assert_eq!(device_lookup(AudioHost::Wasapi), DeviceLookup::Enumerate);
+        assert_eq!(device_lookup(AudioHost::Demo), DeviceLookup::NoDevice);
+    }
+
+    fn installed(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_exact_asio_driver_name_wins_over_a_longer_match() {
+        let drivers = installed(&["Realtek ASIO", "Volt", "Volt 476"]);
+        assert_eq!(
+            resolve_asio_driver_name(&drivers, "volt"),
+            Ok("Volt".to_owned())
+        );
+        assert_eq!(
+            resolve_asio_driver_name(&drivers, "  Realtek ASIO "),
+            Ok("Realtek ASIO".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_unique_part_of_an_asio_driver_name_picks_it() {
+        let drivers = installed(&["Realtek ASIO", "Universal Audio Volt"]);
+        assert_eq!(
+            resolve_asio_driver_name(&drivers, "VOLT"),
+            Ok("Universal Audio Volt".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_asio_filter_names_every_candidate_instead_of_picking_one() {
+        let drivers = installed(&["Realtek ASIO", "ASIO4ALL v2", "Universal Audio Volt"]);
+        let error = resolve_asio_driver_name(&drivers, "asio").unwrap_err();
+        assert!(error.contains("Realtek ASIO"), "{error}");
+        assert!(error.contains("ASIO4ALL v2"), "{error}");
+        assert!(!error.contains("Universal Audio Volt"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_asio_driver_lists_the_installed_ones() {
+        let drivers = installed(&["Realtek ASIO", "Universal Audio Volt"]);
+        let error = resolve_asio_driver_name(&drivers, "Focusrite").unwrap_err();
+        assert!(error.contains("Focusrite"), "{error}");
+        assert!(
+            error.contains("Realtek ASIO, Universal Audio Volt"),
+            "{error}"
+        );
+
+        let error = resolve_asio_driver_name(&[], "Volt").unwrap_err();
+        assert!(error.contains("no ASIO drivers are installed"), "{error}");
+    }
+
+    #[test]
+    fn a_blank_asio_filter_names_no_driver() {
+        let drivers = installed(&["Realtek ASIO"]);
+        assert!(resolve_asio_driver_name(&drivers, "   ").is_err());
+    }
+
+    /// A fake opener stands in for cpal's `device_by_id`: it records every driver it is asked to
+    /// load, so the test sees that only the resolved driver is ever opened, once.
+    #[test]
+    fn only_the_resolved_asio_driver_is_opened() {
+        let drivers = installed(&["Realtek ASIO", "Universal Audio Volt"]);
+        let mut opened = Vec::new();
+
+        let device = open_named_asio_driver(&drivers, "volt", |name| {
+            opened.push(name.to_owned());
+            Some(format!("device for {name}"))
+        });
+
+        assert_eq!(device, Ok("device for Universal Audio Volt".to_owned()));
+        assert_eq!(opened, vec!["Universal Audio Volt".to_owned()]);
+    }
+
+    #[test]
+    fn an_unresolved_asio_filter_opens_no_driver_at_all() {
+        let drivers = installed(&["Realtek ASIO", "ASIO4ALL v2"]);
+        for filter in ["asio", "Focusrite", "  "] {
+            let mut opened = Vec::new();
+            let refused = open_named_asio_driver(&drivers, filter, |name| {
+                opened.push(name.to_owned());
+                Some(())
+            });
+            assert!(refused.is_err(), "{filter:?}");
+            assert!(opened.is_empty(), "{filter:?} opened {opened:?}");
+        }
+    }
+
+    #[test]
+    fn an_asio_driver_that_does_not_open_is_named_in_the_error() {
+        let drivers = installed(&["Universal Audio Volt"]);
+        let error =
+            open_named_asio_driver(&drivers, "Universal Audio Volt", |_| None::<()>).unwrap_err();
+        assert!(error.contains("\"Universal Audio Volt\""), "{error}");
+        assert!(error.contains("could not be opened"), "{error}");
     }
 
     /// Only ASIO can fail to give a host: every other backend is the platform's own, which always

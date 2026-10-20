@@ -121,6 +121,12 @@ impl StripProcessor {
         self.non_finite
     }
 
+    /// [Self::non_finite_samples] counted since the last call, back to zero: for a stage that
+    /// keeps the running total across strips it replaces.
+    pub(crate) fn take_non_finite_samples(&mut self) -> u64 {
+        std::mem::take(&mut self.non_finite)
+    }
+
     /// Processes channels `first..first + channels` of each `stride`-wide frame of `block`, in
     /// place, leaving the other channels alone.
     pub(crate) fn process(&mut self, block: &mut [f32], stride: usize, first: usize) {

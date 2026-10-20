@@ -795,13 +795,20 @@ pub struct LocalOutputSetDto {
 }
 
 /// The payload of the `meters` event: the live levels.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetersDto {
     /// The engine run the levels were read from; 0 until the reader sets it.
     pub run: u64,
     /// One 0-100 input peak per source channel, index-aligned with the status's `channels`.
     pub channels: Vec<u8>,
+    /// One 0-100 peak per source channel after its channel strip, on the same scale: what every
+    /// mix hears. A channel whose strip does nothing reads its input peak.
+    pub processed: Vec<u8>,
+    /// Per source channel, the gate's gain reduction now, in dB (0 open or off).
+    pub gate_reduction_db: Vec<f32>,
+    /// Per source channel, the compressor's gain reduction now, in dB, before the makeup gain.
+    pub compressor_reduction_db: Vec<f32>,
     /// Each musician's 0-100 output peak, keyed by the address the status rows show.
     pub musicians: BTreeMap<String, OutputLevelsDto>,
     /// The 0-100 peak of the engineer's local mix, whether or not an output plays it.
@@ -820,6 +827,9 @@ impl From<&EngineMeters> for MetersDto {
         Self {
             run: 0,
             channels: meters.channel_levels.clone(),
+            processed: meters.processed_levels.clone(),
+            gate_reduction_db: meters.gate_reduction_db.clone(),
+            compressor_reduction_db: meters.compressor_reduction_db.clone(),
             musicians: meters
                 .musicians
                 .iter()
@@ -1578,6 +1588,7 @@ mod tests {
             soundcheck: Default::default(),
             demo: false,
             load: Default::default(),
+            non_finite_samples: 0,
         }
     }
 
@@ -2217,6 +2228,9 @@ mod tests {
     fn meters_reach_the_window_with_output_peaks_keyed_by_address() {
         let meters = EngineMeters {
             channel_levels: vec![50, 0],
+            processed_levels: vec![40, 0],
+            gate_reduction_db: vec![0.0, 12.5],
+            compressor_reduction_db: vec![3.25, 0.0],
             musicians: vec![
                 MusicianMeters {
                     address: "192.168.1.4:50000".parse().expect("test address"),
@@ -2237,6 +2251,9 @@ mod tests {
             serde_json::json!({
                 "run": 0,
                 "channels": [50, 0],
+                "processed": [40, 0],
+                "gateReductionDb": [0.0, 12.5],
+                "compressorReductionDb": [3.25, 0.0],
                 "musicians": {
                     "192.168.1.3:50000": { "left": 100, "right": 50 },
                     "192.168.1.4:50000": { "left": 0, "right": 7 },
@@ -2415,6 +2432,9 @@ mod tests {
         status.run = 3;
         let mut meters = MetersDto::from(&EngineMeters {
             channel_levels: vec![0],
+            processed_levels: vec![0],
+            gate_reduction_db: vec![0.0],
+            compressor_reduction_db: vec![0.0],
             musicians: Vec::new(),
             local_levels: [0, 0],
         });
@@ -2467,6 +2487,9 @@ mod tests {
         let status = EngineStatusDto::from(&status_with(Vec::new(), vec![0, 0]));
         let meters = MetersDto::from(&EngineMeters {
             channel_levels: Vec::new(),
+            processed_levels: Vec::new(),
+            gate_reduction_db: Vec::new(),
+            compressor_reduction_db: Vec::new(),
             musicians: Vec::new(),
             local_levels: [0, 0],
         });

@@ -17,6 +17,7 @@ use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, G
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
 use crate::demo::{DemoReader, DEMO_CHANNELS, DEMO_DEVICE_NAME};
 use crate::discovery::spawn_discovery_thread;
+use crate::dsp::strip::StripSettings;
 use crate::health::{link_status, LinkStatus};
 use crate::link_history::LinkHistoryRead;
 use crate::load::{EngineLoad, EngineLoadStatus};
@@ -32,6 +33,7 @@ use crate::output::{
 };
 use crate::pipeline::{CaptureLinks, CaptureStats, Pipeline, PipelineHandle, SourceReader};
 use crate::playback::{BufferOutcome, BufferSetting, PlaybackBuffer};
+use crate::processing::{processing_stage, Processing, ProcessingMeters};
 use crate::recorder::{
     free_space, minutes_left, open_take, plan_tracks, recorder_sink, take_bytes_per_second,
     DiskEstimate, FileOpener, RecordRequest, Recorder, RecordingStatus, TakeEnd, TakeMarker,
@@ -408,6 +410,9 @@ pub struct EngineStatus {
     /// How long the engine thread takes for each block, as a share of the time the block lasts
     /// (see [crate::load]): over 100% a block was late, and many late blocks drop audio.
     pub load: EngineLoadStatus,
+    /// Input samples that were not finite numbers (NaN or an infinity) when they reached a
+    /// working channel strip, which took them as silence (see [EngineHandle::set_channel_processing]).
+    pub non_finite_samples: u64,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -1101,10 +1106,19 @@ impl OutputMeter {
 ///
 /// The meter stream's read: it touches only the held peaks and the target list, never the mixes,
 /// the control peers or the link reports, so it costs a fraction of [EngineHandle::status].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EngineMeters {
     /// One 0-100 input peak per source channel, as [EngineStatus::channel_levels] reports it.
     pub channel_levels: Vec<u8>,
+    /// One 0-100 peak per source channel after its channel strip (see
+    /// [EngineHandle::set_channel_processing]), on the same scale: the level every mix hears. A
+    /// channel whose strip does nothing reads its input level.
+    pub processed_levels: Vec<u8>,
+    /// Per source channel, how far its gate turns it down now, in dB (0 open or off).
+    pub gate_reduction_db: Vec<f32>,
+    /// Per source channel, how far its compressor turns it down now, in dB, before the makeup
+    /// gain (0 when it does not compress or is off).
+    pub compressor_reduction_db: Vec<f32>,
     /// Each musician's output peak, in the order [EngineStatus::musicians] lists them.
     pub musicians: Vec<MusicianMeters>,
     /// The 0-100 peak of the engine's local mix, left then right: metered whether or not a local
@@ -1121,16 +1135,22 @@ pub struct MusicianMeters {
     pub output_levels: [u8; 2],
 }
 
-/// Reads the input levels of `channels` source channels, every musician's output level and the
-/// local mix's. A pure read: it changes no meter.
+/// Reads the input levels of `channels` source channels and their levels and gain reductions
+/// after processing, every musician's output level and the local mix's. A pure read: it changes no
+/// meter.
 pub(crate) fn read_meters(
     levels: &LevelMeter,
+    processing: &ProcessingMeters,
     channels: usize,
     local: &OutputMeter,
     entries: &[TargetEntry],
 ) -> EngineMeters {
+    let processed = processing.read(channels, levels);
     EngineMeters {
         channel_levels: levels.read(channels),
+        processed_levels: processed.levels,
+        gate_reduction_db: processed.gate_reduction_db,
+        compressor_reduction_db: processed.compressor_reduction_db,
         musicians: entries
             .iter()
             .map(|entry| MusicianMeters {
@@ -1147,8 +1167,14 @@ pub(crate) fn read_meters(
 /// A stopped capture delivers no more audio, so no audio time passes for the levels to fall by,
 /// and the send loop that would count the silence has ended too; the engine clears the meters
 /// instead, so a reader never sees the last level frozen.
-pub(crate) fn clear_meters(levels: &LevelMeter, local: &OutputMeter, entries: &[TargetEntry]) {
+pub(crate) fn clear_meters(
+    levels: &LevelMeter,
+    processing: &ProcessingMeters,
+    local: &OutputMeter,
+    entries: &[TargetEntry],
+) {
     levels.clear();
+    processing.clear();
     local.clear();
     for entry in entries {
         entry.output_meter.clear();
@@ -1527,6 +1553,11 @@ pub struct EngineHandle {
     pipeline: Option<PipelineHandle>,
     /// The engine thread's load, as it publishes it (see [crate::load]).
     load: Arc<EngineLoad>,
+    /// The channel processing: every channel's settings, kept for the whole run, and the lines to
+    /// the stage on the engine thread (see [crate::processing]).
+    processing: Mutex<Processing>,
+    /// The levels after processing and the gain reductions, as the stage publishes them.
+    processing_meters: Arc<ProcessingMeters>,
     control_thread: Option<JoinHandle<()>>,
     discovery_thread: Option<JoinHandle<()>>,
 }
@@ -1690,6 +1721,7 @@ impl EngineHandle {
             soundcheck: self.soundcheck(),
             demo: self.is_demo(),
             load: self.load.status(),
+            non_finite_samples: self.processing_meters.non_finite_samples(),
         }
     }
 
@@ -1700,6 +1732,7 @@ impl EngineHandle {
     pub fn meters(&self) -> EngineMeters {
         read_meters(
             &self.levels,
+            &self.processing_meters,
             usize::from(self.source_channels),
             &self.local_meter,
             &self.targets.read(),
@@ -1835,6 +1868,7 @@ impl EngineHandle {
         // The old device's levels describe a stream that is gone, and channels the new device lacks
         // would keep theirs frozen until a switch back; the new stream raises its own at once.
         self.levels.clear();
+        self.processing_meters.clear();
         Ok(self.capture_format.clone())
     }
 
@@ -1914,6 +1948,9 @@ impl EngineHandle {
     /// Runs `change`, which may publish a new configuration (groups, channel details or a device's
     /// channel count) and move every musician's mix onto it, then moves the local mix onto it too
     /// and announces it when its values moved: after the change's own events.
+    ///
+    /// The channel strips follow it too: a new channel count, or a pair linked or unlinked, gives
+    /// the engine thread strips for the new layout, with every channel's settings kept.
     fn publish<T>(&self, change: impl FnOnce() -> T) -> T {
         let previous = self.config_state.snapshot();
         let result = change();
@@ -1921,7 +1958,80 @@ impl EngineHandle {
         if follow_configuration(&self.local_mix, &previous, &live) {
             self.events.emit(EngineEvent::LocalMixChanged);
         }
+        let followed = self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .follow(&live.channels);
+        if let Err(reason) = followed {
+            crate::log_warn!(
+                "engine",
+                "the channel strips could not follow the new channel layout: {reason}"
+            );
+        }
         result
+    }
+
+    /// Sets the processing of input `channel` (0 is CH 1) to `settings` and returns what is kept:
+    /// the settings with every number held in its range (see [StripSettings::clamped]).
+    ///
+    /// The strip changes from the next block, gliding to the new settings without a click, and
+    /// every mix hears it (the phones, the local output and the recorder's local mix; the recorded
+    /// input tracks stay as captured). A linked pair is one strip: setting either side sets both.
+    /// The settings stay with the channel for the whole engine run, through device switches: a
+    /// channel the device lacks keeps them for when it is back. Neutral settings take the strip
+    /// out of the audio path entirely.
+    ///
+    /// An error past the mixer's 32 channels, when the engine is stopping, or when settings come
+    /// faster than the engine thread takes them; nothing changes then.
+    pub fn set_channel_processing(
+        &self,
+        channel: usize,
+        settings: StripSettings,
+    ) -> Result<StripSettings, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_channel(channel, settings)?)
+    }
+
+    /// The processing settings of input `channel` (0 is CH 1); `None` past the mixer's channels.
+    pub fn channel_processing(&self, channel: usize) -> Option<StripSettings> {
+        self.processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .channel(channel)
+    }
+
+    /// Every channel's processing settings, one per mixer channel (32, CH 1 first), inputs the
+    /// device lacks included.
+    pub fn processing(&self) -> Vec<StripSettings> {
+        self.processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .settings()
+    }
+
+    /// Replaces every channel's processing settings at once, as a session load does: `settings`
+    /// from CH 1 on (at most 32), the channels past the list neutral; a linked pair takes its first
+    /// side's. Returns every channel's settings now kept, as [Self::processing] does. Refused, with
+    /// nothing changed, as [Self::set_channel_processing] is.
+    pub fn replace_processing(
+        &self,
+        settings: &[StripSettings],
+    ) -> Result<Vec<StripSettings>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(settings)?)
     }
 
     /// The engine's local mix, with its revision: the engineer's own mix for the local output
@@ -2692,7 +2802,12 @@ impl EngineHandle {
         self.local_output.active = None;
         self.local_output.reap();
         // Capture and the engine thread have ended, so nothing would ever lower the last levels.
-        clear_meters(&self.levels, &self.local_meter, &self.targets.read());
+        clear_meters(
+            &self.levels,
+            &self.processing_meters,
+            &self.local_meter,
+            &self.targets.read(),
+        );
         if let Some(thread) = self.control_thread.take() {
             thread
                 .join()
@@ -2840,12 +2955,18 @@ fn launch(
     let local_meter = OutputMeter::default();
     let (local, output_control) = local_output_sink(Arc::clone(&local_mix), local_meter.clone());
     let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
-    let pipeline = Pipeline::new(
+    let (stage, processing_control) = processing_stage();
+    let pipeline = Pipeline::with_processing(
         vec![Box::new(network), Box::new(local), Box::new(recorder)],
         Arc::clone(&levels),
+        stage,
     );
     let load = pipeline.load();
+    let processing_meters = pipeline.processing_meters();
     let pipeline = PipelineHandle::spawn(pipeline)?;
+    // One strip per input, all neutral: out of the audio path until the desk sets one.
+    let mut processing = Processing::new(processing_control);
+    processing.follow(&config_state.snapshot().channels)?;
     let playback_clock = Arc::new(PlaybackClock::new());
     playback_clock.set_waker(pipeline.waker());
     let (stream, capture_device, device_name, capture_format, block_frames) = match capture {
@@ -2924,6 +3045,8 @@ fn launch(
         stream,
         pipeline: Some(pipeline),
         load,
+        processing: Mutex::new(processing),
+        processing_meters,
         control_thread: Some(control_thread),
         discovery_thread: Some(discovery_thread),
     })
@@ -3976,12 +4099,16 @@ mod tests {
         let local = OutputMeter::default();
         local.observe(&pcm(&[16_384, 16_384]));
 
-        clear_meters(&inputs, &local, &registry.read());
+        let processing = ProcessingMeters::new();
+        clear_meters(&inputs, &processing, &local, &registry.read());
 
         assert_eq!(
-            read_meters(&inputs, 2, &local, &registry.read()),
+            read_meters(&inputs, &processing, 2, &local, &registry.read()),
             EngineMeters {
                 channel_levels: vec![0, 0],
+                processed_levels: vec![0, 0],
+                gate_reduction_db: vec![0.0, 0.0],
+                compressor_reduction_db: vec![0.0, 0.0],
                 musicians: vec![MusicianMeters {
                     address,
                     output_levels: [0, 0],
@@ -4005,12 +4132,16 @@ mod tests {
         let local = OutputMeter::default();
         local.observe(&pcm(&[8_192, 32_767]));
 
-        let meters = read_meters(&inputs, 2, &local, &registry.read());
+        let processing = ProcessingMeters::new();
+        let meters = read_meters(&inputs, &processing, 2, &local, &registry.read());
 
         assert_eq!(
             meters,
             EngineMeters {
                 channel_levels: vec![100, 0],
+                processed_levels: vec![100, 0],
+                gate_reduction_db: vec![0.0, 0.0],
+                compressor_reduction_db: vec![0.0, 0.0],
                 musicians: vec![
                     MusicianMeters {
                         address: first,
@@ -4025,7 +4156,7 @@ mod tests {
             }
         );
         assert_eq!(
-            read_meters(&inputs, 2, &local, &registry.read()),
+            read_meters(&inputs, &processing, 2, &local, &registry.read()),
             meters,
             "a read changes nothing"
         );
@@ -5197,11 +5328,14 @@ mod tests {
         let (local, output_control) =
             local_output_sink(Arc::clone(&local_mix), local_meter.clone());
         let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
-        let pipeline = Pipeline::new(
+        let (stage, processing_control) = processing_stage();
+        let pipeline = Pipeline::with_processing(
             vec![Box::new(network), Box::new(local), Box::new(recorder)],
             Arc::clone(&levels),
+            stage,
         );
         let load = pipeline.load();
+        let processing_meters = pipeline.processing_meters();
         let pipeline = PipelineHandle::spawn(pipeline).expect("the engine thread starts");
         let playback_clock = Arc::new(PlaybackClock::new());
         playback_clock.set_waker(pipeline.waker());
@@ -5232,6 +5366,8 @@ mod tests {
             stream: None,
             pipeline: Some(pipeline),
             load,
+            processing: Mutex::new(Processing::new(processing_control)),
+            processing_meters,
             control_thread: None,
             discovery_thread: None,
         };
@@ -5281,6 +5417,9 @@ mod tests {
             engine.meters(),
             EngineMeters {
                 channel_levels: vec![0, 0],
+                processed_levels: vec![0, 0],
+                gate_reduction_db: vec![0.0, 0.0],
+                compressor_reduction_db: vec![0.0, 0.0],
                 musicians: vec![MusicianMeters {
                     address,
                     output_levels: [0, 0],
@@ -5318,6 +5457,133 @@ mod tests {
             "{raised:?}"
         );
 
+        engine.stop().expect("the engine stops");
+    }
+
+    /// `frames` frames of a `frequency` Hz tone at `amplitude` on every one of `channels`
+    /// channels, from frame `from`.
+    fn tone(
+        channels: usize,
+        frames: usize,
+        frequency: f32,
+        amplitude: f32,
+        from: usize,
+    ) -> Vec<f32> {
+        (from..from + frames)
+            .flat_map(|frame| {
+                let phase = std::f32::consts::TAU * frequency * frame as f32 / 48_000.0;
+                std::iter::repeat_n(amplitude * phase.sin(), channels)
+            })
+            .collect()
+    }
+
+    /// The loudest sample of a phone packet, on the 16-bit scale.
+    fn packet_peak(phone: &std::net::UdpSocket) -> i32 {
+        let mut packet = [0u8; 2_048];
+        let length = phone.recv(&mut packet).expect("a packet arrives");
+        packet[20..length]
+            .chunks_exact(2)
+            .map(|pair| i32::from(i16::from_le_bytes([pair[0], pair[1]])).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A channel's processing stays with it through a device switch: with the same channel count
+    /// the strips run on as they were, and with another count the engine thread gets strips for the
+    /// new layout, the settings of every channel kept. Here a 2 kHz high-pass filter set before the
+    /// switches still cuts a 100 Hz tone on the mono device after them.
+    #[test]
+    fn channel_processing_survives_a_device_switch_and_follows_a_new_channel_count() {
+        use crate::processing::{tests::high_pass, StripLayout};
+
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        phone
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout should set");
+        let (mut engine, old) = engine_without_device(phone.local_addr().expect("address"));
+        let layout = |engine: &EngineHandle| engine.processing.lock().unwrap().layout();
+        assert_eq!(layout(&engine), StripLayout::mono(2));
+        let kept = engine
+            .set_channel_processing(0, high_pass(2_000.0))
+            .expect("the engine takes it");
+        assert_eq!(kept, high_pass(2_000.0).clamped());
+
+        let (same, opened) = test_capture(&engine, 2);
+        drop(old);
+        engine.install_capture(opened).expect("the switch commits");
+        assert_eq!(layout(&engine), StripLayout::mono(2));
+        assert_eq!(engine.channel_processing(0), Some(kept));
+
+        let (mut mono, opened) = test_capture(&engine, 1);
+        drop(same);
+        engine.install_capture(opened).expect("the switch commits");
+        assert_eq!(layout(&engine), StripLayout::mono(1));
+        assert_eq!(engine.channel_processing(0), Some(kept));
+        assert_eq!(engine.processing().len(), MAX_MIX_CHANNELS);
+
+        let mut peak = 0;
+        for block in 0..40 {
+            mono.write(&tone(1, 64, 100.0, 0.5, block * 64));
+            peak = packet_peak(&phone);
+        }
+        // Unprocessed, a 0.5 tone reaches the phone thousands of 16-bit steps high; with the corner
+        // 2 kHz above it, the filter takes it down by about 50 dB.
+        assert!(peak < 500, "{peak}");
+        assert_eq!(engine.status().non_finite_samples, 0);
+
+        assert!(engine
+            .set_channel_processing(MAX_MIX_CHANNELS, high_pass(100.0))
+            .is_err());
+        assert_eq!(engine.channel_processing(MAX_MIX_CHANNELS), None);
+        engine.stop().expect("the engine stops");
+        assert!(engine.set_channel_processing(0, high_pass(100.0)).is_err());
+    }
+
+    /// The meters report each channel after its strip and the gain its gate and compressor take
+    /// off, alongside the input levels from before it.
+    #[test]
+    fn the_meters_report_each_channel_after_processing_and_its_gain_reduction() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let (mut engine, mut capture) = engine_without_device(phone.local_addr().expect("address"));
+        let mut compressed = StripSettings::default();
+        compressed.compressor.enabled = true;
+        compressed.compressor.threshold_db = -30.0;
+        compressed.compressor.ratio = 4.0;
+        compressed.compressor.knee_db = 0.0;
+        let mut gated = StripSettings::default();
+        gated.gate.enabled = true;
+        gated.gate.threshold_db = -6.0;
+        gated.gate.range_db = 40.0;
+        engine
+            .set_channel_processing(0, compressed)
+            .expect("the engine takes it");
+        engine
+            .set_channel_processing(1, gated)
+            .expect("the engine takes it");
+
+        // A second of a -12 dBFS tone on both inputs: the level the gate let through before it
+        // closed has fallen away since.
+        for block in 0..750 {
+            capture.write(&tone(2, 64, 220.0, 0.25, block * 64));
+            if block % 25 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        let meters = meters_until(&engine, |meters| {
+            meters.compressor_reduction_db[0] > 10.0
+                && meters.gate_reduction_db[1] > 39.0
+                && meters.processed_levels[1] < 2
+        });
+
+        assert!(meters.compressor_reduction_db[0] > 10.0, "{meters:?}");
+        assert_eq!(meters.gate_reduction_db[0], 0.0, "{meters:?}");
+        assert!(meters.gate_reduction_db[1] > 39.0, "{meters:?}");
+        assert_eq!(meters.compressor_reduction_db[1], 0.0, "{meters:?}");
+        assert!(meters.processed_levels[1] < 2, "{meters:?}");
+        assert!(
+            meters.processed_levels[0] < meters.channel_levels[0],
+            "{meters:?}"
+        );
         engine.stop().expect("the engine stops");
     }
 

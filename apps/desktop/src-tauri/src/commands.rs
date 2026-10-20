@@ -6390,6 +6390,7 @@ mod tests {
             soundcheck: Default::default(),
             demo: false,
             load: Default::default(),
+            non_finite_samples: 0,
         }
     }
 

@@ -1,6 +1,7 @@
 //! A bench for the engine thread's cost, for the `engine_load` example: the engine's own sinks
 //! (the phones' network sink, the local output's and the recorder's) fed by a generated source
-//! through a capture ring, as the engine thread runs them, with each block timed.
+//! through a capture ring and the channel processing stage, as the engine thread runs them, with
+//! each block timed.
 //!
 //! Hidden from the documentation: it is a measuring tool, not part of the engine's interface.
 
@@ -10,7 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::capture::TARGET_SAMPLE_RATE;
-use crate::engine::{LevelMeter, OutputMeter};
+use crate::dsp::strip::StripSettings;
+use crate::engine::{ChannelMeta, LevelMeter, OutputMeter};
 use crate::load::EngineLoadStatus;
 use crate::mix::{GroupLayout, MixState, MAX_MIX_CHANNELS};
 use crate::network::{NetworkSink, PacketStats};
@@ -18,6 +20,7 @@ use crate::output::local_output_sink;
 use crate::pipeline::{
     CaptureLinks, CaptureStats, CaptureWriter, Pipeline, SourceFormat, MAX_BLOCK_FRAMES,
 };
+use crate::processing::{processing_stage, Processing};
 use crate::recorder::recorder_sink;
 use crate::targets::TargetRegistry;
 
@@ -32,6 +35,9 @@ pub struct LoadBenchOptions {
     pub seconds: f64,
     /// Frames per block at 48 kHz.
     pub block_frames: usize,
+    /// A typical channel strip working on every input ([typical_strip]), so the cost of the
+    /// channel processing is in the measure; off, every strip is neutral and out of the path.
+    pub strips: bool,
 }
 
 /// The most musicians the bench runs: each is a socket on its own loopback address.
@@ -79,6 +85,7 @@ impl Default for LoadBenchOptions {
             targets: 16,
             seconds: 10.0,
             block_frames: 256,
+            strips: false,
         }
     }
 }
@@ -97,6 +104,19 @@ pub struct LoadBenchReport {
     pub load: EngineLoadStatus,
     pub packets_sent: u64,
     pub packets_discarded: u64,
+}
+
+/// The strip the bench runs on every input with `--strips`: a high-pass filter at 80 Hz, two of
+/// the four bands (-3 dB at 400 Hz, +2 dB at 8 kHz) and a compressor at -30 dBFS, 3:1, which the
+/// bench's quiet tones (about -26 dBFS) drive into a few dB of reduction.
+pub fn typical_strip() -> StripSettings {
+    let mut settings = StripSettings::default();
+    settings.eq.high_pass.enabled = true;
+    settings.eq.bands[1].gain_db = -3.0;
+    settings.eq.bands[3].gain_db = 2.0;
+    settings.compressor.enabled = true;
+    settings.compressor.threshold_db = -30.0;
+    settings
 }
 
 /// Runs the engine's sinks on a generated source for `options.seconds` of audio, paced in real
@@ -145,9 +165,11 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
         local_output_sink(Arc::clone(&local_mix), OutputMeter::default());
     let (recorder, _recorder_lines) = recorder_sink(Arc::clone(&local_mix));
     let levels = Arc::new(LevelMeter::new());
-    let mut pipeline = Pipeline::new(
+    let (stage, processing_control) = processing_stage();
+    let mut pipeline = Pipeline::with_processing(
         vec![Box::new(network), Box::new(local), Box::new(recorder)],
         Arc::clone(&levels),
+        stage,
     );
     let load = pipeline.load();
     let links = CaptureLinks {
@@ -164,6 +186,12 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
         links,
     )?;
     pipeline.set_source(reader);
+    // One strip per input, as the engine lays them out; typical ones when asked, else neutral.
+    let mut processing = Processing::new(processing_control);
+    processing.follow(&vec![ChannelMeta::default(); inputs])?;
+    if options.strips {
+        processing.replace(&vec![typical_strip(); inputs])?;
+    }
 
     let period = Duration::from_secs_f64(block_frames as f64 / f64::from(TARGET_SAMPLE_RATE));
     let blocks = ((options.seconds / period.as_secs_f64()).ceil() as usize).max(1);
@@ -192,6 +220,7 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
         pipeline.tick(Instant::now());
     }
     drop(phones);
+    drop(processing);
 
     times.sort_unstable();
     let total: Duration = times.iter().sum();

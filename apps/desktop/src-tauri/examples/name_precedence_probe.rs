@@ -74,6 +74,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         soundcheck: Default::default(),
         demo: false,
         load: Default::default(),
+        non_finite_samples: 0,
     }
 }
 

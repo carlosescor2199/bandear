@@ -1,3 +1,10 @@
 [workspace]
 members = ["apps/server", "apps/desktop/src-tauri"]
+exclude = ["vendor/cpal"]
 resolver = "2"
+
+# cpal is vendored with one patch: its ASIO host opens a single driver by name instead of loading every
+# installed driver to list them. See "TA (ASIO safety port)" in odd/tasks/desktop-dsp.md for what
+# changed and when to drop it.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

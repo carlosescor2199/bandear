@@ -104,6 +104,11 @@
 //!   engine the desk starts and taken from a loaded session (see [crate::commands::redundancy]). A
 //!   delay this build cannot use is kept as written and the musician's audio is sent once; one that
 //!   cannot be read costs only itself.
+//!   An entry's `limiter` (added the same way) is the master limiter the desk set on the musician's
+//!   mix (`enabled`, `ceilingDb` from -24 to 0, `releaseMs` from 1 to 1,000; absent while it is the
+//!   default: off, 0 dBFS, 50 ms): it is given to every engine the desk starts and taken from a
+//!   loaded session (see [crate::commands::limiter]). Numbers out of range are held in range when an
+//!   engine takes them; one that cannot be read costs only itself.
 //! - `groups` holds the engineer's groups in their order: each with the stable id every musician's
 //!   group level follows, a name and 1-based channel numbers (as the engineer numbers them). They are
 //!   applied to every engine the desk starts (see [crate::commands::start_engine]) and replaced by
@@ -144,9 +149,10 @@
 //!   are `0`); null for no local output, the default. Both are applied to every engine the desk
 //!   starts: the mix through the desk's path, then the output, which opens only when the running
 //!   driver offers that device (under ASIO only the capture driver's own outputs) and is otherwise
-//!   left off with a notice, never replaced by another device. Like `audio`, the section was added
-//!   within version 1 and is absent until something was kept: an earlier build reads the file and
-//!   drops it when it saves.
+//!   left off with a notice, never replaced by another device. `limiter` is the local mix's master
+//!   limiter, as a musician's entry keeps theirs (absent while it is the default, off), handed to
+//!   every engine the desk starts. Like `audio`, the section was added within version 1 and is
+//!   absent until something was kept: an earlier build reads the file and drops it when it saves.
 //! - `recording` is how this desk records takes (see [crate::commands::recording]): the folder the
 //!   take folders are made in (absent or null for the desk's default, the user's Music folder +
 //!   `MixLink\Recordings`), the WAV format (`int24`, the default, or `float32`), whether the local
@@ -198,7 +204,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use personal_monitoring::{log_warn, StripSettings};
+use personal_monitoring::{log_warn, LimiterSettings, StripSettings};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -339,6 +345,15 @@ impl Session {
             .filter_map(|(key, entry)| Some((key.clone(), entry.redundancy.clone()?)))
             .collect()
     }
+
+    /// Every musician's master limiter the session keeps, each with its musician's key
+    /// ([client_key] or [address_key]), in key order.
+    pub fn limiters(&self) -> Vec<(String, LimiterSettings)> {
+        self.musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.limiter?)))
+            .collect()
+    }
 }
 
 /// The audio input the desk last ran with, as the window starts every engine from it.
@@ -381,8 +396,8 @@ pub struct SessionMix {
     pub muted: bool,
 }
 
-/// The engineer's local mix and the output it plays on, as the desk keeps them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The engineer's local mix, the output it plays on and its master limiter, as the desk keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionLocal {
     /// The local mix; `None` until the engineer changed it, and then the engine's default mix
     /// plays.
@@ -391,6 +406,14 @@ pub struct SessionLocal {
     /// The output the local mix plays on; `None` for no local output, the default.
     #[serde(default)]
     pub output: Option<SessionOutput>,
+    /// The master limiter on the local mix (see [crate::commands::limiter]); `None` while it is the
+    /// default (off).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_limiter"
+    )]
+    pub limiter: Option<LimiterSettings>,
 }
 
 /// An output the local mix plays on: the device by its exact name, and the first output of the
@@ -451,7 +474,7 @@ pub struct SessionRecording {
 }
 
 /// What the desk keeps about one musician.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MusicianEntry {
     /// The engineer's local label, shown while the musician's phone announced no name of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,6 +508,14 @@ pub struct MusicianEntry {
         deserialize_with = "lenient_redundancy"
     )]
     pub redundancy: Option<SessionRedundancy>,
+    /// The master limiter the desk set on this musician's mix (see [crate::commands::limiter]);
+    /// `None` while it is the default (off, 0 dBFS, 50 ms).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_limiter"
+    )]
+    pub limiter: Option<LimiterSettings>,
 }
 
 /// The playback buffer the desk set for one musician's phone (see
@@ -515,6 +546,16 @@ where
 pub struct SessionRedundancy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_blocks: Option<u32>,
+}
+
+/// Reads a `limiter` (a musician's, or the local mix's) without ever failing what holds it, as
+/// [lenient_engineer] does.
+fn lenient_limiter<'de, D>(deserializer: D) -> Result<Option<LimiterSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| LimiterSettings::deserialize(value).ok()))
 }
 
 /// Reads an entry's `redundancy` without ever failing the entry, as [lenient_engineer] does.
@@ -988,6 +1029,40 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Every musician's master limiter the session keeps, each with its musician's key, in key
+    /// order.
+    pub fn limiters(&self) -> Vec<(String, LimiterSettings)> {
+        self.lock().session.limiters()
+    }
+
+    /// Keeps the master limiter of the musician `key` names ([client_key] or [address_key], the
+    /// key the engine kept it under), or drops it with `None` (the default), as
+    /// [Self::set_redundancy] keeps redundancy: one kept for a phone's key also drops any kept for
+    /// `address`. Saved as [Self::set_redundancy] is.
+    pub fn set_limiter(
+        &self,
+        key: &str,
+        address: &str,
+        limiter: Option<LimiterSettings>,
+    ) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let mut session = loaded.session.clone();
+        if key.starts_with("client:") {
+            update_entry(&mut session, address_key(address), |entry| {
+                entry.limiter = None
+            });
+        }
+        update_entry(&mut session, key.to_owned(), |entry| {
+            entry.limiter = limiter
+        });
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     /// The engineer's mix presets, in the order they were saved.
     pub fn presets(&self) -> Vec<SessionPreset> {
         self.lock().session.presets.clone()
@@ -1090,6 +1165,12 @@ impl SessionStore {
     /// [Self::set_local_mix] is.
     pub fn set_local_output(&self, output: Option<SessionOutput>) -> Result<(), String> {
         self.update_local(|local| local.output = output)
+    }
+
+    /// Keeps the local mix's master limiter, or drops it with `None` (the default); the mix and
+    /// its output stay as kept. Saved as [Self::set_local_mix] is.
+    pub fn set_local_limiter(&self, limiter: Option<LimiterSettings>) -> Result<(), String> {
+        self.update_local(|local| local.limiter = limiter)
     }
 
     /// How this desk records takes, or `None` before the engineer changed it (the defaults apply).
@@ -2777,6 +2858,7 @@ mod tests {
         session.set_local_output(Some(volt_out(0))).expect("saved");
 
         let kept = SessionLocal {
+            limiter: None,
             mix: Some(local_mix()),
             output: Some(volt_out(0)),
         };
@@ -2816,6 +2898,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                limiter: None,
                 mix: None,
                 output: Some(volt_out(2)),
             }),
@@ -2833,6 +2916,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                limiter: None,
                 mix: Some(local_mix()),
                 output: None,
             }),
@@ -2890,6 +2974,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                limiter: None,
                 mix: Some(SessionMix {
                     channels: vec![SessionPresetChannel {
                         gain: 20,
@@ -2942,6 +3027,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                limiter: None,
                 mix: Some(local_mix()),
                 output: None,
             })

@@ -496,6 +496,29 @@ async fn set_musician_redundancy(
     commands::redundancy::set_musician_redundancy(state.inner(), &musician_key, on, delay_blocks)
 }
 
+/// Sets the master limiter on the mix of the musician `musicianKey` names (`client:<id>` or
+/// `address:<ip:port>`): `settings` `{ enabled, ceilingDb, releaseMs }` (held to -24-0 dBFS and
+/// 1-1,000 ms). Answers `{ musicianKey, outcome, settings, saved, saveError, message }` (see
+/// [commands::limiter::set_musician_limiter]).
+#[tauri::command]
+async fn set_musician_limiter(
+    state: State<'_, DesktopState>,
+    musician_key: String,
+    settings: personal_monitoring::LimiterSettings,
+) -> Result<dto::LimiterSetDto, String> {
+    commands::limiter::set_musician_limiter(state.inner(), &musician_key, settings)
+}
+
+/// Sets the master limiter on the engineer's local mix, as [set_musician_limiter] does (see
+/// [commands::limiter::set_local_limiter]).
+#[tauri::command]
+async fn set_local_limiter(
+    state: State<'_, DesktopState>,
+    settings: personal_monitoring::LimiterSettings,
+) -> Result<dto::LimiterSetDto, String> {
+    commands::limiter::set_local_limiter(state.inner(), settings)
+}
+
 /// Every channel's strip, CH 1 first: `[{ channel, settings, active }]`, `channel` 1-based and
 /// `settings` `{ eq: { highPass, bands }, gate, compressor }` (see
 /// [commands::processing::processing]): the running engine's, or with none what the session keeps.
@@ -703,6 +726,8 @@ pub fn run() {
             link_history,
             set_musician_buffer,
             set_musician_redundancy,
+            set_musician_limiter,
+            set_local_limiter,
             processing,
             channel_processing,
             set_channel_processing,

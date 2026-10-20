@@ -555,6 +555,7 @@ mod tests {
 
     fn idle_status() -> EngineStatusDto {
         EngineStatusDto {
+            local_limiter: personal_monitoring::LimiterSettings::master(),
             run: 0,
             device_name: "Test device".to_owned(),
             capture_format: CaptureFormatDto {
@@ -603,6 +604,7 @@ mod tests {
                 compressor_reduction_db: vec![0.0, 0.0],
                 musicians: BTreeMap::new(),
                 local: OutputLevelsDto {
+                    limiter_reduction_db: 0.0,
                     left: 20,
                     right: 30,
                 },
@@ -722,7 +724,7 @@ mod tests {
                 "gateReductionDb": [0.0, 0.0],
                 "compressorReductionDb": [0.0, 0.0],
                 "musicians": {},
-                "local": { "left": 20, "right": 30 }
+                "local": { "left": 20, "right": 30, "limiterReductionDb": 0.0 }
             })),
             "meters name the pump's run"
         );

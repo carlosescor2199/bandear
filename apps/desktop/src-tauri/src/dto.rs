@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
     CaptureFormat, EngineLoadStatus, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate,
-    InputDevice, LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus,
-    MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer,
-    RecordingState, RecordingStatus, Redundancy, SampleFormat, SoundcheckClock, SoundcheckState,
-    SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack, CAPABILITY_PLAYBACK_BUFFER,
-    CAPABILITY_REDUNDANCY_HOLD, CAPABILITY_REDUNDANCY_RECOVERED,
+    InputDevice, LimiterSettings, LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus,
+    MirrorStatus, MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice,
+    PlaybackBuffer, RecordingState, RecordingStatus, Redundancy, SampleFormat, SoundcheckClock,
+    SoundcheckState, SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack,
+    CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_HOLD, CAPABILITY_REDUNDANCY_RECOVERED,
 };
 
 use crate::session::{
@@ -261,6 +261,9 @@ pub struct MusicianDto {
     /// configured target, which take immediate copies only and the window shows a delay as "needs
     /// a newer app" for.
     pub redundancy_hold_supported: bool,
+    /// The master limiter on the musician's mix (see [crate::commands::limiter]): `{ enabled,
+    /// ceilingDb, releaseMs }`; off at 0 dBFS and 50 ms when the desk set none.
+    pub limiter: LimiterSettings,
 }
 
 /// A musician's redundancy as the window reads and sets it: `on`, and the `delayBlocks` of the
@@ -280,6 +283,23 @@ impl From<Redundancy> for RedundancyDto {
             delay_blocks: redundancy.delay_blocks(),
         }
     }
+}
+
+/// What [crate::commands::limiter::set_musician_limiter] or
+/// [crate::commands::limiter::set_local_limiter] did, for the window: `outcome` `set` (in force
+/// from the next block), `settings` the limiter now in force, held in range (`{ enabled,
+/// ceilingDb, releaseMs }`), `musicianKey` the key asked for (null for the local mix), `saved`
+/// whether the session keeps it for the next start (a save that failed is in `saveError`, the
+/// engine having it all the same) and `message` the outcome in words.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimiterSetDto {
+    pub musician_key: Option<String>,
+    pub outcome: &'static str,
+    pub settings: LimiterSettings,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    pub message: String,
 }
 
 /// What [crate::commands::redundancy::set_musician_redundancy] did, for the window.
@@ -815,11 +835,14 @@ pub struct MetersDto {
     pub local: OutputLevelsDto,
 }
 
-/// The 0-100 peak of the stereo mix one musician is sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// The 0-100 peak of the stereo mix one musician (or the local mix) is sent, and how far its master
+/// limiter turns it down now, in dB (0: not at all, or off).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct OutputLevelsDto {
     pub left: u8,
     pub right: u8,
+    #[serde(rename = "limiterReductionDb")]
+    pub limiter_reduction_db: f32,
 }
 
 impl From<&EngineMeters> for MetersDto {
@@ -837,13 +860,18 @@ impl From<&EngineMeters> for MetersDto {
                     let [left, right] = musician.output_levels;
                     (
                         musician.address.to_string(),
-                        OutputLevelsDto { left, right },
+                        OutputLevelsDto {
+                            left,
+                            right,
+                            limiter_reduction_db: musician.limiter_reduction_db,
+                        },
                     )
                 })
                 .collect(),
             local: OutputLevelsDto {
                 left: meters.local_levels[0],
                 right: meters.local_levels[1],
+                limiter_reduction_db: meters.local_limiter_reduction_db,
             },
         }
     }
@@ -986,6 +1014,7 @@ impl From<&MusicianStatus> for MusicianDto {
                 .capabilities
                 .iter()
                 .any(|name| name == CAPABILITY_REDUNDANCY_HOLD),
+            limiter: musician.limiter,
         }
     }
 }
@@ -1121,6 +1150,8 @@ pub struct EngineStatusDto {
     pub demo: bool,
     /// How long the engine thread takes per block, as a share of the time a block lasts.
     pub load: EngineLoadDto,
+    /// The master limiter on the engineer's local mix (see [crate::commands::limiter]).
+    pub local_limiter: LimiterSettings,
 }
 
 /// The engine thread's load on the status (`load`): each block's processing time in percent of
@@ -1210,6 +1241,7 @@ impl From<&EngineStatus> for EngineStatusDto {
             soundcheck: SoundcheckDto::from(&status.soundcheck),
             demo: status.demo,
             load: EngineLoadDto::from(&status.load),
+            local_limiter: status.local_limiter,
         }
     }
 }
@@ -2238,7 +2270,7 @@ mod tests {
     #[test]
     fn meters_reach_the_window_with_output_peaks_keyed_by_address() {
         let meters = EngineMeters {
-            local_limiter_reduction_db: 0.0,
+            local_limiter_reduction_db: 2.5,
             channel_levels: vec![50, 0],
             processed_levels: vec![40, 0],
             gate_reduction_db: vec![0.0, 12.5],
@@ -2250,7 +2282,7 @@ mod tests {
                     output_levels: [0, 7],
                 },
                 MusicianMeters {
-                    limiter_reduction_db: 0.0,
+                    limiter_reduction_db: 6.25,
                     address: "192.168.1.3:50000".parse().expect("test address"),
                     output_levels: [100, 50],
                 },
@@ -2269,12 +2301,40 @@ mod tests {
                 "gateReductionDb": [0.0, 12.5],
                 "compressorReductionDb": [3.25, 0.0],
                 "musicians": {
-                    "192.168.1.3:50000": { "left": 100, "right": 50 },
-                    "192.168.1.4:50000": { "left": 0, "right": 7 },
+                    "192.168.1.3:50000": { "left": 100, "right": 50, "limiterReductionDb": 6.25 },
+                    "192.168.1.4:50000": { "left": 0, "right": 7, "limiterReductionDb": 0.0 },
                 },
-                "local": { "left": 25, "right": 90 },
+                "local": { "left": 25, "right": 90, "limiterReductionDb": 2.5 },
             }),
-            "the local mix's peak, left then right, beside the musicians'"
+            "the local mix's peak, left then right, beside the musicians', each with its limiter's reduction"
+        );
+    }
+
+    #[test]
+    fn each_mixs_limiter_reaches_the_window_on_the_status_in_camel_case() {
+        let mut status = status_with(Vec::new(), vec![0, 0]);
+        status.local_limiter = LimiterSettings {
+            enabled: true,
+            ceiling_db: -3.0,
+            release_ms: 25.0,
+        };
+        let mut musician = musician_with_link(LinkStatus::default());
+        musician.limiter = LimiterSettings {
+            enabled: true,
+            ceiling_db: -9.5,
+            release_ms: 200.0,
+        };
+        status.musicians = vec![musician];
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).expect("serializes");
+
+        assert_eq!(
+            json["localLimiter"],
+            serde_json::json!({ "enabled": true, "ceilingDb": -3.0, "releaseMs": 25.0 })
+        );
+        assert_eq!(
+            json["musicians"][0]["limiter"],
+            serde_json::json!({ "enabled": true, "ceilingDb": -9.5, "releaseMs": 200.0 })
         );
     }
 

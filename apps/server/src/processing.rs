@@ -103,6 +103,13 @@ impl StripLayout {
             .filter(|(_, width)| **width > 0)
             .map(|(first, width)| (first, usize::from(*width)))
     }
+
+    /// How many channels the strips reach: one past the last strip's last channel.
+    fn span(&self) -> usize {
+        self.strips()
+            .last()
+            .map_or(0, |(first, width)| first + width)
+    }
 }
 
 /// A whole set of strips for one layout, built off the engine thread.
@@ -248,6 +255,11 @@ pub(crate) struct ProcessingStage {
     processed: Vec<f32>,
     /// Some strip works: the stage copies and processes the block.
     running: bool,
+    /// The source's channel count, from [Self::source_changed].
+    channels: usize,
+    /// The strips are laid out for another channel count than the source's (a device switch whose
+    /// new layout has not come yet): the stage passes every block on as it came until it does.
+    stale: bool,
     meters: Arc<ProcessingMeters>,
     /// Samples taken as silence so far, published to [ProcessingMeters::non_finite_samples].
     non_finite: u64,
@@ -273,6 +285,8 @@ pub(crate) fn processing_stage() -> (ProcessingStage, ProcessingControl) {
         parked: None,
         processed: Vec::new(),
         running: false,
+        channels: 0,
+        stale: false,
         meters: Arc::new(ProcessingMeters::new()),
         non_finite: 0,
     };
@@ -323,6 +337,16 @@ impl ProcessingStage {
         self.processed
             .resize(format.block_frames * format.channels, 0.0);
         self.meters.clear();
+        self.channels = format.channels;
+        self.follow_source();
+    }
+
+    /// Marks the strips stale while their layout is for another channel count than the source's.
+    fn follow_source(&mut self) {
+        self.stale = self.set.layout.span() != self.channels.min(MAX_MIX_CHANNELS);
+        if self.stale {
+            self.meters.working.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Takes the designs and strip sets the engine sent, in order.
@@ -358,6 +382,7 @@ impl ProcessingStage {
                     std::mem::swap(&mut self.set, &mut set);
                     self.hand_back(set);
                     self.meters.clear_reductions();
+                    self.follow_source();
                 }
             }
         }
@@ -396,11 +421,11 @@ impl ProcessingStage {
     }
 
     /// Processes `raw`, `channels`-interleaved, into the stage's own buffer and returns it, or
-    /// `None` when no strip works: the raw block is then the processed one, untouched and not
-    /// copied.
+    /// `None` when no strip works or the strips are [stale](Self::stale): the raw block is then the
+    /// processed one, untouched and not copied. A strip past the block's channels is left as it is.
     pub(crate) fn process(&mut self, raw: &[f32], channels: usize) -> Option<&[f32]> {
         self.take_commands();
-        if !self.running || channels == 0 {
+        if !self.running || self.stale || channels == 0 {
             return None;
         }
         let processed = self.processed.get_mut(..raw.len())?;
@@ -408,6 +433,9 @@ impl ProcessingStage {
         let mut working = 0u32;
         let StripSet { layout, strips, .. } = &mut *self.set;
         for (first, width) in layout.strips() {
+            if first + width > channels {
+                continue;
+            }
             let strip = &mut strips[first];
             strip.process(processed, channels, first);
             let gate = strip.gate_reduction_db().to_bits();
@@ -915,5 +943,43 @@ pub(crate) mod tests {
         assert!(channel(processed, 2, 1).iter().all(|s| s.is_finite()));
         assert!(processed[0].is_nan());
         assert_eq!(stage.meters().non_finite_samples(), 2);
+    }
+
+    /// A switch to a device with fewer inputs: until strips for its layout arrive (or when they
+    /// never do) the stage passes the block on as it came, and a block narrower than the layout
+    /// runs only the strips that fit in it. Never a panic, never an allocation.
+    #[test]
+    fn a_layout_wider_than_the_block_is_never_run() {
+        use crate::pipeline::tests::allocations;
+
+        let (mut stage, mut processing) = stage(&metas(2, &[]), 256);
+        processing.set_channel(0, high_pass(2_000.0)).unwrap();
+        processing.set_channel(1, typical()).unwrap();
+        for index in 0..10 {
+            assert!(stage.process(&tones(2, 256, 0.5, index * 256), 2).is_some());
+        }
+        let peak = |block: &[f32]| block.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        let raw = tones(1, 256, 0.5, 2_560);
+        let (mut narrow, mut stale) = (None, 0);
+        let counted = allocations::count(|| {
+            // One channel on the two-input source: the first strip runs, the second is left.
+            narrow = stage.process(&raw, 1).map(peak);
+            stage.source_changed(SourceFormat {
+                channels: 1,
+                block_frames: 256,
+            });
+            // The new layout has not come: nothing runs, the block goes on as captured.
+            for _ in 0..20 {
+                stale += usize::from(stage.process(&raw, 1).is_some());
+            }
+        });
+        assert_eq!(counted, (0, 0));
+        assert!(narrow.is_some_and(|peak| peak < 0.05), "{narrow:?}");
+        assert_eq!(stale, 0);
+
+        // Its strips come: the first one carries on from the block it last processed.
+        processing.follow(&metas(1, &[])).unwrap();
+        let processed = stage.process(&tones(1, 256, 0.5, 2_816), 1).map(peak);
+        assert!(processed.is_some_and(|peak| peak < 0.05), "{processed:?}");
     }
 }

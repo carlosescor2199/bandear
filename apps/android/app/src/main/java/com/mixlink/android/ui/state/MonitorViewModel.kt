@@ -178,6 +178,12 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             playerMix.deskBufferMs = fixedMs
         }
 
+        // Likewise the hold for delayed copies: the receive thread holds packets that long from its
+        // next packet.
+        override fun onRedundancyHold(holdPackets: Int) {
+            playerMix.redundancyHoldPackets = holdPackets
+        }
+
         override fun onClosed() = publishControlState()
 
         override fun onControlError(message: String) {
@@ -248,6 +254,8 @@ internal class MonitorViewModel(collaborators: MonitorCollaborators) : ViewModel
             // Every session starts on Auto: the phone keeps nothing of a buffer an earlier server set,
             // and a server that takes it from the desk sends it again on registering.
             playerMix.deskBufferMs = PlaybackLatency.DESK_BUFFER_AUTO
+            // Nor does it keep a hold for delayed copies: a server that delays them says so again.
+            playerMix.redundancyHoldPackets = 0
             // The name and the UDP port travel in the registration, so the server adds this musician
             // as a target with no address typed; the client id keeps their row when the IP changes.
             control.connect(host, controlPort, audioPort, _state.value.musicianName, clientId())

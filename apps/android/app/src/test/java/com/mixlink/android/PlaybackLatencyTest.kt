@@ -75,6 +75,38 @@ class PlaybackLatencyTest {
     }
 
     @Test
+    fun theCushionReportedCountsThePacketsHeldBackForDelayedCopies() {
+        // 240-frame packets at 48 kHz are 5 ms each: a 3-packet cushion and a 2-packet hold are 25 ms;
+        // swapped they would read the same, so the track's applied size is used too: 600 frames and 2
+        // held packets are 12.5 + 10 ms.
+        val asked = PlaybackLatency.reportExtras(
+            packetFrames = 240,
+            cushionPackets = 3,
+            playbackRate = 48_000,
+            timestampRead = false,
+            framesWritten = 0L,
+            presentedFrame = 0L,
+            holdPackets = 2,
+        )
+        assertEquals(25.0, asked.cushionMs, 1e-9)
+        val applied = PlaybackLatency.reportExtras(
+            packetFrames = 240,
+            cushionPackets = 3,
+            playbackRate = 48_000,
+            timestampRead = false,
+            framesWritten = 0L,
+            presentedFrame = 0L,
+            appliedBufferFrames = 600,
+            holdPackets = 2,
+        )
+        assertEquals(22.5, applied.cushionMs, 1e-9)
+        assertTrue(
+            "no packet, no cushion, held or not",
+            PlaybackLatency.reportExtras(0, 3, 48_000, false, 0L, 0L, holdPackets = 2).cushionMs.isNaN(),
+        )
+    }
+
+    @Test
     fun aReportBeforeTheFirstPacketHasNoCushionWhateverTheCushionPackets() {
         // No packet sized the buffer yet: the start cushion of 2 packets is not a cushion. Swapped,
         // 2-frame packets would read as a tiny cushion instead of none.

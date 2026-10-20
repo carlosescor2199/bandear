@@ -83,6 +83,14 @@ internal class ControlChannel(
          */
         fun onPlaybackBuffer(fixedMs: Int) = Unit
 
+        /**
+         * The desk sends this musician's redundant copies [holdPackets] packets late (`redundancy`):
+         * the receive loop holds packets back that long so a copy can fill its lost original's gap; 0
+         * for none (redundancy off, or copies right after their original). Nothing is sent back. A
+         * message the phone cannot use is ignored.
+         */
+        fun onRedundancyHold(holdPackets: Int) = Unit
+
         fun onClosed()
         fun onControlError(message: String)
     }
@@ -169,6 +177,7 @@ internal class ControlChannel(
                     }
                     "mix_state" -> listener.onMixPushed(parseMixReport(message))
                     "playback" -> parsePlaybackBuffer(message)?.let(listener::onPlaybackBuffer)
+                    "redundancy" -> parseRedundancyHold(message)?.let(listener::onRedundancyHold)
                 }
             } catch (error: Exception) {
                 listener.onControlError("Invalid control response: ${error.message ?: "unknown error"}")
@@ -502,10 +511,16 @@ internal const val CAPABILITY_STATS_V2 = "stats.v2"
 internal const val CAPABILITY_PLAYBACK_BUFFER = "playback.buffer"
 
 /**
- * The phone's `stats` carry `recovered`, the packets that filled a gap after a newer one was
- * played ([LinkStatsReport.recovered]): what the desk's redundancy brought.
+ * The phone's `stats` carry `recovered`, the packets played after they filled a gap, arriving after
+ * a newer one ([LinkStatsReport.recovered]): what the desk's delayed redundant copies brought.
  */
 internal const val CAPABILITY_REDUNDANCY_RECOVERED = "redundancy.recovered"
+
+/**
+ * The phone holds packets back for the delay the desk gives its redundant copies, so a late copy can
+ * fill its lost original's gap: the `redundancy` message ([parseRedundancyHold], [ReorderHold]).
+ */
+internal const val CAPABILITY_REDUNDANCY_HOLD = "redundancy.hold"
 
 /**
  * What this build of the app implements, announced in every registration so the server only sends
@@ -517,6 +532,7 @@ internal val CLIENT_CAPABILITIES: List<String> = listOf(
     CAPABILITY_STATS_V2,
     CAPABILITY_PLAYBACK_BUFFER,
     CAPABILITY_REDUNDANCY_RECOVERED,
+    CAPABILITY_REDUNDANCY_HOLD,
 )
 
 /**
@@ -682,3 +698,16 @@ internal fun parsePlaybackBuffer(message: JSONObject): Int? {
         else -> null
     }
 }
+
+/**
+ * The hold a `redundancy` message asks for (`{"type":"redundancy","delay_blocks":2}`): the packets
+ * the desk sends this musician's copies late, a whole number from 0 (no hold) to
+ * [MAX_HOLD_PACKETS]. Null for anything else, which is then ignored; fields it does not know are
+ * too.
+ */
+internal fun parseRedundancyHold(message: JSONObject): Int? =
+    (message.opt("delay_blocks") as? Number)
+        ?.takeIf { it is Int || it is Long }
+        ?.toLong()
+        ?.takeIf { it in 0L..MAX_HOLD_PACKETS.toLong() }
+        ?.toInt()

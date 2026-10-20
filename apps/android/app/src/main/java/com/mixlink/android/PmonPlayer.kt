@@ -123,7 +123,8 @@ internal class PmonPlayer(
 
     private fun receiveLoop(host: String, port: Int) {
         var packetsReceived = 0L
-        val sequenceTracker = SequenceTracker()
+        // Puts packets in sequence order, holding them back as long as the desk's delayed copies need.
+        val hold = ReorderHold<PmonPacket>()
         var lastSampleRate: Int? = null
         var sourceSampleRate: Int? = null
         var audioTrack: AudioTrack? = null
@@ -175,13 +176,14 @@ internal class PmonPlayer(
                             framesWritten = framesWritten,
                             presentedFrame = audioTimestamp.framePosition,
                             appliedBufferFrames = appliedBufferFrames,
+                            holdPackets = hold.holdPackets,
                         )
                         linkStats.poll(
                             nowMs,
                             track?.underrunCount ?: 0,
                             cushionMs = extras.cushionMs,
                             backlogMs = extras.backlogMs,
-                            cumulativeRecovered = sequenceTracker.recovered,
+                            cumulativeRecovered = hold.recovered,
                         )?.let { report ->
                             listener.onLinkStats(report)
                         }
@@ -189,132 +191,151 @@ internal class PmonPlayer(
 
                     val datagram = DatagramPacket(buffer, buffer.size)
                     datagram.setLength(buffer.size)
-                    try {
+                    val arrived = try {
                         openedSocket.receive(datagram)
+                        true
                     } catch (_: java.net.SocketTimeoutException) {
                         linkStats.onReceiveTimeout()
-                        continue
+                        // Nothing came for a while: what is held is not worth waiting for any longer.
+                        hold.release()
+                        false
                     }
 
                     try {
-                        val packet = PmonPacketParser.parse(datagram.data, datagram.length)
-                        if (packet.channels > MAX_CHANNELS) {
-                            throw PmonPacketParseException(
-                                "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
-                            )
-                        }
-                        val lostBefore = sequenceTracker.accept(packet.sequence)
-                        if (lostBefore == SequenceTracker.DROPPED) {
-                            // A duplicate, or a packet that arrived after a newer one was played:
-                            // playing it now would be out of order, and its gap is already counted. One
-                            // that filled a gap is counted as recovered by the tracker.
-                            continue
-                        }
-                        packetsReceived++
-                        lastSampleRate = packet.sampleRate
-                        val packetReceivedAtNanos = System.nanoTime()
-                        linkStats.onPacket(lostBefore, packetReceivedAtNanos / NANOS_PER_MILLISECOND)
-                        previousPacketAtNanos?.let { previousAtNanos ->
-                            val intervalMs = (packetReceivedAtNanos - previousAtNanos) / 1_000_000.0
-                            if (interArrivalMs == 0.0) {
-                                interArrivalMs = intervalMs
-                            } else {
-                                interArrivalMs += 0.1 * (intervalMs - interArrivalMs)
+                        // The desk's hold is read once per wake-up (one volatile read), so a change
+                        // applies from the next packet.
+                        hold.holdPackets = mixState.redundancyHoldPackets
+                        if (arrived) {
+                            val packet = PmonPacketParser.parse(datagram.data, datagram.length)
+                            if (packet.channels > MAX_CHANNELS) {
+                                throw PmonPacketParseException(
+                                    "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
+                                )
                             }
-                            jitterMs += 0.1 * (kotlin.math.abs(intervalMs - interArrivalMs) - jitterMs)
-                            linkStats.onArrivalDeviation(intervalMs - interArrivalMs)
-                        }
-                        previousPacketAtNanos = packetReceivedAtNanos
-                        val elapsedSeconds = (packetReceivedAtNanos - metricsStartedAtNanos) / 1_000_000_000.0
-                        packetsPerSecond = if (elapsedSeconds > 0.0) packetsReceived / elapsedSeconds else 0.0
-
-                        if (audioTrack == null) {
-                            sourceSampleRate = packet.sampleRate
-                            playbackRate = selectPlaybackRate(packet.sampleRate)
-                            packetFrames = packet.samples.size / PlaybackLatency.CHANNELS
-                            val track = openLowLatencyTrack(playbackRate, packetFrames)
-                            capacityFrames = track.bufferCapacityInFrames
-                            // A buffer the desk set before the audio started applies from the first packet.
-                            cushion.follow(mixState.deskBufferMs, packetFrames, playbackRate, capacityFrames)
-                            appliedBufferFrames = applyPlaybackBufferTarget(track, packetFrames, cushion.cushionPackets)
-                            audioTrack = track
-                        } else if (packet.sampleRate != sourceSampleRate) {
-                            throw PmonPacketParseException(
-                                "sample rate changed from $sourceSampleRate to ${packet.sampleRate}",
-                            )
+                            if (!hold.offer(packet.sequence, packet)) {
+                                // A duplicate, or a packet that arrived after a newer one was played
+                                // or given up on: playing it now would be out of order, and its gap is
+                                // already counted.
+                                continue
+                            }
+                            // The arrival's spacing, as it arrived, whatever the hold does with it.
+                            val packetReceivedAtNanos = System.nanoTime()
+                            previousPacketAtNanos?.let { previousAtNanos ->
+                                val intervalMs = (packetReceivedAtNanos - previousAtNanos) / 1_000_000.0
+                                if (interArrivalMs == 0.0) {
+                                    interArrivalMs = intervalMs
+                                } else {
+                                    interArrivalMs += 0.1 * (intervalMs - interArrivalMs)
+                                }
+                                jitterMs += 0.1 * (kotlin.math.abs(intervalMs - interArrivalMs) - jitterMs)
+                                linkStats.onArrivalDeviation(intervalMs - interArrivalMs)
+                            }
+                            previousPacketAtNanos = packetReceivedAtNanos
                         }
 
-                        val processedSamples = Pcm16Processor.applyLocalProtection(
-                            samples = packet.samples,
-                            volumePercent = mixState.volumePercent,
-                            maxLevelPercent = mixState.maxLevelPercent,
-                            muted = mixState.muted,
-                            serverOwnsMix = listener.serverOwnsMix(),
-                        )
-                        val writtenSamples = audioTrack.write(
-                            processedSamples,
-                            0,
-                            processedSamples.size,
-                            AudioTrack.WRITE_BLOCKING,
-                        )
-                        // A blocking write returns only once every sample is queued, so a short count
-                        // now means a write error. The guard stays as the honest signal that audio
-                        // was lost instead of being played.
-                        if (writtenSamples < processedSamples.size) {
-                            discardedSamples += if (writtenSamples >= 0) {
-                                (processedSamples.size - writtenSamples).toLong()
-                            } else {
-                                processedSamples.size.toLong()
+                        // Every packet now due, in sequence order: at once with no hold, else once
+                        // the hold has passed or a late copy filled its gap.
+                        while (true) {
+                            val packet = hold.next() ?: break
+                            val lostBefore = hold.lostBefore
+                            packetsReceived++
+                            lastSampleRate = packet.sampleRate
+                            val packetPlayedAtNanos = System.nanoTime()
+                            linkStats.onPacket(lostBefore, packetPlayedAtNanos / NANOS_PER_MILLISECOND)
+                            val elapsedSeconds = (packetPlayedAtNanos - metricsStartedAtNanos) / 1_000_000_000.0
+                            packetsPerSecond = if (elapsedSeconds > 0.0) packetsReceived / elapsedSeconds else 0.0
+
+                            if (audioTrack == null) {
+                                sourceSampleRate = packet.sampleRate
+                                playbackRate = selectPlaybackRate(packet.sampleRate)
+                                packetFrames = packet.samples.size / PlaybackLatency.CHANNELS
+                                val track = openLowLatencyTrack(playbackRate, packetFrames)
+                                capacityFrames = track.bufferCapacityInFrames
+                                // A buffer the desk set before the audio started applies from the first packet.
+                                cushion.follow(mixState.deskBufferMs, packetFrames, playbackRate, capacityFrames)
+                                appliedBufferFrames =
+                                    applyPlaybackBufferTarget(track, packetFrames, cushion.cushionPackets)
+                                audioTrack = track
+                            } else if (packet.sampleRate != sourceSampleRate) {
+                                throw PmonPacketParseException(
+                                    "sample rate changed from $sourceSampleRate to ${packet.sampleRate}",
+                                )
                             }
-                            packetsWithDiscardedSamples++
-                        }
-                        // Only samples that actually entered the track count as written. A partial
-                        // write leaves the rest dropped, and counting it anyway would understate how
-                        // far the writer has run ahead of the render position.
-                        if (writtenSamples > 0) {
-                            framesWritten += writtenSamples / PlaybackLatency.CHANNELS
-                        }
-                        if (audioTrack.getTimestamp(audioTimestamp)) {
-                            val instantBacklog = PlaybackLatency.backlogMs(
-                                framesWritten,
-                                audioTimestamp.framePosition,
-                                playbackRate ?: packet.sampleRate,
+
+                            val processedSamples = Pcm16Processor.applyLocalProtection(
+                                samples = packet.samples,
+                                volumePercent = mixState.volumePercent,
+                                maxLevelPercent = mixState.maxLevelPercent,
+                                muted = mixState.muted,
+                                serverOwnsMix = listener.serverOwnsMix(),
                             )
-                            playbackBacklogMs = if (playbackBacklogMs == 0.0) {
-                                instantBacklog
-                            } else {
-                                playbackBacklogMs + 0.1 * (instantBacklog - playbackBacklogMs)
+                            val writtenSamples = audioTrack.write(
+                                processedSamples,
+                                0,
+                                processedSamples.size,
+                                AudioTrack.WRITE_BLOCKING,
+                            )
+                            // A blocking write returns only once every sample is queued, so a short count
+                            // now means a write error. The guard stays as the honest signal that audio
+                            // was lost instead of being played.
+                            if (writtenSamples < processedSamples.size) {
+                                discardedSamples += if (writtenSamples >= 0) {
+                                    (processedSamples.size - writtenSamples).toLong()
+                                } else {
+                                    processedSamples.size.toLong()
+                                }
+                                packetsWithDiscardedSamples++
                             }
-                        }
-                        listener.onStats(
-                            packetsReceived,
-                            sequenceTracker.lost,
-                            lastSampleRate,
-                            packetsPerSecond,
-                            interArrivalMs,
-                            jitterMs,
-                            discardedSamples,
-                            packetsWithDiscardedSamples,
-                            playbackBacklogMs,
-                        )
-                        // The desk's buffer is read once per packet (one volatile read), so a change
-                        // applies at once, well within the second the desk expects; once per second of
-                        // audio played, whatever the block size, the track's underrun count is read,
-                        // and a fixed buffer never moves.
-                        val step = cushion.onPacket(
-                            deskBufferMs = mixState.deskBufferMs,
-                            packetFrames = packetFrames,
-                            packetSamples = packet.samples.size,
-                            playbackRate = playbackRate,
-                            packetRate = packet.sampleRate,
-                            capacityFrames = capacityFrames,
-                        )
-                        var resize = step and CushionController.STEP_APPLY != 0
-                        if (step and CushionController.STEP_ADJUST != 0 && cushion.adjust(audioTrack.underrunCount)) {
-                            resize = true
-                        }
-                        if (resize) {
-                            appliedBufferFrames = applyPlaybackBufferTarget(audioTrack, packetFrames, cushion.cushionPackets)
+                            // Only samples that actually entered the track count as written. A partial
+                            // write leaves the rest dropped, and counting it anyway would understate how
+                            // far the writer has run ahead of the render position.
+                            if (writtenSamples > 0) {
+                                framesWritten += writtenSamples / PlaybackLatency.CHANNELS
+                            }
+                            if (audioTrack.getTimestamp(audioTimestamp)) {
+                                val instantBacklog = PlaybackLatency.backlogMs(
+                                    framesWritten,
+                                    audioTimestamp.framePosition,
+                                    playbackRate ?: packet.sampleRate,
+                                )
+                                playbackBacklogMs = if (playbackBacklogMs == 0.0) {
+                                    instantBacklog
+                                } else {
+                                    playbackBacklogMs + 0.1 * (instantBacklog - playbackBacklogMs)
+                                }
+                            }
+                            listener.onStats(
+                                packetsReceived,
+                                hold.lost,
+                                lastSampleRate,
+                                packetsPerSecond,
+                                interArrivalMs,
+                                jitterMs,
+                                discardedSamples,
+                                packetsWithDiscardedSamples,
+                                playbackBacklogMs,
+                            )
+                            // The desk's buffer is read once per packet (one volatile read), so a change
+                            // applies at once, well within the second the desk expects; once per second of
+                            // audio played, whatever the block size, the track's underrun count is read,
+                            // and a fixed buffer never moves.
+                            val step = cushion.onPacket(
+                                deskBufferMs = mixState.deskBufferMs,
+                                packetFrames = packetFrames,
+                                packetSamples = packet.samples.size,
+                                playbackRate = playbackRate,
+                                packetRate = packet.sampleRate,
+                                capacityFrames = capacityFrames,
+                            )
+                            var resize = step and CushionController.STEP_APPLY != 0
+                            val adjustDue = step and CushionController.STEP_ADJUST != 0
+                            if (adjustDue && cushion.adjust(audioTrack.underrunCount)) {
+                                resize = true
+                            }
+                            if (resize) {
+                                appliedBufferFrames =
+                                    applyPlaybackBufferTarget(audioTrack, packetFrames, cushion.cushionPackets)
+                            }
                         }
                     } catch (error: Exception) {
                         listener.onError(error.message ?: "invalid PMON packet")

@@ -14,7 +14,7 @@ use personal_monitoring::{
     MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer,
     RecordingState, RecordingStatus, Redundancy, SampleFormat, SoundcheckClock, SoundcheckState,
     SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack, CAPABILITY_PLAYBACK_BUFFER,
-    CAPABILITY_REDUNDANCY_RECOVERED,
+    CAPABILITY_REDUNDANCY_HOLD, CAPABILITY_REDUNDANCY_RECOVERED,
 };
 
 use crate::session::{
@@ -245,7 +245,8 @@ pub struct MusicianDto {
     /// `linkLatest.cushionMs`.
     pub buffer_supported: bool,
     /// Whether the musician's audio is sent twice (see [crate::commands::redundancy]): `{ on:
-    /// false }` or `{ on: true, delayBlocks }`. Every phone takes it.
+    /// false }` or `{ on: true, delayBlocks }` (0: each copy right after its original, which every
+    /// phone takes; 1-4 only for a phone that holds packets back, `redundancyHoldSupported`).
     pub redundancy: RedundancyDto,
     /// Copies of packets sent again while redundancy is on; not in `packetsSent`.
     pub duplicates_sent: u64,
@@ -255,6 +256,11 @@ pub struct MusicianDto {
     /// [personal_monitoring::CAPABILITY_REDUNDANCY_RECOVERED]). Redundancy works without it: an
     /// older phone drops the copies as duplicates and recovers nothing.
     pub redundancy_supported: bool,
+    /// Whether the musician's phone holds packets back so a delayed copy can fill a gap (it
+    /// announced [personal_monitoring::CAPABILITY_REDUNDANCY_HOLD]); false for an older app and a
+    /// configured target, which take immediate copies only and the window shows a delay as "needs
+    /// a newer app" for.
+    pub redundancy_hold_supported: bool,
 }
 
 /// A musician's redundancy as the window reads and sets it: `on`, and the `delayBlocks` of the
@@ -279,9 +285,11 @@ impl From<Redundancy> for RedundancyDto {
 /// What [crate::commands::redundancy::set_musician_redundancy] did, for the window.
 ///
 /// `outcome` is `set` (the engine sends this musician's audio as `redundancy` says from the next
-/// block) or `invalid` (a delay outside `minDelayBlocks`-`maxDelayBlocks`; nothing changed, and
-/// `redundancy` is absent). `bandwidthFactor` is what this musician's link now carries against
-/// once (2 with redundancy on, 1 off). `saved` says whether the session keeps it for the next start;
+/// block), `unsupported` (a delayed copy for a phone that does not hold packets back for one: it
+/// needs a newer app; nothing changed) or `invalid` (a delay outside `minDelayBlocks`-
+/// `maxDelayBlocks`; nothing changed). `redundancy` is absent unless `set`. `bandwidthFactor` is
+/// what this musician's link now carries against once when `set` (2 with redundancy on, 1 off),
+/// else 1. `saved` says whether the session keeps it for the next start;
 /// a save that failed is in `saveError`, the engine having it all the same. `message` says the
 /// outcome in words.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -964,6 +972,10 @@ impl From<&MusicianStatus> for MusicianDto {
                 .capabilities
                 .iter()
                 .any(|name| name == CAPABILITY_REDUNDANCY_RECOVERED),
+            redundancy_hold_supported: musician
+                .capabilities
+                .iter()
+                .any(|name| name == CAPABILITY_REDUNDANCY_HOLD),
         }
     }
 }
@@ -1859,9 +1871,13 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_redundancy_its_counts_and_whether_its_phone_reports_recoveries_reach_the_window() {
+    fn a_rows_redundancy_its_counts_and_what_its_phone_does_with_copies_reach_the_window() {
         let mut phone = musician_with_link(LinkStatus::default());
-        phone.capabilities = vec!["stats.v2".to_owned(), "redundancy.recovered".to_owned()];
+        phone.capabilities = vec![
+            "stats.v2".to_owned(),
+            "redundancy.recovered".to_owned(),
+            "redundancy.hold".to_owned(),
+        ];
         phone.redundancy = Redundancy::On { delay_blocks: 2 };
         phone.counters.duplicates_sent = 1_200;
         phone.counters.recovered = 7;
@@ -1877,9 +1893,14 @@ mod tests {
         assert_eq!(phone["duplicatesSent"], 1_200);
         assert_eq!(phone["recovered"], 7);
         assert_eq!(phone["redundancySupported"], true);
+        assert_eq!(phone["redundancyHoldSupported"], true);
         assert_eq!(older["redundancy"], serde_json::json!({ "on": false }));
         assert_eq!(older["duplicatesSent"], 0);
         assert_eq!(older["redundancySupported"], false, "an older phone");
+        assert_eq!(
+            older["redundancyHoldSupported"], false,
+            "an older phone takes immediate copies only"
+        );
     }
 
     #[test]

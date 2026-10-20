@@ -9,7 +9,8 @@
 // panel follows their history once a second while it is open, with the range and the table its own.
 // Each row's Buffer sets that phone's playback buffer from the desk, Auto or Fixed
 // (playback-buffer.js), and says on the row what came of it; its Redundancy sends that musician's
-// audio twice or once (redundancy.js), with what it does to their bandwidth.
+// audio twice or once, the copy right after its packet or a few blocks later (redundancy.js), with
+// what it does to their bandwidth and latency.
 
 import "../components/audio-setup.js";
 import "../components/link-health.js";
@@ -244,10 +245,10 @@ export function mountNetworkScreen(main, app) {
     update({ bufferSaid: { address, ok: result.ok, message: result.message } });
   }
 
-  // Redundancy switched on a row: sent with the default delay; what came of it, with what it does
-  // to that musician's bandwidth, is said on the row.
-  async function onMusicianRedundancy({ detail: { address, key, on } }) {
-    const result = await app.setMusicianRedundancy(key, on);
+  // Redundancy switched on a row (with the default delay, an immediate copy) or its Copy chosen; what
+  // came of it, with what it does to that musician's bandwidth and latency, is said on the row.
+  async function onMusicianRedundancy({ detail: { address, key, on, delayBlocks = null } }) {
+    const result = await app.setMusicianRedundancy(key, on, delayBlocks);
     update({ redundancySaid: { address, ok: result.ok, message: result.message } });
   }
 

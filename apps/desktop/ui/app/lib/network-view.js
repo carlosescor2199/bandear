@@ -12,7 +12,7 @@
 import { rememberedDevice } from "./engine-config.js";
 import { formatCaptureFormat, formatPercent, linkState } from "./format.js";
 import { bufferView } from "./playback-buffer.js";
-import { redundancyView } from "./redundancy.js";
+import { blockMsOf, redundancyView } from "./redundancy.js";
 import { RECORDING_BLOCKS_SWITCH, isRecording, recordingOf } from "./recording.js";
 import { SOUNDCHECK_BLOCKS_SWITCH, isSoundchecking, soundcheckOf } from "./soundcheck.js";
 
@@ -49,9 +49,10 @@ function count(value) {
  * any IP (`labelFollows: "phone"`), and for the address otherwise (`"address"`). `loss` is the
  * share of packets this server discarded for that phone. `buffer` is the row's Buffer cell
  * (bufferView in playback-buffer.js) and `redundancy` its Redundancy cell (redundancyView in
- * redundancy.js).
+ * redundancy.js), its delays priced in the block of the engine running.
  */
 export function musicianRows(state) {
+  const blockMs = blockMsOf(state.engine?.status?.captureFormat);
   return state.musicians.map((musician) => {
     const sent = musician.packetsSent ?? 0;
     const discarded = musician.packetsDiscarded ?? 0;
@@ -73,7 +74,7 @@ export function musicianRows(state) {
       loss: `${loss.toFixed(2)}%`,
       lossHigh: loss > 0,
       buffer: bufferView(musician),
-      redundancy: redundancyView(musician),
+      redundancy: redundancyView(musician, blockMs),
     };
   });
 }

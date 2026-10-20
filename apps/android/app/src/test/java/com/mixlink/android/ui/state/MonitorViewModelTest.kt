@@ -1175,6 +1175,20 @@ class MonitorViewModelTest {
         )
     }
 
+    @Test
+    fun theHoldForDelayedCopiesReachesTheReceiveThreadAndANewSessionHoldsNothing() {
+        connected()
+        assertEquals(0, receiver.mixState.redundancyHoldPackets)
+
+        socket().receive("""{"type":"redundancy","delay_blocks":2}""")
+        assertEquals(2, receiver.mixState.redundancyHoldPackets)
+
+        viewModel.disconnect()
+        receiver.finishStopping()
+        viewModel.connect(SERVER)
+        assertEquals("the phone keeps nothing: the server sends it again", 0, receiver.mixState.redundancyHoldPackets)
+    }
+
     private companion object {
         const val CLIENT_ID = "6f1c2a7e-0d4b-4c55-9a3e-2b8f6c1d9e70"
         val SERVER = ServerEndpoint("192.168.1.20", 50001)

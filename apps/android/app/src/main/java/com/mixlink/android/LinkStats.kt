@@ -31,10 +31,12 @@ internal const val LINK_STATS_STARTUP_GRACE_MS = 3_000L
  * - [backlogMs]: the audio queued for playback at the interval's end, as last read from the track.
  *
  * [recovered] (announced with `redundancy.recovered`, see [CAPABILITY_REDUNDANCY_RECOVERED]) counts
- * the packets over the interval that filled a gap: each arrived for the first time after a newer
- * one was played, which only a delayed redundant copy or Wi-Fi reordering does (see
- * [SequenceTracker.recovered]). The receiver plays packets as they come, so it cannot play them:
- * they stay in [packetsLost] and are not in [packetsReceived].
+ * the packets over the interval that were played after filling a gap: each arrived for the first
+ * time after a newer one, while the receiver held that newer one back for the desk's delayed
+ * copies ([ReorderHold.recovered]), which only a delayed redundant copy or Wi-Fi reordering does.
+ * They are in [packetsReceived], not in [packetsLost]. A late packet that could not be played (no
+ * hold, or past it) is not counted, nor is an immediate copy, which cannot be told from its
+ * original.
  *
  * They are primitives, so a report boxes nothing on the receive thread that builds it.
  *
@@ -137,8 +139,8 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
      *
      * [cushionMs] and [backlogMs] are the playback values at [nowMs], `NaN` when not measured; the
      * jitter is the interval's own (see [LinkStatsReport]). [cumulativeRecovered] is the
-     * tracker's count ([SequenceTracker.recovered]); the report carries its difference since the
-     * last one.
+     * hold's count ([ReorderHold.recovered]); the report carries its difference since the last
+     * one.
      */
     fun poll(
         nowMs: Long,
@@ -151,7 +153,7 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
         // A count that went down belongs to a new track, which starts from zero.
         val underruns = (cumulativeUnderruns - lastUnderruns).coerceAtLeast(0)
         lastUnderruns = cumulativeUnderruns
-        // Likewise a recovered count that went down belongs to a new tracker.
+        // Likewise a recovered count that went down belongs to a new hold.
         val recovered =
             if (cumulativeRecovered >= lastRecovered) cumulativeRecovered - lastRecovered else cumulativeRecovered
         lastRecovered = cumulativeRecovered

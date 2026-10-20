@@ -47,6 +47,7 @@ use crate::capture::TARGET_SAMPLE_RATE;
 use crate::decimate::Decimator;
 use crate::demo::DemoReader;
 use crate::engine::{LevelMeter, METER_IDLE_FRAMES, METER_IDLE_WAIT};
+use crate::load::{EngineLoad, LoadMeter};
 use crate::soundcheck::PlaybackReader;
 
 /// The longest block the engine thread hands the sinks: 8192 frames, 171 ms. A stereo packet of it
@@ -320,6 +321,9 @@ pub(crate) struct Pipeline {
     received: usize,
     /// Frames received beyond the time they were checked against, carried to the next checks.
     credit: usize,
+    /// How long each block takes, from taking it to the return of the last sink (see
+    /// [crate::load]).
+    load: LoadMeter,
 }
 
 /// `duration` in frames at 48 kHz, rounded down.
@@ -339,7 +343,13 @@ impl Pipeline {
             checked: None,
             received: 0,
             credit: 0,
+            load: LoadMeter::new(),
         }
+    }
+
+    /// Where the engine thread publishes its load, for the status.
+    pub(crate) fn load(&self) -> Arc<EngineLoad> {
+        self.load.shared()
     }
 
     /// Reads `source` from now on. The block buffer and every sink are sized for its layout here,
@@ -423,11 +433,13 @@ impl Pipeline {
                     &mut self.sinks,
                     &self.levels,
                     &mut self.received,
+                    &mut self.load,
                 );
             }
         };
         let mut blocks = 0;
         while length > 0 && consumer.slots() >= length {
+            let started = Instant::now();
             if consumer.pop_entire_slice(&mut self.block).is_err() {
                 break;
             }
@@ -441,6 +453,7 @@ impl Pipeline {
             }
             self.sequence = self.sequence.wrapping_add(1);
             self.received += length / channels;
+            self.load.block(started.elapsed(), length / channels);
             blocks += 1;
         }
         blocks
@@ -457,6 +470,7 @@ impl Pipeline {
             sinks,
             levels,
             received,
+            load,
             ..
         } = self;
         let (Some(source), Some(playback)) = (source.as_ref(), playback.as_mut()) else {
@@ -471,6 +485,7 @@ impl Pipeline {
         }
         let due = playback.due(now, format.block_frames);
         for _ in 0..due {
+            let started = Instant::now();
             playback.fill(block.as_mut_slice());
             levels.observe(block.as_slice(), format.channels);
             let handed = Block {
@@ -483,6 +498,7 @@ impl Pipeline {
             }
             *sequence = sequence.wrapping_add(1);
             *received += format.block_frames;
+            load.block(started.elapsed(), format.block_frames);
         }
         due
     }
@@ -562,12 +578,14 @@ fn pump_demo(
     sinks: &mut [Box<dyn Sink>],
     levels: &LevelMeter,
     received: &mut usize,
+    load: &mut LoadMeter,
 ) -> usize {
     if format.channels == 0 || block.len() != format.block_frames * format.channels {
         return 0;
     }
     let due = demo.due(now, format.block_frames);
     for _ in 0..due {
+        let started = Instant::now();
         demo.fill(block);
         levels.observe(block, format.channels);
         let handed = Block {
@@ -580,6 +598,7 @@ fn pump_demo(
         }
         *sequence = sequence.wrapping_add(1);
         *received += format.block_frames;
+        load.block(started.elapsed(), format.block_frames);
     }
     due
 }
@@ -1050,6 +1069,44 @@ pub(crate) mod tests {
         });
 
         assert_eq!((allocations, frees), (0, 0));
+    }
+
+    /// A sink that takes `delay` over every block.
+    struct Slow {
+        delay: Duration,
+    }
+
+    impl Sink for Slow {
+        fn process(&mut self, _block: &Block<'_>) {
+            thread::sleep(self.delay);
+        }
+    }
+
+    /// Each block is timed from its pop to the return of the last sink: a sink that takes three
+    /// times as long as 48 frames last (1 ms) makes every block late, and the load says so.
+    #[test]
+    fn the_engine_thread_times_every_block_and_counts_the_late_ones() {
+        let links = links();
+        let (mut writer, reader) = source(1, 48, links.clone());
+        let mut pipeline = Pipeline::new(
+            vec![
+                Box::new(Recorder::new()),
+                Box::new(Slow {
+                    delay: Duration::from_millis(3),
+                }),
+            ],
+            Arc::clone(&links.levels),
+        );
+        pipeline.set_source(reader);
+        let load = pipeline.load();
+
+        writer.write(&[0.25f32; 3 * 48]);
+        assert_eq!(pipeline.pump(), 3);
+
+        let status = load.status();
+        assert_eq!(status.late_blocks, 3, "{status:?}");
+        assert!(status.percent >= 300.0, "{status:?}");
+        assert!(status.peak_percent >= status.percent);
     }
 
     fn demo_source(block_frames: usize, links: &CaptureLinks) -> SourceReader {

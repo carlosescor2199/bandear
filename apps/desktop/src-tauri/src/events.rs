@@ -583,6 +583,7 @@ mod tests {
                 &personal_monitoring::SoundcheckStatus::default(),
             ),
             demo: false,
+            load: Default::default(),
         }
     }
 

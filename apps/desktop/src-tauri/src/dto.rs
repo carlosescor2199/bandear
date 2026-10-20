@@ -9,9 +9,9 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
-    CaptureFormat, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate, InputDevice,
-    LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin,
-    MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer,
+    CaptureFormat, EngineLoadStatus, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate,
+    InputDevice, LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus,
+    MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer,
     RecordingState, RecordingStatus, Redundancy, SampleFormat, SoundcheckClock, SoundcheckState,
     SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack, CAPABILITY_PLAYBACK_BUFFER,
     CAPABILITY_REDUNDANCY_HOLD, CAPABILITY_REDUNDANCY_RECOVERED,
@@ -1109,6 +1109,35 @@ pub struct EngineStatusDto {
     /// The engine runs on the demo source, a generated band with no interface: the window says
     /// "Demo source".
     pub demo: bool,
+    /// How long the engine thread takes per block, as a share of the time a block lasts.
+    pub load: EngineLoadDto,
+}
+
+/// The engine thread's load on the status (`load`): each block's processing time in percent of
+/// the time the block lasts (5.33 ms for 256 frames). Over 100% a block was late; many late
+/// blocks drop audio.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineLoadDto {
+    /// The last block.
+    pub percent: f32,
+    /// Smoothed over about a second.
+    pub average_percent: f32,
+    /// The highest block of the last two to four seconds.
+    pub peak_percent: f32,
+    /// The blocks that took longer than they last, since the engine started.
+    pub late_blocks: u64,
+}
+
+impl From<&EngineLoadStatus> for EngineLoadDto {
+    fn from(load: &EngineLoadStatus) -> Self {
+        Self {
+            percent: load.percent,
+            average_percent: load.average_percent,
+            peak_percent: load.peak_percent,
+            late_blocks: load.late_blocks,
+        }
+    }
 }
 
 impl From<&EngineStatus> for EngineStatusDto {
@@ -1170,6 +1199,7 @@ impl From<&EngineStatus> for EngineStatusDto {
                 .map(TakeSummaryDto::from),
             soundcheck: SoundcheckDto::from(&status.soundcheck),
             demo: status.demo,
+            load: EngineLoadDto::from(&status.load),
         }
     }
 }
@@ -1547,6 +1577,7 @@ mod tests {
             recording: Default::default(),
             soundcheck: Default::default(),
             demo: false,
+            load: Default::default(),
         }
     }
 
@@ -1573,6 +1604,29 @@ mod tests {
         assert_eq!(dto.channels[1].level, 100);
         assert_eq!(dto.groups.len(), 1);
         assert_eq!(dto.groups[0].channels, vec![0]);
+    }
+
+    #[test]
+    fn the_engine_load_reaches_the_window_in_camel_case() {
+        let mut status = status_with(Vec::new(), vec![0, 0]);
+        status.load = EngineLoadStatus {
+            percent: 12.5,
+            average_percent: 10.0,
+            peak_percent: 30.0,
+            late_blocks: 2,
+        };
+
+        let json = serde_json::to_value(EngineStatusDto::from(&status)).unwrap();
+
+        assert_eq!(
+            json["load"],
+            serde_json::json!({
+                "percent": 12.5,
+                "averagePercent": 10.0,
+                "peakPercent": 30.0,
+                "lateBlocks": 2,
+            })
+        );
     }
 
     #[test]

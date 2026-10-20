@@ -165,7 +165,33 @@ test("the fake runs the demo with no interface, as the desktop does", async () =
   const back = await api.status();
   assert.equal(back.demo, false);
   assert.equal(back.deviceName, "Demo interface");
-  assert.equal(back.captureFormat.sampleFormat, "I24");
+  assert.deepEqual(back.captureFormat, {
+    channels: 6,
+    sampleRate: 48000,
+    sampleFormat: "I24",
+    bufferSize: "Fixed(256)",
+  });
+});
+
+test("back on an interface after the demo, the fake reports none of the demo's format", async () => {
+  const fake = createFakeBridge({ running: true });
+  const api = createEngineApi(fake);
+  const interfaceFormat = (await api.status()).captureFormat;
+  await api.start(startRequest({ ...DEFAULT_AUDIO, host: "demo", bufferFrames: 128 }));
+  assert.equal((await api.status()).captureFormat.bufferSize, "Fixed(128)");
+
+  // An input whose channel count is unknown keeps the interface's count, not the demo's 8.
+  await api.start(startRequest(DEFAULT_AUDIO, { deviceFilter: "Digital input" }));
+  const back = await api.status();
+  assert.equal(back.demo, false);
+  assert.equal(back.deviceName, "Digital input");
+  assert.deepEqual(back.captureFormat, interfaceFormat);
+  assert.equal(back.sourceChannels, interfaceFormat.channels);
+
+  // And a known one takes its own count on the interface's format.
+  await api.start(startRequest({ ...DEFAULT_AUDIO, host: "demo", bufferFrames: 128 }));
+  await api.start(startRequest(DEFAULT_AUDIO, { deviceFilter: "Microphone" }));
+  assert.deepEqual((await api.status()).captureFormat, { ...interfaceFormat, channels: 2 });
 });
 
 test("the console starts the demo by its driver and keeps the choice", async () => {

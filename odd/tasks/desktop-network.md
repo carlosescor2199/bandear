@@ -716,7 +716,50 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     source that needs no interface` (+964/-91); 645a324 `feat(desktop): choose the demo source in
     the audio setup` (+78/-5); this commit `feat(desktop-ui): demo source entry and badge`
     (+337/-18 before this document).
-- [ ] T9 (close): PRD update, docs, live test with the S23. Route: inline or writer.
+- [x] T8-fix (review-5557b69a8fe0a1d1 SUGGESTION): switching the fake bridge back from the demo
+  to an interface spread the demo's `captureFormat` and only reset `sampleFormat`, so its 8
+  channels and its buffer ("Fixed(<demo buffer>)") leaked into the interface run (and its
+  `sourceChannels` for an input whose channel count is unknown). A start that leaves the demo now
+  rebuilds the interface's whole format, the one held before the demo (the sample interface's for a
+  bridge that begins on the demo), and the chosen device sets its channels. Route: delegated writer
+  (with T9's docs).
+  - Tests: the switch-back in `the fake runs the demo with no interface` asserts the whole format;
+    new `back on an interface after the demo, the fake reports none of the demo's format` (demo at
+    128 frames, back on "Digital input" with no channel count, then on the 2-channel microphone).
+  - RED: 1 of 8 demo-source tests failed (8 channels and `Fixed(128)` against 6 and `Fixed(256)`).
+    GREEN: `node --test apps/desktop/ui/tests`: 540 passed.
+  - Commit: 3c33f9d `fix(desktop-ui): rebuild the fake's capture format after the demo` (+50/-10).
+- [x] T9 (close): PRD update, docs, live test with the S23. Route: delegated writer for the docs
+  (with T8-fix); the live test with the user.
+  - Docs done: `PRD.md` version 0.4 (RF5 with the link health history and chart, RF11 with the
+    buffer from the desk and the phone's extras, new RF17 redundancy, RF18 log file, RF19 demo
+    source, RF20 mixes backup; technical decisions on transport, capabilities on `register` for
+    compatibility, and the round trip). `apps/desktop/README.md`: Network health (the chart and
+    each line), Phone buffer, Redundancy (bandwidth ×2, the delay's cost in ms, "needs a newer
+    app"), Log file (folder per OS, `log_location`, line format, rotation), Mix backups (when,
+    where, how many, restore) and Demo source. There is no Android README or `docs/` folder.
+  - Commit: this commit `docs: network health, phone buffer, redundancy, log, backup and demo
+    source`.
+  - Remaining: live test with the user.
+    - [x] Install the new APK (`apps/android/app/build/outputs/apk/debug/app-debug.apk`) on the
+      S23.
+    - [x] The link health chart fills over a few minutes and the round trip shows.
+    - [x] Buffer Fixed 40 ms, then Auto: the cushion follows; Auto's latency did not grow (the
+      large-track risk from T6-fix).
+    - [x] Redundancy immediate on and off: the musician's bandwidth doubles and returns.
+    - [x] Redundancy delayed 2 blocks: about +10.7 ms, and recovered packets when the Wi-Fi drops
+      some.
+    - [x] The log file is present in the app's log folder and readable.
+    - [x] A mixes backup appears after changing a mix, and Restore works.
+    - [x] The demo source runs with no interface (the Volt unplugged or not selected) and streams to
+      the phone.
+  - Live test (2026-10-19, desktop debug build at c530c85, capture on the Realtek microphone array
+    under WASAPI, Galaxy S23 with the new APK installed over adb): the link health panel for the
+    phone showed loss 0.00% over 10 min, round trip 7.1 ms now and 7.9 ms on average, no
+    underruns, and the jitter and cushion lines the phone now reports; the Mix backups list showed
+    a backup. The user then confirmed the rest of the checklist with "Todo funciona bien". Only the
+    chart and the backups list were seen on screen; the other items rest on the user's word. The
+    Volt 4 was not the capture device in this run.
 
 ## Delivery
 
@@ -767,7 +810,13 @@ per reviewed slice, only with the user's approval.
   ReorderHold stale-waiting bug, corrected in b82d3a3, validated and acknowledged. Next review base
   b82d3a3.
 - T7-fix and T8 done (demo source), seven commits.
+- review-5557b69a8fe0a1d1 (b82d3a3..9a1ae1f, T7-fix and T8) approved and acknowledged, with one
+  SUGGESTION: the fake's capture format leaking from the demo into an interface run (fixed in
+  T8-fix). Next review base 9a1ae1f.
+- T8-fix and T9's docs done, two commits (217 changed lines, under the review budget, pending in
+  the slice from 9a1ae1f).
+- T9's live test passed (see T9). Phase 4 is complete.
 
 ## Next step
 
-T9 (close: PRD update, docs, live test with the S23).
+Push and stacked pull requests to main, only with the user's approval; then phase 5 (DSP).

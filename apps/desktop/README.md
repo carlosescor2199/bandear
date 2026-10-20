@@ -8,11 +8,106 @@ interface and sends each phone its own mix; this app runs that engine and shows 
   reaches the phone at once, and a change on the phone shows here. The last tab, **Local mix**,
   is the engineer's own mix for this computer's output.
 - **Record**: multitrack recording of the inputs, the takes, and the virtual soundcheck.
-- **Network and system**: the phones (name, link health, remove, add by address) and the audio
-  setup (driver, device, buffer, and **Local mix out**).
+- **Network and system**: the phones (name, link health and its history, playback buffer,
+  redundancy, remove, add by address), the session (named sessions and **Mix backups**) and the
+  audio setup (driver, device, buffer, and **Local mix out**).
 
 ASIO loads a kernel-mode driver, so the app never picks it: choose it under Network and system,
 then pick the driver and start on it.
+
+## Network health
+
+Each phone's link is kept as a history of one-second samples (the last 10 minutes), so a bad
+patch can be seen after it happened.
+
+1. On Network and system, press **History** in a musician's Link cell (or click their row).
+2. Pick a range: **1**, **5** or **10 min**. Hover the chart, or use the arrow keys, to read a
+   second; **Show as table** lists every second, newest first.
+3. Press History again, or **Close**, to close it.
+
+| Line | What it means |
+| --- | --- |
+| Summary | The link's level (as in the table), the loss over the range, the round trip now and on average, the underruns, and when any the timeouts, seconds without reports and reconnects. |
+| Loss (%) | The packets lost in each second. |
+| Round trip (ms) | The control channel's ping to pong time, measured every 2 s, for any phone. |
+| Jitter (ms) | How irregularly the packets arrive. Only from a phone with a newer app ("not reported by this phone" otherwise). |
+| Cushion (ms) | The audio the phone holds back before playing, a redundancy hold included. Newer app only. |
+| Shaded band | Seconds with no report from a connected phone. |
+| Dashed "Reconnected" line | The phone connected again; its history is kept. |
+| Ticks | Underruns (the phone ran out of audio) and receive timeouts, in their own lanes. |
+
+A new engine starts every history empty.
+
+## Phone buffer
+
+The **Buffer** column sets how much audio a phone holds before playing.
+
+| Choice | Behaviour |
+| --- | --- |
+| Auto (default) | The phone adapts its own cushion, from one to four packets, as before. |
+| Fixed | Type 5 to 500 ms and press Enter (or leave the field; Escape reverts). The phone plays that much, rounded up to whole packets and clamped to what it can hold, and stops adapting. |
+
+- The cell shows what the phone really plays ("plays 42.7 ms"), from its reports.
+- A phone that is not connected gets the setting when it is back. The choice is kept in the
+  session.
+- A phone with an older app shows "needs a newer app" and no control; it keeps adapting.
+
+## Redundancy
+
+Turned on for a musician, each audio packet is sent twice, so a lost packet's copy can still
+play.
+
+| Copy | Cost | Covers |
+| --- | --- | --- |
+| Immediate (default) | 2× that musician's bandwidth, no added latency. Every phone takes it. | Isolated losses. |
+| 1 to 4 blocks later | 2× bandwidth, plus the delay on that phone: about 5.3 ms a block at 256 frames and 48 kHz (2 blocks: +10.7 ms). | Wi-Fi bursts shorter than the delay. |
+
+- A delayed copy needs a phone that holds packets back for it: other phones show the delays
+  disabled with "needs a newer app".
+- While on, the cell shows the copies sent and, for a phone that reports them, the packets
+  recovered (packets a delayed copy filled in time). Immediate copies are never counted.
+- The choice is kept in the session. Only that musician's bandwidth doubles.
+
+## Log file
+
+The engine and the desk write to a log file, so a release build (which has no console) can be
+diagnosed.
+
+| Topic | Behaviour |
+| --- | --- |
+| Where | `mixlink.log` in the app's log folder: on Windows `%LOCALAPPDATA%\com.mixlink.desktop\logs\`, on macOS `~/Library/Logs/com.mixlink.desktop/`. The `log_location` command answers `{ directory, file, failedLines }`, and the file's path is the log's first line. |
+| Line | `2026-10-18T19:04:05.123Z WARN  [control] message`: UTC time, level, area (`engine`, `control`, `session`, ...). |
+| Rotation | At 5 MB the file moves to `mixlink.log.1` (older ones to `.2` ... `.5`); five old files are kept. |
+| Failure | A line the file cannot take goes to stderr, and is counted in `failedLines`. A rotation that fails keeps writing to the current file. |
+| Development | Debug lines are written only in a development build, which also mirrors every line to stderr. |
+
+## Mix backups
+
+The musicians' live mixes are backed up as they change, so a crash loses at most a few seconds.
+
+| Topic | Behaviour |
+| --- | --- |
+| When | 3 s after the mixes go still (at most 20 s after the first change), on engine stop and on exit. An unchanged backup is not written again. |
+| Where | `backups/mixes-<UTC stamp>.json` in the app's config folder (on Windows `%APPDATA%\com.mixlink.desktop\`), written through a temporary file. The newest 10 are kept. |
+| What | Each musician's name, client id, address and mix. Locks and limits are not in it: the session keeps them. |
+| Restore | Network and system, **Mix backups**: pick a backup, **Restore**, confirm. Each mix goes to that musician if they are connected now; the others keep their own. A damaged backup is listed with its problem and cannot be restored. |
+
+A phone that reconnects keeps its own opening mix: restoring is always the engineer's choice.
+
+## Demo source
+
+The engine can run with no audio interface, to show the app or test phones.
+
+1. Under Network and system, choose the driver **Demo (no interface)** and start.
+2. The top bar shows **Demo source — no interface in use**, and the window's title says so.
+
+| Topic | Behaviour |
+| --- | --- |
+| Sound | A generated four-bar loop at 120 BPM on 8 inputs (kick, snare, hi-hat, bass, keys, pad, a vocal-like line and room noise), each at -18 dBFS. The same on every run. |
+| Format | 8 channels, 48 kHz, 32-bit float, in blocks of the buffer chosen. |
+| Allowed | Phones, mixes, the local output and recording (the take's device is "Demo (no interface)"). |
+| Refused | The virtual soundcheck, and switching to any other device: start on another driver instead. |
+| Default | Never chosen on its own, even with no interface; a machine with no input is told it can pick it. |
 
 ## Local mix
 

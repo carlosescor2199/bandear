@@ -3,6 +3,10 @@
 // shapes, the same mix-merge rules and the same refusals as the real engine, and emits the same
 // events. Like a Tauri command, a refused call rejects with the error text, not an Error. Every
 // start, even a failed one, begins a new engine run, and every payload names its run.
+//
+// The demo driver ("demo", demo-source.js) is mirrored too: its one device, an engine on it with
+// eight generated inputs at 48 kHz (`demo` on the status), a switch to any other device and a
+// soundcheck refused in the desktop's words.
 
 import {
   CHANNEL_KINDS,
@@ -13,6 +17,7 @@ import {
   keepPairsEqual,
   lockPairs,
 } from "./channels.js";
+import { DEMO_CHANNELS, DEMO_DEVICE, DEMO_HOST, demoDevices } from "./demo-source.js";
 import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
@@ -403,6 +408,8 @@ export function sampleStatus() {
     lastTake: null,
     // The inputs are live: no soundcheck plays.
     soundcheck: clone(IDLE_SOUNDCHECK),
+    // On an interface, not the demo source.
+    demo: false,
   };
 }
 
@@ -1370,6 +1377,9 @@ export function createFakeBridge({
     switchRefused:
       "a soundcheck is playing a take: go back to the live inputs before switching the input device",
     empty: "the take has no input audio to play",
+    demoSource:
+      "the engine runs on the demo source: a take plays in place of an interface's inputs, so " +
+      "choose an interface's driver first",
   });
 
   // `frames` of a take as the refusals say them: "2.5 s".
@@ -1767,7 +1777,7 @@ export function createFakeBridge({
       return {
         audio: keptAudio,
         loaded: false,
-        skipped: `the audio driver \`${saved.host}\` is none of auto, wasapi, asio`,
+        skipped: `the audio driver \`${saved.host}\` is none of auto, wasapi, asio, demo`,
       };
     }
     if (host === "asio" && !asioDriver) {
@@ -2060,8 +2070,10 @@ export function createFakeBridge({
       // As the engine does: the first device whose name contains the one asked for, in any case,
       // and no start when none does (an interface left unplugged); with none asked for, the
       // driver's first one when a driver is named.
-      const offered = config?.host === "asio" ? sampleAsioDrivers() : devices;
-      const filter = config?.deviceFilter ?? null;
+      const demo = config?.host === DEMO_HOST;
+      const offered = config?.host === "asio" ? sampleAsioDrivers() : demo ? demoDevices() : devices;
+      // As the engine does: the demo source is its one device, whatever name is asked for.
+      const filter = demo ? null : (config?.deviceFilter ?? null);
       let wanted = null;
       if (filter !== null) {
         const sought = filter.toLowerCase();
@@ -2072,6 +2084,17 @@ export function createFakeBridge({
       } else if (config?.host) {
         wanted = offered[0];
       }
+      // As the engine reports it: the demo is generated as 32-bit float at 48 kHz in blocks of the
+      // buffer asked for; an interface is the sample one's 24-bit format again.
+      engine.demo = demo;
+      engine.captureFormat = demo
+        ? {
+            channels: DEMO_CHANNELS,
+            sampleRate: 48000,
+            sampleFormat: "F32",
+            bufferSize: `Fixed(${config?.bufferFrames ?? 256})`,
+          }
+        : { ...engine.captureFormat, sampleFormat: "I24" };
       // As the desktop does: a start that names no groups takes the kept ones; one that names
       // some runs with those and keeps nothing.
       const named = config?.groups ?? [];
@@ -2116,7 +2139,7 @@ export function createFakeBridge({
       return null;
     },
     list_input_devices({ host } = {}) {
-      return clone(host === "asio" ? sampleAsioDrivers() : devices);
+      return clone(host === "asio" ? sampleAsioDrivers() : host === DEMO_HOST ? demoDevices() : devices);
     },
     audio_settings() {
       return keptAudio ? clone(keptAudio) : null;
@@ -2129,7 +2152,7 @@ export function createFakeBridge({
       }
       const host = String(settings.host ?? "auto").trim().toLowerCase();
       if (!HOSTS.includes(host)) {
-        throw `the audio driver \`${settings.host}\` is none of auto, wasapi, asio`;
+        throw `the audio driver \`${settings.host}\` is none of auto, wasapi, asio, demo`;
       }
       const named = (name) => (typeof name === "string" && name.trim() ? name.trim() : null);
       const asioDriver = named(settings.asioDriver);
@@ -2151,6 +2174,13 @@ export function createFakeBridge({
       }
       if (check) {
         throw SOUNDCHECK_WORDS.switchRefused;
+      }
+      if (engine.demo) {
+        // As the engine does: the demo source is its one device; nothing else is listed.
+        if (device !== DEMO_DEVICE) {
+          throw `"${device}" is not the demo source's device: choose an interface's driver to use it`;
+        }
+        return summary();
       }
       const found = devices.find((candidate) => candidate.name === device);
       if (!found || found.channels === 0) {
@@ -3042,6 +3072,9 @@ export function createFakeBridge({
       // Then as the engine does, in its order.
       if (check) {
         throw SOUNDCHECK_WORDS.already;
+      }
+      if (engine.demo) {
+        throw SOUNDCHECK_WORDS.demoSource;
       }
       if (take && !take.failure) {
         throw SOUNDCHECK_WORDS.recording;

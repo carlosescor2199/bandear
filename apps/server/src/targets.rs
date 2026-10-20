@@ -963,7 +963,13 @@ impl TargetRegistry {
             }
             existing.address = address;
             existing.origin = origin;
-            hold_copies(existing, redundancy);
+            if same_musician {
+                hold_copies(existing, redundancy);
+            } else {
+                // The copies still held are the previous occupant's mix: never sent to whoever
+                // takes the row, even at the same delay.
+                existing.held = new_held(redundancy);
+            }
             let controls_changed = if same_musician {
                 self.restore_kept_controls(existing)
             } else {
@@ -1405,10 +1411,12 @@ impl TargetRegistry {
     /// total. An IP with no target is a no-op.
     pub(crate) fn count_recovered(&self, ip: IpAddr, recovered: u64) {
         if let Some(entry) = self.read().iter().find(|entry| entry.address.ip() == ip) {
-            entry
-                .counters
-                .recovered
-                .fetch_add(recovered, std::sync::atomic::Ordering::Relaxed);
+            // Saturates rather than wraps: a running total never falls back to a small number.
+            let _ = entry.counters.recovered.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |total| Some(total.saturating_add(recovered)),
+            );
         }
     }
 
@@ -3385,6 +3393,42 @@ mod tests {
             None,
             "Eva has none kept"
         );
+    }
+
+    /// Another musician taking the row over at the same delay gets a store of their own: the copies
+    /// of the previous occupant's mix still held are never sent to the new phone.
+    #[test]
+    fn a_row_taken_over_at_the_same_delay_never_sends_the_previous_musicians_copies() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry.replace_redundancies(&[
+            (MusicianKey::Client(PHONE_A.to_owned()), TWO_BLOCKS),
+            (MusicianKey::Client(PHONE_B.to_owned()), TWO_BLOCKS),
+        ]);
+        let store = |registry: &TargetRegistry| {
+            Arc::clone(registry.read()[0].held.as_ref().expect("a store"))
+        };
+        let anas = store(&registry);
+
+        register_phone(&registry, "192.168.1.10", 50000, "Eva", Some(PHONE_B));
+        let evas = store(&registry);
+        assert_eq!(evas.delay_blocks(), 2, "Eva keeps her own redundancy");
+        assert!(
+            !Arc::ptr_eq(&anas, &evas),
+            "Ana's held copies are dropped with her store"
+        );
+
+        // The same goes for a phone that announces no id where Eva's was.
+        register_phone(&registry, "192.168.1.10", 50000, "Rack", None);
+        registry
+            .set_redundancy(
+                &MusicianKey::Address(address("192.168.1.10:50000")),
+                TWO_BLOCKS,
+            )
+            .expect("the rack is here");
+        let racks = store(&registry);
+        register_phone(&registry, "192.168.1.10", 50000, "Eva", Some(PHONE_B));
+        assert!(!Arc::ptr_eq(&racks, &store(&registry)));
     }
 
     /// A configured target is keyed by its address, and one added later takes what is kept for its

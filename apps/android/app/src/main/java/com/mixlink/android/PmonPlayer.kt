@@ -131,6 +131,8 @@ internal class PmonPlayer(
         var playbackRate: Int? = null
         val metricsStartedAtNanos = System.nanoTime()
         val linkStats = LinkStatsAccumulator(metricsStartedAtNanos / NANOS_PER_MILLISECOND)
+        // The hold and the link report together, wake-up by wake-up (see [HoldPlayout]).
+        val playout = HoldPlayout(hold, linkStats)
         var previousPacketAtNanos: Long? = null
         var interArrivalMs = 0.0
         var jitterMs = 0.0
@@ -176,14 +178,13 @@ internal class PmonPlayer(
                             framesWritten = framesWritten,
                             presentedFrame = audioTimestamp.framePosition,
                             appliedBufferFrames = appliedBufferFrames,
-                            holdPackets = hold.holdPackets,
+                            holdPackets = playout.holdPackets,
                         )
-                        linkStats.poll(
+                        playout.poll(
                             nowMs,
                             track?.underrunCount ?: 0,
                             cushionMs = extras.cushionMs,
                             backlogMs = extras.backlogMs,
-                            cumulativeRecovered = hold.recovered,
                         )?.let { report ->
                             listener.onLinkStats(report)
                         }
@@ -195,16 +196,15 @@ internal class PmonPlayer(
                         openedSocket.receive(datagram)
                         true
                     } catch (_: java.net.SocketTimeoutException) {
-                        linkStats.onReceiveTimeout()
                         // Nothing came for a while: what is held is not worth waiting for any longer.
-                        hold.release()
+                        playout.onTimeout()
                         false
                     }
 
                     try {
                         // The desk's hold is read once per wake-up (one volatile read), so a change
                         // applies from the next packet.
-                        hold.holdPackets = mixState.redundancyHoldPackets
+                        playout.wake(mixState.redundancyHoldPackets)
                         if (arrived) {
                             val packet = PmonPacketParser.parse(datagram.data, datagram.length)
                             if (packet.channels > MAX_CHANNELS) {
@@ -212,7 +212,7 @@ internal class PmonPlayer(
                                     "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
                                 )
                             }
-                            if (!hold.offer(packet.sequence, packet)) {
+                            if (!playout.offer(packet.sequence, packet)) {
                                 // A duplicate, or a packet that arrived after a newer one was played
                                 // or given up on: playing it now would be out of order, and its gap is
                                 // already counted.
@@ -236,12 +236,10 @@ internal class PmonPlayer(
                         // Every packet now due, in sequence order: at once with no hold, else once
                         // the hold has passed or a late copy filled its gap.
                         while (true) {
-                            val packet = hold.next() ?: break
-                            val lostBefore = hold.lostBefore
+                            val packetPlayedAtNanos = System.nanoTime()
+                            val packet = playout.nextToPlay(packetPlayedAtNanos / NANOS_PER_MILLISECOND) ?: break
                             packetsReceived++
                             lastSampleRate = packet.sampleRate
-                            val packetPlayedAtNanos = System.nanoTime()
-                            linkStats.onPacket(lostBefore, packetPlayedAtNanos / NANOS_PER_MILLISECOND)
                             val elapsedSeconds = (packetPlayedAtNanos - metricsStartedAtNanos) / 1_000_000_000.0
                             packetsPerSecond = if (elapsedSeconds > 0.0) packetsReceived / elapsedSeconds else 0.0
 
@@ -306,7 +304,7 @@ internal class PmonPlayer(
                             }
                             listener.onStats(
                                 packetsReceived,
-                                hold.lost,
+                                playout.lost,
                                 lastSampleRate,
                                 packetsPerSecond,
                                 interArrivalMs,
@@ -378,7 +376,8 @@ internal class PmonPlayer(
      * ([PlaybackLatency.keepsLowLatency]). A track that will not shrink is released and reopened at
      * the minimum: Auto plays as tight as before, and a fixed buffer goes only as long as that track
      * holds (its capacity is what the cushion is clamped to), the cushion reported being the size
-     * the track applied.
+     * the track applied. A track that fails to start is released before the failure goes on
+     * ([openTrackKeepingLowLatency]).
      */
     private fun openLowLatencyTrack(sampleRate: Int, packetFrames: Int): AudioTrack {
         val minimum = AudioTrack.getMinBufferSize(
@@ -387,20 +386,35 @@ internal class PmonPlayer(
             AudioFormat.ENCODING_PCM_16BIT,
         )
         if (minimum <= 0) throw IllegalStateException("sample rate $sampleRate is not supported")
-        val large = createAudioTrack(
-            sampleRate,
-            maxOf(minimum, PlaybackLatency.trackCapacityFrames(sampleRate, packetFrames) * BYTES_PER_FRAME),
-        )
-        large.play()
-        val applied = applyPlaybackBufferTarget(large, packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
         val wanted = PlaybackLatency.targetBufferFrames(packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
-        if (PlaybackLatency.keepsLowLatency(wanted, applied, minimum / BYTES_PER_FRAME, sampleRate)) {
-            return large
+        return openTrackKeepingLowLatency(
+            openLarge = {
+                createAudioTrack(
+                    sampleRate,
+                    maxOf(minimum, PlaybackLatency.trackCapacityFrames(sampleRate, packetFrames) * BYTES_PER_FRAME),
+                )
+            },
+            openMinimum = { createAudioTrack(sampleRate, minimum) },
+            start = { track -> track.play() },
+            applyLowestCushion = { track ->
+                applyPlaybackBufferTarget(track, packetFrames, PlaybackLatency.MIN_CUSHION_PACKETS)
+            },
+            keepsLowLatency = { applied ->
+                PlaybackLatency.keepsLowLatency(wanted, applied, minimum / BYTES_PER_FRAME, sampleRate)
+            },
+            close = ::closeTrack,
+        )
+    }
+
+    /** Stops [track] and gives back its resources; a track that never played is released too. */
+    private fun closeTrack(track: AudioTrack) {
+        try {
+            track.pause()
+            track.flush()
+        } catch (_: IllegalStateException) {
+            // Not playing: there is nothing to stop, only to release.
         }
-        large.pause()
-        large.flush()
-        large.release()
-        return createAudioTrack(sampleRate, minimum).also { it.play() }
+        track.release()
     }
 
     /** Builds a low-latency stream track at [sampleRate] with a capacity of [bufferBytes]. */

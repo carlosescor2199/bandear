@@ -110,7 +110,8 @@ test("a muted musician's mix reads muted", () => {
 test("the driver choices put the safe one first and say what ASIO risks", () => {
   assert.deepEqual(
     HOST_OPTIONS.map(({ value }) => value),
-    ["auto", "wasapi", "asio"],
+    ["auto", "wasapi", "asio", "demo"],
+    "the demo source last, never in the way of an interface",
   );
   assert.match(HOST_OPTIONS[0].label, /safe/);
   assert.match(HOST_OPTIONS[2].label, /risky/);

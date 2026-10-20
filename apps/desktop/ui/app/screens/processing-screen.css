@@ -1,0 +1,400 @@
+/*
+ * The Processing screen: the strip's actions in one wrapping bar, the input and processed meters,
+ * then the equaliser across the width and the gate and compressor side by side below it (stacked
+ * in a narrower window).
+ */
+
+.processing-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-4);
+  padding-top: var(--ml-space-1);
+}
+
+.processing-screen [hidden] {
+  display: none !important;
+}
+
+.processing-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ml-space-3);
+  color: var(--ml-text-secondary);
+}
+
+.processing-messages {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-2);
+}
+
+.processing-message {
+  padding: var(--ml-space-2) var(--ml-space-3);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-surface);
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-md);
+}
+
+.processing-message--error {
+  border-color: var(--ml-danger-border);
+  background: var(--ml-danger-bg);
+  color: var(--ml-danger-text);
+}
+
+/* Live regions stay in the page so every outcome is announced; empty, they take no room. */
+.processing-message:empty {
+  display: none;
+}
+
+.processing-messages:not(:has(.processing-message:not(:empty))) {
+  margin-top: calc(-1 * var(--ml-space-4));
+}
+
+.processing-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-4);
+}
+
+.processing-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ml-space-3) var(--ml-space-5);
+  padding: var(--ml-space-3) 14px;
+  border: 1px solid var(--ml-border);
+  border-radius: 14px;
+  background: var(--ml-surface);
+}
+
+.processing-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ml-space-2);
+  margin: 0;
+}
+
+.processing-bar label {
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-md);
+}
+
+.processing-bar select,
+.processing-text {
+  min-height: var(--ml-target);
+  max-width: 16em;
+  padding: 0 var(--ml-space-2);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-ground);
+  font-size: var(--ml-text-md);
+}
+
+.processing-text {
+  width: 10em;
+}
+
+.processing-text::placeholder {
+  color: var(--ml-text-muted);
+}
+
+.processing-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--ml-target);
+  padding: 0 var(--ml-space-3);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-surface-raised);
+  font-size: var(--ml-text-md);
+  font-weight: var(--ml-weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+  list-style: none;
+}
+
+.processing-button::-webkit-details-marker {
+  display: none;
+}
+
+.processing-button:disabled {
+  border-style: dashed;
+  background: transparent;
+  color: var(--ml-text-muted);
+  cursor: default;
+}
+
+.processing-button--primary {
+  border-color: var(--ml-accent);
+  background: var(--ml-accent);
+  color: var(--ml-text-on-bright);
+  font-weight: var(--ml-weight-bold);
+}
+
+.processing-button[aria-pressed="true"] {
+  border-color: var(--ml-accent);
+  background: var(--ml-accent-bg);
+  color: var(--ml-accent);
+}
+
+.processing-step {
+  min-width: var(--ml-target);
+  padding: 0;
+  font-size: var(--ml-text-xl);
+  line-height: 1;
+}
+
+.processing-state {
+  padding: 3px 9px;
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-sm);
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+  font-weight: var(--ml-weight-bold);
+}
+
+.processing-state[data-state="on"] {
+  border-color: var(--ml-ok-border);
+  background: var(--ml-ok-bg);
+  color: var(--ml-text);
+}
+
+.processing-state[data-state="bypassed"] {
+  border-color: var(--ml-warn-border);
+  background: var(--ml-warn-bg);
+  color: var(--ml-text);
+}
+
+.processing-copy {
+  position: relative;
+}
+
+.processing-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-3);
+  width: max-content;
+  max-width: min(320px, 80vw);
+  padding: var(--ml-space-3);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-lg);
+  background: var(--ml-surface-raised);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+}
+
+.processing-popover fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.processing-popover legend {
+  margin-bottom: var(--ml-space-2);
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-md);
+}
+
+.processing-copy-list {
+  display: grid;
+  gap: 2px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.processing-on {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--ml-target);
+  font-size: var(--ml-text-md);
+  cursor: pointer;
+}
+
+.processing-on input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--ml-accent);
+}
+
+.processing-levels {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--ml-space-2) var(--ml-space-3);
+  padding: var(--ml-space-3) 14px;
+  border: 1px solid var(--ml-border);
+  border-radius: 14px;
+  background: var(--ml-surface);
+}
+
+.processing-level-label {
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-md);
+}
+
+.processing-bypassed {
+  padding: var(--ml-space-2) var(--ml-space-3);
+  border: 1px solid var(--ml-warn-border);
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-warn-bg);
+  font-size: var(--ml-text-md);
+}
+
+.processing-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.processing-sections:disabled .processing-card {
+  opacity: 0.7;
+}
+
+.processing-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px var(--ml-space-4);
+  border: 1px solid var(--ml-border);
+  border-radius: var(--ml-radius-xl);
+  background: var(--ml-surface);
+}
+
+.processing-card--eq {
+  grid-column: 1 / -1;
+}
+
+.processing-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ml-space-2) var(--ml-space-3);
+}
+
+.processing-card-head p {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+}
+
+.processing-card-head .processing-on {
+  margin-left: auto;
+}
+
+.processing-bands {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--ml-space-3);
+}
+
+.processing-band {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--ml-radius-md);
+  background: var(--ml-ground);
+}
+
+.processing-band h3 {
+  font-size: var(--ml-text-sm);
+}
+
+/* In a band the label and value share a line and the slider takes the panel's width below. */
+.processing-band .processing-field {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+}
+
+.processing-band .processing-field input {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+.processing-field {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr) 72px;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.processing-field label {
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-sm);
+}
+
+.processing-field input {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  accent-color: var(--ml-accent);
+}
+
+.processing-field output {
+  font-family: var(--ml-font-mono);
+  font-size: var(--ml-text-sm);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.processing-reduction {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: var(--ml-text-secondary);
+  font-size: var(--ml-text-sm);
+}
+
+.processing-transfer {
+  display: flex;
+  align-items: center;
+  gap: var(--ml-space-3);
+  margin: 0;
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+}
+
+.processing-transfer svg {
+  flex: none;
+  width: 96px;
+  height: 96px;
+  border: 1px solid var(--ml-border-subtle);
+  border-radius: var(--ml-radius-sm);
+  background: var(--ml-ground);
+}
+
+.processing-transfer-grid {
+  fill: none;
+  stroke: var(--ml-border);
+  stroke-dasharray: 2 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.processing-transfer-curve {
+  fill: none;
+  stroke: var(--ml-accent);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+@media (max-width: 700px) {
+  .processing-levels {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+}

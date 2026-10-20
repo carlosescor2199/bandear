@@ -9,7 +9,8 @@
 // Property: `data`, one entry of channelStrips (mix-view.js):
 //   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout, lockable,
 //   locked, lockText, following }. A strip that is not `lockable` (the engineer's local mix, which
-//   no phone plays) has no lock.
+//   no phone plays) has no lock. `processing` (the screen adds it) is true while the input's
+//   processing is on; the strip links to its editor, "Processing on" in words when it is.
 // Method: `setLevel(level)`, the input peak from the `meters` event (a pair's louder side).
 // Event: `mix-edit` { field, index, sides, stereo, value } (bubbling, composed) for a move of the
 //   fader ("channelGains") or the pan ("pans", a balance for a pair) and a press of Mute
@@ -24,6 +25,7 @@ import "./pan.js";
 import "./toggle.js";
 import { kindIcon, stereoIcon } from "./kind-icons.js";
 import { followingState } from "../lib/mix-tools.js";
+import { processingHash } from "../lib/router.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
@@ -79,6 +81,29 @@ const styles = sheet(`
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .processing {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 24px;
+    border: 1px solid var(--ml-border);
+    border-radius: var(--ml-radius-sm);
+    background: var(--ml-surface-raised);
+    color: var(--ml-text-secondary);
+    font-size: var(--ml-text-2xs);
+    font-weight: var(--ml-weight-bold);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .processing[data-on] {
+    border-color: var(--ml-accent);
+    color: var(--ml-text);
+  }
+  .processing:focus-visible {
+    outline: 2px solid var(--ml-focus);
+    outline-offset: 2px;
+  }
   /* "Unlocked" fits the strip in the small type. */
   .lock::part(button) {
     min-width: 64px;
@@ -108,6 +133,7 @@ class MlChannelStrip extends HTMLElement {
           <ml-toggle kind="mute">M</ml-toggle><ml-toggle kind="solo">S</ml-toggle>
         </div>
         <ml-toggle class="lock">Unlocked</ml-toggle>
+        <a class="processing">Processing</a>
       </div>`,
     );
     const [mute, solo, lock] = root.querySelectorAll("ml-toggle");
@@ -122,6 +148,7 @@ class MlChannelStrip extends HTMLElement {
       meter: root.querySelector("ml-meter"),
       fader: root.querySelector("ml-fader"),
       readout: root.querySelector(".readout"),
+      processing: root.querySelector(".processing"),
       mute,
       solo,
       lock,
@@ -179,6 +206,13 @@ class MlChannelStrip extends HTMLElement {
     parts.lock.title = data.locked
       ? "Locked: the musician's phone cannot change this channel; you still can"
       : "Unlocked: the musician's phone can change this channel";
+    // The input's processing is shared by every mix; a pair's opens on its first side.
+    const on = data.processing === true;
+    reflect(parts.processing, "href", processingHash(data.sides[0] + 1));
+    reflect(parts.processing, "data-on", on);
+    reflect(parts.processing, "aria-label", `Processing of ${label}, ${on ? "on" : "off"}`);
+    setText(parts.processing, on ? "Processing on" : "Processing");
+    parts.processing.title = "Open this input's high-pass, equaliser, gate and compressor";
   }
 
   setLevel(level) {

@@ -365,8 +365,77 @@ test.
   - Counts: `cargo test -p mixlink-desktop` 325 passed (307 before); `cargo check -p
     mixlink-desktop --all-targets` clean; UI `node --test apps/desktop/ui/tests` 553 passed (542
     before). Server untouched. Commit: this commit.
-- [ ] T6 (editor): the channel processing editor (EQ curve, dynamics, meters), opened from the
-  Channels screen and the strip. Route: delegated writer.
+- [x] T5-fix (review-62e9809767b1790e's and review-ae983bec860aca54's findings: five WARNINGs, two
+  SUGGESTIONs). Route: delegated writer (with T6; trigger: Rust commands plus the console's store and
+  actions). Commits cf238a4 `fix(desktop): copy a strip atomically and clamp the response request`
+  (+273/-25) and 7b25b2d `fix(desktop-ui): keep strip edits honest around loads and pairs`
+  (+234/-34). A previous writer's run was cut off by a machine crash; its uncommitted Rust half was
+  checked (no NUL bytes), formatted, tested and committed as cf238a4.
+  - `copy_channel_processing` reads its source and writes its targets under one hold of the engine
+    lock (`apply_on`); `eq_response` holds the settings in range (`EqSettings::clamped`) before
+    `magnitude_db`, so a zero, negative or NaN frequency or Q never reaches the window as `null`; a
+    load whose strips the engine refuses marks the strips it still plays (`processing_kept`) for the
+    session instead of dropping the change waiting.
+  - Console: a strip edit held back by a session load answers once the load is over (dropped and
+    said so: "CH 1's processing was not changed: a session was loaded meanwhile.", or sent when the
+    load was refused), and edits made after the load landed go out; an answer before the strips were
+    ever read keeps `processing` null and reads them all (no 32 made-up neutral strips, the
+    connect-time read not blocked); a load whose strips cannot be read sets `processingError`
+    (`channel: null`), leaves `processing` unknown and says so in the load's answer; reset, copy and
+    preset wait for a linked partner's edit too (`stripUnitChannels`).
+  - RED: the five new UI tests failed against the old console (the edit reported `ok` with no send,
+    32 made-up strips and no read, the load's answer silent, the reset sent before CH 4's edit), then
+    passed. The three Rust tests (`a_change_to_the_source_sent_during_a_copy_lands_after_the_copy`,
+    forced interleaving with the stand-in's read park over 8 rounds;
+    `the_equaliser_response_of_settings_out_of_range_is_finite`;
+    `a_load_whose_strips_the_engine_refuses_keeps_the_strips_it_plays`) were written with the fix
+    and not run red, to keep compiles to a minimum on this machine.
+- [x] T6 (editor): the channel processing editor (EQ curve, dynamics, meters), opened from the
+  Channels screen and the strip. Route: delegated writer (trigger: new pure modules, two organisms, a
+  screen and its sheet, the router, the shell and both entry points). Commits 21b9f98
+  `feat(desktop-ui): the processing editor's logic` (+1,247) and this commit
+  `feat(desktop-ui): the channel processing editor`.
+  - Route `#/processing` ("Processing" in the sidebar, between Channels and groups and Network and
+    system, as the design's board), `#/processing/5` opens CH 5 (`routeChannel`, `processingHash`,
+    `canonicalHash`; the shell keeps the channel in the address). Opened from each row of the
+    Channels and groups table (a "Processing" link with "On"/"Off" in words) and from every Mix
+    channel strip ("Processing" / "Processing on"); a pair opens on its first side.
+  - The design's processing board was followed for layout (one bar of actions, the equaliser across
+    the width with its band panels, the gate and compressor side by side); its per-musician
+    selector, effect sends, reverb and delay are not built (per-input processing was the user's
+    decision; effects are T8).
+  - Editor: channel picker with previous and next (a stereo pair once, "CH 3–4 · Keys"), state in
+    words ("Processing on", "No processing", "Bypassed"); Bypass (A/B) keeps the strip in the editor,
+    sends a neutral one and puts it back (also on leaving the screen; a strip changed elsewhere
+    while bypassed ends the bypass and is not overwritten); Reset; Copy to… (a list of the other
+    strips); Presets (apply, save as, delete; built-in ones marked "(built-in)" and not deletable).
+    Input and processed meters. Equaliser: `<ml-eq-graph>` (log 20 Hz-20 kHz, ±18 dB, grid with
+    labels) with a handle per part: drag sets frequency and gain (the high-pass only frequency) and
+    turns it on, wheel or Page Up/Down change Q, arrows move it (Shift for octaves and 3 dB), Home
+    sets 0 dB, Enter turns it on or off; the curve is worked out at once in the window and replaced
+    by the desk's `eq_response` once the edits pause 120 ms (`curveSource` keeps the desk's curve
+    only for the equaliser it was asked for). Band panels with On, frequency, gain and Q sliders
+    (log scales for frequency, Q and times). Gate and compressor with On, every setting as a
+    slider with its value in words and `<ml-reduction-meter>` (gate 40 dB, compressor 20 dB full
+    scale, filled from the right); the compressor's static curve (soft knee, makeup) in a small
+    square. Text alternatives: every handle is named in words, the graph has the whole equaliser in
+    words, the transfer curve its settings.
+  - Pure logic in `lib/processing-view.js` (scales, handles, keys, words, slider scales, transfer
+    curve, reduction, choices, presets, A/B) and `lib/processing-editor.js` (the editor's commands
+    over the console app), tested in node; the screen and organisms only draw and forward.
+  - RED: `processing-view.test.js` (17 tests) all failed against a stub module, then passed (an 18th,
+    the slider definitions, was written with them); `processing-editor.test.js` (7) all failed
+    against a stub, then passed; the router test failed to import (no `routeChannel`), then passed.
+  - Browser check (`desktop-ui`, `?fake`): opened from the Channels table (CH 2) and from the Mix
+    strip (Lead vox, CH 5); dragged the low peak to +12.3 dB at 868 Hz, wheel raised Q to 1.12;
+    gate and compressor on with the gain-reduction meters moving (−40.0 dB, −9.3 dB); applied
+    "Vocal" (built-in), saved and deleted "Snare crack", "Delete" disabled on built-in presets;
+    copied CH 2 to CH 5; A/B bypassed (controls disabled, kept settings shown, reduction 0) and
+    restored; two quick keys on a handle both landed after building gestures on the current strip
+    (found here, fixed). Band panels reflowed to five across at 1,100 px. No console errors.
+  - Counts: UI `node --test apps/desktop/ui/tests` 584 passed (553 before T5-fix); `cargo test -p
+    mixlink-desktop` 328 passed (325 before); `cargo check -p mixlink-desktop --all-targets` clean.
+    Commit: this commit.
 - [ ] T7 (master limiter): per mix, engine, desk and master strip. Route: delegated writer.
 - [ ] T8 (effects): reverb and delay buses, per-channel sends, per-mix returns, editor. Route:
   delegated writer.
@@ -411,9 +480,14 @@ per reviewed slice, only with the user's approval.
   sessions, the commands, strip presets and the equaliser's response; free disk after its builds
   about 13 GB.
 
+- Reviews review-62e9809767b1790e (d4fe007..ae49ddc, T5's desk half) and review-ae983bec860aca54
+  (ae49ddc..9bdd0e9, T5's console): approved and acknowledged; their findings fixed in T5-fix
+  (cf238a4, 7b25b2d). Next review base: 9bdd0e9.
+- Machine: 13 unexpected shutdowns in 30 days with mixed bugchecks on a Windows Insider build with
+  HVCI on, several under compile load; builds kept minimal (one focused desktop test build, one full
+  run and one check for T5-fix and T6, `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, no release builds).
+- T5-fix and T6 done (cf238a4, 7b25b2d, 21b9f98 and the editor commit).
+
 ## Next step
 
-T6 (editor: the channel processing editor with the EQ curve, dynamics and gain-reduction meters,
-opened from the Channels screen and the strip), on T5's console API (`channelStrip`,
-`editProcessing`, `loadEqResponse`, the preset actions and the meters' `processed`,
-`gateReductionDb`, `compressorReductionDb`). Review of d4fe007..T5 pending.
+T7 (master limiter: per mix, engine, desk and master strip). Review of 9bdd0e9..T6 pending.

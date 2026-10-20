@@ -1,5 +1,5 @@
 // The console shell: the sidebar, hash routing (#/mix by default, #/record, #/channels,
-// #/network), the REC chip above every screen while a take records (and the demo badge while the
+// #/processing, which may name the channel it opens on as #/processing/5, and #/network), the REC chip above every screen while a take records (and the demo badge while the
 // engine plays the demo source), and the main region.
 //
 // Each section renders into the main region through a screen: a function `(main, route)` that
@@ -17,16 +17,18 @@ import { createTauriBridge } from "./lib/bridge.js";
 import { createConsoleApp } from "./lib/console-app.js";
 import { createFakeBridge } from "./lib/fake-bridge.js";
 import { mountRecChip } from "./lib/record-controller.js";
-import { ROUTES, documentTitle, resolveRoute } from "./lib/router.js";
+import { ROUTES, canonicalHash, documentTitle, resolveRoute } from "./lib/router.js";
 import { mountChannelsScreen } from "./screens/channels-screen.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
 import { mountNetworkScreen } from "./screens/network-screen.js";
+import { mountProcessingScreen } from "./screens/processing-screen.js";
 import { mountRecordScreen } from "./screens/record-screen.js";
 
 const ICONS = Object.freeze({
   mix: `<path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 14h4M10 8h4M16 12h4"/>`,
   record: `<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/>`,
   channels: `<path d="M4 6h16M4 12h16M4 18h10"/>`,
+  processing: `<path d="M3 15c3 0 3-6 6-6s3 6 6 6 3-6 6-6"/>`,
   network: `<path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1"/>`,
 });
 
@@ -34,6 +36,7 @@ const PLACEHOLDERS = Object.freeze({
   mix: "Each musician's channel strips, groups and master appear here.",
   record: "Record every input to its own track while the show runs.",
   channels: "Name each input, pair stereo sources, hide spares and build groups.",
+  processing: "Shape each input with a high-pass filter, an equaliser, a gate and a compressor.",
   network: "Tune each phone's connection, watch its health and look after the server.",
 });
 
@@ -73,9 +76,10 @@ export function mountShell({ nav, main, skipLink = null, screens = {} }) {
 
   function show() {
     const route = resolveRoute(window.location.hash);
-    if (window.location.hash !== route.hash) {
+    const address = canonicalHash(window.location.hash);
+    if (window.location.hash !== address) {
       // An empty or unknown hash shows the default section under its own address.
-      history.replaceState(null, "", route.hash);
+      history.replaceState(null, "", address);
     }
     for (const link of nav.querySelectorAll("a[data-route]")) {
       if (link.dataset.route === route.id) {
@@ -170,6 +174,7 @@ if (nav && main) {
       mix: app ? (screenMain) => mountMixScreen(screenMain, app) : unavailableScreen,
       record: app ? (screenMain) => mountRecordScreen(screenMain, app) : unavailableScreen,
       channels: app ? (screenMain) => mountChannelsScreen(screenMain, app) : unavailableScreen,
+      processing: app ? (screenMain) => mountProcessingScreen(screenMain, app) : unavailableScreen,
       network: app ? (screenMain) => mountNetworkScreen(screenMain, app) : unavailableScreen,
     },
   });

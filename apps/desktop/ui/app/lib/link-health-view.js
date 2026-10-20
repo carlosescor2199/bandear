@@ -477,13 +477,18 @@ function rangeWords(rangeMs) {
   return range ?? { label: `${Math.round(rangeMs / 60_000)} min`, long: `last ${Math.round(rangeMs / 60_000)} minutes` };
 }
 
-/** What the phone reports of its own numbers: `{ jitter, cushion }`. */
+/**
+ * What the phone reports of its own numbers: `{ jitter, cushion, recovered }`, `recovered` the packets
+ * a redundant copy recovered (a phone that announced "redundancy.recovered").
+ */
 export function extrasReported(musician, samples) {
-  const announced = (musician?.capabilities ?? []).includes("stats.v2");
+  const capabilities = musician?.capabilities ?? [];
+  const announced = capabilities.includes("stats.v2");
   const some = (field) => samples.some((sample) => valueOf(sample, field) !== null);
   return {
     jitter: announced || some("jitterMs"),
     cushion: announced || some("cushionMs"),
+    recovered: capabilities.includes("redundancy.recovered") || some("recovered"),
   };
 }
 
@@ -496,7 +501,9 @@ function levelOf(musician) {
 /**
  * The line above the chart: `{ level, label, parts, text }`, the musician's link level now, then
  * the loss over the window, the round trip now and on average, the underruns in the window and,
- * when there were any, the timeouts, the seconds without reports and the reconnects.
+ * when there were any, the timeouts, the seconds without reports and the reconnects. For a phone
+ * that reports recoveries, the packets a redundant copy recovered in the window, said while
+ * redundancy is on or when there were any.
  */
 export function linkSummary(window, rangeMs, musician) {
   const { level, label } = levelOf(musician);
@@ -533,6 +540,14 @@ export function linkSummary(window, rangeMs, musician) {
   if (reconnects > 0) {
     parts.push(plural(reconnects, "reconnect", "reconnects"));
   }
+  if (reports.some((sample) => typeof sample.recovered === "number")) {
+    const recovered = sum("recovered");
+    if (recovered > 0) {
+      parts.push(`${plural(recovered, "packet", "packets")} recovered by redundancy in ${words}`);
+    } else if (musician?.redundancy?.on) {
+      parts.push(`No packets recovered in ${words}`);
+    }
+  }
   return { level, label, parts, text: parts.join(" · ") };
 }
 
@@ -561,6 +576,9 @@ export function sampleTooltip(sample, { extras, timeZone } = {}) {
     lines.push(["Cushion", formatMs(sample.cushionMs)]);
   }
   lines.push(["Underruns", formatCount(sample.underruns)], ["Timeouts", formatCount(sample.receiveTimeouts)]);
+  if (extras?.recovered) {
+    lines.push(["Recovered", formatCount(sample.recovered)]);
+  }
   return {
     time,
     title: LEVEL_WORDS[sample.health] ?? LEVEL_WORDS.unknown,
@@ -584,14 +602,17 @@ export function historyTable(window, { timeZone } = {}) {
       cushion: formatMs(sample.gap ? null : sample.cushionMs),
       underruns: formatCount(sample.gap ? null : sample.underruns),
       timeouts: formatCount(sample.gap ? null : sample.receiveTimeouts),
+      recovered: formatCount(sample.gap ? null : sample.recovered),
       note: sample.gap ? "Gap" : sample.reconnected ? "Reconnected" : "",
     }));
 }
 
 /**
  * The panel's view for `musician` (a status row) and the history held for them, `buffer`:
- * `{ title, ranges, rangeMs, summary, description, window, extras, extrasNote, table, message,
- * empty, timeZone }`. `table` is the rows only when `showTable`; `message` says why the last read
+ * `{ title, ranges, rangeMs, summary, description, window, extras, extrasNote, recoveredNote, table,
+ * message, empty, timeZone }`. `recoveredNote` says, while the musician's redundancy is on, that their
+ * phone does not report the packets a copy recovered (null otherwise). `table` is the rows only when
+ * `showTable`; `message` says why the last read
  * failed; `empty` says why there is no chart yet.
  */
 export function linkHealthView({ musician, buffer, rangeMs, error, showTable, timeZone }) {
@@ -605,6 +626,10 @@ export function linkHealthView({ musician, buffer, rangeMs, error, showTable, ti
     missing.length === 0
       ? null
       : `${missing.join(" and ").replace(/^c/, "C")}: not reported by this phone (it needs a newer app).`;
+  const recoveredNote =
+    musician.redundancy?.on && !extras.recovered
+      ? "Recovered packets: not reported by this phone (it needs a newer app)."
+      : null;
   const summary = linkSummary(window, rangeMs, musician);
   return {
     title: `${name} · ${words.long}`,
@@ -615,6 +640,7 @@ export function linkHealthView({ musician, buffer, rangeMs, error, showTable, ti
     window,
     extras,
     extrasNote,
+    recoveredNote,
     table: showTable ? historyTable(window, { timeZone }) : null,
     message: error ? `The link history could not be read: ${error}.` : null,
     empty:

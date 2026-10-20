@@ -439,8 +439,98 @@ optional recovered-packet count), the Network and system screen, the PRD update 
     280837e `feat(desktop): keep and send each musician's buffer` (+775/-10); f363377
     `feat(desktop-ui): buffer control per musician` (+664/-12); this commit `feat(android): follow
     the buffer the desk sets`.
-- [ ] T7 (redundancy): delayed duplicate send per musician, desk toggle, recovered count. Route:
-  delegated writer.
+- [x] T6-fix (review-1e5f9aa8d353b411 findings). Route: delegated writer (trigger: findings across
+  the server control tests, the Android player and the desktop UI; done before T7).
+  - Server: `an older phone never gets a buffer` announced the change before the registration was
+    visible, so it could pass with the capability check gone; it now waits for a round trip,
+    announces the change and checks two more round trips carry no playback message.
+  - Android: the track opened with room for 500 ms relied on the platform honouring the smaller
+    size set after it; it now sets the one-packet Auto cushion, reads the size applied and keeps the
+    large track only when it came down (5 ms tolerance) or no higher than a minimum-size track would
+    queue, else reopens at the minimum (fixed buffers clamp to what it holds); `stats.cushion_ms` is
+    the size applied. The loop's cushion wiring is the pure `CushionController.onPacket` step, with
+    tests.
+  - Desktop UI: the Buffer cell settled a typed length against the reported one as strings (a typed
+    040 never settled against 40); `pendingBufferChoice` in `playback-buffer.js` compares numbers,
+    with tests.
+  - RED: recorded only for 64ac183 (its message: with the push path ignoring the capability, the
+    test fails); not recorded for 89197ff and 701f3e0.
+  - Commits: 64ac183 `test(server): prove an older phone never gets a buffer` (+42/-9); 89197ff
+    `fix(android): keep auto latency when the track will not shrink` (+228/-30); 701f3e0
+    `fix(desktop-ui): settle the buffer choice by value` (+67/-8).
+- [x] T7 (redundancy): delayed duplicate send per musician, desk toggle, recovered count. Route:
+  delegated writer (trigger: 2+ non-trivial files on every layer: network sink and target table,
+  engine, desktop session, command, DTO, console, fake bridge, table, link health panel, Android
+  tracker, link stats and control channel). A first writer was interrupted after the engine commit
+  with the desktop session, DTO and command module uncommitted; the second judged them complete
+  but unwired (no `mod`, no start or load handoff, no Tauri registration, a test DTO literal
+  missing the new fields) and finished them.
+  - Engine (5c4294e): per musician `Redundancy::Off | On { delay_blocks }` (1-4, 2 by default); the
+    network sink sends the exact datagram again `delay_blocks` blocks later, right after that
+    block's own (PMON unchanged); copies held in a `HeldCopies` per row allocated off the engine
+    thread (the no-allocation test runs with redundancy on); kept per client id, else IP;
+    `EngineHandle::set_redundancy` / `replace_redundancies`; status `redundancy`,
+    `duplicates_sent`, `recovered`.
+  - Desktop: the session keeps an entry's `redundancy` (`{ "delayBlocks": 2 }`, absent when off,
+    read leniently, a delay it cannot use kept as written); every start and session load hands the
+    readable ones to the engine (`replace_redundancies`, after the buffers, before the mixes).
+    Command `set_musician_redundancy(musicianKey, on, delayBlocks?)` answers `{ musicianKey,
+    outcome, redundancy, bandwidthFactor, saved, saveError, message, minDelayBlocks,
+    maxDelayBlocks, defaultDelayBlocks }`, outcome `set` (bandwidth factor 2 on, 1 off) or `invalid`
+    (nothing changed); a key it cannot read, nobody and no engine are errors (the engine answers for
+    musicians here only, so there is no `notConnected`). Saved under the key the engine kept it
+    under. The row gains `redundancy {on, delayBlocks}`, `duplicatesSent`, `recovered` and
+    `redundancySupported` (the phone announced `redundancy.recovered`; every phone takes the
+    copies).
+  - UI: a Redundancy column on the musicians table: a switch, the cost under it ("2× bandwidth, each
+    copy 2 blocks later" or "Sends once; on doubles this musician's bandwidth"), while on the
+    copies sent and the packets recovered (or "Recovered packets not reported by this phone"), the
+    outcome said on the row ("Bass's audio is now sent twice, each copy 2 blocks later: their
+    bandwidth doubles (×2)."). The link health panel counts recovered packets in the summary ("15
+    packets recovered by redundancy in 10 min"), the readout and a table column for a phone that
+    reports them, and notes "Recovered packets: not reported by this phone (it needs a newer app)."
+    while redundancy is on for one that does not. Logic in `lib/redundancy.js` (`redundancyView`,
+    `formatRedundancySet`, `pendingRedundancyChoice`) and `link-health-view.js`; console and bridge
+    `setMusicianRedundancy(musicianKey, on, delayBlocks)`; the fake keeps it per musician across
+    starts and in named sessions, Bass's phone announces `redundancy.recovered` and recovers three
+    in four of its losses from the second it is turned on.
+  - Android: `redundancy.recovered` in `CLIENT_CAPABILITIES`; `stats.recovered` always sent (an
+    integer). Recovered, as counted: a sequence the phone receives for the first time only after a
+    newer one already arrived, within the last 64 sequences (`RECOVERY_WINDOW_PACKETS`, one bit
+    each in a `Long` in `SequenceTracker`, no allocation): only a delayed copy or Wi-Fi reordering
+    can do that, so reordering can inflate it slightly; a second copy, or one older than the window,
+    is not counted, and a new stream forgets the window. `LinkStatsAccumulator.poll(...,
+    cumulativeRecovered)` reports the difference per interval, as underruns.
+  - Open (product decision, before the live test): the Android player plays packets as they arrive,
+    so a copy that fills a gap always comes after newer audio was played and is still dropped: today
+    redundancy recovers no audio on Android, and `recovered` counts the copies that would have
+    filled a gap (they stay in `packets_lost`; `protocol.rs` says so now). Recovering them needs the
+    phone to hold newer packets while copies are arriving (up to the copy delay, which its cushion
+    must cover), as `redundancy.rs` describes. The acceptance criterion "recovered packets instead
+    of dropouts" is not met in audio until then.
+  - RED: desktop, with the load not handing redundancy to the engine, 1 of 302 failed (the load
+    order test); the uncommitted tests were proven by mutation: with the recovered capability check
+    reading `playback.buffer`, the session keeping the address's setting, the delay range unchecked
+    and `session_redundancy` returning nothing, 6 of 302 failed. UI: the suite failed to load
+    (module missing), then 7 of 531 failed before the rows, bridge, console and fake were wired.
+    Android, with compile-only stubs, 9 of 496 failed (the "copy of a played packet" guard passed).
+    GREEN below.
+  - Browser check (`desktop-ui`, `?fake#/network`): Bass on showed "2× bandwidth, each copy 2
+    blocks later", "750 copies sent · 9 packets recovered" and the outcome with ×2; its panel said
+    "15 packets recovered by redundancy in 10 min" and its table had a Recovered column; Drums on
+    showed "Recovered packets not reported by this phone" on the row and the note in its panel; Bass
+    off said "Bass's audio is sent once again: their bandwidth is back to normal (×1)." No console
+    errors. Fake only: turning it off forgets the seconds recovered while it was on.
+  - Checks: `CARGO_BUILD_JOBS=2 cargo test -p personal-monitoring`: 501 passed;
+    `CARGO_BUILD_JOBS=2 cargo test -p mixlink-desktop`: 302 passed;
+    `CARGO_BUILD_JOBS=2 cargo check -p mixlink-desktop --all-targets`: finished, no warnings;
+    `node --test apps/desktop/ui/tests`: 531 passed; `gradle -p apps/android :app:testDebugUnitTest
+    --max-workers=2 --no-daemon`: 496 tests, 0 failures; `:app:assembleDebug`: BUILD SUCCESSFUL,
+    APK `apps/android/app/build/outputs/apk/debug/app-debug.apk` (not installed).
+  - Commits: 5c4294e `feat(engine): send each block again a few blocks later` (+898/-20); 531ece6
+    `feat(desktop): set redundancy per musician` (+725/-7); a2eead1 `feat(desktop-ui): redundancy
+    toggle and recovered packets` (+703/-24); this commit `feat(android): report packets a
+    duplicate recovered`.
 - [ ] T8 (demo source): generator reader, engine start without a capture device, audio-setup
   entry. Route: delegated writer.
 - [ ] T9 (close): PRD update, docs, live test with the S23. Route: inline or writer.
@@ -482,7 +572,11 @@ per reviewed slice, only with the user's approval.
   SUGGESTION: the receive loop's stats extras wiring untested (fixed in T5-fix). Next review base
   88ecaff.
 - T5-fix and T6 done (buffer from the desk), five commits.
+- review-65facc2806258c4e (88ecaff..6afc117) and review-1e5f9aa8d353b411 (6afc117..a5cfa2c), T5-fix
+  and T6, approved and acknowledged, with four findings fixed in T6-fix. Next review base a5cfa2c.
+- T6-fix and T7 done (redundancy), seven commits. Open before the live test: the Android player
+  cannot play a late copy yet (see T7).
 
 ## Next step
 
-T7 (redundancy: delayed duplicate send per musician, desk toggle, recovered count).
+T8 (demo source: generator reader, engine start without a capture device, audio-setup entry).

@@ -481,7 +481,8 @@ async fn set_musician_buffer(
 }
 
 /// Turns redundancy on or off for the musician `musicianKey` names (`client:<id>` or
-/// `address:<ip:port>`): `on`, with the copies `delayBlocks` (1-4, 2 when absent) blocks late.
+/// `address:<ip:port>`): `on`, with the copies `delayBlocks` (0-4, 0 when absent: right after the
+/// original) blocks late.
 /// Answers `{ musicianKey, outcome, redundancy, bandwidthFactor, saved, saveError, message,
 /// minDelayBlocks, maxDelayBlocks, defaultDelayBlocks }`, `outcome` `set` or `invalid` (see
 /// [commands::redundancy::set_musician_redundancy]).

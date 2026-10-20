@@ -21,7 +21,7 @@ use crate::mix::{GroupLayout, Membership, MixState};
 use crate::protocol::{
     control_error, control_message_type, mix_ack, mix_error, mix_sequence, mix_state_message,
     parse_mix_update, parse_register_command, parse_stats_command, playback_message,
-    registered_name, ChannelConfig, ControlConfig, GroupConfig,
+    redundancy_message, registered_name, ChannelConfig, ControlConfig, GroupConfig,
 };
 use crate::targets::TargetRegistry;
 
@@ -508,6 +508,13 @@ fn should_push_buffer(event: &EngineEvent, peer: SocketAddr) -> bool {
     matches!(event, EngineEvent::PlaybackBufferChanged { address } if address.ip() == peer.ip())
 }
 
+/// Whether a connection with `peer` should be sent the hold its musician's redundancy needs because
+/// of `event`: a change of the redundancy kept for the musician at the same IP. Whether the phone
+/// holds packets back at all is checked when it is sent ([TargetRegistry::redundancy_for_phone]).
+fn should_push_redundancy(event: &EngineEvent, peer: SocketAddr) -> bool {
+    matches!(event, EngineEvent::RedundancyChanged { address } if address.ip() == peer.ip())
+}
+
 /// What a connection's phone must be sent now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Push {
@@ -515,7 +522,9 @@ enum Push {
     Mix,
     /// The musician's playback buffer (`playback`).
     Buffer,
-    /// Both, after the feed missed events and cannot tell which of them were for this phone.
+    /// The hold the musician's redundancy needs (`redundancy`).
+    Redundancy,
+    /// All of them, after the feed missed events and cannot tell which of them were for this phone.
     Everything,
 }
 
@@ -527,6 +536,10 @@ impl Push {
     fn buffer(self) -> bool {
         matches!(self, Push::Buffer | Push::Everything)
     }
+
+    fn redundancy(self) -> bool {
+        matches!(self, Push::Redundancy | Push::Everything)
+    }
 }
 
 /// One connection's view of the live event bus: it only ever answers what to push now (see
@@ -536,7 +549,8 @@ impl Push {
 ///
 /// - A change of this musician's mix that this connection did not make asks for the mix.
 /// - A change of this musician's playback buffer asks for the buffer.
-/// - A feed that lagged behind the bus asks for both: an event for this musician may be among the
+/// - A change of this musician's redundancy asks for the hold it needs.
+/// - A feed that lagged behind the bus asks for all of them: an event for this musician may be among the
 ///   missed ones, and each push carries the whole value, so sending it is always correct.
 /// - A closed bus turns the feed off for good. The connection carries on without it, and the feed
 ///   parks instead of resolving at once on every poll, so the loop cannot spin on it. The
@@ -566,6 +580,7 @@ impl PushFeed {
             match self.events.recv().await {
                 Ok(event) if should_push_mix(&event, self.peer) => return Push::Mix,
                 Ok(event) if should_push_buffer(&event, self.peer) => return Push::Buffer,
+                Ok(event) if should_push_redundancy(&event, self.peer) => return Push::Redundancy,
                 Ok(_) => {}
                 Err(RecvError::Lagged(_)) => return Push::Everything,
                 Err(RecvError::Closed) => self.open = false,
@@ -708,12 +723,19 @@ async fn handle_control_connection(
             }
             // The feed applies the recovery rules (a lagged feed pushes, a closed one parks).
             push = pushes.next_push() => {
-                let mut outgoing: Vec<String> = Vec::with_capacity(2);
+                let mut outgoing: Vec<String> = Vec::with_capacity(3);
                 // Only a phone that takes a buffer is sent one; an older phone never sees the
                 // message, and a peer whose target is gone has nothing to follow.
                 if push.buffer() {
                     if let Some(buffer) = targets.playback_buffer_for_phone(peer.ip()) {
                         outgoing.push(playback_message(buffer)?);
+                    }
+                }
+                // Only a phone that holds packets back for copies is told the hold; any other takes
+                // the copies as they come.
+                if push.redundancy() {
+                    if let Some(redundancy) = targets.redundancy_for_phone(peer.ip()) {
+                        outgoing.push(redundancy_message(redundancy)?);
                     }
                 }
                 // A peer whose target is gone has no mix to follow; it keeps its channel as before.
@@ -766,6 +788,8 @@ async fn handle_control_connection(
         match message {
             Message::Text(text) => {
                 let message_type = control_message_type(&text).unwrap_or_default();
+                // A second message some answers are followed by.
+                let mut then_also: Option<String> = None;
                 let response = if message_type == "register" {
                     // A registration is the client announcing itself: the address comes from the
                     // socket and the port and name come from the message. Success is answered with
@@ -834,7 +858,13 @@ async fn handle_control_connection(
                             // A phone that takes a playback buffer is told the one the desk keeps for
                             // it on every registration, Auto included: the engineer's choice survives
                             // a reconnect, and a phone never keeps one an earlier server set. Any
-                            // other phone is answered with nothing, as before.
+                            // other phone is answered with nothing, as before. A phone that holds
+                            // packets back for copies is told the hold its redundancy needs after
+                            // it, the same way, none included.
+                            then_also = targets
+                                .redundancy_for_phone(peer.ip())
+                                .map(redundancy_message)
+                                .transpose()?;
                             targets
                                 .playback_buffer_for_phone(peer.ip())
                                 .map(playback_message)
@@ -905,13 +935,18 @@ async fn handle_control_connection(
                 };
                 // An ack carries the mix `apply` stored, read under its writer lock, so it follows
                 // a new `config` like a push does (see [send_with_config]).
-                if let Some(response) = response {
+                let mut gone = false;
+                for response in response.into_iter().chain(then_also) {
                     if send_with_config(&writer, &config, Some(Message::Text(response.into())))
                         .await
                         .is_err()
                     {
+                        gone = true;
                         break;
                     }
+                }
+                if gone {
+                    break;
                 }
             }
             Message::Close(_) => break,
@@ -3410,6 +3445,61 @@ mod tests {
         stop_server(address, &stopped, server).await;
     }
 
+    const REGISTER_WITH_HOLD: &str = r#"{"type":"register","name":"Ana","udp_port":50123,"client_id":"0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b","capabilities":["playback.buffer","redundancy.hold"]}"#;
+
+    /// A phone that holds packets back for copies hears the hold its redundancy needs when it
+    /// registers (none until the desk sets a delay), when the desk changes it, and again on its
+    /// next connection.
+    #[tokio::test]
+    async fn a_phone_that_holds_copies_is_told_the_hold_on_registering_on_a_change_and_after_a_reconnect(
+    ) {
+        use crate::redundancy::{Redundancy, RedundancyOutcome};
+
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let events = EventBus::default();
+        let (address, stopped, server) = start_server_with_events(
+            Arc::clone(&targets),
+            Arc::new(Mutex::new(HashMap::new())),
+            Heartbeat::default(),
+            events.clone(),
+        );
+
+        let mut phone = connect_client(address).await;
+        send_text(&mut phone, REGISTER_WITH_HOLD).await;
+        let first = read_message_of_type(&mut phone, "redundancy")
+            .await
+            .expect("told on registering");
+        assert_eq!(
+            first,
+            serde_json::json!({"type": "redundancy", "delay_blocks": 0})
+        );
+
+        let set = crate::engine::set_target_redundancy(
+            &targets,
+            &events,
+            &crate::targets::MusicianKey::Client(BUFFER_PHONE_ID.to_owned()),
+            Redundancy::On { delay_blocks: 2 },
+        )
+        .expect("the phone is here");
+        assert_eq!(set.outcome, RedundancyOutcome::Set);
+        let changed = read_message_of_type(&mut phone, "redundancy")
+            .await
+            .expect("told of the change");
+        assert_eq!(changed["delay_blocks"], 2);
+
+        phone.close(None).await.expect("the phone should close");
+        drop(phone);
+        let mut back = connect_client(address).await;
+        send_text(&mut back, REGISTER_WITH_HOLD).await;
+        let again = read_message_of_type(&mut back, "redundancy")
+            .await
+            .expect("told again on its next connection");
+        assert_eq!(again["delay_blocks"], 2);
+
+        stop_server(address, &stopped, server).await;
+    }
+
     /// Reads every text message up to and including the next `mix_ack`, and answers their types.
     async fn types_until_mix_ack(client: &mut ClientStream) -> Vec<String> {
         let mut types = Vec::new();
@@ -3463,6 +3553,9 @@ mod tests {
         events.emit(EngineEvent::PlaybackBufferChanged {
             address: "127.0.0.1:50123".parse().unwrap(),
         });
+        events.emit(EngineEvent::RedundancyChanged {
+            address: "127.0.0.1:50123".parse().unwrap(),
+        });
         for _ in 0..2 {
             send_text(&mut phone, mix).await;
             seen.extend(types_until_mix_ack(&mut phone).await);
@@ -3470,6 +3563,10 @@ mod tests {
         assert!(
             !seen.iter().any(|kind| kind == "playback"),
             "an older phone is never sent a buffer: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|kind| kind == "redundancy"),
+            "nor a hold: {seen:?}"
         );
 
         stop_server(address, &stopped, server).await;
@@ -3580,6 +3677,19 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), feed.next_push()).await,
             Ok(Push::Buffer),
             "another musician's buffer is passed over, this one's is pushed"
+        );
+        bus.send(EngineEvent::RedundancyChanged {
+            address: "192.168.1.4:50000".parse().unwrap(),
+        })
+        .expect("the feed is subscribed");
+        bus.send(EngineEvent::RedundancyChanged {
+            address: "192.168.1.3:50000".parse().unwrap(),
+        })
+        .expect("the feed is subscribed");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), feed.next_push()).await,
+            Ok(Push::Redundancy),
+            "another musician's redundancy is passed over, this one's hold is pushed"
         );
     }
 

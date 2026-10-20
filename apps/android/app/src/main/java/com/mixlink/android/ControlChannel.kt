@@ -502,14 +502,21 @@ internal const val CAPABILITY_STATS_V2 = "stats.v2"
 internal const val CAPABILITY_PLAYBACK_BUFFER = "playback.buffer"
 
 /**
+ * The phone's `stats` carry `recovered`, the packets that filled a gap after a newer one was
+ * played ([LinkStatsReport.recovered]): what the desk's redundancy brought.
+ */
+internal const val CAPABILITY_REDUNDANCY_RECOVERED = "redundancy.recovered"
+
+/**
  * What this build of the app implements, announced in every registration so the server only sends
  * a phone the messages it understands. A feature adds its name here, one line, once the phone
- * implements it: `redundancy.recovered` (the packets a redundant copy brought) is still to come.
+ * implements it.
  * Names are 1-32 of `[a-z0-9._-]`, at most 16.
  */
 internal val CLIENT_CAPABILITIES: List<String> = listOf(
     CAPABILITY_STATS_V2,
     CAPABILITY_PLAYBACK_BUFFER,
+    CAPABILITY_REDUNDANCY_RECOVERED,
 )
 
 /**
@@ -539,10 +546,11 @@ private const val MAX_STATS_EXTRA_MS = 60_000.0
 
 /**
  * Builds the link-stats message the client sends about once a second: the counts of one report
- * interval, all integers, then the extras of `stats.v2` that were measured, in milliseconds to the
- * hundredth. An extra not measured (`NaN`) or outside 0 to 60 000 ms is left out, never sent as a
- * value the server would refuse. The server matches it to this musician by the socket's IP, like a
- * mix, and an older server ignores the extras.
+ * interval, all integers (`recovered` among them, see [CAPABILITY_REDUNDANCY_RECOVERED]), then the
+ * extras of `stats.v2` that were measured, in milliseconds to the hundredth. An extra not measured
+ * (`NaN`) or outside 0 to 60 000 ms is left out, never sent as a value the server would refuse. The
+ * server matches it to this musician by the socket's IP, like a mix, and an older server ignores
+ * the extras.
  */
 internal fun buildStatsMessage(report: LinkStatsReport): String {
     val message = JSONObject()
@@ -552,6 +560,7 @@ internal fun buildStatsMessage(report: LinkStatsReport): String {
         .put("packets_lost", report.packetsLost)
         .put("underruns", report.underruns)
         .put("receive_timeouts", report.receiveTimeouts)
+        .put("recovered", report.recovered)
     message.putMilliseconds("jitter_ms", report.jitterMs)
     message.putMilliseconds("cushion_ms", report.cushionMs)
     message.putMilliseconds("backlog_ms", report.backlogMs)

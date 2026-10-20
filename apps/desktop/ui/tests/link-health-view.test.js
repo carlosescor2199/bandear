@@ -441,6 +441,7 @@ test("the table lists the window's seconds, the newest first", () => {
     cushion: "40.0 ms",
     underruns: "0",
     timeouts: "0",
+    recovered: "—",
     note: "",
   });
   assert.equal(rows[1].level, "No report");
@@ -448,14 +449,16 @@ test("the table lists the window's seconds, the newest first", () => {
 });
 
 test("jitter and cushion are shown for a phone that announces stats.v2 or reports them", () => {
-  assert.deepEqual(extrasReported({ capabilities: ["stats.v2"] }, []), { jitter: true, cushion: true });
+  assert.deepEqual(extrasReported({ capabilities: ["stats.v2"] }, []), { jitter: true, cushion: true, recovered: false });
   assert.deepEqual(extrasReported({ capabilities: [] }, [sample(1, { jitterMs: null, cushionMs: null })]), {
     jitter: false,
     cushion: false,
+    recovered: false,
   });
   assert.deepEqual(extrasReported({ capabilities: [] }, [sample(1, { cushionMs: null })]), {
     jitter: true,
     cushion: false,
+    recovered: false,
   });
 });
 
@@ -501,4 +504,43 @@ test("the panel's view: a title with the range, the range buttons, the summary a
 
 test("a clock time is local to the given zone, to the second", () => {
   assert.equal(formatClock(T0 + 65_000, UTC), "21:31:05");
+});
+
+test("recovered packets are shown for a phone that reports them, and said as not reported otherwise", () => {
+  const reporting = { ...MUSICIAN, capabilities: ["stats.v2", "redundancy.recovered"], redundancy: { on: true, delayBlocks: 2 } };
+  assert.equal(extrasReported(reporting, []).recovered, true, "announced");
+  assert.equal(extrasReported({ capabilities: [] }, [sample(1, { recovered: 0 })]).recovered, true, "reported");
+
+  const samples = [...seconds(1, 3, (seq) => sample(seq, { recovered: 2 })), gap(4), sample(5, { recovered: 1 })];
+  const window = windowOf(samples, 60_000);
+  assert.ok(linkSummary(window, 60_000, reporting).parts.includes("7 packets recovered by redundancy in 1 min"));
+  const quiet = seconds(1, 3, (seq) => sample(seq, { recovered: 0 }));
+  assert.ok(linkSummary(windowOf(quiet, 60_000), 60_000, reporting).parts.includes("No packets recovered in 1 min"));
+  assert.ok(
+    !linkSummary(windowOf(quiet, 60_000), 60_000, { ...reporting, redundancy: { on: false } }).parts.some((part) =>
+      part.includes("recovered"),
+    ),
+    "nothing to say with redundancy off and nothing recovered",
+  );
+
+  const extras = { jitter: true, cushion: true, recovered: true };
+  assert.deepEqual(sampleTooltip(sample(5, { recovered: 3 }), { extras, timeZone: UTC }).lines.at(-1), ["Recovered", "3"]);
+  assert.equal(historyTable(windowOf([sample(1, { recovered: 3 })], 60_000), { timeZone: UTC })[0].recovered, "3");
+
+  const view = linkHealthView({ musician: reporting, buffer: { historyId: 1, samples }, rangeMs: 60_000, error: null, showTable: false, timeZone: UTC });
+  assert.equal(view.recoveredNote, null);
+  const older = linkHealthView({
+    musician: { ...MUSICIAN, redundancy: { on: true, delayBlocks: 2 } },
+    buffer: { historyId: 1, samples: seconds(1, 3) },
+    rangeMs: 60_000,
+    error: null,
+    showTable: false,
+    timeZone: UTC,
+  });
+  assert.equal(older.recoveredNote, "Recovered packets: not reported by this phone (it needs a newer app).");
+  assert.equal(
+    linkHealthView({ musician: MUSICIAN, buffer: { historyId: 1, samples: seconds(1, 3) }, rangeMs: 60_000, error: null, showTable: false, timeZone: UTC }).recoveredNote,
+    null,
+    "redundancy off: nothing to report",
+  );
 });

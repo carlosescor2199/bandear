@@ -30,6 +30,12 @@ internal const val LINK_STATS_STARTUP_GRACE_MS = 3_000L
  *   the track for), not measured before the first packet opened the track.
  * - [backlogMs]: the audio queued for playback at the interval's end, as last read from the track.
  *
+ * [recovered] (announced with `redundancy.recovered`, see [CAPABILITY_REDUNDANCY_RECOVERED]) counts
+ * the packets over the interval that filled a gap: each arrived for the first time after a newer
+ * one was played, which only a delayed redundant copy or Wi-Fi reordering does (see
+ * [SequenceTracker.recovered]). The receiver plays packets as they come, so it cannot play them:
+ * they stay in [packetsLost] and are not in [packetsReceived].
+ *
  * They are primitives, so a report boxes nothing on the receive thread that builds it.
  *
  * Public because the Activity, which is public, receives it through [PmonPlayer.Listener].
@@ -43,6 +49,7 @@ data class LinkStatsReport(
     val jitterMs: Double = Double.NaN,
     val cushionMs: Double = Double.NaN,
     val backlogMs: Double = Double.NaN,
+    val recovered: Long = 0L,
 )
 
 /**
@@ -72,6 +79,7 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
     private var packetsLost = 0L
     private var receiveTimeouts = 0L
     private var lastUnderruns = 0
+    private var lastRecovered = 0L
     private var streamStarted = false
     private var arrivalDeviationSumMs = 0.0
     private var arrivalDeviations = 0
@@ -128,18 +136,25 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
      * and the server's rates stay honest. The interval counts start again from zero.
      *
      * [cushionMs] and [backlogMs] are the playback values at [nowMs], `NaN` when not measured; the
-     * jitter is the interval's own (see [LinkStatsReport]).
+     * jitter is the interval's own (see [LinkStatsReport]). [cumulativeRecovered] is the
+     * tracker's count ([SequenceTracker.recovered]); the report carries its difference since the
+     * last one.
      */
     fun poll(
         nowMs: Long,
         cumulativeUnderruns: Int,
         cushionMs: Double = Double.NaN,
         backlogMs: Double = Double.NaN,
+        cumulativeRecovered: Long = 0L,
     ): LinkStatsReport? {
         if (!isDue(nowMs)) return null
         // A count that went down belongs to a new track, which starts from zero.
         val underruns = (cumulativeUnderruns - lastUnderruns).coerceAtLeast(0)
         lastUnderruns = cumulativeUnderruns
+        // Likewise a recovered count that went down belongs to a new tracker.
+        val recovered =
+            if (cumulativeRecovered >= lastRecovered) cumulativeRecovered - lastRecovered else cumulativeRecovered
+        lastRecovered = cumulativeRecovered
         val report = LinkStatsReport(
             intervalMs = (nowMs - intervalStartedAtMs).coerceIn(1L, MAX_LINK_STATS_INTERVAL_MS),
             packetsReceived = packetsReceived,
@@ -149,6 +164,7 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
             jitterMs = if (arrivalDeviations > 0) arrivalDeviationSumMs / arrivalDeviations else Double.NaN,
             cushionMs = cushionMs,
             backlogMs = backlogMs,
+            recovered = recovered,
         )
         intervalStartedAtMs = nowMs
         packetsReceived = 0L

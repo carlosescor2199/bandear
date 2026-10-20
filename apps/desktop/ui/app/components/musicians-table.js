@@ -1,10 +1,11 @@
 // <ml-musicians-table>: the musicians the engine sends to, with their names, links and counts, a
 // guarded Remove, and a form to add a phone by address.
 //
-// Property: `data` = { rows, addError, tableError, selected, bufferSaid }: rows from musicianRows
-//   (network-view.js); the two errors are sentences to show, or null; `selected` the address of the
-//   musician whose link history is open, or null; `bufferSaid` `{ address, ok, message }`, what the
-//   last buffer change of that row did, or null.
+// Property: `data` = { rows, addError, tableError, selected, bufferSaid, redundancySaid }: rows from
+//   musicianRows (network-view.js); the two errors are sentences to show, or null; `selected` the
+//   address of the musician whose link history is open, or null; `bufferSaid` and
+//   `redundancySaid` `{ address, ok, message }`, what the last buffer or redundancy change of that
+//   row did, or null.
 // Method: `clearAddress()` empties the address field after a phone was added.
 // Events (bubbling, composed): `musician-rename` { address, name } when an editable name is
 //   committed, `musician-remove` { address } when a removal is confirmed, `musician-add`
@@ -12,6 +13,7 @@
 //   pressed or their row is clicked outside its fields and buttons (again on the open one closes it).
 //   `musician-buffer` { address, key, mode, ms } when a Buffer is chosen: "auto", or "fixed" with
 //   the length typed (a string, checked by the screen); see playback-buffer.js.
+//   `musician-redundancy` { address, key, on } when Redundancy is switched; see redundancy.js.
 //
 // A name commits on Enter or when the field loses focus; Escape puts the saved name back. A name
 // the phone announced is the phone's, so its field is read-only; a local label is marked as such,
@@ -21,6 +23,10 @@
 // it, Escape puts the last one back), with the cushion the phone reports under it; a phone that
 // takes no buffer from the desk shows "needs a newer app" and no control. A choice waiting for its
 // answer stays shown until the row's buffer or its outcome says otherwise.
+// The Redundancy cell: a switch (every packet sent again a few blocks later), what it costs in
+// bandwidth under it and, while on, the copies sent and the packets the phone reports recovered (or
+// that it does not report them); a switch waiting for its answer stays as it was set until the row
+// or its outcome says otherwise.
 // A field being typed in is never overwritten by new data. Remove asks first: the row shows
 // "Keep" where Remove was, and the confirming Remove only works after a short pause, so a double
 // click or a stray click cannot remove anyone.
@@ -33,6 +39,7 @@ import {
   MIN_BUFFER_MS,
   pendingBufferChoice,
 } from "../lib/playback-buffer.js";
+import { pendingRedundancyChoice } from "../lib/redundancy.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
 const CLIENT_NAME_TITLE =
@@ -137,8 +144,27 @@ const styles = sheet(`
     color: var(--ml-text-secondary);
     font-size: var(--ml-text-xs);
   }
-  .buffer-said[data-error] {
+  .buffer-said[data-error],
+  .redundancy-said[data-error] {
     color: var(--ml-danger-text);
+  }
+  .redundancy-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    font-size: var(--ml-text-sm);
+  }
+  .redundancy-switch {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: var(--ml-blue);
+  }
+  .redundancy-said {
+    max-width: 16em;
+    color: var(--ml-text-secondary);
+    font-size: var(--ml-text-xs);
   }
   .name-line {
     display: flex;
@@ -293,6 +319,7 @@ class MlMusiciansTable extends HTMLElement {
               <th scope="col">Control</th>
               <th scope="col" title="What the musician's phone reports about the audio it receives">Link</th>
               <th scope="col" title="The phone's playback buffer: Auto lets the phone adapt it; Fixed keeps the length set here. Under it, the cushion the phone reports it plays">Buffer</th>
+              <th scope="col" title="Redundancy: every packet sent again a few blocks later; it doubles this musician's bandwidth. Under it, the copies sent and the packets the phone reports a copy recovered">Redundancy</th>
               <th scope="col">Mix</th>
               <th scope="col" class="num">Sent</th>
               <th scope="col" class="num">Discarded</th>
@@ -408,6 +435,15 @@ class MlMusiciansTable extends HTMLElement {
         <div class="detail buffer-detail"></div>
         <div class="buffer-said" role="status"></div>
       </td>
+      <td class="redundancy">
+        <label class="redundancy-line">
+          <input class="redundancy-switch" type="checkbox" role="switch" />
+          <span class="redundancy-word"></span>
+        </label>
+        <div class="detail redundancy-cost"></div>
+        <div class="detail redundancy-counts"></div>
+        <div class="redundancy-said" role="status"></div>
+      </td>
       <td class="mix"></td>
       <td class="num sent"></td>
       <td class="num discarded"></td>
@@ -436,6 +472,14 @@ class MlMusiciansTable extends HTMLElement {
       key: null,
       asked: null,
       said: null,
+      redundancySwitch: row.querySelector(".redundancy-switch"),
+      redundancyWord: row.querySelector(".redundancy-word"),
+      redundancyCost: row.querySelector(".redundancy-cost"),
+      redundancyCounts: row.querySelector(".redundancy-counts"),
+      redundancySaid: row.querySelector(".redundancy-said"),
+      // A redundancy switch sent and not answered yet, and the outcome last shown.
+      redundancyAsked: null,
+      redundancySeen: null,
       mix: row.querySelector(".mix"),
       sent: row.querySelector(".sent"),
       discarded: row.querySelector(".discarded"),
@@ -478,10 +522,15 @@ class MlMusiciansTable extends HTMLElement {
         this.#askBuffer(view, "fixed");
       }
     });
+    view.redundancySwitch.addEventListener("change", () => {
+      const on = view.redundancySwitch.checked;
+      view.redundancyAsked = { on };
+      emit(this, "musician-redundancy", { address, key: view.key, on });
+    });
     row.addEventListener("click", (event) => {
       // A click on the row's own fields and buttons does what they do; anywhere else opens the
       // musician's link history, as History does.
-      if (!event.composedPath().some((node) => node.matches?.("input, button, select, a"))) {
+      if (!event.composedPath().some((node) => node.matches?.("input, button, select, label, a"))) {
         emit(this, "musician-select", { address });
       }
     });
@@ -515,6 +564,7 @@ class MlMusiciansTable extends HTMLElement {
     reflect(view.link, "detail", row.link.detail);
     setText(view.detail, row.link.detail);
     this.#updateBuffer(view, row);
+    this.#updateRedundancy(view, row);
     setText(view.mix, row.mix);
     setText(view.sent, row.sent);
     setText(view.discarded, row.discarded);
@@ -558,6 +608,25 @@ class MlMusiciansTable extends HTMLElement {
       : "This phone's app does not take its playback buffer from the desk; update MixLink on it";
     setText(view.bufferSaid, said?.message ?? "");
     reflect(view.bufferSaid, "data-error", said ? !said.ok : false);
+  }
+
+  #updateRedundancy(view, row) {
+    const cell = row.redundancy;
+    const said = this.#data.redundancySaid?.address === row.address ? this.#data.redundancySaid : null;
+    // A switch is shown as set until the engine reports it, or until its outcome came back.
+    view.redundancyAsked = pendingRedundancyChoice(view.redundancyAsked, cell, said, view.redundancySeen);
+    view.redundancySeen = said;
+    const on = view.redundancyAsked?.on ?? cell.on;
+    view.redundancySwitch.checked = on;
+    setText(view.redundancyWord, on ? "On" : "Off");
+    const label = row.name || row.address;
+    reflect(view.redundancySwitch, "aria-label", `Send ${label}'s audio twice (redundancy)`);
+    setText(view.redundancyCost, cell.bandwidth);
+    view.redundancyCost.title =
+      "Every packet is sent again a few blocks later, so a Wi-Fi burst must take both copies to cost audio";
+    setText(view.redundancyCounts, cell.on ? [cell.duplicates, cell.recovered].join(" · ") : "");
+    setText(view.redundancySaid, said?.message ?? "");
+    reflect(view.redundancySaid, "data-error", said ? !said.ok : false);
   }
 
   #renderActions(view) {

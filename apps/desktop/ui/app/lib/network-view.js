@@ -12,6 +12,7 @@
 import { rememberedDevice } from "./engine-config.js";
 import { formatCaptureFormat, formatPercent, linkState } from "./format.js";
 import { bufferView } from "./playback-buffer.js";
+import { redundancyView } from "./redundancy.js";
 import { RECORDING_BLOCKS_SWITCH, isRecording, recordingOf } from "./recording.js";
 import { SOUNDCHECK_BLOCKS_SWITCH, isSoundchecking, soundcheckOf } from "./soundcheck.js";
 
@@ -41,12 +42,14 @@ function count(value) {
 
 /**
  * One row per musician: `{ address, clientId, name, editable, nameIsLocal, labelFollows,
- * connected, link, mix, sent, discarded, loss, lossHigh, buffer }`. A name the phone announced is
- * the phone's, so it is not editable; a local label is only offered while the phone announced none.
+ * connected, link, mix, sent, discarded, loss, lossHigh, buffer, redundancy }`. A name the phone
+ * announced is the phone's, so it is not editable; a local label is only offered while the phone
+ * announced none.
  * The desk keeps a local label for the phone when it has a client id, so the label follows it to
  * any IP (`labelFollows: "phone"`), and for the address otherwise (`"address"`). `loss` is the
  * share of packets this server discarded for that phone. `buffer` is the row's Buffer cell
- * (bufferView in playback-buffer.js).
+ * (bufferView in playback-buffer.js) and `redundancy` its Redundancy cell (redundancyView in
+ * redundancy.js).
  */
 export function musicianRows(state) {
   return state.musicians.map((musician) => {
@@ -70,6 +73,7 @@ export function musicianRows(state) {
       loss: `${loss.toFixed(2)}%`,
       lossHigh: loss > 0,
       buffer: bufferView(musician),
+      redundancy: redundancyView(musician),
     };
   });
 }

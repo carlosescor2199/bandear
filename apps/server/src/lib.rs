@@ -34,16 +34,16 @@ pub use playback::{
     BufferOutcome, BufferSetting, PlaybackBuffer, MAX_FIXED_BUFFER_MS, MIN_FIXED_BUFFER_MS,
 };
 pub use protocol::{
-    CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_RECOVERED, CAPABILITY_STATS_V2,
-    KNOWN_CAPABILITIES,
+    CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_HOLD, CAPABILITY_REDUNDANCY_RECOVERED,
+    CAPABILITY_STATS_V2, KNOWN_CAPABILITIES,
 };
 pub use recorder::{
     free_space, minutes_left, DiskEstimate, RecordRequest, RecordingState, RecordingStatus,
     TakeEnd, TakeMarker, TakeSummary, TakeTrack, TrackKind,
 };
 pub use redundancy::{
-    Redundancy, RedundancySetting, DEFAULT_REDUNDANCY_DELAY_BLOCKS, MAX_REDUNDANCY_DELAY_BLOCKS,
-    MIN_REDUNDANCY_DELAY_BLOCKS,
+    Redundancy, RedundancyOutcome, RedundancySetting, DEFAULT_REDUNDANCY_DELAY_BLOCKS,
+    MAX_REDUNDANCY_DELAY_BLOCKS, MIN_REDUNDANCY_DELAY_BLOCKS,
 };
 pub use soundcheck::{
     SoundcheckClock, SoundcheckError, SoundcheckRequest, SoundcheckState, SoundcheckStatus,

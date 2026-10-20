@@ -42,8 +42,9 @@ impl RedundancyEngine for EngineHandle {
     }
 }
 
-/// The redundancy the window asked for: off (any delay is ignored), or on with `delay_blocks`
-/// within [MIN_REDUNDANCY_DELAY_BLOCKS]-[MAX_REDUNDANCY_DELAY_BLOCKS], or
+/// The redundancy the window asked for: off (any delay is ignored), or on with `delay_blocks` (0:
+/// each copy right after its original) within
+/// [MIN_REDUNDANCY_DELAY_BLOCKS]-[MAX_REDUNDANCY_DELAY_BLOCKS], or
 /// [DEFAULT_REDUNDANCY_DELAY_BLOCKS] when it names none.
 fn requested_redundancy(on: bool, delay_blocks: Option<u32>) -> Result<Redundancy, String> {
     if !on {
@@ -87,7 +88,7 @@ pub(crate) fn redundancies_of(session: &Session) -> Vec<(MusicianKey, Redundancy
         .collect()
 }
 
-/// Turns redundancy on (`on`, with the copies `delay_blocks` blocks late, 2 when it names none) or
+/// Turns redundancy on (`on`, with the copies `delay_blocks` blocks late, 0 when it names none) or
 /// off for the musician `musician_key` names (`client:<id>` or `address:<ip:port>`). Answers what
 /// was done ([RedundancySetDto]): `set`, in force from the next block, with what it does to that
 /// musician's bandwidth, or `invalid` (a delay out of range, nothing changed). A setting the engine
@@ -160,6 +161,11 @@ pub(crate) fn set_redundancy_with<E: RedundancyEngine>(
         Redundancy::Off => "Each packet is sent once again: this musician's bandwidth is back to \
                             normal."
             .to_owned(),
+        Redundancy::On { delay_blocks: 0 } => {
+            "Each packet is sent twice, the copy right after it: \
+                                               this musician's bandwidth doubles."
+                .to_owned()
+        }
         Redundancy::On { delay_blocks } => format!(
             "Each packet is sent twice, the copy {delay_blocks} {} later: this musician's \
              bandwidth doubles.",
@@ -224,6 +230,7 @@ mod tests {
                 kept_for,
                 address,
                 redundancy,
+                outcome: personal_monitoring::RedundancyOutcome::Set,
             })
         }
     }
@@ -278,9 +285,9 @@ mod tests {
                 "saved": true,
                 "saveError": null,
                 "message": "Each packet is sent twice, the copy 3 blocks later: this musician's bandwidth doubles.",
-                "minDelayBlocks": 1,
+                "minDelayBlocks": 0,
                 "maxDelayBlocks": 4,
-                "defaultDelayBlocks": 2
+                "defaultDelayBlocks": 0
             })
         );
         assert_eq!(
@@ -322,10 +329,14 @@ mod tests {
             set.redundancy,
             Some(RedundancyDto {
                 on: true,
-                delay_blocks: Some(2)
+                delay_blocks: Some(0)
             })
         );
-        assert!(set.message.contains("2 blocks later"), "{}", set.message);
+        assert!(
+            set.message.contains("the copy right after it"),
+            "{}",
+            set.message
+        );
         assert_eq!(session.redundancies()[0].0, address_key(RACK));
     }
 
@@ -334,12 +345,12 @@ mod tests {
         let session = SessionStore::open(&test_directory("invalid"));
         let engine = running();
 
-        for delay in [0, 5, 64] {
+        for delay in [5, 64] {
             let set = set_redundancy_with(&engine, &session, &client_key(PHONE), true, Some(delay))
                 .expect("answered");
             assert_eq!(set.outcome, "invalid", "{delay}");
             assert!(
-                set.message.contains("from 1 to 4 blocks"),
+                set.message.contains("from 0 to 4 blocks"),
                 "{}",
                 set.message
             );
@@ -394,7 +405,7 @@ mod tests {
             vec![
                 (
                     MusicianKey::Address(RACK.parse().unwrap()),
-                    Redundancy::On { delay_blocks: 2 }
+                    Redundancy::On { delay_blocks: 0 }
                 ),
                 (
                     MusicianKey::Client(PHONE.to_owned()),

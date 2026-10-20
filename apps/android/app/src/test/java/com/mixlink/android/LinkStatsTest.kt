@@ -187,6 +187,18 @@ class LinkStatsTest {
     }
 
     @Test
+    fun recoveredIsTheDifferenceOfTheTrackersCumulativeCount() {
+        val stats = LinkStatsAccumulator(startedAtMs = 0)
+        stats.onPacket(lostBefore = 0, nowMs = 0)
+
+        assertEquals(3L, stats.poll(1_000, cumulativeUnderruns = 0, cumulativeRecovered = 3)?.recovered)
+        assertEquals(0L, stats.poll(2_000, cumulativeUnderruns = 0, cumulativeRecovered = 3)?.recovered)
+        assertEquals(2L, stats.poll(3_000, cumulativeUnderruns = 0, cumulativeRecovered = 5)?.recovered)
+        // A count that went down belongs to a new tracker, which starts from zero.
+        assertEquals(1L, stats.poll(4_000, cumulativeUnderruns = 0, cumulativeRecovered = 1)?.recovered)
+    }
+
+    @Test
     fun theJitterIsTheMeanArrivalDeviationOverTheInterval() {
         val stats = LinkStatsAccumulator(startedAtMs = 0)
         stats.onPacket(lostBefore = 0, nowMs = 0)

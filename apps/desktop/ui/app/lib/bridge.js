@@ -239,6 +239,18 @@ export function createEngineApi(bridge) {
     setMusicianBuffer: (musicianKey, mode, ms = null) =>
       bridge.invoke("set_musician_buffer", { musicianKey, mode, ms }),
     /**
+     * Turns redundancy on (`on`, the copies `delayBlocks` blocks late, 1-4, 2 when null) or off for
+     * the musician `musicianKey` names. Resolves to `{ musicianKey, outcome, redundancy,
+     * bandwidthFactor, saved, saveError, message, minDelayBlocks, maxDelayBlocks,
+     * defaultDelayBlocks }`, `outcome` "set" (`redundancy` `{ on, delayBlocks? }` what the musician
+     * has now, `bandwidthFactor` 2 on and 1 off) or "invalid" (a delay out of range; nothing changed,
+     * `redundancy` null); see formatRedundancySet in redundancy.js. A key that names nobody, or no
+     * engine, rejects. Status rows carry `redundancy`, `duplicatesSent`, `recovered` and
+     * `redundancySupported`.
+     */
+    setMusicianRedundancy: (musicianKey, on, delayBlocks = null) =>
+      bridge.invoke("set_musician_redundancy", { musicianKey, on, delayBlocks }),
+    /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
      */

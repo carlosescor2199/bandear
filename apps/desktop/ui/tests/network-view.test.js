@@ -58,6 +58,14 @@ test("a row per musician with the name, who owns it, the link and the counts", (
       playing: null,
       note: null,
     },
+    redundancy: {
+      key: `client:${status.musicians[0].clientId}`,
+      on: false,
+      delayBlocks: null,
+      bandwidth: "Sends once; on doubles this musician's bandwidth",
+      recovered: null,
+      duplicates: null,
+    },
   });
   assert.equal(rows[1].buffer.note, "needs a newer app", "Bass's phone takes no buffer");
   assert.equal(rows[3].name, "Drums");

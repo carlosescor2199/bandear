@@ -181,6 +181,7 @@ internal class PmonPlayer(
                             track?.underrunCount ?: 0,
                             cushionMs = extras.cushionMs,
                             backlogMs = extras.backlogMs,
+                            cumulativeRecovered = sequenceTracker.recovered,
                         )?.let { report ->
                             listener.onLinkStats(report)
                         }
@@ -205,7 +206,8 @@ internal class PmonPlayer(
                         val lostBefore = sequenceTracker.accept(packet.sequence)
                         if (lostBefore == SequenceTracker.DROPPED) {
                             // A duplicate, or a packet that arrived after a newer one was played:
-                            // playing it now would be out of order, and its gap is already counted.
+                            // playing it now would be out of order, and its gap is already counted. One
+                            // that filled a gap is counted as recovered by the tracker.
                             continue
                         }
                         packetsReceived++

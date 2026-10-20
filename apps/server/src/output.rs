@@ -368,8 +368,9 @@ pub(crate) struct LocalOutputSink {
     /// Room for the stereo mix of the longest block.
     stereo: Box<[f32]>,
     block_frames: usize,
-    /// The local mix's weights in the previous block, so a fader move glides (see [MixRamp]).
-    ramp: MixRamp,
+    /// The local mix's weights in the previous block, so a fader move glides, and its master
+    /// limiter's state (see [MixRamp]). Shared with the engine, which reads its gain reduction.
+    ramp: Arc<MixRamp>,
 }
 
 /// The engine's end of the local output sink's lines: feeds go to the sink, and the feeds it lets
@@ -382,11 +383,13 @@ pub(crate) struct OutputControl {
 /// Feeds (or stops) waiting for the sink to take them.
 const COMMAND_SLOTS: usize = 4;
 
-/// The local output's sink for the local mix `mix`, metered into `meter`, and the engine's end of
-/// its lines.
+/// The local output's sink for the local mix `mix`, metered into `meter`, with its running state in
+/// `ramp` (which the engine reads the master limiter's gain reduction from), and the engine's end
+/// of its lines.
 pub(crate) fn local_output_sink(
     mix: Arc<MixState>,
     meter: OutputMeter,
+    ramp: Arc<MixRamp>,
 ) -> (LocalOutputSink, OutputControl) {
     let (command_producer, commands) = RingBuffer::new(COMMAND_SLOTS);
     // Every command lets go of at most one feed, and the engine frees the returned feeds before
@@ -401,7 +404,7 @@ pub(crate) fn local_output_sink(
         feed: None,
         stereo: vec![0.0; MAX_BLOCK_FRAMES * usize::from(OUTPUT_CHANNELS)].into_boxed_slice(),
         block_frames: DEFAULT_BLOCK_FRAMES,
-        ramp: MixRamp::default(),
+        ramp,
     };
     let control = OutputControl {
         commands: command_producer,
@@ -468,8 +471,9 @@ impl Sink for LocalOutputSink {
         let Some(stereo) = self.stereo.get_mut(..frames * usize::from(OUTPUT_CHANNELS)) else {
             return;
         };
-        MixPlan::new(&self.mix.snapshot(), block.channels).mix_ramped(
+        MixPlan::new(&self.mix.snapshot(), block.channels).mix_master(
             &self.ramp,
+            self.mix.limiter(),
             block.samples,
             stereo,
         );
@@ -845,7 +849,7 @@ mod tests {
 
     fn sink_with(mix: Arc<MixState>) -> (LocalOutputSink, OutputControl, OutputMeter) {
         let meter = OutputMeter::default();
-        let (mut sink, outputs) = local_output_sink(mix, meter.clone());
+        let (mut sink, outputs) = local_output_sink(mix, meter.clone(), Arc::default());
         sink.source_changed(SourceFormat {
             channels: 2,
             block_frames: 4,

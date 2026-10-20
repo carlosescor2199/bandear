@@ -509,6 +509,16 @@ impl LimiterSettings {
         }
     }
 
+    /// The settings a mix's master limiter starts with: off, with its ceiling at 0 dBFS, so that
+    /// once on it limits at the mix's own ceiling (see [crate::mix::LimiterControl]), and a 50 ms
+    /// release.
+    pub fn master() -> Self {
+        Self {
+            ceiling_db: 0.0,
+            ..Self::default()
+        }
+    }
+
     /// True when the limiter changes nothing: it is off.
     pub fn is_neutral(&self) -> bool {
         !self.enabled
@@ -544,6 +554,31 @@ impl Default for LimiterDesign {
     }
 }
 
+impl LimiterDesign {
+    /// Whether it limits (false: it only releases what it still turns down, then stops), its
+    /// linear ceiling and its release coefficient: the plain numbers a mix keeps in atomics.
+    pub(crate) fn parts(&self) -> (bool, f32, f32) {
+        (self.enabled, self.ceiling, self.release)
+    }
+
+    /// The design [Self::parts] gave.
+    pub(crate) fn from_parts(enabled: bool, ceiling: f32, release: f32) -> Self {
+        Self {
+            enabled,
+            ceiling,
+            release,
+        }
+    }
+
+    /// This design with its ceiling no higher than `ceiling` (linear).
+    pub(crate) fn capped(self, ceiling: f32) -> Self {
+        Self {
+            ceiling: self.ceiling.min(ceiling),
+            ..self
+        }
+    }
+}
+
 /// A running peak limiter.
 #[derive(Clone, Debug)]
 pub(crate) struct Limiter {
@@ -568,6 +603,31 @@ impl Limiter {
             non_finite: 0,
             active: false,
         }
+    }
+
+    /// A limiter for `channels` channels that carries on from a running state kept between blocks
+    /// outside it ([Self::attenuation] and [Self::is_active] of the block before), with `design`.
+    /// Nothing allocated: a mix makes one on the stack every block.
+    pub(crate) fn resumed(
+        channels: usize,
+        design: &LimiterDesign,
+        attenuation: f32,
+        active: bool,
+    ) -> Self {
+        let mut limiter = Self::new(channels);
+        limiter.attenuation = if attenuation.is_finite() {
+            attenuation.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        limiter.active = active;
+        limiter.apply(design);
+        limiter
+    }
+
+    /// How far below 1 the gain is now: the running state [Self::resumed] carries on from.
+    pub(crate) fn attenuation(&self) -> f32 {
+        self.attenuation
     }
 
     /// Takes `design`; the gain recovers from where it is with the release.

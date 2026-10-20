@@ -2768,6 +2768,7 @@ mod tests {
     /// The engine's row for the phone `client_id` at `address`, every other value neutral.
     fn engine_row(address: &str, client_id: Option<&str>) -> personal_monitoring::MusicianStatus {
         personal_monitoring::MusicianStatus {
+            limiter: Default::default(),
             address: address.parse().expect("test address"),
             name: None,
             client_id: client_id.map(str::to_owned),
@@ -5586,6 +5587,7 @@ mod tests {
         mix: MixValues,
     ) -> MusicianStatus {
         MusicianStatus {
+            limiter: Default::default(),
             control_connected: connected,
             mix,
             ..engine_row(address, client_id)
@@ -6322,6 +6324,7 @@ mod tests {
                 live_groups: vec!["kit".to_owned(), "vox".to_owned()],
                 here: Mutex::new(vec![
                     MusicianStatus {
+                        limiter: Default::default(),
                         name: Some("Ana's phone".to_owned()),
                         ..here(
                             ANA,
@@ -6476,6 +6479,7 @@ mod tests {
     /// A status of the engine with no musicians and no local output.
     fn engine_status_now() -> personal_monitoring::EngineStatus {
         personal_monitoring::EngineStatus {
+            local_limiter: Default::default(),
             device_name: "Test device".to_owned(),
             capture_format: personal_monitoring::CaptureFormat {
                 channels: 2,
@@ -7139,6 +7143,7 @@ mod tests {
             test,
             Some(StandInEngine {
                 here: Mutex::new(vec![MusicianStatus {
+                    limiter: Default::default(),
                     capabilities: Vec::new(),
                     mirror: Some(personal_monitoring::MirrorStatus {
                         leader: MusicianKey::Address(RACK.parse().expect("an address")),

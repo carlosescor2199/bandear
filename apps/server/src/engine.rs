@@ -18,13 +18,14 @@ use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, G
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
 use crate::demo::{DemoReader, DEMO_CHANNELS, DEMO_DEVICE_NAME};
 use crate::discovery::spawn_discovery_thread;
+use crate::dsp::dynamics::LimiterSettings;
 use crate::dsp::strip::StripSettings;
 use crate::health::{link_status, LinkStatus};
 use crate::link_history::LinkHistoryRead;
 use crate::load::{EngineLoad, EngineLoadStatus};
 use crate::mix::{
     group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
-    MixPreset, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
+    MixPreset, MixRamp, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
 };
 use crate::network::{NetworkSink, PacketStats};
 use crate::output::{
@@ -185,6 +186,9 @@ pub struct MusicianStatus {
     /// Whether this musician's audio is sent twice (see [EngineHandle::set_redundancy]); off when
     /// the desk set nothing.
     pub redundancy: Redundancy,
+    /// The master limiter on this musician's mix (see [EngineHandle::set_musician_limiter]);
+    /// [LimiterSettings::master] (off) when the desk set none.
+    pub limiter: LimiterSettings,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -372,6 +376,18 @@ pub(crate) fn channel_flags(channels: &[ChannelMeta]) -> ChannelFlags {
     flags
 }
 
+/// What [EngineHandle::set_musician_limiter] did, and for whom.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LimiterSetting {
+    /// The key the engine keeps the setting under: the musician's phone's client id when it
+    /// announced one, else their address.
+    pub kept_for: MusicianKey,
+    /// The musician's row, as the status reports it.
+    pub address: SocketAddr,
+    /// The settings in force, held in range.
+    pub settings: LimiterSettings,
+}
+
 /// A snapshot of everything the engine can report without blocking the audio path.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineStatus {
@@ -414,6 +430,8 @@ pub struct EngineStatus {
     /// Input samples that were not finite numbers (NaN or an infinity) when they reached a
     /// working channel strip, which took them as silence (see [EngineHandle::set_channel_processing]).
     pub non_finite_samples: u64,
+    /// The master limiter on the local mix (see [EngineHandle::set_local_limiter]).
+    pub local_limiter: LimiterSettings,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -853,6 +871,7 @@ pub(crate) fn join_musicians(
     mirrors: &HashMap<IpAddr, MirrorStatus>,
     buffers: &HashMap<IpAddr, PlaybackBuffer>,
     redundancies: &HashMap<IpAddr, Redundancy>,
+    limiters: &HashMap<IpAddr, LimiterSettings>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -871,6 +890,10 @@ pub(crate) fn join_musicians(
                 mirror: mirrors.get(&ip).cloned(),
                 playback_buffer: buffers.get(&ip).copied().unwrap_or_default(),
                 redundancy: redundancies.get(&ip).copied().unwrap_or_default(),
+                limiter: limiters
+                    .get(&ip)
+                    .copied()
+                    .unwrap_or_else(LimiterSettings::master),
             }
         })
         .collect()
@@ -1125,15 +1148,21 @@ pub struct EngineMeters {
     /// The 0-100 peak of the engine's local mix, left then right: metered whether or not a local
     /// output plays it.
     pub local_levels: [u8; 2],
+    /// How far the local mix's master limiter turns it down now, in dB (0: not at all, or off),
+    /// as the local output mixes it.
+    pub local_limiter_reduction_db: f32,
 }
 
-/// One musician's output peak.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One musician's output peak and their master limiter's gain reduction.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MusicianMeters {
     /// The musician's address as [EngineStatus::musicians] reports it.
     pub address: SocketAddr,
     /// The 0-100 peak of the stereo mix the musician is sent, left then right.
     pub output_levels: [u8; 2],
+    /// How far the master limiter on the musician's mix turns it down now, in dB (0: not at
+    /// all, or off).
+    pub limiter_reduction_db: f32,
 }
 
 /// Reads the input levels of `channels` source channels and their levels and gain reductions
@@ -1144,6 +1173,7 @@ pub(crate) fn read_meters(
     processing: &ProcessingMeters,
     channels: usize,
     local: &OutputMeter,
+    local_ramp: &MixRamp,
     entries: &[TargetEntry],
 ) -> EngineMeters {
     let processed = processing.read(channels, levels);
@@ -1157,9 +1187,11 @@ pub(crate) fn read_meters(
             .map(|entry| MusicianMeters {
                 address: entry.address,
                 output_levels: entry.output_meter.read(),
+                limiter_reduction_db: entry.ramp.limiter_reduction_db(),
             })
             .collect(),
         local_levels: local.read(),
+        local_limiter_reduction_db: local_ramp.limiter_reduction_db(),
     }
 }
 
@@ -1172,13 +1204,17 @@ pub(crate) fn clear_meters(
     levels: &LevelMeter,
     processing: &ProcessingMeters,
     local: &OutputMeter,
+    local_ramp: &MixRamp,
     entries: &[TargetEntry],
 ) {
     levels.clear();
     processing.clear();
     local.clear();
+    // The limiters' gain reduction too (and their running state, with nothing left to limit).
+    local_ramp.reset();
     for entry in entries {
         entry.output_meter.clear();
+        entry.ramp.reset();
     }
 }
 
@@ -1534,6 +1570,9 @@ pub struct EngineHandle {
     local_mix: Arc<MixState>,
     /// The local mix's left and right peak, shared with the local output's sink.
     local_meter: OutputMeter,
+    /// The local output's running state of the local mix (its ramp and master limiter), shared
+    /// with its sink: the meters read the limiter's gain reduction from it.
+    local_ramp: Arc<MixRamp>,
     /// The local output: the line to its sink and the output that plays, if any.
     local_output: LocalOutput,
     /// The capture device, kept so an ASIO output can be opened on the driver the capture holds
@@ -1689,6 +1728,10 @@ impl EngineHandle {
         let mirrors = self.targets.mirror_statuses(&entries);
         let buffers = self.targets.playback_buffers(&entries);
         let redundancies = self.targets.redundancies(&entries);
+        let limiters: HashMap<IpAddr, LimiterSettings> = entries
+            .iter()
+            .map(|entry| (entry.address.ip(), entry.mix_state.limiter_settings()))
+            .collect();
         let config = self.config_state.snapshot();
         EngineStatus {
             device_name: self.device_name.clone(),
@@ -1715,6 +1758,7 @@ impl EngineHandle {
                 &mirrors,
                 &buffers,
                 &redundancies,
+                &limiters,
             ),
             local_mix: self.local_mix.current(),
             local_output: self.local_output(),
@@ -1723,6 +1767,7 @@ impl EngineHandle {
             demo: self.is_demo(),
             load: self.load.status(),
             non_finite_samples: self.processing_meters.non_finite_samples(),
+            local_limiter: self.local_mix.limiter_settings(),
         }
     }
 
@@ -1736,6 +1781,7 @@ impl EngineHandle {
             &self.processing_meters,
             usize::from(self.source_channels),
             &self.local_meter,
+            &self.local_ramp,
             &self.targets.read(),
         )
     }
@@ -2796,6 +2842,77 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Sets the master limiter on the mix of the musician `key` names (by their phone's client
+    /// id, or an address by IP) from their next block: a peak limiter after the mix's sum and
+    /// before its clamp, with no lookahead, so it adds no latency. Its ceiling is the lower of its
+    /// own and the mix's ceiling (the lower of the phone's level cap and the engineer's limit):
+    /// at 0 dBFS, the default, it limits right at the mix's ceiling. Off, the default, the mix is
+    /// as without it, bit for bit.
+    ///
+    /// Engineer-only, like [Self::set_engineer_controls]: no phone can change it and its `mix`
+    /// does not carry it. The engine keeps it for the musician (by client id, else by address)
+    /// while it runs, also while they are away, and puts it in force on their mix when they
+    /// register again. Answers the key it is kept under, their row and the settings kept, held in
+    /// range. A key that names nobody here and an engine that is stopping are errors. The status
+    /// reports it ([MusicianStatus::limiter]) and the meters its gain reduction
+    /// ([MusicianMeters::limiter_reduction_db]).
+    pub fn set_musician_limiter(
+        &self,
+        key: &MusicianKey,
+        settings: LimiterSettings,
+    ) -> Result<LimiterSetting, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let (kept_for, address, settings) = self.targets.set_limiter(key, settings)?;
+        Ok(LimiterSetting {
+            kept_for,
+            address,
+            settings,
+        })
+    }
+
+    /// The master limiter on the mix of the musician `key` names: theirs when they are here, else
+    /// the one kept for them, else `None`.
+    pub fn musician_limiter(&self, key: &MusicianKey) -> Option<LimiterSettings> {
+        self.targets.limiter_of(key)
+    }
+
+    /// Replaces every musician's master limiter the engine keeps with `kept` (keys as
+    /// [Self::set_musician_limiter] keeps them), as a desk does when it starts an engine or loads
+    /// a saved session: one kept before and not in `kept` goes back to off, also for a musician
+    /// who is not here. Answers the settings kept, held in range, in the order given.
+    pub fn replace_musician_limiters(
+        &self,
+        kept: &[(MusicianKey, LimiterSettings)],
+    ) -> Result<Vec<LimiterSettings>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self.targets.replace_limiters(kept))
+    }
+
+    /// Sets the master limiter on the engine's local mix from its next block, as
+    /// [Self::set_musician_limiter] does for a musician's: the local output and the recorder's
+    /// local mix track both go through it, each with its own running state. Answers the settings
+    /// kept, held in range; an engine that is stopping is an error. The status reports it
+    /// ([EngineStatus::local_limiter]) and the meters its gain reduction as the local output mixes
+    /// it ([EngineMeters::local_limiter_reduction_db]).
+    pub fn set_local_limiter(
+        &self,
+        settings: LimiterSettings,
+    ) -> Result<LimiterSettings, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self.local_mix.set_limiter(settings))
+    }
+
+    /// The master limiter on the engine's local mix.
+    pub fn local_limiter(&self) -> LimiterSettings {
+        self.local_mix.limiter_settings()
+    }
+
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         self.stopped.store(true, Ordering::SeqCst);
@@ -2818,6 +2935,7 @@ impl EngineHandle {
             &self.levels,
             &self.processing_meters,
             &self.local_meter,
+            &self.local_ramp,
             &self.targets.read(),
         );
         if let Some(thread) = self.control_thread.take() {
@@ -2977,7 +3095,12 @@ fn launch(
     let capture_stats = Arc::new(CaptureStats::default());
     let network = NetworkSink::new(Arc::clone(&target_registry), Arc::clone(&packet_stats))?;
     let local_meter = OutputMeter::default();
-    let (local, output_control) = local_output_sink(Arc::clone(&local_mix), local_meter.clone());
+    let local_ramp = Arc::new(MixRamp::default());
+    let (local, output_control) = local_output_sink(
+        Arc::clone(&local_mix),
+        local_meter.clone(),
+        Arc::clone(&local_ramp),
+    );
     let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
     let (stage, processing_control) = processing_stage();
     let pipeline = Pipeline::with_processing(
@@ -3060,6 +3183,7 @@ fn launch(
         events,
         local_mix,
         local_meter,
+        local_ramp,
         local_output: LocalOutput::new(output_control),
         capture_device,
         block_frames,
@@ -3184,6 +3308,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(musicians.len(), 1, "the row moved instead of doubling");
@@ -3258,6 +3383,7 @@ mod tests {
             &mixes,
             &announced,
             &links,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -3669,6 +3795,7 @@ mod tests {
             &HashMap::new(),
             &registry.playback_buffers(&registry.read()),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(musicians[0].playback_buffer, PlaybackBuffer::Auto);
         assert_eq!(musicians[1].playback_buffer, forty);
@@ -3798,6 +3925,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &registry.redundancies(&entries),
+            &HashMap::new(),
         );
         assert_eq!(musicians[0].redundancy, Redundancy::Off);
         assert_eq!(musicians[1].redundancy, two);
@@ -4124,10 +4252,23 @@ mod tests {
         local.observe(&pcm(&[16_384, 16_384]));
 
         let processing = ProcessingMeters::new();
-        clear_meters(&inputs, &processing, &local, &registry.read());
+        clear_meters(
+            &inputs,
+            &processing,
+            &local,
+            &MixRamp::default(),
+            &registry.read(),
+        );
 
         assert_eq!(
-            read_meters(&inputs, &processing, 2, &local, &registry.read()),
+            read_meters(
+                &inputs,
+                &processing,
+                2,
+                &local,
+                &MixRamp::default(),
+                &registry.read()
+            ),
             EngineMeters {
                 channel_levels: vec![0, 0],
                 processed_levels: vec![0, 0],
@@ -4136,8 +4277,10 @@ mod tests {
                 musicians: vec![MusicianMeters {
                     address,
                     output_levels: [0, 0],
+                    limiter_reduction_db: 0.0,
                 }],
                 local_levels: [0, 0],
+                local_limiter_reduction_db: 0.0,
             }
         );
     }
@@ -4157,7 +4300,14 @@ mod tests {
         local.observe(&pcm(&[8_192, 32_767]));
 
         let processing = ProcessingMeters::new();
-        let meters = read_meters(&inputs, &processing, 2, &local, &registry.read());
+        let meters = read_meters(
+            &inputs,
+            &processing,
+            2,
+            &local,
+            &MixRamp::default(),
+            &registry.read(),
+        );
 
         assert_eq!(
             meters,
@@ -4170,17 +4320,27 @@ mod tests {
                     MusicianMeters {
                         address: first,
                         output_levels: [100, 50],
+                        limiter_reduction_db: 0.0,
                     },
                     MusicianMeters {
                         address: second,
                         output_levels: [0, 0],
+                        limiter_reduction_db: 0.0,
                     },
                 ],
                 local_levels: [25, 100],
+                local_limiter_reduction_db: 0.0,
             }
         );
         assert_eq!(
-            read_meters(&inputs, &processing, 2, &local, &registry.read()),
+            read_meters(
+                &inputs,
+                &processing,
+                2,
+                &local,
+                &MixRamp::default(),
+                &registry.read()
+            ),
             meters,
             "a read changes nothing"
         );
@@ -5349,8 +5509,12 @@ mod tests {
         let config_state = Arc::new(ConfigState::new(2, Vec::new(), GroupLayout::default()));
         let local_mix = Arc::new(config_state.new_mix());
         let local_meter = OutputMeter::default();
-        let (local, output_control) =
-            local_output_sink(Arc::clone(&local_mix), local_meter.clone());
+        let local_ramp = Arc::new(MixRamp::default());
+        let (local, output_control) = local_output_sink(
+            Arc::clone(&local_mix),
+            local_meter.clone(),
+            Arc::clone(&local_ramp),
+        );
         let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
         let (stage, processing_control) = processing_stage();
         let pipeline = Pipeline::with_processing(
@@ -5381,6 +5545,7 @@ mod tests {
             events: EventBus::default(),
             local_mix,
             local_meter,
+            local_ramp,
             local_output: LocalOutput::new(output_control),
             capture_device: None,
             block_frames: DEFAULT_BLOCK_FRAMES,
@@ -5412,6 +5577,63 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// The desk sets a musician's and the local mix's master limiter; the status reads them back
+    /// held in range and the meters carry what each turns down, from the engine thread.
+    #[test]
+    fn the_status_and_meters_report_each_mixs_limiter() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let address = phone.local_addr().expect("phone address");
+        let (mut engine, mut capture) = engine_without_device(address);
+        let status = engine.status();
+        assert_eq!(status.musicians[0].limiter, LimiterSettings::master());
+        assert_eq!(status.local_limiter, LimiterSettings::master());
+
+        let on = LimiterSettings {
+            enabled: true,
+            ceiling_db: -12.0,
+            release_ms: 5_000.0,
+        };
+        let set = engine
+            .set_musician_limiter(&MusicianKey::Address(address), on)
+            .expect("the phone is here");
+        let held = LimiterSettings {
+            release_ms: 1_000.0,
+            ..on
+        };
+        assert_eq!(set.settings, held, "held in range");
+        assert_eq!(set.address, address);
+        assert_eq!(
+            engine.set_local_limiter(on).expect("running"),
+            held,
+            "the local mix's too"
+        );
+        assert_eq!(
+            engine.musician_limiter(&MusicianKey::Address(address)),
+            Some(held)
+        );
+        assert_eq!(engine.local_limiter(), held);
+        let status = engine.status();
+        assert_eq!(status.musicians[0].limiter, held);
+        assert_eq!(status.local_limiter, held);
+
+        capture.write(&[0.9f32; 2 * 64]);
+        let limited = meters_until(&engine, |meters| {
+            meters.musicians[0].limiter_reduction_db > 0.0
+                && meters.local_limiter_reduction_db > 0.0
+        });
+        assert!(
+            limited.musicians[0].limiter_reduction_db > 10.0,
+            "{limited:?}"
+        );
+        assert!(limited.local_limiter_reduction_db > 10.0, "{limited:?}");
+
+        engine.stop().expect("the engine stops");
+        assert!(engine
+            .set_musician_limiter(&MusicianKey::Address(address), on)
+            .is_err());
+        assert_eq!(engine.meters().local_limiter_reduction_db, 0.0);
     }
 
     /// Stopping ends capture and the engine thread, which would leave the last levels frozen, so
@@ -5447,8 +5669,10 @@ mod tests {
                 musicians: vec![MusicianMeters {
                     address,
                     output_levels: [0, 0],
+                    limiter_reduction_db: 0.0,
                 }],
                 local_levels: [0, 0],
+                local_limiter_reduction_db: 0.0,
             }
         );
     }

@@ -161,8 +161,11 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
     let network = NetworkSink::new(Arc::clone(&targets), Arc::clone(&packet_stats))
         .map_err(|error| format!("could not open the network sink: {error}"))?;
     let local_mix = Arc::new(MixState::default());
-    let (local, _output_control) =
-        local_output_sink(Arc::clone(&local_mix), OutputMeter::default());
+    let (local, _output_control) = local_output_sink(
+        Arc::clone(&local_mix),
+        OutputMeter::default(),
+        Arc::default(),
+    );
     let (recorder, _recorder_lines) = recorder_sink(Arc::clone(&local_mix));
     let levels = Arc::new(LevelMeter::new());
     let (stage, processing_control) = processing_stage();

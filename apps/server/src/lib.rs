@@ -35,8 +35,8 @@ pub use dsp::eq::{EqBandSettings, EqSettings, HighPassSettings};
 pub use dsp::strip::StripSettings;
 pub use engine::{
     check_channels, start, CaptureFormat, ChannelKind, ChannelMeta, EngineEvent, EngineHandle,
-    EngineMeters, EngineStatus, GroupStatus, MirrorOutcome, MirrorSource, MixOrigin,
-    MusicianCounters, MusicianMeters, MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
+    EngineMeters, EngineStatus, GroupStatus, LimiterSetting, MirrorOutcome, MirrorSource,
+    MixOrigin, MusicianCounters, MusicianMeters, MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
 };
 pub use health::{LinkHealth, LinkStatus};
 pub use link_history::{LinkHistoryRead, LinkSample, RoundTrip, HISTORY_SAMPLES};

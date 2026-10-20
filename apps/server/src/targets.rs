@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
+use crate::dsp::dynamics::LimiterSettings;
 use crate::engine::OutputMeter;
 use crate::health::{LatestLinkReport, LinkReport};
 use crate::link_history::{LinkHistory, LinkHistoryRead, LinkMoment, SharedLinkHistory};
@@ -389,6 +390,11 @@ pub(crate) struct TargetRegistry {
     /// id, else their IP; a musician with none kept has it off. Kept like the playback buffers, and
     /// taken after the table's lock, never with another book's.
     redundancies: Mutex<HashMap<BookKey, Redundancy>>,
+    /// The master limiter the desk set per musician's mix (see [crate::mix::LimiterControl]), by
+    /// their phone's client id, else their IP; a musician with none kept has
+    /// [LimiterSettings::master] (off). Kept like the playback buffers, put in force on the mix of
+    /// whoever registers on a row, and taken after the table's lock, never with another book's.
+    limiters: Mutex<HashMap<BookKey, LimiterSettings>>,
     propagation: Mutex<()>,
     /// The link histories of phones whose rows were removed (the grace period ran out, or the
     /// engineer removed them), by client id, the most recent last; at most
@@ -438,6 +444,7 @@ impl TargetRegistry {
             mirrors: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             redundancies: Mutex::new(HashMap::new()),
+            limiters: Mutex::new(HashMap::new()),
             propagation: Mutex::new(()),
             departed_histories: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -940,6 +947,7 @@ impl TargetRegistry {
             entry.address = address;
             entry.origin = origin;
             hold_copies(entry, redundancy);
+            self.restore_limiter(entry);
             let controls_changed = self.restore_kept_controls(entry);
             let (mirror_changed, followed) = self.restore_mirror(&entries, &entries[index]);
             return Registration {
@@ -976,6 +984,9 @@ impl TargetRegistry {
                 // takes the row, even at the same delay.
                 existing.held = new_held(redundancy);
             }
+            // Whoever registers takes the limiter kept for them, or none: never the previous
+            // occupant's.
+            self.restore_limiter(existing);
             let controls_changed = if same_musician {
                 self.restore_kept_controls(existing)
             } else {
@@ -1002,6 +1013,7 @@ impl TargetRegistry {
             held: new_held(redundancy),
             ramp: Arc::default(),
         };
+        self.restore_limiter(&entry);
         let controls_changed = self.restore_kept_controls(&entry);
         let (mirror_changed, followed) = self.restore_mirror(&entries, &entry);
         entries.push(entry);
@@ -1103,6 +1115,7 @@ impl TargetRegistry {
             )),
             ramp: Arc::default(),
         };
+        self.restore_limiter(&entry);
         self.restore_kept_controls(&entry);
         self.restore_mirror(&entries, &entry);
         entries.push(entry);
@@ -1413,6 +1426,102 @@ impl TargetRegistry {
             hold_copies(entry, redundancy);
         }
         changed
+    }
+
+    fn limiter_book(&self) -> MutexGuard<'_, HashMap<BookKey, LimiterSettings>> {
+        self.limiters.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The limiter kept for the musician with this client id at this IP: the one kept for their
+    /// phone first, then the one kept for their IP; [LimiterSettings::master] when none is.
+    fn kept_limiter(
+        book: &HashMap<BookKey, LimiterSettings>,
+        client_id: Option<&str>,
+        ip: IpAddr,
+    ) -> LimiterSettings {
+        client_id
+            .and_then(|id| book.get(&BookKey::Client(id.to_owned())).copied())
+            .or_else(|| book.get(&BookKey::Ip(ip)).copied())
+            .unwrap_or_else(LimiterSettings::master)
+    }
+
+    /// Puts the limiter kept for `entry`'s musician (or the master default) in force on its mix.
+    fn restore_limiter(&self, entry: &TargetEntry) {
+        let kept = Self::kept_limiter(
+            &self.limiter_book(),
+            entry.origin.client_id(),
+            entry.address.ip(),
+        );
+        entry.mix_state.set_limiter(kept);
+    }
+
+    /// Sets the master limiter of the musician `key` names (by their phone's client id, or an
+    /// address by IP) from their next block and keeps it for them as [Self::set_playback_buffer]
+    /// keeps a buffer (the master default is kept as nothing kept). Answers the key it is kept
+    /// under, the musician's row and the settings kept, held in range; a key that names nobody here
+    /// is an error. The table is held from the change through the keeping, so a registration
+    /// cannot come between them.
+    pub(crate) fn set_limiter(
+        &self,
+        key: &MusicianKey,
+        settings: LimiterSettings,
+    ) -> Result<(MusicianKey, SocketAddr, LimiterSettings), String> {
+        let entries = self.read();
+        let entry = entries
+            .iter()
+            .find(|entry| names(key, entry))
+            .ok_or_else(|| format!("{} is not here", describe_key(key)))?;
+        let kept_for = musician_key(entry);
+        let kept = entry.mix_state.set_limiter(settings);
+        let mut book = self.limiter_book();
+        if matches!(kept_for, MusicianKey::Client(_)) {
+            book.remove(&BookKey::Ip(entry.address.ip()));
+        }
+        if kept == LimiterSettings::master() {
+            book.remove(&BookKey::from(&kept_for));
+        } else {
+            book.insert(BookKey::from(&kept_for), kept);
+        }
+        Ok((kept_for, entry.address, kept))
+    }
+
+    /// The master limiter of the musician `key` names: the one on their mix when they are here,
+    /// else the one kept for them, else `None`.
+    pub(crate) fn limiter_of(&self, key: &MusicianKey) -> Option<LimiterSettings> {
+        let entries = self.read();
+        if let Some(entry) = entries.iter().find(|entry| names(key, entry)) {
+            return Some(entry.mix_state.limiter_settings());
+        }
+        self.limiter_book().get(&BookKey::from(key)).copied()
+    }
+
+    /// Replaces every limiter kept with `kept`, as a desk starting an engine or loading a session
+    /// does: one kept before and not in `kept` is forgotten (back to the master default), also for
+    /// a musician who is not here, and every row here takes the one now kept for it. Answers the
+    /// settings kept, each held in range, in the order given.
+    pub(crate) fn replace_limiters(
+        &self,
+        kept: &[(MusicianKey, LimiterSettings)],
+    ) -> Vec<LimiterSettings> {
+        let entries = self.entries.write().expect("target registry lock poisoned");
+        let (book, held) = {
+            let mut book = self.limiter_book();
+            book.clear();
+            let mut held = Vec::with_capacity(kept.len());
+            for (key, settings) in kept {
+                let settings = settings.clamped();
+                held.push(settings);
+                if settings != LimiterSettings::master() {
+                    book.insert(BookKey::from(key), settings);
+                }
+            }
+            (book.clone(), held)
+        };
+        for entry in entries.iter() {
+            let settings = Self::kept_limiter(&book, entry.origin.client_id(), entry.address.ip());
+            entry.mix_state.set_limiter(settings);
+        }
+        held
     }
 
     /// Adds the packets the musician at `ip` reports a redundant copy recovered to their running
@@ -3506,5 +3615,107 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             7
         );
+    }
+
+    fn limiter(ceiling_db: f32) -> LimiterSettings {
+        LimiterSettings {
+            enabled: true,
+            ceiling_db,
+            release_ms: 80.0,
+        }
+    }
+
+    fn limiter_at(registry: &TargetRegistry, peer: &str) -> LimiterSettings {
+        let entries = registry.read();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.address.ip() == ip(peer))
+            .expect("the row");
+        entry.mix_state.limiter_settings()
+    }
+
+    /// A musician's master limiter is kept for their phone: it follows them to a new IP and back
+    /// after their row left, and whoever else takes their old row gets none of it.
+    #[test]
+    fn a_limiter_is_kept_for_the_phone_follows_it_and_never_goes_to_whoever_takes_its_row() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(
+            limiter_at(&registry, "192.168.1.10"),
+            LimiterSettings::master()
+        );
+
+        let ana = MusicianKey::Client(PHONE_A.to_owned());
+        let (kept_for, row, kept) = registry
+            .set_limiter(
+                &ana,
+                LimiterSettings {
+                    ceiling_db: -99.0,
+                    ..limiter(-6.0)
+                },
+            )
+            .expect("Ana is here");
+        assert_eq!(kept_for, ana);
+        assert_eq!(row, address("192.168.1.10:50000"));
+        assert_eq!(kept, limiter(-24.0), "held in range");
+        assert_eq!(limiter_at(&registry, "192.168.1.10"), limiter(-24.0));
+
+        register_phone(&registry, "192.168.1.3", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(limiter_at(&registry, "192.168.1.3"), limiter(-24.0));
+        registry.remove("192.168.1.3:50000").expect("removed");
+        assert_eq!(
+            registry.limiter_of(&ana),
+            Some(limiter(-24.0)),
+            "kept while away"
+        );
+        register_phone(&registry, "192.168.1.3", 50000, "Eva", Some(PHONE_B));
+        assert_eq!(
+            limiter_at(&registry, "192.168.1.3"),
+            LimiterSettings::master(),
+            "Eva gets none of Ana's"
+        );
+        register_phone(&registry, "192.168.1.20", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(limiter_at(&registry, "192.168.1.20"), limiter(-24.0));
+
+        // Back to the default keeps nothing.
+        registry
+            .set_limiter(&ana, LimiterSettings::master())
+            .expect("Ana is here");
+        assert!(registry.limiter_book().is_empty());
+        assert!(registry
+            .set_limiter(&MusicianKey::Client("nobody".to_owned()), limiter(-1.0))
+            .is_err());
+    }
+
+    /// Replacing the limiters (a start or a session load) puts each row's in force and forgets
+    /// the rest, also for a musician who is not here.
+    #[test]
+    fn replacing_the_limiters_puts_each_rows_in_force_and_forgets_the_rest() {
+        let rack = address("192.168.1.31:50000");
+        let registry =
+            TargetRegistry::new(&[rack], &GroupLayout::default()).expect("registry should build");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        registry
+            .set_limiter(&MusicianKey::Address(rack), limiter(-3.0))
+            .expect("the rack is here");
+
+        let held = registry.replace_limiters(&[
+            (MusicianKey::Client(PHONE_A.to_owned()), limiter(-9.0)),
+            (MusicianKey::Client(PHONE_B.to_owned()), limiter(-12.0)),
+        ]);
+        assert_eq!(held, vec![limiter(-9.0), limiter(-12.0)]);
+        assert_eq!(limiter_at(&registry, "192.168.1.10"), limiter(-9.0));
+        assert_eq!(
+            limiter_at(&registry, "192.168.1.31"),
+            LimiterSettings::master(),
+            "the rack's was not in the list"
+        );
+        assert_eq!(
+            registry.limiter_of(&MusicianKey::Client(PHONE_B.to_owned())),
+            Some(limiter(-12.0)),
+            "kept for Eva, who is not here"
+        );
+        register_phone(&registry, "192.168.1.11", 50000, "Eva", Some(PHONE_B));
+        assert_eq!(limiter_at(&registry, "192.168.1.11"), limiter(-12.0));
     }
 }

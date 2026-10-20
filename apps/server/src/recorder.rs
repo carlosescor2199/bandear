@@ -721,8 +721,8 @@ pub(crate) struct RecorderSink {
     /// Room for the local mix of the longest block.
     stereo: Box<[f32]>,
     /// The local mix's weights in the previous block mixed for a take, so a fader move glides
-    /// (see [MixRamp]). Its own, not the local output's: each is mixed on its own. Reset for every
-    /// take, whose first block has nothing before it.
+    /// (see [MixRamp]), and its master limiter's state. Its own, not the local output's: each is
+    /// mixed and limited on its own. Reset for every take, whose first block has nothing before it.
     ramp: MixRamp,
 }
 
@@ -825,7 +825,12 @@ impl Sink for RecorderSink {
             .get_mut(..frames * usize::from(OUTPUT_CHANNELS))
             .unwrap_or_default();
         if feed.local && !stereo.is_empty() {
-            MixPlan::new(&mix.snapshot(), channels).mix_ramped(ramp, block.samples, stereo);
+            MixPlan::new(&mix.snapshot(), channels).mix_master(
+                ramp,
+                mix.limiter(),
+                block.samples,
+                stereo,
+            );
         }
         feed.record(block, stereo);
     }

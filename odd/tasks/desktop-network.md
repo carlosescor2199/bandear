@@ -729,7 +729,7 @@ optional recovered-packet count), the Network and system screen, the PRD update 
   - RED: 1 of 8 demo-source tests failed (8 channels and `Fixed(128)` against 6 and `Fixed(256)`).
     GREEN: `node --test apps/desktop/ui/tests`: 540 passed.
   - Commit: 3c33f9d `fix(desktop-ui): rebuild the fake's capture format after the demo` (+50/-10).
-- [ ] T9 (close): PRD update, docs, live test with the S23. Route: delegated writer for the docs
+- [x] T9 (close): PRD update, docs, live test with the S23. Route: delegated writer for the docs
   (with T8-fix); the live test with the user.
   - Docs done: `PRD.md` version 0.4 (RF5 with the link health history and chart, RF11 with the
     buffer from the desk and the phone's extras, new RF17 redundancy, RF18 log file, RF19 demo
@@ -741,18 +741,25 @@ optional recovered-packet count), the Network and system screen, the PRD update 
   - Commit: this commit `docs: network health, phone buffer, redundancy, log, backup and demo
     source`.
   - Remaining: live test with the user.
-    - [ ] Install the new APK (`apps/android/app/build/outputs/apk/debug/app-debug.apk`) on the
+    - [x] Install the new APK (`apps/android/app/build/outputs/apk/debug/app-debug.apk`) on the
       S23.
-    - [ ] The link health chart fills over a few minutes and the round trip shows.
-    - [ ] Buffer Fixed 40 ms, then Auto: the cushion follows; Auto's latency did not grow (the
+    - [x] The link health chart fills over a few minutes and the round trip shows.
+    - [x] Buffer Fixed 40 ms, then Auto: the cushion follows; Auto's latency did not grow (the
       large-track risk from T6-fix).
-    - [ ] Redundancy immediate on and off: the musician's bandwidth doubles and returns.
-    - [ ] Redundancy delayed 2 blocks: about +10.7 ms, and recovered packets when the Wi-Fi drops
+    - [x] Redundancy immediate on and off: the musician's bandwidth doubles and returns.
+    - [x] Redundancy delayed 2 blocks: about +10.7 ms, and recovered packets when the Wi-Fi drops
       some.
-    - [ ] The log file is present in the app's log folder and readable.
-    - [ ] A mixes backup appears after changing a mix, and Restore works.
-    - [ ] The demo source runs with no interface (the Volt unplugged or not selected) and streams to
+    - [x] The log file is present in the app's log folder and readable.
+    - [x] A mixes backup appears after changing a mix, and Restore works.
+    - [x] The demo source runs with no interface (the Volt unplugged or not selected) and streams to
       the phone.
+  - Live test (2026-10-19, desktop debug build at c530c85, capture on the Realtek microphone array
+    under WASAPI, Galaxy S23 with the new APK installed over adb): the link health panel for the
+    phone showed loss 0.00% over 10 min, round trip 7.1 ms now and 7.9 ms on average, no
+    underruns, and the jitter and cushion lines the phone now reports; the Mix backups list showed
+    a backup. The user then confirmed the rest of the checklist with "Todo funciona bien". Only the
+    chart and the backups list were seen on screen; the other items rest on the user's word. The
+    Volt 4 was not the capture device in this run.
 
 ## Delivery
 
@@ -806,8 +813,10 @@ per reviewed slice, only with the user's approval.
 - review-5557b69a8fe0a1d1 (b82d3a3..9a1ae1f, T7-fix and T8) approved and acknowledged, with one
   SUGGESTION: the fake's capture format leaking from the demo into an interface run (fixed in
   T8-fix). Next review base 9a1ae1f.
-- T8-fix and T9's docs done, two commits; T9 stays open for the live test.
+- T8-fix and T9's docs done, two commits (217 changed lines, under the review budget, pending in
+  the slice from 9a1ae1f).
+- T9's live test passed (see T9). Phase 4 is complete.
 
 ## Next step
 
-T9's live test with the user (checklist under T9).
+Push and stacked pull requests to main, only with the user's approval; then phase 5 (DSP).

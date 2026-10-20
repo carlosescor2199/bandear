@@ -372,6 +372,42 @@ class ControlChannelTest {
         }
     }
 
+    @Test
+    fun statsMessageCarriesTheMeasuredExtrasInMilliseconds() {
+        val message = JSONObject(
+            buildStatsMessage(
+                LinkStatsReport(
+                    intervalMs = 1_000,
+                    packetsReceived = 200,
+                    packetsLost = 0,
+                    underruns = 0,
+                    receiveTimeouts = 0,
+                    jitterMs = 1.2345,
+                    cushionMs = 10.0,
+                    backlogMs = 37.5,
+                ),
+            ),
+        )
+
+        assertEquals(wireKeys + setOf("jitter_ms", "cushion_ms", "backlog_ms"), message.keySet())
+        assertEquals("rounded to a hundredth", 1.23, message.getDouble("jitter_ms"), 0.0)
+        assertEquals(10.0, message.getDouble("cushion_ms"), 0.0)
+        assertEquals(37.5, message.getDouble("backlog_ms"), 0.0)
+        assertFalse("recovered comes with redundancy", message.has("recovered"))
+    }
+
+    @Test
+    fun statsMessageLeavesOutAnExtraNotMeasuredOrOutsideWhatTheServerReads() {
+        fun keysFor(jitterMs: Double, cushionMs: Double, backlogMs: Double): Set<String> =
+            JSONObject(
+                buildStatsMessage(LinkStatsReport(1_000, 200, 0, 0, 0, jitterMs, cushionMs, backlogMs)),
+            ).keySet() - wireKeys
+
+        assertEquals(setOf("jitter_ms"), keysFor(2.0, Double.NaN, Double.NaN))
+        assertEquals(setOf("cushion_ms"), keysFor(Double.POSITIVE_INFINITY, 0.0, -1.0))
+        assertEquals(setOf("backlog_ms"), keysFor(60_000.5, -0.5, 60_000.0))
+    }
+
     private class RecordingListener : ControlChannel.Listener {
         val pushed = mutableListOf<MixSnapshot>()
         val answers = mutableListOf<Pair<Long, MixSnapshot?>>()

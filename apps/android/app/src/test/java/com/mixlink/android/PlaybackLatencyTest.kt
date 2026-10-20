@@ -1,6 +1,7 @@
 package com.mixlink.android
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlaybackLatencyTest {
@@ -39,6 +40,20 @@ class PlaybackLatencyTest {
     @Test
     fun bufferIsNeverZeroFrames() {
         assertEquals(1, PlaybackLatency.targetBufferFrames(0, 2))
+    }
+
+    @Test
+    fun theCushionInMillisecondsIsTheBufferItAsksForAtTheTracksRate() {
+        // 240-frame packets at 48 kHz are 5 ms each.
+        assertEquals(10.0, PlaybackLatency.cushionMs(240, 2, 48_000), 1e-9)
+        assertEquals(5.0, PlaybackLatency.cushionMs(240, 1, 48_000), 1e-9)
+        assertEquals(40.0, PlaybackLatency.cushionMs(480, 4, 48_000), 1e-9)
+    }
+
+    @Test
+    fun theCushionIsNotMeasuredBeforeTheFirstPacketOrAtAnUnusableRate() {
+        assertTrue(PlaybackLatency.cushionMs(0, 2, 48_000).isNaN())
+        assertTrue(PlaybackLatency.cushionMs(240, 2, 0).isNaN())
     }
 
     @Test

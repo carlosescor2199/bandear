@@ -21,6 +21,17 @@ internal const val LINK_STATS_STARTUP_GRACE_MS = 3_000L
  * from. [packetsReceived] counts the packets played, so a dropped duplicate or late packet is not
  * received twice, and received plus lost is the stretch of the stream the interval covered.
  *
+ * The extras the phone announces with `stats.v2` (see [CAPABILITY_STATS_V2]), in milliseconds, are
+ * `NaN` when not measured:
+ * - [jitterMs]: how much the packets' arrival varied over the interval, the mean distance of each
+ *   packet's spacing from the smoothed spacing (the deviation the receiver's own jitter smooths).
+ *   Not measured when no two packets arrived in the interval.
+ * - [cushionMs]: the playback cushion the phone aims for at the interval's end (the buffer it asks
+ *   the track for), not measured before the first packet opened the track.
+ * - [backlogMs]: the audio queued for playback at the interval's end, as last read from the track.
+ *
+ * They are primitives, so a report boxes nothing on the receive thread that builds it.
+ *
  * Public because the Activity, which is public, receives it through [PmonPlayer.Listener].
  */
 data class LinkStatsReport(
@@ -29,6 +40,9 @@ data class LinkStatsReport(
     val packetsLost: Long,
     val underruns: Long,
     val receiveTimeouts: Long,
+    val jitterMs: Double = Double.NaN,
+    val cushionMs: Double = Double.NaN,
+    val backlogMs: Double = Double.NaN,
 )
 
 /**
@@ -59,6 +73,8 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
     private var receiveTimeouts = 0L
     private var lastUnderruns = 0
     private var streamStarted = false
+    private var arrivalDeviationSumMs = 0.0
+    private var arrivalDeviations = 0
 
     /**
      * One played packet, arriving at [nowMs], with the [lostBefore] packets the stream skipped
@@ -87,6 +103,15 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
         if (streamStarted) receiveTimeouts++
     }
 
+    /**
+     * How far one packet's spacing from the one before it was from the smoothed spacing, in
+     * milliseconds, early or late alike: the interval's jitter is the mean of these.
+     */
+    fun onArrivalDeviation(deviationMs: Double) {
+        arrivalDeviationSumMs += kotlin.math.abs(deviationMs)
+        arrivalDeviations++
+    }
+
     /** True once a report is due at [nowMs], so the caller reads the underrun count only then. */
     fun isDue(nowMs: Long): Boolean =
         (streamStarted || gracePassed(nowMs)) &&
@@ -101,8 +126,16 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
      * The interval is the real time since the last report, clamped to what the server accepts, so a
      * late poll (the loop waits up to one receive timeout) is reported as the longer interval it was
      * and the server's rates stay honest. The interval counts start again from zero.
+     *
+     * [cushionMs] and [backlogMs] are the playback values at [nowMs], `NaN` when not measured; the
+     * jitter is the interval's own (see [LinkStatsReport]).
      */
-    fun poll(nowMs: Long, cumulativeUnderruns: Int): LinkStatsReport? {
+    fun poll(
+        nowMs: Long,
+        cumulativeUnderruns: Int,
+        cushionMs: Double = Double.NaN,
+        backlogMs: Double = Double.NaN,
+    ): LinkStatsReport? {
         if (!isDue(nowMs)) return null
         // A count that went down belongs to a new track, which starts from zero.
         val underruns = (cumulativeUnderruns - lastUnderruns).coerceAtLeast(0)
@@ -113,11 +146,16 @@ internal class LinkStatsAccumulator(private val startedAtMs: Long) {
             packetsLost = packetsLost,
             underruns = underruns.toLong(),
             receiveTimeouts = receiveTimeouts,
+            jitterMs = if (arrivalDeviations > 0) arrivalDeviationSumMs / arrivalDeviations else Double.NaN,
+            cushionMs = cushionMs,
+            backlogMs = backlogMs,
         )
         intervalStartedAtMs = nowMs
         packetsReceived = 0L
         packetsLost = 0L
         receiveTimeouts = 0L
+        arrivalDeviationSumMs = 0.0
+        arrivalDeviations = 0
         return report
     }
 }

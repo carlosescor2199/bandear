@@ -487,34 +487,71 @@ internal class ControlChannel(
     }
 }
 
+/** The phone's `stats` carry `jitter_ms`, `cushion_ms` and `backlog_ms` ([LinkStatsReport]). */
+internal const val CAPABILITY_STATS_V2 = "stats.v2"
+
+/**
+ * What this build of the app implements, announced in every registration so the server only sends
+ * a phone the messages it understands. A feature adds its name here, one line, once the phone
+ * implements it: `playback.buffer` (the buffer set from the desk) and `redundancy.recovered` (the
+ * packets a redundant copy brought) are still to come. Names are 1-32 of `[a-z0-9._-]`, at most 16.
+ */
+internal val CLIENT_CAPABILITIES: List<String> = listOf(
+    CAPABILITY_STATS_V2,
+)
+
 /**
  * Builds the registration message a client sends when the control channel opens: its name, the
- * UDP port it listens on and, when it has one, its stable client id (see [ClientIdentity]), which
- * lets the server keep this musician's row when the phone returns from a new IP. The server takes
- * the address from the socket, so none is carried here.
+ * UDP port it listens on, when it has one its stable client id (see [ClientIdentity]), which lets
+ * the server keep this musician's row when the phone returns from a new IP, and the [capabilities]
+ * it implements. The server takes the address from the socket, so none is carried here. An older
+ * server ignores the fields it does not know, so the capabilities never break a registration.
  */
-internal fun buildRegisterMessage(name: String, udpPort: Int, clientId: String? = null): String {
+internal fun buildRegisterMessage(
+    name: String,
+    udpPort: Int,
+    clientId: String? = null,
+    capabilities: List<String> = CLIENT_CAPABILITIES,
+): String {
     val message = JSONObject()
         .put("type", "register")
         .put("name", name.trim())
         .put("udp_port", udpPort)
     if (clientId != null) message.put("client_id", clientId)
+    if (capabilities.isNotEmpty()) message.put("capabilities", JSONArray(capabilities))
     return message.toString()
 }
 
+/** The longest duration a `stats` extra may name; the server reads a longer one as absent. */
+private const val MAX_STATS_EXTRA_MS = 60_000.0
+
 /**
  * Builds the link-stats message the client sends about once a second: the counts of one report
- * interval, all integers. The server matches it to this musician by the socket's IP, like a mix.
+ * interval, all integers, then the extras of `stats.v2` that were measured, in milliseconds to the
+ * hundredth. An extra not measured (`NaN`) or outside 0 to 60 000 ms is left out, never sent as a
+ * value the server would refuse. The server matches it to this musician by the socket's IP, like a
+ * mix, and an older server ignores the extras.
  */
-internal fun buildStatsMessage(report: LinkStatsReport): String =
-    JSONObject()
+internal fun buildStatsMessage(report: LinkStatsReport): String {
+    val message = JSONObject()
         .put("type", "stats")
         .put("interval_ms", report.intervalMs)
         .put("packets_received", report.packetsReceived)
         .put("packets_lost", report.packetsLost)
         .put("underruns", report.underruns)
         .put("receive_timeouts", report.receiveTimeouts)
-        .toString()
+    message.putMilliseconds("jitter_ms", report.jitterMs)
+    message.putMilliseconds("cushion_ms", report.cushionMs)
+    message.putMilliseconds("backlog_ms", report.backlogMs)
+    return message.toString()
+}
+
+private fun JSONObject.putMilliseconds(key: String, value: Double) {
+    // A NaN fails both comparisons, so a value not measured stays out too.
+    if (value >= 0.0 && value <= MAX_STATS_EXTRA_MS) {
+        put(key, Math.round(value * 100.0) / 100.0)
+    }
+}
 
 /**
  * Reads a whole mix as the server reports it, in the field names of the `mix` message: `mix_state`

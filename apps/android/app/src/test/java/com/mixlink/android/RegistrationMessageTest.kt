@@ -3,6 +3,7 @@ package com.mixlink.android
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -48,7 +49,7 @@ class RegistrationMessageTest {
     fun carriesTheClientIdSoTheServerCanFollowThePhoneToANewAddress() {
         val message = JSONObject(buildRegisterMessage("Ana", 50000, CLIENT_ID))
 
-        assertEquals(setOf("type", "name", "udp_port", "client_id"), message.keySet())
+        assertEquals(setOf("type", "name", "udp_port", "client_id", "capabilities"), message.keySet())
         assertEquals("register", message.getString("type"))
         assertEquals("Ana", message.getString("name"))
         assertEquals(50000, message.getInt("udp_port"))
@@ -57,8 +58,35 @@ class RegistrationMessageTest {
 
     @Test
     fun leavesTheClientIdOutWhenThereIsNone() {
-        assertEquals(setOf("type", "name", "udp_port"), JSONObject(buildRegisterMessage("Ana", 50000)).keySet())
-        assertEquals(setOf("type", "name", "udp_port"), JSONObject(buildRegisterMessage("Ana", 50000, null)).keySet())
+        assertEquals(setOf("type", "name", "udp_port", "capabilities"), JSONObject(buildRegisterMessage("Ana", 50000)).keySet())
+        assertEquals(setOf("type", "name", "udp_port", "capabilities"), JSONObject(buildRegisterMessage("Ana", 50000, null)).keySet())
+    }
+
+    @Test
+    fun announcesWhatThisBuildImplements() {
+        val announced = JSONObject(buildRegisterMessage("Ana", 50000)).getJSONArray("capabilities")
+
+        // `playback.buffer` and `redundancy.recovered` join the list with the features that use them.
+        assertEquals(listOf("stats.v2"), List(announced.length()) { announced.getString(it) })
+        assertEquals(listOf(CAPABILITY_STATS_V2), CLIENT_CAPABILITIES)
+    }
+
+    /** The server keeps 1-32 characters of `[a-z0-9._-]`, at most 16 names, each once. */
+    @Test
+    fun everyAnnouncedNameIsOneTheServerKeeps() {
+        val name = Regex("[a-z0-9._-]{1,32}")
+
+        assertTrue(CLIENT_CAPABILITIES.size <= 16)
+        assertEquals(CLIENT_CAPABILITIES.distinct(), CLIENT_CAPABILITIES)
+        assertTrue(CLIENT_CAPABILITIES.toString(), CLIENT_CAPABILITIES.all { name.matches(it) })
+    }
+
+    @Test
+    fun anEmptyCapabilityListPutsNoKey() {
+        assertEquals(
+            setOf("type", "name", "udp_port"),
+            JSONObject(buildRegisterMessage("Ana", 50000, null, emptyList())).keySet(),
+        )
     }
 
     /**
@@ -93,6 +121,10 @@ class RegistrationMessageTest {
             .filter { it.getString("type") == "register" }
         assertEquals(listOf("Ana", "Ana", "Bea"), registrations.map { it.getString("name") })
         assertEquals(listOf(CLIENT_ID, CLIENT_ID, CLIENT_ID), registrations.map { it.optString("client_id") })
+        assertTrue(
+            "every registration announces the capabilities",
+            registrations.all { it.getJSONArray("capabilities").getString(0) == CAPABILITY_STATS_V2 },
+        )
     }
 
     private class RecordingSocket(val events: ControlSocketEvents) : ControlSocket {

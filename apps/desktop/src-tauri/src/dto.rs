@@ -1478,6 +1478,7 @@ mod tests {
             link: Default::default(),
             capabilities: Vec::new(),
             mirror: None,
+            playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
         };
 
         let dto = MusicianDto::from(&musician);
@@ -1499,6 +1500,7 @@ mod tests {
             link: Default::default(),
             capabilities: Vec::new(),
             mirror: None,
+            playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
         };
 
         let dto = MusicianDto::from(&musician);
@@ -1609,6 +1611,7 @@ mod tests {
             link,
             capabilities: Vec::new(),
             mirror: None,
+            playback_buffer: personal_monitoring::PlaybackBuffer::Auto,
         }
     }
 

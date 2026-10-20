@@ -57,6 +57,81 @@ class PlaybackLatencyTest {
     }
 
     @Test
+    fun aReportEndsWithTheCushionAskedOfTheTrackAndTheAudioQueued() {
+        // Distinct packet frames and cushion packets: 240-frame packets, 3 of them, are 15 ms; using
+        // one value twice would give 1200 ms or 0.19 ms.
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 240,
+            cushionPackets = 3,
+            playbackRate = 48_000,
+            timestampRead = true,
+            framesWritten = 1_000L,
+            presentedFrame = 520L,
+        )
+        assertEquals(15.0, extras.cushionMs, 1e-9)
+        // 480 frames queued at 48 kHz.
+        assertEquals(10.0, extras.backlogMs, 1e-9)
+    }
+
+    @Test
+    fun aReportBeforeTheFirstPacketHasNoCushionWhateverTheCushionPackets() {
+        // No packet sized the buffer yet: the start cushion of 2 packets is not a cushion. Swapped,
+        // 2-frame packets would read as a tiny cushion instead of none.
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 0,
+            cushionPackets = PlaybackLatency.START_CUSHION_PACKETS,
+            playbackRate = 48_000,
+            timestampRead = false,
+            framesWritten = 0L,
+            presentedFrame = 0L,
+        )
+        assertTrue(extras.cushionMs.isNaN())
+        assertTrue(extras.backlogMs.isNaN())
+    }
+
+    @Test
+    fun theBacklogCountsFramesWrittenPastThePresentedFrameNotTheOtherWayRound() {
+        // Swapped, the written count would sit behind the render position and read as 0 ms.
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 256,
+            cushionPackets = 2,
+            playbackRate = 48_000,
+            timestampRead = true,
+            framesWritten = 2_400L,
+            presentedFrame = 480L,
+        )
+        assertEquals(40.0, extras.backlogMs, 1e-9)
+    }
+
+    @Test
+    fun withoutATimestampTheBacklogIsNotMeasuredAndTheCushionStillIs() {
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 256,
+            cushionPackets = 2,
+            playbackRate = 48_000,
+            timestampRead = false,
+            framesWritten = 2_400L,
+            presentedFrame = 480L,
+        )
+        assertTrue(extras.backlogMs.isNaN())
+        assertEquals(512 * 1000.0 / 48_000, extras.cushionMs, 1e-9)
+    }
+
+    @Test
+    fun withoutATrackRateTheCushionIsNotMeasured() {
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 256,
+            cushionPackets = 2,
+            playbackRate = null,
+            timestampRead = false,
+            framesWritten = 0L,
+            presentedFrame = 0L,
+        )
+        assertTrue(extras.cushionMs.isNaN())
+        assertTrue(extras.backlogMs.isNaN())
+    }
+
+    @Test
     fun growsTheCushionWhenAnUnderrunHappened() {
         assertEquals(
             PlaybackLatency.CushionDecision(3, 0),

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::mix::{MixUpdate, MixValues, MAX_MIX_CHANNELS};
+use crate::playback::PlaybackBuffer;
 
 const PACKET_MAGIC: [u8; 4] = *b"PMON";
 const PACKET_VERSION: u8 = 1;
@@ -536,6 +537,50 @@ fn mix_report(
     })
 }
 
+/// The `playback` message: the playback buffer the desk set for this musician (see
+/// [crate::playback]), sent only to a phone that announced [CAPABILITY_PLAYBACK_BUFFER]:
+///
+/// ```json
+/// {"type":"playback","buffer":{"mode":"auto"}}
+/// {"type":"playback","buffer":{"mode":"fixed","ms":40}}
+/// ```
+///
+/// - `mode` `auto`: the phone adapts its cushion on its own again, from the cushion it plays now.
+/// - `mode` `fixed`: the phone keeps a cushion of `ms` milliseconds (an integer from
+///   [crate::playback::MIN_FIXED_BUFFER_MS] to [crate::playback::MAX_FIXED_BUFFER_MS]), rounded up
+///   to whole packets at its block size and clamped to what its audio track holds, and stops
+///   adapting it.
+///
+/// The server sends it whenever such a phone registers (on every connection, so the engineer's
+/// choice survives a reconnect and a phone never keeps a fixed buffer an earlier server set) and
+/// whenever the engineer changes it. There is no answer: the phone's next `stats` say the cushion it
+/// plays (`cushion_ms`). A phone keeps nothing of it once its session ends. The setting is an
+/// object of its own so later playback settings can join it; a phone ignores fields it does not
+/// know, and one that predates the message ignores it, as it ignores any unknown type.
+pub(crate) fn playback_message(buffer: PlaybackBuffer) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&PlaybackReport {
+        message_type: "playback",
+        buffer: BufferReport {
+            mode: buffer.mode(),
+            ms: buffer.fixed_ms(),
+        },
+    })
+}
+
+#[derive(Serialize)]
+struct PlaybackReport {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    buffer: BufferReport,
+}
+
+#[derive(Serialize)]
+struct BufferReport {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ms: Option<u16>,
+}
+
 /// An `error` answering anything but a `mix`; it never carries a number.
 pub(crate) fn control_error(message: String) -> Result<String, serde_json::Error> {
     error_reply(message, None)
@@ -666,6 +711,18 @@ mod tests {
         ] {
             assert_eq!(mix_sequence(odd), None, "{odd}");
         }
+    }
+
+    #[test]
+    fn the_playback_message_carries_the_buffer_mode_and_a_fixed_length_only() {
+        assert_eq!(
+            playback_message(PlaybackBuffer::Auto).unwrap(),
+            r#"{"type":"playback","buffer":{"mode":"auto"}}"#
+        );
+        assert_eq!(
+            playback_message(PlaybackBuffer::Fixed { ms: 40 }).unwrap(),
+            r#"{"type":"playback","buffer":{"mode":"fixed","ms":40}}"#
+        );
     }
 
     #[test]

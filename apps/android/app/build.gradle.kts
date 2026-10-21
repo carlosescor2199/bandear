@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.mixlink.android"
+    namespace = "com.bandear.android"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.mixlink.android"
+        applicationId = "com.bandear.android"
         minSdk = 29
         targetSdk = 35
         versionCode = 1

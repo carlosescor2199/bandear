@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The MixLink launcher icon: the mark on the app's ground colour, with a layer for themed icons. -->
+<!-- The BandEar launcher icon: the mark on the app's ground colour, with a layer for themed icons. -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@color/mixlink_ground" />
+    <background android:drawable="@color/bandear_ground" />
     <foreground android:drawable="@drawable/ic_launcher_foreground" />
     <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
 </adaptive-icon>

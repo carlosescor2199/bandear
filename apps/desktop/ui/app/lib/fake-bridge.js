@@ -163,11 +163,11 @@ const METER_INTERVAL_MS = 33;
 /** The outputs the fake's ASIO driver has: under ASIO it offers only these, its own. */
 const ASIO_OUTPUTS = 4;
 
-/** The fake desk's default recordings folder: the Music folder + MixLink\Recordings. */
-export const FAKE_RECORDINGS_FOLDER = "C:\\Users\\Demo\\Music\\MixLink\\Recordings";
+/** The fake desk's default recordings folder: the Music folder + BandEar\Recordings. */
+export const FAKE_RECORDINGS_FOLDER = "C:\\Users\\Demo\\Music\\BandEar\\Recordings";
 
 /** The fake desk's own settings folder, which no recordings folder may be in. */
-export const FAKE_CONFIG_FOLDER = "C:\\Users\\Demo\\AppData\\Roaming\\MixLink";
+export const FAKE_CONFIG_FOLDER = "C:\\Users\\Demo\\AppData\\Roaming\\BandEar";
 
 /** The rate every take is recorded at. */
 const RECORD_RATE = 48000;
@@ -1410,7 +1410,7 @@ export function createFakeBridge({
       return null;
     }
     if (isInside(text, FAKE_CONFIG_FOLDER)) {
-      throw `the recordings folder cannot be in MixLink's own settings folder (${FAKE_CONFIG_FOLDER}): \`${text}\``;
+      throw `the recordings folder cannot be in BandEar's own settings folder (${FAKE_CONFIG_FOLDER}): \`${text}\``;
     }
     return text;
   }

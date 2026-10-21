@@ -34,7 +34,7 @@ export function createTauriBridge(tauri = globalThis.__TAURI__) {
   const invoke = tauri?.core?.invoke;
   const listen = tauri?.event?.listen;
   if (typeof invoke !== "function" || typeof listen !== "function") {
-    throw new Error("the Tauri globals are not available: open the console in the MixLink app");
+    throw new Error("the Tauri globals are not available: open the console in the BandEar app");
   }
   return {
     invoke: (command, args) => invoke(command, args),
@@ -177,7 +177,7 @@ export function createEngineApi(bridge) {
       bridge.invoke("set_mirror", { address, clientId, leader }),
     /**
      * What went wrong or changed when the desk opened its session (a damaged part set aside, a
-     * session from a newer MixLink left alone, labels imported), or null.
+     * session from a newer BandEar left alone, labels imported), or null.
      */
     sessionNotice: () => bridge.invoke("session_notice"),
     /**
@@ -294,7 +294,7 @@ export function createEngineApi(bridge) {
     /**
      * Keeps `settings`, the whole `{ folder, format, includeLocal, armed }` (the folder null for
      * the default; see settingsRequest), and resolves to them as recordingSettings answers. A
-     * folder that is not a whole path, goes up with `..` or is in MixLink's settings folder, an
+     * folder that is not a whole path, goes up with `..` or is in BandEar's settings folder, an
      * unknown format or an input out of 1-255 rejects, and nothing changed.
      */
     setRecordingSettings: (settings) => bridge.invoke("set_recording_settings", { settings }),

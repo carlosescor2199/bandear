@@ -1,16 +1,16 @@
 [package]
-name = "mixlink-desktop"
+name = "bandear-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "Desktop mixing console for the MixLink server engine: every musician's mix, the phones and the audio input."
+description = "Desktop mixing console for the BandEar server engine: every musician's mix, the phones and the audio input."
 publish = false
 
 [lib]
-name = "mixlink_desktop"
+name = "bandear_desktop"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "mixlink-desktop"
+name = "bandear-desktop"
 path = "src/main.rs"
 
 [build-dependencies]

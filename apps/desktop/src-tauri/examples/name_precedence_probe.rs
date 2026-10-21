@@ -1,7 +1,7 @@
 //! Drives the command layer's name resolution against the real stored labels, without a webview.
 //!
 //! It reproduces the exact input of the name-precedence defect: the app's own
-//! `%APPDATA%\com.mixlink.desktop\musicians.json`, which maps `192.168.1.10:50000` to `Carlos`.
+//! `%APPDATA%\com.bandear.desktop\musicians.json`, which maps `192.168.1.10:50000` to `Carlos`.
 //! That file is only read, never written, and the run fails if its bytes change: it is copied
 //! into a scratch config directory, where opening the session imports it exactly as the app's
 //! first start after the session file arrived does, so the real config directory gains no
@@ -16,9 +16,9 @@
 
 use std::path::PathBuf;
 
-use mixlink_desktop::commands;
-use mixlink_desktop::dto::EngineStatusDto;
-use mixlink_desktop::session::{SessionStore, LEGACY_LABELS_FILE};
+use bandear_desktop::commands;
+use bandear_desktop::dto::EngineStatusDto;
+use bandear_desktop::session::{SessionStore, LEGACY_LABELS_FILE};
 use personal_monitoring::{CaptureFormat, EngineStatus, MusicianStatus};
 
 /// The address stored in the user's real label file, and the one the bug was reported at.
@@ -29,7 +29,7 @@ const CLIENT_NAME: &str = "Carlos Daniel";
 fn store_path() -> PathBuf {
     let appdata = std::env::var_os("APPDATA").expect("APPDATA should be set on Windows");
     PathBuf::from(appdata)
-        .join("com.mixlink.desktop")
+        .join("com.bandear.desktop")
         .join(LEGACY_LABELS_FILE)
 }
 
@@ -105,7 +105,7 @@ fn main() {
     println!("store bytes -> {}", raw.len());
     println!("store contents -> {raw}");
 
-    let scratch = std::env::temp_dir().join("mixlink-name-precedence-probe");
+    let scratch = std::env::temp_dir().join("bandear-name-precedence-probe");
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("the scratch config directory should be created");
     std::fs::copy(&path, scratch.join(LEGACY_LABELS_FILE))

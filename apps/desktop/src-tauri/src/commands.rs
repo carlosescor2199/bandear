@@ -2027,7 +2027,7 @@ fn session_audio(settings: AudioSettingsRequest) -> Result<SessionAudio, String>
 }
 
 /// What went wrong or changed when the desk opened its session (a damaged section set aside, a
-/// damaged file moved aside, a session from a newer MixLink left alone, labels imported), for the
+/// damaged file moved aside, a session from a newer BandEar left alone, labels imported), for the
 /// window to say; `None` when it simply loaded (see [SessionStore::notice]).
 pub fn session_notice(state: &DesktopState) -> Option<String> {
     state.session.notice()
@@ -2254,7 +2254,7 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 /// is applied live. Answers what was applied, saved and skipped ([SessionLoadedDto]).
 ///
 /// - Before anything changes, the saved groups and channel details are checked as the engine
-///   checks them, and a session file this build must not replace (one a newer MixLink wrote) is
+///   checks them, and a session file this build must not replace (one a newer BandEar wrote) is
 ///   refused: an error, and nothing changed. A section of the saved session that cannot be read is
 ///   left out (it loads empty) and named in the answer.
 /// - With an engine running, in this order: the groups and the channel details, as a start applies
@@ -2787,7 +2787,7 @@ mod tests {
     /// An empty scratch config directory for one test's session.
     fn session_directory(test: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-command-tests")
+            .join("bandear-command-tests")
             .join(test);
         let _ = std::fs::remove_dir_all(&directory);
         directory
@@ -2910,7 +2910,7 @@ mod tests {
     /// The saved session's `musicians` section in `test`'s scratch directory.
     fn saved_musicians(test: &str) -> serde_json::Value {
         let path = std::env::temp_dir()
-            .join("mixlink-command-tests")
+            .join("bandear-command-tests")
             .join(test)
             .join(crate::session::SESSION_FILE);
         let text = std::fs::read_to_string(path).expect("the session should be saved");
@@ -5837,7 +5837,7 @@ mod tests {
     /// The scratch directory of `test`, as it is (not emptied).
     fn session_directory_kept(test: &str) -> std::path::PathBuf {
         std::env::temp_dir()
-            .join("mixlink-command-tests")
+            .join("bandear-command-tests")
             .join(test)
     }
 

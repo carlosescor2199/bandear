@@ -38,7 +38,7 @@
 //!   label), `engineer` the engineer's limit and locks for them when they had any. Both are for
 //!   the engineer to read: the limit and locks live in the desk's session, which keeps them across
 //!   a crash, so a restore puts back the mixes only.
-//! - A file that is not a backup this build can read (damaged, or written by a newer MixLink) is
+//! - A file that is not a backup this build can read (damaged, or written by a newer BandEar) is
 //!   listed with its problem and cannot be restored; it is never changed, and it ages out like any
 //!   other.
 //! - A stamp is only ever read as exactly the form above, and the file it names must be directly
@@ -114,7 +114,7 @@ pub struct MixBackupSummary {
     pub musicians: usize,
     /// What the window calls each of them, in the order kept.
     pub names: Vec<String>,
-    /// Why it cannot be restored (it cannot be read, or a newer MixLink wrote it); null when it can.
+    /// Why it cannot be restored (it cannot be read, or a newer BandEar wrote it); null when it can.
     pub problem: Option<String>,
 }
 
@@ -220,7 +220,7 @@ impl BackupStore {
     }
 
     /// Reads the backup `stamp` for a restore: only a stamp of the right form naming a file
-    /// directly in the folder. One that cannot be read, or that a newer MixLink wrote, is an
+    /// directly in the folder. One that cannot be read, or that a newer BandEar wrote, is an
     /// error saying so.
     pub fn read(&self, stamp: &str) -> Result<MixBackup, String> {
         let _files = self.lock();
@@ -298,7 +298,7 @@ impl BackupStore {
             .map_err(|error| format!("it is damaged and cannot be read ({error})"))?;
         if backup.version > BACKUP_VERSION {
             return Err(format!(
-                "a newer MixLink wrote it (version {}; this one reads up to {BACKUP_VERSION})",
+                "a newer BandEar wrote it (version {}; this one reads up to {BACKUP_VERSION})",
                 backup.version
             ));
         }
@@ -346,7 +346,7 @@ pub(crate) mod tests {
     use std::time::UNIX_EPOCH;
 
     fn scratch(test: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join("mixlink-backup-tests").join(test);
+        let directory = std::env::temp_dir().join("bandear-backup-tests").join(test);
         let _ = fs::remove_dir_all(&directory);
         directory
     }

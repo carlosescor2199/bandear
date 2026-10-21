@@ -62,5 +62,5 @@ test("the processing editor's hash names the channel it opens on", () => {
 });
 
 test("the window title names the section", () => {
-  assert.equal(documentTitle(resolveRoute("#/network")), "Network and system · MixLink");
+  assert.equal(documentTitle(resolveRoute("#/network")), "Network and system · BandEar");
 });

@@ -314,6 +314,6 @@ test("a removal can only be confirmed after a pause, so a double click cannot re
 });
 
 test("the window is titled after the input device, as before", () => {
-  assert.equal(windowTitle(running), "MixLink Server — Demo interface");
-  assert.equal(windowTitle(initialState), "MixLink Server");
+  assert.equal(windowTitle(running), "BandEar Server — Demo interface");
+  assert.equal(windowTitle(initialState), "BandEar Server");
 });

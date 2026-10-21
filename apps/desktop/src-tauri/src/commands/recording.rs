@@ -8,7 +8,7 @@
 //! integer by default, or 32-bit float), whether the local mix is recorded too, and the armed
 //! inputs by their 1-based number. The settings can be changed at any time, engine or not, and a
 //! take that records keeps what it started with. The default folder is the user's Music folder +
-//! `MixLink\Recordings`; when the Music folder cannot be found the desk falls back to its own data
+//! `BandEar\Recordings`; when the Music folder cannot be found the desk falls back to its own data
 //! folder and the settings say so ([RecordingsFolder]). No recordings folder, the default included,
 //! is ever inside the app's own config folder. A folder is created when the first take is recorded
 //! in it.
@@ -71,19 +71,34 @@ pub struct RecordingsFolder {
     pub notice: Option<String>,
 }
 
-/// The default recordings folder: `music` (the user's Music folder) + `MixLink\Recordings`; when it
+/// The name of the folder the desk's takes go in by default, inside the user's Music folder.
+pub const PRODUCT_FOLDER: &str = "BandEar";
+
+/// The default recordings folder: `music` (the user's Music folder) + `BandEar\Recordings`; when it
 /// is not known, `fallback` (the app's own data folder) + `Recordings`, and when neither is, the
-/// system's temporary folder + `MixLink\Recordings`, each saying so. Like any recordings folder it
+/// system's temporary folder + `BandEar\Recordings`, each saying so. Like any recordings folder it
 /// is never inside `config`, the app's own config folder (the app's data folder is that folder on
 /// macOS): a place inside it gives way to the next, and when even the temporary folder is inside
-/// it, the folder is `MixLink Recordings` beside it. Never fails.
+/// it, the folder is `BandEar Recordings` beside it. Never fails.
 pub fn default_recordings_folder(
     music: Option<PathBuf>,
     fallback: Option<PathBuf>,
     config: &Path,
 ) -> RecordingsFolder {
+    default_recordings_folder_for(PRODUCT_FOLDER, music, fallback, config)
+}
+
+/// [default_recordings_folder] for a desk whose product folder is `product`: `BandEar` for this
+/// desk, `MixLink` for the one it was called before (see [crate::migration]), whose takes may still
+/// be in that folder.
+pub fn default_recordings_folder_for(
+    product: &str,
+    music: Option<PathBuf>,
+    fallback: Option<PathBuf>,
+    config: &Path,
+) -> RecordingsFolder {
     let outside = |folder: &PathBuf| !inside(folder, config);
-    let music_folder = music.map(|music| music.join("MixLink").join("Recordings"));
+    let music_folder = music.map(|music| music.join(product).join("Recordings"));
     if let Some(folder) = music_folder.clone().filter(outside) {
         return RecordingsFolder {
             folder,
@@ -94,15 +109,17 @@ pub fn default_recordings_folder(
     let folder = data_folder
         .clone()
         .filter(outside)
-        .or_else(|| Some(std::env::temp_dir().join("MixLink").join("Recordings")).filter(outside))
-        .unwrap_or_else(|| beside(config));
+        .or_else(|| Some(std::env::temp_dir().join(product).join("Recordings")).filter(outside))
+        .unwrap_or_else(|| beside(product, config));
     let mut why = if music_folder.is_some() {
-        "Your Music folder is inside MixLink's own settings folder".to_owned()
+        format!("Your Music folder is inside {product}'s own settings folder")
     } else {
         "Your Music folder could not be found".to_owned()
     };
     if data_folder.is_some_and(|data| !outside(&data)) {
-        why.push_str(" and MixLink's data folder is inside its settings folder");
+        why.push_str(&format!(
+            " and {product}'s data folder is inside its settings folder"
+        ));
     }
     RecordingsFolder {
         notice: Some(format!(
@@ -113,10 +130,13 @@ pub fn default_recordings_folder(
     }
 }
 
-/// `MixLink Recordings` beside the `config` folder, which is never inside it (but for a config
+/// `<product> Recordings` beside the `config` folder, which is never inside it (but for a config
 /// folder that is a whole drive, which has nothing beside it).
-fn beside(config: &Path) -> PathBuf {
-    config.parent().unwrap_or(config).join("MixLink Recordings")
+fn beside(product: &str, config: &Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or(config)
+        .join(format!("{product} Recordings"))
 }
 
 /// Where recording looks for its folders: the default recordings folder and the app's own config
@@ -423,7 +443,7 @@ fn kept_folder(folder: Option<&str>, places: Places<'_>) -> Result<Option<String
     // the default is.
     if inside(path, places.config) {
         return Err(format!(
-            "the recordings folder cannot be in MixLink's own settings folder ({}): `{text}`",
+            "the recordings folder cannot be in BandEar's own settings folder ({}): `{text}`",
             places.config.display()
         ));
     }
@@ -761,7 +781,7 @@ enum TakeEndFile {
 }
 
 /// The take in folder `take` whose `take.json` holds `bytes`; `None` when it cannot be read (or a
-/// newer MixLink wrote it). `recording` says it is the take being recorded now. A take that never
+/// newer BandEar wrote it). `recording` says it is the take being recorded now. A take that never
 /// ended is interrupted, and its frames are what its files hold.
 fn read_take(take: &Path, bytes: &[u8], recording: bool) -> Option<TakeListItemDto> {
     let file: TakeFile = serde_json::from_slice(bytes).ok()?;
@@ -897,7 +917,7 @@ mod tests {
     /// An empty scratch directory for one test.
     fn scratch(test: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-recording-tests")
+            .join("bandear-recording-tests")
             .join(test);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("scratch directory");
@@ -919,7 +939,7 @@ mod tests {
             let config = root.join("config");
             let session = SessionStore::open(&config);
             let default = RecordingsFolder {
-                folder: root.join("Music").join("MixLink").join("Recordings"),
+                folder: root.join("Music").join("BandEar").join("Recordings"),
                 notice: None,
             };
             Self {
@@ -1080,13 +1100,13 @@ mod tests {
     #[test]
     fn the_default_folder_is_in_the_music_folder_or_says_where_it_fell_back_to() {
         let music = PathBuf::from("C:\\Users\\Ana\\Music");
-        let data = PathBuf::from("C:\\Users\\Ana\\AppData\\Local\\MixLink");
-        let config = PathBuf::from("C:\\Users\\Ana\\AppData\\Roaming\\MixLink");
+        let data = PathBuf::from("C:\\Users\\Ana\\AppData\\Local\\BandEar");
+        let config = PathBuf::from("C:\\Users\\Ana\\AppData\\Roaming\\BandEar");
 
         assert_eq!(
             default_recordings_folder(Some(music.clone()), Some(data.clone()), &config),
             RecordingsFolder {
-                folder: music.join("MixLink").join("Recordings"),
+                folder: music.join("BandEar").join("Recordings"),
                 notice: None,
             }
         );
@@ -1101,7 +1121,7 @@ mod tests {
         let nowhere = default_recordings_folder(None, None, &config);
         assert!(nowhere
             .folder
-            .ends_with(Path::new("MixLink").join("Recordings")));
+            .ends_with(Path::new("BandEar").join("Recordings")));
         assert!(nowhere.folder.is_absolute());
         assert!(nowhere.notice.is_some());
     }
@@ -1112,8 +1132,8 @@ mod tests {
     /// config folder gives way to the next, and the notice says where takes go.
     #[test]
     fn the_default_folder_is_never_inside_the_config_folder() {
-        let config = PathBuf::from("C:\\Users\\Ana\\Library\\Application Support\\MixLink");
-        let temporary = std::env::temp_dir().join("MixLink").join("Recordings");
+        let config = PathBuf::from("C:\\Users\\Ana\\Library\\Application Support\\BandEar");
+        let temporary = std::env::temp_dir().join("BandEar").join("Recordings");
 
         let same = default_recordings_folder(None, Some(config.clone()), &config);
         assert_eq!(
@@ -1127,7 +1147,7 @@ mod tests {
             "{notice}"
         );
 
-        let data = PathBuf::from("C:\\Users\\Ana\\AppData\\Local\\MixLink");
+        let data = PathBuf::from("C:\\Users\\Ana\\AppData\\Local\\BandEar");
         let music_inside =
             default_recordings_folder(Some(config.join("Music")), Some(data.clone()), &config);
         assert_eq!(music_inside.folder, data.join("Recordings"));

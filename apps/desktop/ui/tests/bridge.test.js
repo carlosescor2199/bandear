@@ -71,9 +71,9 @@ test("the Tauri bridge titles the app's window", async () => {
     window: { getCurrentWindow: () => ({ setTitle: async (title) => titles.push(title) }) },
   };
 
-  await createTauriBridge(tauri).setTitle("MixLink Server — Volt 4");
+  await createTauriBridge(tauri).setTitle("BandEar Server — Volt 4");
 
-  assert.deepEqual(titles, ["MixLink Server — Volt 4"]);
+  assert.deepEqual(titles, ["BandEar Server — Volt 4"]);
 });
 
 test("without the Tauri globals the bridge says so", () => {

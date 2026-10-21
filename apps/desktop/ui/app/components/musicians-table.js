@@ -627,7 +627,7 @@ class MlMusiciansTable extends HTMLElement {
     setText(view.bufferDetail, buffer.supported ? (buffer.playing ?? "") : buffer.note);
     view.bufferDetail.title = buffer.supported
       ? "The cushion the phone reports it plays"
-      : "This phone's app does not take its playback buffer from the desk; update MixLink on it";
+      : "This phone's app does not take its playback buffer from the desk; update BandEar on it";
     setText(view.bufferSaid, said?.message ?? "");
     reflect(view.bufferSaid, "data-error", said ? !said.ok : false);
   }
@@ -665,7 +665,7 @@ class MlMusiciansTable extends HTMLElement {
       "must last that long to take both, and the phone plays that much later";
     setText(view.redundancyNote, on ? (cell.holdNote ?? "") : "");
     view.redundancyNote.title = cell.holdNote
-      ? "This phone's app cannot hold packets back for a delayed copy; update MixLink on it"
+      ? "This phone's app cannot hold packets back for a delayed copy; update BandEar on it"
       : "";
     setText(view.redundancyCost, cell.bandwidth);
     view.redundancyCost.title =

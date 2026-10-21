@@ -259,7 +259,7 @@ mod tests {
 
     fn test_directory(name: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-desktop-tests")
+            .join("bandear-desktop-tests")
             .join(format!("redundancy-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("test directory");

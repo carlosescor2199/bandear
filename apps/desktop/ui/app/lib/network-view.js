@@ -254,8 +254,8 @@ export function confirmReady(armedAt, now, delay = CONFIRM_DELAY_MS) {
 /** The app window's title: the old window's, after the input device in use, or "Demo source". */
 export function windowTitle(state) {
   if (isDemoRunning(state)) {
-    return "MixLink Server — Demo source";
+    return "BandEar Server — Demo source";
   }
   const device = state.engine.status?.deviceName;
-  return device ? `MixLink Server — ${device}` : "MixLink Server";
+  return device ? `BandEar Server — ${device}` : "BandEar Server";
 }

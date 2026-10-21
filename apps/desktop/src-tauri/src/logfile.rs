@@ -2,10 +2,10 @@
 //!
 //! A release build has no console (`windows_subsystem = "windows"`), so stderr is lost. At startup
 //! [install] hands the engine's log facade ([personal_monitoring::logging]) a sink that appends to
-//! `<app log dir>/mixlink.log`:
+//! `<app log dir>/bandear.log`:
 //!
 //! - **Rotation by size**: a line that would take the file past [MAX_FILE_BYTES] first moves it to
-//!   `mixlink.log.1` (`.1` to `.2` and so on), keeping [KEPT_FILES] old files; the oldest is
+//!   `bandear.log.1` (`.1` to `.2` and so on), keeping [KEPT_FILES] old files; the oldest is
 //!   dropped. A single line longer than the limit is still written whole, to a fresh file.
 //! - **Created lazily**: nothing is touched on disk until the first line.
 //! - **No line lost on exit**: each line is written to the file in one call as it comes, with no
@@ -32,10 +32,10 @@ use personal_monitoring::logging::{self, Level, LogSink};
 use serde::Serialize;
 
 /// The log file's name in the app's log directory.
-pub const LOG_FILE_NAME: &str = "mixlink.log";
+pub const LOG_FILE_NAME: &str = "bandear.log";
 /// The size a log file is rotated at.
 pub const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
-/// How many rotated files are kept beside the current one (`mixlink.log.1` to `.5`).
+/// How many rotated files are kept beside the current one (`bandear.log.1` to `.5`).
 pub const KEPT_FILES: usize = 5;
 
 /// The two file operations a rotation is made of, so a test can make one fail while the folder
@@ -288,7 +288,7 @@ impl Installed {
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
-/// Sends every later engine and desk line to `<directory>/mixlink.log`; answers the file's path.
+/// Sends every later engine and desk line to `<directory>/bandear.log`; answers the file's path.
 /// Called once at startup; a second call changes nothing.
 pub fn install(directory: PathBuf) -> PathBuf {
     let file = RotatingFile::new(directory.clone(), LOG_FILE_NAME, MAX_FILE_BYTES, KEPT_FILES);
@@ -317,7 +317,7 @@ mod tests {
 
     fn fresh(name: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-logfile-tests")
+            .join("bandear-logfile-tests")
             .join(name);
         let _ = fs::remove_dir_all(&directory);
         directory
@@ -346,7 +346,7 @@ mod tests {
         let second = RotatingFile::new(directory.clone(), LOG_FILE_NAME, 20, 2);
         assert!(second.write_line("abcdefghij\n"));
         assert_eq!(read(&second.path()), "abcdefghij\n");
-        assert_eq!(read(&directory.join("mixlink.log.1")), "0123456789\n");
+        assert_eq!(read(&directory.join("bandear.log.1")), "0123456789\n");
     }
 
     #[test]
@@ -359,19 +359,19 @@ mod tests {
         }
         assert_eq!(read(&file.path()), "line 010\nline 011\n");
         assert_eq!(
-            read(&directory.join("mixlink.log.1")),
+            read(&directory.join("bandear.log.1")),
             "line 008\nline 009\n"
         );
         assert_eq!(
-            read(&directory.join("mixlink.log.2")),
+            read(&directory.join("bandear.log.2")),
             "line 006\nline 007\n"
         );
         assert_eq!(
-            read(&directory.join("mixlink.log.3")),
+            read(&directory.join("bandear.log.3")),
             "line 004\nline 005\n"
         );
         assert!(
-            !directory.join("mixlink.log.4").exists(),
+            !directory.join("bandear.log.4").exists(),
             "only three old files are kept; the oldest lines are gone"
         );
         for kept in fs::read_dir(&directory).expect("log folder").flatten() {
@@ -387,7 +387,7 @@ mod tests {
         assert!(file.write_line("short\n"));
         assert!(file.write_line("a line far past the limit\n"));
         assert_eq!(read(&file.path()), "a line far past the limit\n");
-        assert_eq!(read(&directory.join("mixlink.log.1")), "short\n");
+        assert_eq!(read(&directory.join("bandear.log.1")), "short\n");
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
         assert_eq!(read(&file.path()), "line 004\n");
         assert_eq!(
-            read(&directory.join("mixlink.log.1")),
+            read(&directory.join("bandear.log.1")),
             "line 000\nline 001\nline 002\nline 003\n"
         );
         // Rotation is back to normal: the limit, not the backoff, decides the next one.

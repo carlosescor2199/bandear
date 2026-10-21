@@ -122,7 +122,7 @@ impl MixBackups {
         let mut backups = Self::manual(store);
         let inner = Arc::clone(&backups.inner);
         backups.thread = thread::Builder::new()
-            .name("mixlink-mix-backups".to_owned())
+            .name("bandear-mix-backups".to_owned())
             .spawn(move || inner.run())
             .map_err(|error| {
                 log_warn!(
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn take_due_hands_the_changes_to_one_backup_and_a_submit_clears_them_too() {
-        let store = BackupStore::new(std::env::temp_dir().join("mixlink-backup-due"), 10);
+        let store = BackupStore::new(std::env::temp_dir().join("bandear-backup-due"), 10);
         let backups = MixBackups::manual(store);
         let start = Instant::now();
         backups.note_change(start);
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn the_writer_writes_the_latest_backup_once_and_skips_an_unchanged_one() {
         let directory = std::env::temp_dir()
-            .join("mixlink-backup-tests")
+            .join("bandear-backup-tests")
             .join("writer");
         let _ = std::fs::remove_dir_all(&directory);
         let backups = MixBackups::manual(BackupStore::new(directory.clone(), 10));
@@ -559,7 +559,7 @@ mod tests {
     fn a_backup_whose_old_ones_cannot_be_dropped_still_counts_as_written() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let directory = std::env::temp_dir()
-            .join("mixlink-backup-tests")
+            .join("bandear-backup-tests")
             .join("writer-prune-fails");
         let _ = std::fs::remove_dir_all(&directory);
         let held = Arc::new(AtomicBool::new(true));
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn the_writer_thread_writes_on_its_own() {
         let directory = std::env::temp_dir()
-            .join("mixlink-backup-tests")
+            .join("bandear-backup-tests")
             .join("writer-thread");
         let _ = std::fs::remove_dir_all(&directory);
         let backups = MixBackups::start(BackupStore::new(directory, 10));

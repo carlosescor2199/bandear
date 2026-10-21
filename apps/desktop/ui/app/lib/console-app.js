@@ -70,6 +70,10 @@
 //   and sent through a per-mix coalescer (one request in flight per mix, the latest change always
 //   sent); answers `{ ok, message }` (formatLimiterSet) once that mix's changes settled, and reads
 //   the status after each answer.
+// - The shared effects (see effects.js): `editChannelSend(channel, effect, level)`,
+//   `editEffect(effect, settings)` and `editMixReturn(address, effect, level)`, each shown at once
+//   over what the desk keeps and sent through its own coalescer (per channel and effect, per effect,
+//   per mix and effect); each answers `{ ok, message }` once settled.
 // - Each input's channel processing (see processing.js): every channel's strip (read once
 //   connected and after a loaded session, `loadProcessing` again), `editProcessing(channel,
 //   settings)` through a per-channel coalescer (one request in flight per channel, the latest edit
@@ -146,6 +150,7 @@ import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
 import { clampLimiter, formatLimiterSet } from "./limiter.js";
+import { clampEffects, clampLevel, clampLevels, formatEffectSet, formatReturnSet } from "./effects.js";
 import { musicianKey } from "./link-health-view.js";
 import { formatBufferSet, nameForKey } from "./playback-buffer.js";
 import { formatProcessingSet, formatStripPresetsSet, stripUnitChannels } from "./processing.js";
@@ -1042,6 +1047,121 @@ export function createConsoleApp({
     return limiterSaid.get(address) ?? { ok: false, message: "The limiter was not set." };
   }
 
+  // The last answer to a send of each channel and effect, a change of each effect and a return of
+  // each mix and effect, in words.
+  const sendSaid = new Map();
+  const effectSaid = new Map();
+  const returnSaid = new Map();
+
+  // Sends the send `level` of `key` ("channel:effect") and applies the strips the desk answers;
+  // the send shown meanwhile is settled either way.
+  async function sendChannelSend(key, level) {
+    const [channel, effect] = [Number(key.split(":")[0]), key.split(":")[1]];
+    try {
+      const answer = await api.setChannelSend(channel, effect, level);
+      const said = formatProcessingSet(answer);
+      sendSaid.set(key, said);
+      if (said.ok) {
+        store.dispatch(actions.processingApplied(channel, null, answer));
+        await readStripsIfUnknown();
+      }
+    } catch (error) {
+      sendSaid.set(key, {
+        ok: false,
+        message: sentenceWithReason(`CH ${channel}'s ${effect} send was not changed`, message(error)),
+      });
+    } finally {
+      store.dispatch(actions.sendSettled(channel, effect, level));
+    }
+  }
+
+  const sendSender = createCoalescer(sendChannelSend);
+
+  // Changes the send of input `channel` (1-based) to `effect` ("reverb" or "delay") to `level`
+  // percent: shown at once, sent through a coalescer per channel and effect (the latest level
+  // wins), answered `{ ok, message }` once settled.
+  async function editChannelSend(channel, effect, level) {
+    const key = `${channel}:${effect}`;
+    const held = clampLevel(level);
+    store.dispatch(actions.sendEdit(channel, effect, held));
+    sendSender.push(key, held);
+    await sendSender.idle(key);
+    return sendSaid.get(key) ?? { ok: false, message: "The send was not changed." };
+  }
+
+  // Sends the effect change `sent` and keeps both effects as the desk answered them.
+  async function sendEffect(effect, sent) {
+    let answer;
+    try {
+      answer = await api.setEffect(effect, sent);
+    } catch (error) {
+      effectSaid.set(effect, {
+        ok: false,
+        message: sentenceWithReason(`The ${effect} was not set`, message(error)),
+      });
+      store.dispatch(actions.effectSettled(effect, sent));
+      return;
+    }
+    const said = formatEffectSet(answer);
+    effectSaid.set(effect, said);
+    store.dispatch(actions.effectSettled(effect, sent, said.ok ? clampEffects(answer.effects) : null));
+  }
+
+  const effectSender = createCoalescer(sendEffect);
+
+  // Changes the shared `effect`'s settings to `settings` (the whole effect): shown at once, sent
+  // through a coalescer per effect, answered `{ ok, message }` once settled.
+  async function editEffect(effect, settings) {
+    const sent = clampEffects({ [effect]: settings })[effect];
+    store.dispatch(actions.effectEdit(effect, sent));
+    effectSender.push(effect, sent);
+    await effectSender.idle(effect);
+    return effectSaid.get(effect) ?? { ok: false, message: "The effect was not set." };
+  }
+
+  // Sends the return `level` of `key` ("address|effect") and keeps the mix's returns as answered.
+  async function sendReturn(key, level) {
+    const cut = key.lastIndexOf("|");
+    const [address, effect] = [key.slice(0, cut), key.slice(cut + 1)];
+    const local = address === LOCAL_MIX;
+    const musician = local ? null : musicianByAddress(store.getState(), address);
+    const name = local ? "The local mix" : musician ? musicianLabel(musician) : address;
+    let answer;
+    try {
+      if (!local && !musician) {
+        throw new Error(`${name} is not here`);
+      }
+      answer = local
+        ? await api.setLocalFxReturn(effect, level)
+        : await api.setMusicianFxReturn(musicianKey(musician), effect, level);
+    } catch (error) {
+      const whose = local ? "The local mix's" : `${name}'s`;
+      returnSaid.set(key, {
+        ok: false,
+        message: sentenceWithReason(`${whose} ${effect} return was not set`, message(error)),
+      });
+      store.dispatch(actions.returnSettled(address, effect, level));
+      return;
+    }
+    const said = formatReturnSet(answer, name);
+    returnSaid.set(key, said);
+    store.dispatch(actions.returnSettled(address, effect, level, said.ok ? clampLevels(answer.returns) : null));
+  }
+
+  const returnSender = createCoalescer(sendReturn);
+
+  // Changes the return of `effect` in the mix `address` (a musician's address, or LOCAL_MIX) to
+  // `level` percent: shown at once, sent through a coalescer per mix and effect, answered
+  // `{ ok, message }` once settled.
+  async function editMixReturn(address, effect, level) {
+    const key = `${address}|${effect}`;
+    const held = clampLevel(level);
+    store.dispatch(actions.returnEdit(address, effect, held));
+    returnSender.push(key, held);
+    await returnSender.idle(key);
+    return returnSaid.get(key) ?? { ok: false, message: "The return was not set." };
+  }
+
   // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
   function sendWaiting() {
     for (const channel of Object.keys(store.getState().processingPending)) {
@@ -1628,6 +1748,9 @@ export function createConsoleApp({
      * and sent with the latest change winning; answers `{ ok, message }` (formatLimiterSet).
      */
     editMixLimiter,
+    editChannelSend,
+    editEffect,
+    editMixReturn,
     /** Reads every channel's strip again; resolves to null, or to the error of a failed read. */
     loadProcessing,
     /**

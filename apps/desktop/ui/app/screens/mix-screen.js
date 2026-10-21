@@ -15,6 +15,7 @@ import { mixToolCommands } from "../lib/mix-tools.js";
 import { musicianLabel } from "../lib/format.js";
 import { LOCAL_MIX, processingActive, selectedMusician } from "../lib/console-state.js";
 import { limiterChange, limiterReduction, masterLimiter } from "../lib/limiter.js";
+import { returnsView } from "../lib/effects.js";
 import {
   channelEdits,
   channelStrips,
@@ -214,7 +215,11 @@ export function mountMixScreen(main, app) {
       element.data = groups[position];
     });
     const master = masterStrip(state, address);
-    parts.master.data = master && { ...master, limiter: masterLimiter(state, address) };
+    parts.master.data = master && {
+      ...master,
+      limiter: masterLimiter(state, address),
+      returns: returnsView(state, address),
+    };
   }
 
   // Store changes can come many times a frame (a fader drag, a burst of events): draw once.
@@ -287,6 +292,18 @@ export function mountMixScreen(main, app) {
       return;
     }
     const outcome = await app.editMixLimiter(address, limiterChange(shown, event.detail.field, event.detail.value, { key: Boolean(event.detail.key) }));
+    if (!outcome.ok && !disposed) {
+      toolsOutcome = outcome;
+      renderTools(app.store.getState());
+    }
+  });
+  // A return slider's level, sent for the open mix; only a refusal is said.
+  screen.addEventListener("return-edit", async (event) => {
+    const address = app.store.getState().selected;
+    if (!address) {
+      return;
+    }
+    const outcome = await app.editMixReturn(address, event.detail.effect, event.detail.level);
     if (!outcome.ok && !disposed) {
       toolsOutcome = outcome;
       renderTools(app.store.getState());

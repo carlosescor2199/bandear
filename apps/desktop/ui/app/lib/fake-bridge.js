@@ -33,7 +33,9 @@ import {
   defaultStrip,
   eqResponseOf,
   isNeutralStrip,
+  isUntouchedStrip,
 } from "./processing.js";
+import { clampDelay, clampLevels, clampReverb, defaultEffects, delayTimeMs } from "./effects.js";
 import { clampLevel } from "./values.js";
 
 /**
@@ -337,6 +339,7 @@ function musicianRow(address, identity, link, mixChanges = {}) {
     redundancy: { on: false },
     duplicatesSent: 0,
     limiter: { enabled: false, ceilingDb: 0, releaseMs: 50 },
+    fxReturns: { reverb: 0, delay: 0 },
     recovered: 0,
     ...identity,
     bufferSupported: (identity.capabilities ?? []).includes("playback.buffer"),
@@ -514,6 +517,9 @@ export function sampleStatus() {
     load: { percent: 9.4, averagePercent: 8.2, peakPercent: 14.6, lateBlocks: 0 },
     // No limiter on the local mix, the default.
     localLimiter: { enabled: false, ceilingDb: 0, releaseMs: 50 },
+    // The shared effects at their defaults, and the local mix returning neither.
+    effects: defaultEffects(),
+    localFxReturns: { reverb: 0, delay: 0 },
   };
 }
 
@@ -603,6 +609,21 @@ function limited(levels, limiter, ceilingPercent) {
 // A number as the desktop writes a limiter setting: at most one decimal, no trailing zero.
 function trimmed(value) {
   return String(Math.round(value * 10) / 10);
+}
+
+// The desktop's answer to a return change for `musicianKey` (null for the local mix), as its words
+// for `whose` mix.
+function returnAnswer(musicianKey, effect, returns, whose) {
+  const level = returns[effect];
+  return {
+    musicianKey,
+    outcome: "set",
+    effect,
+    returns: clone(returns),
+    saved: true,
+    saveError: null,
+    message: level === 0 ? `${whose} mix returns no ${effect}.` : `${whose} mix returns the ${effect} at ${level}%.`,
+  };
 }
 
 // The desktop's answer to a limiter change for `musicianKey` (null for the local mix), `held` the
@@ -1084,6 +1105,11 @@ export function createFakeBridge({
   // Each musician's master limiter as the desk's session keeps it, by labelKey (the default, off, is
   // kept as nothing); the local mix's is in the local section (`keptLocal.limiter`).
   const limiterBook = new Map();
+  // Each musician's effect returns as the session keeps them, by labelKey (none returned is kept
+  // as nothing); the local mix's are in the local section (`keptLocal.fxReturns`). And the shared
+  // effects' settings as the session keeps them (null for the defaults).
+  const returnBook = new Map();
+  let keptEffects = null;
   const redundancySince = new Map();
   // The audio input as the desk's session keeps it, `{ host, device, bufferFrames, asioDriver }`,
   // or null before any was kept.
@@ -1307,6 +1333,12 @@ export function createFakeBridge({
       row.limiter = clone(key ? limiterBook.get(key) : defaultLimiter());
     }
     engine.localLimiter = clone(keptLocal?.limiter ?? defaultLimiter());
+    for (const row of engine.musicians) {
+      const key = keysOf(row).find((candidate) => returnBook.has(candidate));
+      row.fxReturns = clone(key ? returnBook.get(key) : { reverb: 0, delay: 0 });
+    }
+    engine.localFxReturns = clone(keptLocal?.fxReturns ?? { reverb: 0, delay: 0 });
+    engine.effects = clone(keptEffects ?? defaultEffects());
   }
 
   // Each row's redundancy as the engine reports it: on with its delay, or off; the copies sent since
@@ -1811,6 +1843,7 @@ export function createFakeBridge({
           mix: savedMixOf(engine.localMix),
           output: keptLocal?.output ?? null,
           ...(keptLocal?.limiter ? { limiter: keptLocal.limiter } : {}),
+          ...(keptLocal?.fxReturns ? { fxReturns: keptLocal.fxReturns } : {}),
         }
       : keptLocal;
     return clone({
@@ -1821,6 +1854,8 @@ export function createFakeBridge({
       buffers: [...bufferBook.entries()],
       redundancies: [...redundancyBook.entries()],
       limiters: [...limiterBook.entries()],
+      fxReturns: [...returnBook.entries()],
+      ...(keptEffects ? { effects: keptEffects } : {}),
       mirrors: [...mirrorBook.entries()],
       presets: keptPresets,
       audio: keptAudio,
@@ -2253,7 +2288,8 @@ export function createFakeBridge({
     const kept = clampStrip(settings);
     for (const target of targets) {
       for (const channel of stripChannels(target)) {
-        keptProcessing[channel - 1] = clone(kept);
+        // As the desktop does: the strip changes, the channel's sends stay.
+        keptProcessing[channel - 1] = { ...clone(kept), sends: clone(before[channel - 1].sends) };
       }
     }
     return keptProcessing
@@ -2286,7 +2322,7 @@ export function createFakeBridge({
     return Object.fromEntries(
       keptProcessing
         .map((settings, index) => [String(index + 1), settings])
-        .filter(([, settings]) => !isNeutralStrip(settings)),
+        .filter(([, settings]) => !isUntouchedStrip(settings)),
     );
   }
 
@@ -2937,6 +2973,12 @@ export function createFakeBridge({
       for (const [key, limiter] of session.limiters ?? []) {
         limiterBook.set(key, limiter);
       }
+      // And its effects and returns, the same way.
+      returnBook.clear();
+      for (const [key, levels] of session.fxReturns ?? []) {
+        returnBook.set(key, levels);
+      }
+      keptEffects = session.effects ?? null;
       keptPresets = session.presets ?? [];
       // As the desktop does: the loaded processing replaces every strip, a channel it keeps none
       // for going back to no processing; the desk's own strip presets stay.
@@ -3065,7 +3107,8 @@ export function createFakeBridge({
           `"${factory.name}" is a built-in preset; save under another name. Nothing was saved.`,
         );
       }
-      const preset = { name: trimmed, settings: clampStrip(settings) };
+      // A preset is a strip: the sends belong to the channel it is applied to.
+      const preset = { name: trimmed, settings: { ...clampStrip(settings), sends: { reverb: 0, delay: 0 } } };
       const at = keptStripPresets.findIndex((kept) => samePresetName(kept.name, trimmed));
       if (at >= 0) {
         keptStripPresets[at] = preset;
@@ -3258,6 +3301,91 @@ export function createFakeBridge({
       keepLocal({ limiter: sameLimiter(held, defaultLimiter()) ? null : held });
       engine.localLimiter = clone(held);
       return limiterAnswer(null, held, "The local mix's");
+    },
+    set_channel_send({ channel, effect, level = 0 } = {}) {
+      // As the desktop answers: a channel of the mixer, then a running engine; a pair shares it.
+      const outside = outsideMixer(channel);
+      if (outside) {
+        return refusedProcessing("invalid", `${outside}; nothing changed.`);
+      }
+      if (effect !== "reverb" && effect !== "delay") {
+        throw `unknown variant "${effect}", expected "reverb" or "delay"`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const before = clone(keptProcessing);
+      const held = clampLevels({ [effect]: level })[effect];
+      for (const side of stripChannels(channel)) {
+        keptProcessing[side - 1] = {
+          ...keptProcessing[side - 1],
+          sends: { ...keptProcessing[side - 1].sends, [effect]: held },
+        };
+      }
+      const channels = keptProcessing
+        .map((_, index) => index + 1)
+        .filter(
+          (number) =>
+            number === channel ||
+            JSON.stringify(before[number - 1]) !== JSON.stringify(keptProcessing[number - 1]),
+        )
+        .map(stripAt);
+      const names = channelList(channels.map((strip) => strip.channel));
+      const verb = channels.length === 1 ? "is" : "are";
+      return { outcome: "set", channels, message: `${names} ${verb} sending ${held}% to the ${effect}.` };
+    },
+    set_effect({ effect, settings = {} } = {}) {
+      if (effect !== "reverb" && effect !== "delay") {
+        throw `unknown variant "${effect}", expected "reverb" or "delay"`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const effects = clone(keptEffects ?? defaultEffects());
+      effects[effect] = effect === "reverb" ? clampReverb(settings) : clampDelay(settings);
+      keptEffects = effects;
+      engine.effects = clone(effects);
+      const { reverb, delay } = effects;
+      const message =
+        effect === "reverb"
+          ? `The reverb is set: size ${Math.round(reverb.sizePercent)}%, damping ${Math.round(reverb.dampingPercent)}%, pre-delay ${Math.round(reverb.preDelayMs)} ms, width ${Math.round(reverb.widthPercent)}%.`
+          : `The delay is set: ${Math.round(delayTimeMs(delay))} ms, feedback ${Math.round(delay.feedbackPercent)}%${delay.pingPong ? ", ping-pong" : ""}.`;
+      return { outcome: "set", effect, effects: clone(effects), saved: true, saveError: null, message };
+    },
+    set_musician_fx_return({ musicianKey, effect, level = 0 } = {}) {
+      const key = String(musicianKey ?? "");
+      if (!key.startsWith("client:") && !key.startsWith("address:")) {
+        throw `"${key}" names no phone or address`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const row = rowForKey(key);
+      if (!row) {
+        const named = key.startsWith("client:") ? `the phone ${key.slice(7)}` : key.slice(8);
+        throw `${named} is not here`;
+      }
+      const returns = clampLevels({ ...(row.fxReturns ?? {}), [effect]: level });
+      const keptFor = labelKey(row);
+      if (row.clientId) {
+        returnBook.delete(`address:${row.address}`);
+      }
+      if (returns.reverb === 0 && returns.delay === 0) {
+        returnBook.delete(keptFor);
+      } else {
+        returnBook.set(keptFor, returns);
+      }
+      row.fxReturns = clone(returns);
+      return returnAnswer(key, effect, returns, "This musician's");
+    },
+    set_local_fx_return({ effect, level = 0 } = {}) {
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const returns = clampLevels({ ...(engine.localFxReturns ?? {}), [effect]: level });
+      keepLocal({ fxReturns: returns.reverb === 0 && returns.delay === 0 ? null : returns });
+      engine.localFxReturns = clone(returns);
+      return returnAnswer(null, effect, returns, "The local");
     },
     set_musician_buffer({ musicianKey, mode, ms = null } = {}) {
       // As the desktop answers: a key of the desk's forms, then the buffer asked for, then a

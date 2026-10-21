@@ -13,6 +13,7 @@ export const ROUTES = Object.freeze([
     title: "Channels and groups",
   }),
   Object.freeze({ id: "processing", hash: "#/processing", label: "Processing", title: "Processing" }),
+  Object.freeze({ id: "effects", hash: "#/effects", label: "Effects", title: "Effects" }),
   Object.freeze({
     id: "network",
     hash: "#/network",

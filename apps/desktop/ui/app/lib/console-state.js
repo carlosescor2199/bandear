@@ -69,6 +69,9 @@
 //   limiterPending { address: settings }: a master limiter change still on its way to the desk (a
 //              musician's address, or LOCAL_MIX), which the master strip shows over the status's
 //              (mixLimiter, limiter.js) until its answer settles it.
+//   sendsPending { channel: { reverb?, delay? } }, effectsPending { reverb?, delay? } and
+//              returnsPending { address: { reverb?, delay? } }: sends, effect settings and returns on
+//              their way to the desk, shown over the kept ones (effects.js) until answered.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -158,6 +161,9 @@ export const initialState = Object.freeze({
   stripPresets: null,
   eqCurves: NO_EDITS,
   limiterPending: NO_EDITS,
+  sendsPending: NO_EDITS,
+  effectsPending: NO_EDITS,
+  returnsPending: NO_EDITS,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -286,6 +292,30 @@ export const actions = Object.freeze({
    * (the status could not be read after the set).
    */
   limiterSettled: (address, sent, kept = null) => ({ type: "limiter-settled", address, sent, kept }),
+  /** A send of input `channel` (1-based) to `effect` on its way to the desk at `level`. */
+  sendEdit: (channel, effect, level) => ({ type: "send-edit", channel, effect, level }),
+  /** The answer (or failure) of the send `level` of `channel` to `effect`: a later one stays. */
+  sendSettled: (channel, effect, level) => ({ type: "send-settled", channel, effect, level }),
+  /** An effect's settings on their way to the desk. */
+  effectEdit: (effect, settings) => ({ type: "effect-edit", effect, settings }),
+  /**
+   * The answer (or failure) of the effect change `sent`: a later one stays; `effects`, when given,
+   * are both effects as the desk answered them, kept until the next status.
+   */
+  effectSettled: (effect, sent, effects = null) => ({ type: "effect-settled", effect, sent, effects }),
+  /** A return of `effect` in the mix `address` on its way to the desk at `level`. */
+  returnEdit: (address, effect, level) => ({ type: "return-edit", address, effect, level }),
+  /**
+   * The answer (or failure) of the return `level`: a later one stays; `returns`, when given, are the
+   * mix's returns as the desk answered them, kept until the next status.
+   */
+  returnSettled: (address, effect, level, returns = null) => ({
+    type: "return-settled",
+    address,
+    effect,
+    level,
+    returns,
+  }),
   /**
    * The desk answered a processing change (an edit of `channel` that carried `sent`, or a reset,
    * copy or preset with `sent` null) with `answer`, `{ outcome, channels, message }`: every channel
@@ -648,6 +678,9 @@ function sessionLoaded(state, outcome) {
     processingPending: NO_EDITS,
     processingError: null,
     limiterPending: NO_EDITS,
+    sendsPending: NO_EDITS,
+    effectsPending: NO_EDITS,
+    returnsPending: NO_EDITS,
     presets: outcome.presets ?? next.presets,
     audio: outcome.audioLoaded ? restoredAudio(outcome.audio) : next.audio,
   };
@@ -661,6 +694,43 @@ function settleStrip(pending, channel, sent) {
   }
   const { [channel]: _settled, ...rest } = pending;
   return Object.keys(rest).length === 0 ? NO_EDITS : rest;
+}
+
+// `pending` without `key`'s `effect` once it is `level` (a later level stays).
+function settleLevel(pending, key, effect, level) {
+  const waiting = pending[key];
+  if (!waiting || waiting[effect] !== level) {
+    return pending;
+  }
+  const { [effect]: _settled, ...left } = waiting;
+  const { [key]: _gone, ...rest } = pending;
+  const next = Object.keys(left).length === 0 ? rest : { ...rest, [key]: left };
+  return Object.keys(next).length === 0 ? NO_EDITS : next;
+}
+
+// Both effects as the desk answered them, kept in the status until the next one.
+function effectsKept(state, effects) {
+  return effects && state.engine.status
+    ? { ...state, engine: { ...state.engine, status: { ...state.engine.status, effects } } }
+    : state;
+}
+
+// The returns of the mix `address` as the desk answered them, kept until the next status.
+function returnsKept(state, address, returns) {
+  if (!returns) {
+    return state;
+  }
+  if (address === LOCAL_MIX) {
+    return state.engine.status
+      ? { ...state, engine: { ...state.engine, status: { ...state.engine.status, localFxReturns: returns } } }
+      : state;
+  }
+  return {
+    ...state,
+    musicians: state.musicians.map((musician) =>
+      musician.address === address ? { ...musician, fxReturns: returns } : musician,
+    ),
+  };
 }
 
 // The limiter `kept` as the mix `address`'s own (the local mix's in the status), when given.
@@ -767,6 +837,36 @@ export function consoleReducer(state, action) {
       return {
         ...state,
         limiterPending: { ...state.limiterPending, [action.address]: action.settings },
+      };
+    case "send-edit":
+      return {
+        ...state,
+        sendsPending: {
+          ...state.sendsPending,
+          [action.channel]: { ...(state.sendsPending[action.channel] ?? {}), [action.effect]: action.level },
+        },
+      };
+    case "send-settled":
+      return { ...state, sendsPending: settleLevel(state.sendsPending, action.channel, action.effect, action.level) };
+    case "effect-edit":
+      return { ...state, effectsPending: { ...state.effectsPending, [action.effect]: action.settings } };
+    case "effect-settled":
+      return {
+        ...effectsKept(state, action.effects),
+        effectsPending: settleStrip(state.effectsPending, action.effect, action.sent),
+      };
+    case "return-edit":
+      return {
+        ...state,
+        returnsPending: {
+          ...state.returnsPending,
+          [action.address]: { ...(state.returnsPending[action.address] ?? {}), [action.effect]: action.level },
+        },
+      };
+    case "return-settled":
+      return {
+        ...returnsKept(state, action.address, action.returns),
+        returnsPending: settleLevel(state.returnsPending, action.address, action.effect, action.level),
       };
     case "limiter-settled":
       return {

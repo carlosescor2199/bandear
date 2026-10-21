@@ -1,0 +1,49 @@
+/* The Effects screen: the reverb and the delay side by side, their sliders as the processing
+   editor's (processing-screen.css). */
+
+.effects-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ml-space-3);
+  padding: var(--ml-space-4);
+}
+
+.effects-head p,
+.effects-note,
+.effects-repeats {
+  color: var(--ml-text-muted);
+  font-size: var(--ml-text-sm);
+}
+
+.effects-head a {
+  color: var(--ml-accent);
+}
+
+.effects-outcome[data-ok="false"] {
+  color: var(--ml-danger, #ff6b6b);
+}
+
+.effects-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--ml-space-3);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.effects-cards:disabled .processing-card {
+  opacity: 0.7;
+}
+
+.effects-tempo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ml-space-2);
+}
+
+.effects-tempo input {
+  width: 6em;
+}

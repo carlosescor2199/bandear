@@ -14,6 +14,7 @@ import "../components/eq-graph.js";
 import "../components/meter.js";
 import "../components/reduction-meter.js";
 import { processingEditor } from "../lib/processing-editor.js";
+import { channelSends, formatLevel } from "../lib/effects.js";
 import {
   BAND_FIELDS,
   BAND_NAMES,
@@ -134,6 +135,23 @@ const LAYOUT = `
         </figure>
       </section>
     </fieldset>
+    <section class="processing-card processing-card--sends" aria-labelledby="processing-sends-title" data-sends>
+      <div class="processing-card-head">
+        <h2 id="processing-sends-title">Effect sends</h2>
+        <p>To the shared reverb and delay, after the strip and before every mix's fader. Each mix returns them on its master strip.</p>
+        <a class="processing-effects-link" href="#/effects" data-effects-link>Effects…</a>
+      </div>
+      <div class="processing-field">
+        <label for="processing-send-reverb">Reverb</label>
+        <input id="processing-send-reverb" type="range" min="0" max="100" step="1" data-send="reverb" />
+        <output for="processing-send-reverb" data-send-value="reverb"></output>
+      </div>
+      <div class="processing-field">
+        <label for="processing-send-delay">Delay</label>
+        <input id="processing-send-delay" type="range" min="0" max="100" step="1" data-send="delay" />
+        <output for="processing-send-delay" data-send-value="delay"></output>
+      </div>
+    </section>
   </div>
 `;
 
@@ -206,6 +224,11 @@ export function mountProcessingScreen(main, app) {
     compressorReduction: $("[data-compressor-reduction]"),
     transfer: $("[data-transfer]"),
     transferCurve: $("[data-transfer-curve]"),
+    sends: [...screen.querySelectorAll("[data-send]")].map((input) => ({
+      input,
+      effect: input.dataset.send,
+      output: screen.querySelector(`[data-send-value="${input.dataset.send}"]`),
+    })),
   };
 
   // Draws at most once a frame, and never once the screen was left: an answer that settles after
@@ -258,6 +281,9 @@ export function mountProcessingScreen(main, app) {
   }
 
   let view = commands.view();
+  // The send slider under the pointer, if any, and the last refused send.
+  let draggingSend = null;
+  let sendOutcome = null;
 
   function readPath(settings, path) {
     return path.split(".").reduce((part, key) => part?.[key], settings);
@@ -302,7 +328,11 @@ export function mountProcessingScreen(main, app) {
       return;
     }
     view = commands.view();
-    const failure = view.outcome && !view.outcome.ok ? view.outcome.message : view.error ?? "";
+    const failure = sendOutcome
+      ? sendOutcome.message
+      : view.outcome && !view.outcome.ok
+        ? view.outcome.message
+        : view.error ?? "";
     parts.outcome.textContent = view.outcome?.ok ? view.outcome.message : "";
     parts.failure.textContent = failure;
 
@@ -388,6 +418,19 @@ export function mountProcessingScreen(main, app) {
         compressor.ratio,
       )}, knee ${formatDb(compressor.kneeDb)}, makeup ${formatDb(compressor.makeupDb)}`,
     );
+    // The sends of the open strip (its first side's: a pair shares them), the change on its way first.
+    const sends = channelSends(app.store.getState(), view.channel);
+    for (const { input, effect, output } of parts.sends) {
+      if (draggingSend !== input && input.value !== String(sends[effect])) {
+        input.value = String(sends[effect]);
+      }
+      const text = formatLevel(sends[effect]);
+      if (output.textContent !== text) {
+        output.textContent = text;
+      }
+      input.setAttribute("aria-label", `${view.choice?.label ?? `CH ${view.channel}`} ${effect} send`);
+      input.setAttribute("aria-valuetext", text);
+    }
     reflectLevels();
   }
 
@@ -435,6 +478,24 @@ export function mountProcessingScreen(main, app) {
       edited(toggle.input.dataset.path, toggle.input.checked);
     }
   });
+  // A send moves as it is dragged; the one under the pointer is not redrawn under it.
+  for (const { input, effect } of parts.sends) {
+    input.addEventListener("pointerdown", () => {
+      draggingSend = input;
+    });
+    const release = () => {
+      draggingSend = draggingSend === input ? null : draggingSend;
+      scheduleRender();
+    };
+    input.addEventListener("pointerup", release);
+    input.addEventListener("change", release);
+    input.addEventListener("input", () => {
+      app.editChannelSend(view.channel, effect, Number(input.value)).then((outcome) => {
+        sendOutcome = outcome.ok ? null : outcome;
+        scheduleRender();
+      });
+    });
+  }
   parts.graph.addEventListener("eq-drag", ({ detail }) =>
     editedEq(dragHandle(currentEq(), detail.target, detail.x, detail.y, detail.width, detail.height)),
   );

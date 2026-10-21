@@ -486,8 +486,111 @@ test.
   - Counts: UI `node --test apps/desktop/ui/tests` 604 passed (592 before this commit);
     `cargo test -p mixlink-desktop` 333 passed; `cargo test -p personal-monitoring` 617 passed
     (`CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one at a time, once at the end). Commit: this commit.
-- [ ] T8 (effects): reverb and delay buses, per-channel sends, per-mix returns, editor. Route:
-  delegated writer.
+- [x] T7-fix (review-186d441c6b486688's and review-8f20640b741f6075's findings: three WARNINGs, one
+  SUGGESTION). Route: delegated writer (with T8). Commits b6bdff7 `test(desktop): prove the copy
+  holds the engine lock` (+101/-86), 36f2173 `fix(desktop): hand every engine the limiters the
+  session keeps` (+176/-47) and ff50994 `fix(desktop-ui): nudge the limiter only on keys and keep a
+  set that read back badly` (+118/-24).
+  - The copy race test parks the copy between its read and its write (a `#[cfg(test)]` hold on the
+    copying thread, `between_read_and_write`), sends a change to the source and checks that the
+    engine lock is still held (`try_lock` is `WouldBlock`) and the change does not land within
+    50 ms; released, the copy writes the strip it read and the change lands after it (writes CH 5,
+    CH 6, then CH 1). RED by mutation: with the copy reading and writing under two holds of the
+    lock the test failed ("the change landed while the copy was between its read and its write"),
+    then passed with the single hold restored.
+  - Limiter keys: `limiterChange(settings, field, value, { key })` moves one unit past a rounding
+    only for a key step; `<ml-master-strip>` marks an `input` that followed an arrow, Page or
+    Home/End key (`limiter-edit { field, value, key }`). RED: a slow drag of 51 positions flipped
+    between -12 and -11.5 dBFS ("flipped back at step 2"), then passed.
+  - `sendLimiter` reads the status apart from the command: a set the desk answered is said as set,
+    and when the status read after it fails the strip keeps the answered limiter
+    (`limiterSettled(address, sent, kept)` keeps it on the row or `localLimiter`) instead of going
+    back to the stale status. RED: the strip showed the old status's limiter, then passed. (The
+    status read never threw, so the reported refusal itself could not happen; the stale strip
+    could.)
+  - One rule for the local limiter (`limiter::hand_kept_limiters`, used by a start and a load): the
+    engine takes the musicians' limiters whole and the local mix the one the session keeps then. A
+    session saved without a local section keeps the desk's own local section, limiter included, so
+    the engine and the session always agree (before, the engine kept whatever it had). Tests: a
+    load with a local section (its limiter, or off when it keeps none) and without one (the
+    desk's), and what a start hands a new engine. RED by mutation (the old rule): the new load test
+    and the load-order test failed, then passed; the start test was written with the helper.
+- [x] T8 (effects): reverb and delay buses, per-channel sends, per-mix returns, editor. Route:
+  delegated writer (trigger: two DSP modules, a new engine module and the stage, mixer, targets and
+  engine; the desk's session, commands and DTOs; the console's lib, store, app, fake bridge, two
+  screens and the master strip). Commits 5584583 `feat(engine): reverb and delay` (+1,185/-1),
+  c99a50c `feat(engine): effect buses with sends and returns` (+1,527/-42), 9016db4
+  `feat(desktop): keep sends, effects and returns` (+1,297/-18) and this commit
+  `feat(desktop-ui): effect sends, the effects panel and returns`.
+  - Reverb (`dsp/reverb.rs`, clean-room from the public Schroeder-Moorer/Freeverb description): a
+    pre-delay line, eight damped feedback combs and four series all-passes a side (the published
+    44.1 kHz lengths scaled to 48 kHz, the right side spread by 23 samples). `sizePercent` 0-100
+    (comb feedback 0.70-0.98, 50 by default), `dampingPercent` 0-100 (40), `preDelayMs` 0-200 (10),
+    `widthPercent` 0-100 (100). About 37,000 floats (150 KB).
+  - Delay (`dsp/delay.rs`): two lines of 96,001 frames (2 s, 750 KB); `timeMs` 1-2,000 (375), or
+    `tempoBpm` 30-300 (0 for none) with `note` (half, quarter, dottedEighth, quarterTriplet, eighth,
+    eighthTriplet, sixteenth), `feedbackPercent` 0-90 (35), `highCutHz` 1-20 kHz on the repeats
+    (6,000), `pingPong` (input to the left, each side feeding the other).
+  - Both: allocated once at full size in `new` (off the engine thread, when the stage is made);
+    feedback, damping, width and the high cut glide over 10 ms, a new pre-delay or delay time
+    crossfades over 20 ms; values under 1e-10 (-200 dBFS) are written as zero, so a dead tail is
+    exact silence and the effect goes idle once nothing else was written for longer than its lines.
+  - Buses (`effects.rs`): each input's sends (`StripSettings.sends { reverb, delay }`, 0-100%) are
+    taken after its strip and before every fader, a pair sharing them; the stage sums them into each
+    effect's mono bus once per block (a changed send glides across the block) and runs each effect
+    once (`ProcessingStage::run` gives the block and its `Wet`). Each mix (every musician's, the
+    local output and the recorder's local mix) adds each effect at its return (0-100%, on its
+    `MixState`, kept per musician like the limiter) times its master volume (nothing under the
+    master mute), after the sum and before the limiter and clamp; a changed return glides. An effect
+    with no send and an idle tail does not run (no `Wet`), and a mix that returns nothing is the
+    ramped mix bit for bit: the goldens are untouched. No added latency: the effects are wet
+    returns. `engine_load --fx` added (debug only, not run).
+  - Engine API: `set_channel_send(channel, effect, level) -> StripSettings`, `set_reverb`,
+    `set_delay`, `replace_effects`, `effects`, `set_musician_fx_return(key, effect, level) ->
+    FxReturnsSetting`, `musician_fx_returns`, `replace_musician_fx_returns`, `set_local_fx_return`,
+    `replace_local_fx_returns`, `local_fx_returns`; status `MusicianStatus.fx_returns`,
+    `EngineStatus.local_fx_returns` and `.effects`. Exported `Effect`, `EffectLevels`,
+    `EffectSettings`, `ReverbSettings`, `DelaySettings`, `DelayNote`.
+  - Desk: sends persist with the strip (a strip that only sends is kept: `is_untouched`), the
+    effects in a new `effects` section, the returns as `fxReturns` on each musician's entry and in
+    the local section; named sessions carry them; a start and a load hand them over
+    (`effects::hand_kept_effects`, the local returns by the same rule as the limiter). Commands
+    `set_channel_send` (answers as a strip change), `set_effect { effect, settings }` (`EffectSetDto
+    { outcome: set | invalid, effect, effects, saved, saveError, message }`),
+    `set_musician_fx_return` and `set_local_fx_return` (`FxReturnSetDto { musicianKey, outcome,
+    effect, returns, saved, saveError, message }`). A strip change, reset, copy and preset keep each
+    target's sends; a preset keeps none. DTOs: `MusicianDto.fxReturns`,
+    `EngineStatusDto.localFxReturns` and `.effects`.
+  - Console: `lib/effects.js` (ranges, clamps, the delay's time at a tempo, the tempo field, views
+    and words); store slices `sendsPending`, `effectsPending`, `returnsPending`; actions
+    `editChannelSend`, `editEffect`, `editMixReturn` (a coalescer each); bridge `setChannelSend`,
+    `setEffect`, `setMusicianFxReturn`, `setLocalFxReturn`; the fake bridge mirrors them and the
+    session. Effect sends (Reverb, Delay) in the processing editor with an "Effects…" link; an
+    Effects screen (`#/effects`, "Effects" in the sidebar after Processing) with the reverb's four
+    sliders and the delay's time, tempo field, note, feedback, high cut and ping-pong; Reverb and
+    Delay return sliders on every master strip (musician tabs and Local mix).
+  - RED: the 14 reverb and delay tests against stubs (no output, `apply` ignored, no tempo): 8
+    failed; the reverb's click test, the delay's silence test (since tightened to check it repeated
+    first) and the JSON and allocation tests passed. Engine layer, against mutations (no return
+    added, no send command, `set_send` ignored, returns not stored, the replace inverted): the five
+    new tests (`a_mix_returns_…`, `a_send_runs_its_effect_…`, `a_pair_shares_its_sends`,
+    `effect_returns_are_kept_…`, `sends_effects_and_returns_reach_…`) failed, then passed; the six
+    `effects::tests` were written with the stage. Desk, against mutations (no handing, no saving,
+    sends not kept, the old filter, presets keeping sends): all six new tests failed, then passed.
+    UI: `effects.test.js` (9) failed to import against the old modules, then 8 of 9 failed against
+    a stub `effects.js` without the fake's and console's commands, then passed.
+  - No allocation: `running_the_effects_never_allocates_…`, the effects' own tests and
+    `the_engine_thread_never_allocates_with_every_strip_working_and_settings_changing` (now with
+    every input sending and sends, reverb and delay changing between blocks) count 0 and 0.
+  - Browser check (`desktop-ui`, `?fake`, pane hidden: renders forced by switching the hash): CH 5
+    Lead vox reverb send 35%; from "Effects…" the Effects screen, reverb size 80% ("The reverb is
+    set: size 80%, …"), delay tempo 120 bpm on a dotted 1/8 ("Repeats every 375 ms (Dotted 1/8 at
+    120 bpm)", the time slider disabled); Lead vocal's reverb return 60% and the Local mix's delay
+    return 45%, each kept on its tab; the limiter ceiling dragged slowly over 60 positions ended on
+    −1.5 dBFS, the value at its release. No console errors.
+  - Counts: `cargo test -p personal-monitoring` 643 passed (617 before); `cargo test -p
+    mixlink-desktop` 341 passed (333); `cargo check -p mixlink-desktop --all-targets` clean; UI
+    `node --test apps/desktop/ui/tests` 615 passed (604). Commit: this commit.
 - [ ] T9 (close): PRD update, docs, latency check, live test with the S23. Route: inline or writer.
 
 ## Delivery
@@ -540,8 +643,13 @@ per reviewed slice, only with the user's approval.
   review-93fc890ef1905355 (21b9f98..0069f51, T6's editor): approved and acknowledged; their findings
   fixed in T6-fix (3a044b2, c7b03e2). Next review base: 0069f51.
 - T6-fix and T7 done (3a044b2, c7b03e2, 992e418, aa58567 and the master strip commit).
+- Reviews review-186d441c6b486688 (0069f51..992e418, T6-fix and T7's engine) and
+  review-8f20640b741f6075 (992e418..62f6926, T7's desk and master strip): approved and
+  acknowledged; their findings fixed in T7-fix (b6bdff7, 36f2173, ff50994). Next review base:
+  62f6926.
+- T7-fix and T8 done (b6bdff7, 36f2173, ff50994, 5584583, c99a50c, 9016db4 and the console commit).
 
 ## Next step
 
-T8 (effects: reverb and delay buses, per-channel sends, per-mix returns, editor). Review of
-0069f51..T7 pending.
+T9 (close: PRD update, docs, latency check, live test with the S23). Review of 62f6926..T8
+pending.

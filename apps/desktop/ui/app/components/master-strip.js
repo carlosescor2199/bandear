@@ -9,6 +9,8 @@
 //   limit (both null, and no note): the strip then shows the level and Mute alone.
 //   `limiter`, from masterLimiter (limiter.js), or absent to hide the limiter: { enabled, ceiling,
 //   release, state, note, ceilingPosition, releasePosition }.
+//   `returns`, from returnsView (effects.js), or absent to hide them: { rows: [{ effect, label,
+//   level, text }] }: the mix's return of the shared reverb and delay.
 // Method: `setLevels(left, right)`, the output peaks from the `meters` event.
 //   `setLimiterReduction(db)`, the limiter's gain reduction from the `meters` event (0 while off).
 // Event: `mix-edit` { field, index: null, value } (bubbling, composed) for the level
@@ -17,6 +19,7 @@
 //   drag sends its last value only.
 //   `limiter-edit` { field, value } (bubbling, composed): "enabled" with true or false, or
 //   "ceilingDb" / "releaseMs" with the slider's position (0-1,000; limiterChange turns it into the
+//   `return-edit` { effect, level } (bubbling, composed): a return slider's level (0-100) as it moves.
 //   setting) as it moves, with `key` true when a key moved the slider (an arrow, Page Up/Down, Home
 //   or End), false for the pointer.
 
@@ -122,6 +125,7 @@ class MlMasterStrip extends HTMLElement {
   #data = null;
   #parts;
   #limiter;
+  #returns;
   // The limiter slider under the pointer, if any.
   #dragging = null;
   // The limiter slider a key is moving, until its `input` event.
@@ -172,6 +176,19 @@ class MlMasterStrip extends HTMLElement {
           <ml-reduction-meter label="Limiter gain reduction" scale="${LIMITER_REDUCTION_SCALE_DB}"></ml-reduction-meter>
           <p class="note" id="limiter-note" data-limiter-note></p>
         </div>
+        <div class="limiter" role="group" aria-label="Effect returns" data-returns hidden>
+          <div class="limiter-head"><span>Effect returns</span></div>
+          <label class="limiter-field">
+            <span>Reverb</span>
+            <output data-return-value="reverb"></output>
+            <input type="range" min="0" max="100" step="1" aria-label="Reverb return" data-return="reverb" />
+          </label>
+          <label class="limiter-field">
+            <span>Delay</span>
+            <output data-return-value="delay"></output>
+            <input type="range" min="0" max="100" step="1" aria-label="Delay return" data-return="delay" />
+          </label>
+        </div>
       </div>`,
     );
     const [left, right] = root.querySelectorAll("ml-meter");
@@ -188,6 +205,34 @@ class MlMasterStrip extends HTMLElement {
         output: root.querySelector(`[data-limiter-value="${input.dataset.limiterField}"]`),
       })),
     };
+    this.#returns = {
+      group: root.querySelector("[data-returns]"),
+      fields: [...root.querySelectorAll("[data-return]")].map((input) => ({
+        input,
+        effect: input.dataset.return,
+        output: root.querySelector(`[data-return-value="${input.dataset.return}"]`),
+      })),
+    };
+    for (const { input, effect } of this.#returns.fields) {
+      input.addEventListener("input", (event) => {
+        event.stopPropagation();
+        if (this.#data?.returns) {
+          emit(this, "return-edit", { effect, level: Number(input.value) });
+        }
+      });
+      input.addEventListener("pointerdown", () => {
+        this.#dragging = input;
+      });
+      const release = () => {
+        if (this.#dragging === input) {
+          this.#dragging = null;
+          this.#showReturns(this.#data?.returns ?? null);
+        }
+      };
+      input.addEventListener("pointerup", release);
+      input.addEventListener("pointercancel", release);
+      input.addEventListener("change", release);
+    }
     this.#wireLimiter();
     this.#parts = {
       left,
@@ -220,6 +265,26 @@ class MlMasterStrip extends HTMLElement {
     parts.note.hidden = !data.ceilingNote;
     setText(parts.note, data.ceilingNote ?? "");
     this.#showLimiter(data.limiter ?? null);
+    this.#showReturns(data.returns ?? null);
+  }
+
+  #showReturns(view) {
+    const returns = this.#returns;
+    returns.group.hidden = view === null;
+    if (view === null) {
+      return;
+    }
+    for (const { input, effect, output } of returns.fields) {
+      const row = view.rows.find((candidate) => candidate.effect === effect);
+      if (!row) {
+        continue;
+      }
+      if (this.#dragging !== input && input.value !== String(row.level)) {
+        input.value = String(row.level);
+      }
+      setText(output, row.text);
+      reflect(input, "aria-valuetext", row.text);
+    }
   }
 
   setLevels(left, right) {

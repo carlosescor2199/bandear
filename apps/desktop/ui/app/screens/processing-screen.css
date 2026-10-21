@@ -398,3 +398,14 @@
     grid-template-columns: auto minmax(0, 1fr);
   }
 }
+
+.processing-card--sends .processing-card-head p {
+  flex: 1 1 280px;
+}
+
+.processing-effects-link {
+  margin-left: auto;
+  color: var(--ml-accent);
+  font-size: var(--ml-text-sm);
+  font-weight: 600;
+}

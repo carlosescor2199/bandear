@@ -203,6 +203,7 @@ pub fn factory_presets() -> Vec<(&'static str, StripSettings)> {
         (
             "Vocal",
             StripSettings {
+                sends: Default::default(),
                 eq: EqSettings {
                     high_pass: high_pass(100.0),
                     bands: [
@@ -219,6 +220,7 @@ pub fn factory_presets() -> Vec<(&'static str, StripSettings)> {
         (
             "Kick",
             StripSettings {
+                sends: Default::default(),
                 eq: EqSettings {
                     high_pass: high_pass(35.0),
                     bands: [
@@ -242,6 +244,7 @@ pub fn factory_presets() -> Vec<(&'static str, StripSettings)> {
         (
             "Bass DI",
             StripSettings {
+                sends: Default::default(),
                 eq: EqSettings {
                     high_pass: high_pass(30.0),
                     bands: [
@@ -258,6 +261,7 @@ pub fn factory_presets() -> Vec<(&'static str, StripSettings)> {
         (
             "Acoustic guitar",
             StripSettings {
+                sends: Default::default(),
                 eq: EqSettings {
                     high_pass: high_pass(90.0),
                     bands: [

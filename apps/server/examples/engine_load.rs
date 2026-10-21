@@ -6,7 +6,8 @@
 //! Run with `cargo run -p personal-monitoring --example engine_load`, optionally with
 //! `--inputs 32 --targets 16 --seconds 10 --block 256` (the defaults; inputs 1 to 32, musicians at
 //! most 64, seconds at most 600). `--strips` runs a typical channel strip on every input (a
-//! high-pass filter, two EQ bands and a compressor), to measure the channel processing too. The
+//! high-pass filter, two EQ bands and a compressor), to measure the channel processing too. `--fx`
+//! sends every input to the shared reverb and delay and returns both in every mix. The
 //! phones are sockets on the loopback interface, so nothing leaves the machine. Each musician needs its own loopback address (127.0.0.1, 127.0.0.2, ...):
 //! on a host that only answers on 127.0.0.1 (macOS by default) run with `--targets 1`, or add the
 //! addresses as loopback aliases. A debug build's numbers are pessimistic,
@@ -22,7 +23,7 @@ fn main() {
         Err(message) => {
             eprintln!("{message}");
             eprintln!(
-                "usage: engine_load [--inputs N] [--targets N] [--seconds S] [--block FRAMES] [--strips]"
+                "usage: engine_load [--inputs N] [--targets N] [--seconds S] [--block FRAMES] [--strips] [--fx]"
             );
             std::process::exit(2);
         }
@@ -33,12 +34,13 @@ fn main() {
         "release"
     };
     println!(
-        "{} inputs, {} musicians, {}-frame blocks, {} s, channel strips {}, {profile} build",
+        "{} inputs, {} musicians, {}-frame blocks, {} s, channel strips {}, effects {}, {profile} build",
         options.inputs,
         options.targets,
         options.block_frames,
         options.seconds,
-        if options.strips { "on" } else { "off" }
+        if options.strips { "on" } else { "off" },
+        if options.fx { "on" } else { "off" },
     );
     let report = match run_engine_load(&options) {
         Ok(report) => report,
@@ -83,6 +85,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<LoadBenchOptions, Str
     while let Some(flag) = args.next() {
         if flag == "--strips" {
             options.strips = true;
+            continue;
+        }
+        if flag == "--fx" {
+            options.fx = true;
             continue;
         }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;

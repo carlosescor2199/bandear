@@ -21,6 +21,7 @@ use super::dynamics::{
 };
 use super::eq::{Eq, EqDesign, EqSettings};
 use super::MAX_CHANNELS;
+use crate::effects::EffectLevels;
 
 /// A channel strip's settings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -30,6 +31,9 @@ pub struct StripSettings {
     pub eq: EqSettings,
     pub gate: GateSettings,
     pub compressor: CompressorSettings,
+    /// The input's sends to the shared reverb and delay (see [crate::effects]). Kept with the strip
+    /// so a session keeps them with the channel; they are not part of its processing.
+    pub sends: EffectLevels,
 }
 
 impl StripSettings {
@@ -39,12 +43,19 @@ impl StripSettings {
             eq: self.eq.clamped(),
             gate: self.gate.clamped(),
             compressor: self.compressor.clamped(),
+            sends: self.sends.clamped(),
         }
     }
 
-    /// True when the strip changes nothing: every part is off or flat.
+    /// True when the strip changes nothing: every part is off or flat (the sends are not part of
+    /// it).
     pub fn is_neutral(&self) -> bool {
         self.eq.is_neutral() && self.gate.is_neutral() && self.compressor.is_neutral()
+    }
+
+    /// True when the channel keeps nothing worth keeping: a neutral strip that sends nothing.
+    pub fn is_untouched(&self) -> bool {
+        self.is_neutral() && self.sends.is_off()
     }
 
     /// The strip worked out for the engine thread.

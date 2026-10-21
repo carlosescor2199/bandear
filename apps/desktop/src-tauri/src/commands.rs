@@ -2784,6 +2784,7 @@ mod tests {
     fn engine_row(address: &str, client_id: Option<&str>) -> personal_monitoring::MusicianStatus {
         personal_monitoring::MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             address: address.parse().expect("test address"),
             name: None,
             client_id: client_id.map(str::to_owned),
@@ -5632,6 +5633,7 @@ mod tests {
     ) -> MusicianStatus {
         MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             control_connected: connected,
             mix,
             ..engine_row(address, client_id)
@@ -6405,6 +6407,7 @@ mod tests {
                 here: Mutex::new(vec![
                     MusicianStatus {
                         limiter: Default::default(),
+                        fx_returns: Default::default(),
                         name: Some("Ana's phone".to_owned()),
                         ..here(
                             ANA,
@@ -6560,6 +6563,8 @@ mod tests {
     fn engine_status_now() -> personal_monitoring::EngineStatus {
         personal_monitoring::EngineStatus {
             local_limiter: Default::default(),
+            local_fx_returns: Default::default(),
+            effects: Default::default(),
             device_name: "Test device".to_owned(),
             capture_format: personal_monitoring::CaptureFormat {
                 channels: 2,
@@ -7290,6 +7295,7 @@ mod tests {
             Some(StandInEngine {
                 here: Mutex::new(vec![MusicianStatus {
                     limiter: Default::default(),
+                    fx_returns: Default::default(),
                     capabilities: Vec::new(),
                     mirror: Some(personal_monitoring::MirrorStatus {
                         leader: MusicianKey::Address(RACK.parse().expect("an address")),

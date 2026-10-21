@@ -38,6 +38,8 @@ fn store_path() -> PathBuf {
 fn engine_status(client_name: Option<&str>) -> EngineStatus {
     EngineStatus {
         local_limiter: Default::default(),
+        local_fx_returns: Default::default(),
+        effects: Default::default(),
         device_name: "Probe device".to_owned(),
         capture_format: CaptureFormat {
             channels: 2,
@@ -57,6 +59,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         packets_discarded: 0,
         musicians: vec![MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             address: ADDRESS.parse().expect("the probe address should parse"),
             name: client_name.map(str::to_owned),
             client_id: None,

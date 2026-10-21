@@ -474,6 +474,8 @@ impl Sink for LocalOutputSink {
         MixPlan::new(&self.mix.snapshot(), block.channels).mix_master(
             &self.ramp,
             self.mix.limiter(),
+            self.mix.fx_returns(),
+            &block.wet,
             block.samples,
             stereo,
         );
@@ -861,6 +863,7 @@ mod tests {
         Block {
             samples,
             raw: samples,
+            wet: crate::effects::Wet::NONE,
             channels: 2,
             sequence,
         }

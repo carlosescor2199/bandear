@@ -18,8 +18,11 @@ use crate::cli::{check_groups, resolve_targets, validate_groups, EngineConfig, G
 use crate::control::{spawn_control_thread, ConfigSnapshot, ConfigState, ControlPeers};
 use crate::demo::{DemoReader, DEMO_CHANNELS, DEMO_DEVICE_NAME};
 use crate::discovery::spawn_discovery_thread;
+use crate::dsp::delay::DelaySettings;
 use crate::dsp::dynamics::LimiterSettings;
+use crate::dsp::reverb::ReverbSettings;
 use crate::dsp::strip::StripSettings;
+use crate::effects::{Effect, EffectLevels, EffectSettings};
 use crate::health::{link_status, LinkStatus};
 use crate::link_history::LinkHistoryRead;
 use crate::load::{EngineLoad, EngineLoadStatus};
@@ -189,6 +192,9 @@ pub struct MusicianStatus {
     /// The master limiter on this musician's mix (see [EngineHandle::set_musician_limiter]);
     /// [LimiterSettings::master] (off) when the desk set none.
     pub limiter: LimiterSettings,
+    /// The shared effects' return levels in this musician's mix (see
+    /// [EngineHandle::set_musician_fx_return]); nothing returned when the desk set none.
+    pub fx_returns: EffectLevels,
 }
 
 /// One configured group of source channels, as the observation API exposes it.
@@ -388,6 +394,17 @@ pub struct LimiterSetting {
     pub settings: LimiterSettings,
 }
 
+/// What [EngineHandle::set_musician_fx_return] did, and for whom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FxReturnsSetting {
+    /// The key the engine keeps the returns under, as [LimiterSetting::kept_for].
+    pub kept_for: MusicianKey,
+    /// The musician's row, as the status reports it.
+    pub address: SocketAddr,
+    /// Every return now in force in their mix.
+    pub returns: EffectLevels,
+}
+
 /// A snapshot of everything the engine can report without blocking the audio path.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineStatus {
@@ -432,6 +449,10 @@ pub struct EngineStatus {
     pub non_finite_samples: u64,
     /// The master limiter on the local mix (see [EngineHandle::set_local_limiter]).
     pub local_limiter: LimiterSettings,
+    /// The shared effects' return levels in the local mix (see [EngineHandle::set_local_fx_return]).
+    pub local_fx_returns: EffectLevels,
+    /// The shared reverb's and delay's settings (see [EngineHandle::set_reverb]).
+    pub effects: EffectSettings,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -871,7 +892,7 @@ pub(crate) fn join_musicians(
     mirrors: &HashMap<IpAddr, MirrorStatus>,
     buffers: &HashMap<IpAddr, PlaybackBuffer>,
     redundancies: &HashMap<IpAddr, Redundancy>,
-    limiters: &HashMap<IpAddr, LimiterSettings>,
+    masters: &HashMap<IpAddr, (LimiterSettings, EffectLevels)>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -890,10 +911,10 @@ pub(crate) fn join_musicians(
                 mirror: mirrors.get(&ip).cloned(),
                 playback_buffer: buffers.get(&ip).copied().unwrap_or_default(),
                 redundancy: redundancies.get(&ip).copied().unwrap_or_default(),
-                limiter: limiters
+                limiter: masters
                     .get(&ip)
-                    .copied()
-                    .unwrap_or_else(LimiterSettings::master),
+                    .map_or_else(LimiterSettings::master, |master| master.0),
+                fx_returns: masters.get(&ip).map(|master| master.1).unwrap_or_default(),
             }
         })
         .collect()
@@ -1728,9 +1749,17 @@ impl EngineHandle {
         let mirrors = self.targets.mirror_statuses(&entries);
         let buffers = self.targets.playback_buffers(&entries);
         let redundancies = self.targets.redundancies(&entries);
-        let limiters: HashMap<IpAddr, LimiterSettings> = entries
+        let masters: HashMap<IpAddr, (LimiterSettings, EffectLevels)> = entries
             .iter()
-            .map(|entry| (entry.address.ip(), entry.mix_state.limiter_settings()))
+            .map(|entry| {
+                (
+                    entry.address.ip(),
+                    (
+                        entry.mix_state.limiter_settings(),
+                        entry.mix_state.fx_returns(),
+                    ),
+                )
+            })
             .collect();
         let config = self.config_state.snapshot();
         EngineStatus {
@@ -1758,7 +1787,7 @@ impl EngineHandle {
                 &mirrors,
                 &buffers,
                 &redundancies,
-                &limiters,
+                &masters,
             ),
             local_mix: self.local_mix.current(),
             local_output: self.local_output(),
@@ -1768,6 +1797,8 @@ impl EngineHandle {
             load: self.load.status(),
             non_finite_samples: self.processing_meters.non_finite_samples(),
             local_limiter: self.local_mix.limiter_settings(),
+            local_fx_returns: self.local_mix.fx_returns(),
+            effects: self.effects(),
         }
     }
 
@@ -2911,6 +2942,150 @@ impl EngineHandle {
     /// The master limiter on the engine's local mix.
     pub fn local_limiter(&self) -> LimiterSettings {
         self.local_mix.limiter_settings()
+    }
+
+    /// Sets input `channel`'s (0 is CH 1) send to the shared `effect` to `level` percent (held to
+    /// 100) from the next block, where it glides; a linked pair's two sides share it. The send is
+    /// kept with the channel's processing settings ([StripSettings::sends]) and answers them. Sends
+    /// are taken after the channel strip and before every mix's fader (see [crate::effects]). An
+    /// error past the mixer's 32 channels, when the engine is stopping, or when changes come
+    /// faster than the engine thread takes them.
+    pub fn set_channel_send(
+        &self,
+        channel: usize,
+        effect: Effect,
+        level: u8,
+    ) -> Result<StripSettings, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_send(channel, effect, level)?)
+    }
+
+    /// Sets the shared reverb's settings, held in range, from the next block: it glides to them,
+    /// and a new pre-delay crossfades in. Answers what is kept. Refused as
+    /// [Self::set_channel_send] is.
+    pub fn set_reverb(&self, settings: ReverbSettings) -> Result<ReverbSettings, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_reverb(settings)?)
+    }
+
+    /// Sets the shared delay's settings, held in range, from the next block: a new time crossfades
+    /// in. Answers what is kept. Refused as [Self::set_channel_send] is.
+    pub fn set_delay(&self, settings: DelaySettings) -> Result<DelaySettings, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_delay(settings)?)
+    }
+
+    /// Replaces both effects' settings at once, as a session load does; answers what is kept.
+    pub fn replace_effects(
+        &self,
+        settings: EffectSettings,
+    ) -> Result<EffectSettings, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace_effects(settings)?)
+    }
+
+    /// Both shared effects' settings in force.
+    pub fn effects(&self) -> EffectSettings {
+        self.processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .effects()
+    }
+
+    /// Sets the return of the shared `effect` in the mix of the musician `key` names to `level`
+    /// percent (held to 100) from their next block, where it glides: added after the mix's sum and
+    /// before its master limiter, scaled by the master volume. Engineer-only, kept for them as
+    /// [Self::set_musician_limiter] keeps a limiter. Answers the key, their row and every return
+    /// now kept ([FxReturnsSetting]).
+    pub fn set_musician_fx_return(
+        &self,
+        key: &MusicianKey,
+        effect: Effect,
+        level: u8,
+    ) -> Result<FxReturnsSetting, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let (kept_for, address, returns) = self.targets.set_fx_return(key, effect, level)?;
+        Ok(FxReturnsSetting {
+            kept_for,
+            address,
+            returns,
+        })
+    }
+
+    /// The effect returns in the mix of the musician `key` names: theirs when they are here, else
+    /// the ones kept for them, else `None`.
+    pub fn musician_fx_returns(&self, key: &MusicianKey) -> Option<EffectLevels> {
+        self.targets.fx_returns_of(key)
+    }
+
+    /// Replaces every musician's effect returns the engine keeps with `kept`, as
+    /// [Self::replace_musician_limiters] replaces the limiters.
+    pub fn replace_musician_fx_returns(
+        &self,
+        kept: &[(MusicianKey, EffectLevels)],
+    ) -> Result<Vec<EffectLevels>, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self.targets.replace_fx_returns(kept))
+    }
+
+    /// Sets the return of the shared `effect` in the engine's local mix to `level` percent: the
+    /// local output and the recorder's local mix track both return it. Answers every return now
+    /// kept.
+    pub fn set_local_fx_return(
+        &self,
+        effect: Effect,
+        level: u8,
+    ) -> Result<EffectLevels, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self
+            .local_mix
+            .set_fx_returns(self.local_mix.fx_returns().with(effect, level)))
+    }
+
+    /// Replaces the local mix's effect returns at once (a start or a session load).
+    pub fn replace_local_fx_returns(
+        &self,
+        levels: EffectLevels,
+    ) -> Result<EffectLevels, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        Ok(self.local_mix.set_fx_returns(levels))
+    }
+
+    /// The effect returns in the engine's local mix.
+    pub fn local_fx_returns(&self) -> EffectLevels {
+        self.local_mix.fx_returns()
     }
 
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
@@ -5577,6 +5752,98 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// The desk sets an input's send, the reverb and the returns; the status reads them back held
+    /// in range, and the reverb reaches a phone that hears no input directly.
+    #[test]
+    fn sends_effects_and_returns_reach_the_status_and_the_phones_mix() {
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let address = phone.local_addr().expect("phone address");
+        let (mut engine, mut capture) = engine_without_device(address);
+        let status = engine.status();
+        assert_eq!(status.musicians[0].fx_returns, EffectLevels::default());
+        assert_eq!(status.local_fx_returns, EffectLevels::default());
+        assert_eq!(status.effects, EffectSettings::default());
+        // The musician hears no input directly: only what the reverb returns.
+        engine
+            .set_mix(
+                &address.to_string(),
+                &MixUpdate {
+                    channel_gains: Some(vec![0, 0]),
+                    ..MixUpdate::default()
+                },
+            )
+            .expect("the phone is here");
+
+        let kept = engine
+            .set_channel_send(0, Effect::Reverb, 80)
+            .expect("running");
+        assert_eq!(
+            kept.sends,
+            EffectLevels {
+                reverb: 80,
+                delay: 0
+            }
+        );
+        assert_eq!(
+            engine.channel_processing(0).map(|kept| kept.sends.reverb),
+            Some(80)
+        );
+        let reverb = engine
+            .set_reverb(ReverbSettings {
+                size_percent: 90.0,
+                ..ReverbSettings::default()
+            })
+            .expect("running");
+        let set = engine
+            .set_musician_fx_return(&MusicianKey::Address(address), Effect::Reverb, 100)
+            .expect("the phone is here");
+        assert_eq!(
+            set.returns,
+            EffectLevels {
+                reverb: 100,
+                delay: 0
+            }
+        );
+        assert_eq!(set.address, address);
+        assert_eq!(
+            engine
+                .set_local_fx_return(Effect::Delay, 140)
+                .expect("running"),
+            EffectLevels {
+                reverb: 0,
+                delay: 100
+            }
+        );
+        assert_eq!(
+            engine.musician_fx_returns(&MusicianKey::Address(address)),
+            Some(set.returns)
+        );
+        let status = engine.status();
+        assert_eq!(status.musicians[0].fx_returns, set.returns);
+        assert_eq!(status.local_fx_returns, engine.local_fx_returns());
+        assert_eq!(status.effects.reverb, reverb);
+
+        let tone: Vec<f32> = (0..2 * 64)
+            .map(|n| if (n / 2) % 8 < 4 { 0.5 } else { -0.5 })
+            .collect();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let heard = loop {
+            capture.write(&tone);
+            let meters = engine.meters();
+            if meters.musicians[0].output_levels[0] > 0 {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert!(heard, "the reverb's return reaches the phone's mix");
+
+        engine.stop().expect("the engine stops");
+        assert!(engine.set_channel_send(0, Effect::Delay, 10).is_err());
     }
 
     /// The desk sets a musician's and the local mix's master limiter; the status reads them back

@@ -34,7 +34,10 @@ use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::dsp::delay::DelaySettings;
+use crate::dsp::reverb::ReverbSettings;
 use crate::dsp::strip::{StripDesign, StripProcessor, StripSettings};
+use crate::effects::{Effect, EffectSettings, EffectsCommand, EffectsStage, Wet};
 use crate::engine::{ChannelMeta, LevelMeter};
 use crate::mix::MAX_MIX_CHANNELS;
 use crate::pipeline::SourceFormat;
@@ -154,6 +157,8 @@ pub(crate) enum ProcessingCommand {
     /// Another layout: this set takes over from the next block, carrying over the running state
     /// of every strip on the same channels; the set it replaces goes back to the engine.
     Strips(Box<StripSet>),
+    /// A send, or a new reverb or delay design, for the effects (see [crate::effects]).
+    Effects(EffectsCommand),
 }
 
 /// The processing meters, written by the engine thread and read by the status.
@@ -263,6 +268,8 @@ pub(crate) struct ProcessingStage {
     meters: Arc<ProcessingMeters>,
     /// Samples taken as silence so far, published to [ProcessingMeters::non_finite_samples].
     non_finite: u64,
+    /// The shared reverb and delay, fed from the processed block (see [crate::effects]).
+    effects: EffectsStage,
 }
 
 /// The engine's end of the stage's lines: commands go to the stage, and the strip sets it lets go
@@ -289,6 +296,7 @@ pub(crate) fn processing_stage() -> (ProcessingStage, ProcessingControl) {
         stale: false,
         meters: Arc::new(ProcessingMeters::new()),
         non_finite: 0,
+        effects: EffectsStage::new(&EffectSettings::default()),
     };
     let control = ProcessingControl {
         commands: command_producer,
@@ -336,6 +344,7 @@ impl ProcessingStage {
         self.processed.clear();
         self.processed
             .resize(format.block_frames * format.channels, 0.0);
+        self.effects.source_changed(format.block_frames);
         self.meters.clear();
         self.channels = format.channels;
         self.follow_source();
@@ -384,6 +393,7 @@ impl ProcessingStage {
                     self.meters.clear_reductions();
                     self.follow_source();
                 }
+                ProcessingCommand::Effects(command) => self.effects.take(command),
             }
         }
         if changed {
@@ -423,12 +433,39 @@ impl ProcessingStage {
     /// Processes `raw`, `channels`-interleaved, into the stage's own buffer and returns it, or
     /// `None` when no strip works or the strips are [stale](Self::stale): the raw block is then the
     /// processed one, untouched and not copied. A strip past the block's channels is left as it is.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn process(&mut self, raw: &[f32], channels: usize) -> Option<&[f32]> {
+        if self.process_in_place(raw, channels) {
+            Some(&self.processed[..raw.len()])
+        } else {
+            None
+        }
+    }
+
+    /// The block every mix hears (the processed one, or `raw` itself while no strip works, see
+    /// [Self::process]) and what the shared effects gave from it this block (see
+    /// [EffectsStage::process]). The engine thread's call for each block.
+    pub(crate) fn run<'a>(&'a mut self, raw: &'a [f32], channels: usize) -> (&'a [f32], Wet<'a>) {
+        let processed = self.process_in_place(raw, channels);
+        let Self {
+            processed: buffer,
+            effects,
+            ..
+        } = self;
+        let samples: &'a [f32] = if processed { &buffer[..raw.len()] } else { raw };
+        (samples, effects.process(samples, channels))
+    }
+
+    /// Processes `raw` into the stage's own buffer, as [Self::process] answers it; false when it
+    /// left it alone.
+    fn process_in_place(&mut self, raw: &[f32], channels: usize) -> bool {
         self.take_commands();
         if !self.running || self.stale || channels == 0 {
-            return None;
+            return false;
         }
-        let processed = self.processed.get_mut(..raw.len())?;
+        let Some(processed) = self.processed.get_mut(..raw.len()) else {
+            return false;
+        };
         processed.copy_from_slice(raw);
         let mut working = 0u32;
         let StripSet { layout, strips, .. } = &mut *self.set;
@@ -455,7 +492,7 @@ impl ProcessingStage {
         self.meters.working.store(working, Ordering::Relaxed);
         self.running = working != 0;
         self.count_non_finite();
-        Some(&self.processed[..raw.len()])
+        true
     }
 
     /// No audio came for `frames`: the levels after processing fall by that much silence, as the
@@ -478,16 +515,100 @@ pub(crate) struct Processing {
     /// Per channel index (CH 1 first), every one of the mixer's channels.
     settings: [StripSettings; MAX_MIX_CHANNELS],
     layout: StripLayout,
+    /// The shared reverb's and delay's settings (see [crate::effects]).
+    effects: EffectSettings,
 }
 
 impl Processing {
-    /// Neutral settings everywhere and no strips yet, as a new stage has.
+    /// Neutral settings everywhere, no send, the effects' defaults and no strips yet, as a new
+    /// stage has.
     pub(crate) fn new(control: ProcessingControl) -> Self {
         Self {
             control,
             settings: [StripSettings::default(); MAX_MIX_CHANNELS],
             layout: StripLayout::default(),
+            effects: EffectSettings::default(),
         }
+    }
+
+    /// The commands that bring the stage's sends from `before` to `after`: one per channel whose
+    /// sends differ.
+    fn send_changes(
+        before: &[StripSettings; MAX_MIX_CHANNELS],
+        after: &[StripSettings; MAX_MIX_CHANNELS],
+    ) -> Vec<ProcessingCommand> {
+        (0..MAX_MIX_CHANNELS)
+            .filter(|&channel| before[channel].sends != after[channel].sends)
+            .map(|channel| {
+                ProcessingCommand::Effects(EffectsCommand::Sends {
+                    channel,
+                    levels: after[channel].sends,
+                })
+            })
+            .collect()
+    }
+
+    /// Sets the send of input `channel` (0 is CH 1) to `effect` to `level` percent (held to 100),
+    /// for both sides of a linked pair; returns the channel's settings now kept. The send glides
+    /// there across the next block. Errors as [Self::set_channel] does.
+    pub(crate) fn set_send(
+        &mut self,
+        channel: usize,
+        effect: Effect,
+        level: u8,
+    ) -> Result<StripSettings, String> {
+        let mut settings = self.channel(channel).ok_or_else(|| {
+            format!(
+                "effect sends are supported for CH 1 to CH {MAX_MIX_CHANNELS}, not CH {}",
+                channel + 1
+            )
+        })?;
+        settings.sends = settings.sends.with(effect, level);
+        self.set_channel(channel, settings)
+    }
+
+    /// Both effects' settings in force.
+    pub(crate) fn effects(&self) -> EffectSettings {
+        self.effects
+    }
+
+    /// Sets the reverb's settings, held in range; it glides or crossfades to them.
+    pub(crate) fn set_reverb(
+        &mut self,
+        settings: ReverbSettings,
+    ) -> Result<ReverbSettings, String> {
+        let settings = settings.clamped();
+        self.control
+            .send(vec![ProcessingCommand::Effects(EffectsCommand::Reverb(
+                settings.design(),
+            ))])?;
+        self.effects.reverb = settings;
+        Ok(settings)
+    }
+
+    /// Sets the delay's settings, held in range; it glides or crossfades to them.
+    pub(crate) fn set_delay(&mut self, settings: DelaySettings) -> Result<DelaySettings, String> {
+        let settings = settings.clamped();
+        self.control
+            .send(vec![ProcessingCommand::Effects(EffectsCommand::Delay(
+                settings.design(),
+            ))])?;
+        self.effects.delay = settings;
+        Ok(settings)
+    }
+
+    /// Replaces both effects' settings at once (a session load); returns what is kept.
+    pub(crate) fn replace_effects(
+        &mut self,
+        settings: EffectSettings,
+    ) -> Result<EffectSettings, String> {
+        let settings = settings.clamped();
+        self.control.send(vec![
+            ProcessingCommand::Effects(EffectsCommand::Reverb(settings.reverb.design())),
+            ProcessingCommand::Effects(EffectsCommand::Delay(settings.delay.design())),
+        ])?;
+        self.effects = settings;
+        Ok(settings)
     }
 
     /// Every channel's settings, one per mixer channel (CH 1 first), inputs the device lacks
@@ -523,15 +644,21 @@ impl Processing {
         }
         let settings = settings.clamped();
         let (first, width) = self.layout.strip_of(channel).unwrap_or((channel, 1));
+        let mut next = self.settings;
+        for side in first..first + width {
+            next[side] = settings;
+        }
+        let mut commands = Self::send_changes(&self.settings, &next);
         if self.layout.width(first) > 0 {
-            self.control.send(vec![ProcessingCommand::Design {
+            commands.push(ProcessingCommand::Design {
                 first,
                 design: settings.design(),
-            }])?;
+            });
         }
-        for side in first..first + width {
-            self.settings[side] = settings;
+        if !commands.is_empty() {
+            self.control.send(commands)?;
         }
+        self.settings = next;
         Ok(settings)
     }
 
@@ -552,14 +679,15 @@ impl Processing {
             table.get(channel).copied().unwrap_or_default().clamped()
         });
         pair_settings(&self.layout, &mut settings);
-        let commands = self
-            .layout
-            .strips()
-            .map(|(first, _)| ProcessingCommand::Design {
-                first,
-                design: settings[first].design(),
-            })
-            .collect();
+        let mut commands = Self::send_changes(&self.settings, &settings);
+        commands.extend(
+            self.layout
+                .strips()
+                .map(|(first, _)| ProcessingCommand::Design {
+                    first,
+                    design: settings[first].design(),
+                }),
+        );
         self.control.send(commands)?;
         self.settings = settings;
         Ok(self.settings())
@@ -575,10 +703,9 @@ impl Processing {
         }
         let mut settings = self.settings;
         pair_settings(&layout, &mut settings);
-        self.control
-            .send(vec![ProcessingCommand::Strips(StripSet::new(
-                layout, &settings,
-            ))])?;
+        let mut commands = Self::send_changes(&self.settings, &settings);
+        commands.push(ProcessingCommand::Strips(StripSet::new(layout, &settings)));
+        self.control.send(commands)?;
         self.settings = settings;
         self.layout = layout;
         Ok(())
@@ -598,6 +725,7 @@ fn pair_settings(layout: &StripLayout, settings: &mut [StripSettings; MAX_MIX_CH
 pub(crate) mod tests {
     use super::*;
     use crate::dsp::dynamics::CompressorSettings;
+    use crate::effects::EffectLevels;
 
     /// The details of `channels` inputs with the pairs starting at `pairs` linked.
     pub(crate) fn metas(channels: usize, pairs: &[usize]) -> Vec<ChannelMeta> {
@@ -895,7 +1023,14 @@ pub(crate) mod tests {
         pipeline.set_source(reader);
         let mut processing = Processing::new(control);
         processing.follow(&metas(32, &[0, 2, 4])).unwrap();
-        processing.replace(&[typical(); MAX_MIX_CHANNELS]).unwrap();
+        let sending = StripSettings {
+            sends: EffectLevels {
+                reverb: 30,
+                delay: 20,
+            },
+            ..typical()
+        };
+        processing.replace(&[sending; MAX_MIX_CHANNELS]).unwrap();
         let callback = tones(32, 64, 0.3, 0);
         writer.write(&callback);
         pipeline.pump();
@@ -912,6 +1047,24 @@ pub(crate) mod tests {
                 let pairs: &[usize] = if round % 20 == 5 { &[0, 2] } else { &[0, 2, 4] };
                 processing.follow(&metas(32, pairs)).unwrap();
             } else {
+                // And the effects: a send, and now and then a new reverb or delay.
+                processing
+                    .set_send(round % 32, Effect::ALL[round % 2], (round % 100) as u8)
+                    .unwrap();
+                if round % 7 == 0 {
+                    processing
+                        .set_delay(DelaySettings {
+                            time_ms: 100.0 + round as f32,
+                            ..DelaySettings::default()
+                        })
+                        .unwrap();
+                    processing
+                        .set_reverb(ReverbSettings {
+                            size_percent: (round % 100) as f32,
+                            ..ReverbSettings::default()
+                        })
+                        .unwrap();
+                }
                 let settings = if round % 2 == 0 {
                     typical()
                 } else {
@@ -981,5 +1134,85 @@ pub(crate) mod tests {
         processing.follow(&metas(1, &[])).unwrap();
         let processed = stage.process(&tones(1, 256, 0.5, 2_816), 1).map(peak);
         assert!(processed.is_some_and(|peak| peak < 0.05), "{processed:?}");
+    }
+
+    /// A send on an input with a neutral strip: the mixes still hear the raw block, and the reverb
+    /// runs on that input alone; the delay, sent nothing, rests.
+    #[test]
+    fn a_send_runs_its_effect_on_the_raw_block_and_nothing_sent_rests() {
+        let (mut stage, mut processing) = stage(&metas(4, &[]), 256);
+        let block = tones(4, 256, 0.5, 0);
+        let (samples, wet) = stage.run(&block, 4);
+        assert!(std::ptr::eq(samples, block.as_slice()));
+        assert!(wet.get(Effect::Reverb).is_none() && wet.get(Effect::Delay).is_none());
+
+        let kept = processing.set_send(1, Effect::Reverb, 60).unwrap();
+        assert_eq!(
+            kept.sends,
+            EffectLevels {
+                reverb: 60,
+                delay: 0
+            }
+        );
+        assert!(kept.is_neutral() && !kept.is_untouched());
+        let mut heard = 0.0f32;
+        for round in 0..20 {
+            let block = tones(4, 256, 0.5, 256 * round);
+            let (samples, wet) = stage.run(&block, 4);
+            assert!(
+                std::ptr::eq(samples, block.as_slice()),
+                "the strip is still neutral"
+            );
+            assert!(
+                wet.get(Effect::Delay).is_none(),
+                "nothing sent to the delay"
+            );
+            let reverb = wet.get(Effect::Reverb).expect("the reverb runs");
+            heard = heard.max(reverb.iter().fold(0.0, |peak, s| peak.max(s.abs())));
+        }
+        assert!(heard > 0.005, "{heard}");
+    }
+
+    /// A linked pair's two sides share their sends, set from either side; a new layout gives a
+    /// newly linked pair's second side the first side's.
+    #[test]
+    fn a_pair_shares_its_sends() {
+        let (_stage, mut processing) = stage(&metas(4, &[2]), 64);
+        processing.set_send(3, Effect::Delay, 45).unwrap();
+        let settings = processing.settings();
+        assert_eq!(settings[2].sends.delay, 45);
+        assert_eq!(settings[3].sends.delay, 45);
+        assert_eq!(settings[0].sends, EffectLevels::default());
+        processing.set_send(0, Effect::Reverb, 20).unwrap();
+        processing.follow(&metas(4, &[0, 2])).unwrap();
+        assert_eq!(processing.settings()[1].sends.reverb, 20);
+        assert!(processing.set_send(32, Effect::Reverb, 10).is_err());
+    }
+
+    /// The effects' settings are kept, held in range, and replaced whole by a load.
+    #[test]
+    fn the_effects_settings_are_kept_and_replaced_whole() {
+        let (_stage, mut processing) = stage(&metas(2, &[]), 64);
+        assert_eq!(processing.effects(), EffectSettings::default());
+        let reverb = processing
+            .set_reverb(ReverbSettings {
+                size_percent: 300.0,
+                ..ReverbSettings::default()
+            })
+            .unwrap();
+        assert_eq!(reverb.size_percent, 100.0);
+        let delay = processing
+            .set_delay(DelaySettings {
+                tempo_bpm: 120.0,
+                ..DelaySettings::default()
+            })
+            .unwrap();
+        assert_eq!(processing.effects().delay, delay);
+        assert_eq!(processing.effects().reverb, reverb);
+        let replaced = processing
+            .replace_effects(EffectSettings::default())
+            .unwrap();
+        assert_eq!(replaced, EffectSettings::default());
+        assert_eq!(processing.effects(), EffectSettings::default());
     }
 }

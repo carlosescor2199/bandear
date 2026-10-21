@@ -160,6 +160,8 @@ impl Sink for NetworkSink {
             plan.mix_master(
                 &destination.ramp,
                 destination.mix.limiter(),
+                destination.mix.fx_returns(),
+                &block.wet,
                 block.samples,
                 &mut self.stereo,
             );
@@ -276,6 +278,7 @@ pub(crate) fn spawn_network_thread(
             sink.process(&Block {
                 samples: &samples,
                 raw: &samples,
+                wet: crate::effects::Wet::NONE,
                 channels: usize::from(packet.channels),
                 sequence: packet.sequence,
             });
@@ -546,6 +549,7 @@ mod tests {
             sink.process(&Block {
                 samples: &gliding,
                 raw: &gliding,
+                wet: crate::effects::Wet::NONE,
                 channels,
                 sequence: sequence - 1,
             });
@@ -556,6 +560,7 @@ mod tests {
             sink.process(&Block {
                 samples: &block,
                 raw: &block,
+                wet: crate::effects::Wet::NONE,
                 channels,
                 sequence,
             });
@@ -667,6 +672,7 @@ mod tests {
             sink.process(&Block {
                 samples: &block,
                 raw: &block,
+                wet: crate::effects::Wet::NONE,
                 channels: 2,
                 sequence,
             });
@@ -726,6 +732,7 @@ mod tests {
         sink.process(&Block {
             samples: &block,
             raw: &block,
+            wet: crate::effects::Wet::NONE,
             channels: 4,
             sequence: 0,
         });
@@ -766,6 +773,7 @@ mod tests {
             sink.process(&Block {
                 samples: &[0.0, 0.0],
                 raw: &[0.0, 0.0],
+                wet: crate::effects::Wet::NONE,
                 channels: 2,
                 sequence: 0,
             });
@@ -796,6 +804,7 @@ mod tests {
         sink.process(&Block {
             samples: &samples,
             raw: &samples,
+            wet: crate::effects::Wet::NONE,
             channels: 2,
             sequence: 0,
         });
@@ -816,6 +825,7 @@ mod tests {
             sink.process(&Block {
                 samples: &[level, -level, level, -level],
                 raw: &[level, -level, level, -level],
+                wet: crate::effects::Wet::NONE,
                 channels: 2,
                 sequence,
             });

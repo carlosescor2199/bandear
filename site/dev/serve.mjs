@@ -5,8 +5,10 @@
 
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { extname, resolve, sep } from "node:path";
+import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { resolveRequest } from "./resolve.mjs";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DEFAULT_PORT = 5300;
@@ -21,21 +23,12 @@ const TYPES = Object.freeze({
   ".png": "image/png",
   ".ttf": "font/ttf",
 });
+const PLAIN = { "Content-Type": "text/plain; charset=utf-8" };
 
 const port = process.argv[2] === undefined ? DEFAULT_PORT : Number(process.argv[2]);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   console.error(`invalid port: ${process.argv[2]}`);
   process.exit(2);
-}
-
-// The file a request names, or null when it would leave the served folder.
-function fileFor(url) {
-  let pathname = decodeURIComponent(new URL(url, "http://localhost").pathname);
-  if (pathname.endsWith("/")) {
-    pathname += "index.html";
-  }
-  const file = resolve(ROOT, `.${pathname}`);
-  return file === ROOT || file.startsWith(ROOT + sep) ? file : null;
 }
 
 async function send(response, method, status, file) {
@@ -48,32 +41,58 @@ async function send(response, method, status, file) {
   response.end(method === "HEAD" ? undefined : body);
 }
 
+async function notFound(response, method) {
+  // Mirror GitHub Pages: serve 404.html when it exists, plain text otherwise.
+  try {
+    await send(response, method, 404, resolve(ROOT, "404.html"));
+  } catch {
+    response.writeHead(404, PLAIN);
+    response.end("Not found\n");
+  }
+}
+
+const isDirectory = (file) => stat(file).then((info) => info.isDirectory(), () => false);
+
 const server = createServer(async (request, response) => {
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    response.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "text/plain" });
+  const target = resolveRequest(request.method, request.url, ROOT);
+  if (target.status === 405) {
+    response.writeHead(405, { ...PLAIN, Allow: "GET, HEAD" });
     response.end("Method not allowed\n");
     return;
   }
-  let file = null;
-  try {
-    file = fileFor(request.url);
-  } catch {
-    // A malformed URL falls through to the 404 below.
+  if (target.status === 400) {
+    response.writeHead(400, PLAIN);
+    response.end("Bad request\n");
+    return;
+  }
+  if (target.status === 404) {
+    await notFound(response, request.method);
+    return;
+  }
+  // Like GitHub Pages, a folder named without its trailing slash redirects to the slash form.
+  if (!target.directory && (await isDirectory(target.file))) {
+    const query = new URL(request.url, "http://localhost").search;
+    // One leading slash only, so the Location can never read as another host ("//host").
+    const path = `/${target.pathname.replace(/^\/+/, "")}`;
+    response.writeHead(301, { ...PLAIN, Location: `${path}/${query}` });
+    response.end();
+    return;
   }
   try {
-    if (file === null || !(await stat(file)).isFile()) {
-      throw new Error("not a file");
-    }
-    await send(response, request.method, 200, file);
+    if (!(await stat(target.file)).isFile()) throw new Error("not a file");
+    await send(response, request.method, 200, target.file);
   } catch {
-    // Mirror GitHub Pages: serve 404.html when it exists, plain text otherwise.
-    try {
-      await send(response, request.method, 404, resolve(ROOT, "404.html"));
-    } catch {
-      response.writeHead(404, { "Content-Type": "text/plain" });
-      response.end("Not found\n");
-    }
+    await notFound(response, request.method);
   }
+});
+
+server.on("error", (error) => {
+  const reasons = {
+    EADDRINUSE: `port ${port} is already in use; stop the other server or pass another port`,
+    EACCES: `no permission to listen on port ${port}; pick a port above 1024`,
+  };
+  console.error(`Cannot serve the site: ${reasons[error.code] ?? error.message}`);
+  process.exit(1);
 });
 
 server.listen(port, "127.0.0.1", () => {

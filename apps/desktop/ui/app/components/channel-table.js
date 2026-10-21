@@ -1,8 +1,9 @@
 // <ml-channel-table>: the device's inputs with the engineer's details: name, instrument, live
-// level, stereo pair, group and whether musicians see the input.
+// level, stereo pair, group, whether musicians see the input and a link to its processing (a
+// pair's opens on its first side), with whether the processing is on in words.
 //
 // Property: `data` = { rows, kinds }: rows from channelRows and kinds KIND_OPTIONS
-//   (channels-view.js).
+//   (channels-view.js), each with `processing`, true while its strip does something.
 // Method: `setLevels(levels)`, the input peaks of a `meters` event, one per input.
 // Events (bubbling, composed): `channel-rename` { index, name } when a name is committed,
 //   `channel-kind` { index, kind }, `channel-link` { index, linked } and `channel-shown`
@@ -17,6 +18,7 @@
 import "./group-chip.js";
 import "./meter.js";
 import { kindIcon, stereoIcon } from "./kind-icons.js";
+import { processingHash } from "../lib/router.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
 const NAME_TITLE = "Shown on every phone and on the Mix. Enter saves, Escape reverts";
@@ -163,6 +165,33 @@ const styles = sheet(`
   .shown-word[data-hidden] {
     color: var(--ml-text-muted);
   }
+  .processing {
+    white-space: nowrap;
+  }
+  .edit-processing {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--ml-target);
+    padding: 0 10px;
+    border: 1px solid var(--ml-border);
+    border-radius: var(--ml-radius-sm);
+    background: var(--ml-surface-raised);
+    color: var(--ml-text);
+    font-size: var(--ml-text-sm);
+    font-weight: var(--ml-weight-bold);
+    text-decoration: none;
+  }
+  .edit-processing:hover {
+    border-color: var(--ml-text-muted);
+  }
+  .processing-word {
+    margin-left: 8px;
+    color: var(--ml-text-muted);
+    font-size: var(--ml-text-sm);
+  }
+  .processing-word[data-on] {
+    color: var(--ml-text);
+  }
   :focus-visible {
     outline: 2px solid var(--ml-focus);
     outline-offset: 2px;
@@ -193,6 +222,7 @@ class MlChannelTable extends HTMLElement {
               <th scope="col">Stereo</th>
               <th scope="col">Group</th>
               <th scope="col" title="A hidden input is shown nowhere and no one hears it">Shown</th>
+              <th scope="col">Processing</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -236,7 +266,8 @@ class MlChannelTable extends HTMLElement {
         <p class="reason" id="reason-${index}" hidden></p>
       </td>
       <td><ml-group-chip></ml-group-chip></td>
-      <td><label class="shown"><input type="checkbox" /><span class="shown-word"></span></label></td>`;
+      <td><label class="shown"><input type="checkbox" /><span class="shown-word"></span></label></td>
+      <td class="processing"><a class="edit-processing">Processing</a><span class="processing-word"></span></td>`;
     const view = {
       row,
       index,
@@ -251,6 +282,8 @@ class MlChannelTable extends HTMLElement {
       chip: row.querySelector("ml-group-chip"),
       shown: row.querySelector(".shown input"),
       shownWord: row.querySelector(".shown-word"),
+      processing: row.querySelector(".edit-processing"),
+      processingWord: row.querySelector(".processing-word"),
       saved: "",
       shownKind: null,
       stereo: null,
@@ -337,6 +370,15 @@ class MlChannelTable extends HTMLElement {
     setText(view.shownWord, row.hidden ? "Hidden" : "Shown");
     reflect(view.shownWord, "data-hidden", row.hidden);
     reflect(view.row, "data-hidden", row.hidden);
+
+    // A pair is one strip: its processing opens on its first side.
+    const first = stereo.linked ? stereo.first : row.index;
+    reflect(view.processing, "href", processingHash(first + 1));
+    const on = row.processing === true;
+    reflect(view.processing, "aria-label", `Processing of ${row.label}, ${on ? "on" : "off"}`);
+    view.processing.title = "Open this input's high-pass, equaliser, gate and compressor";
+    setText(view.processingWord, on ? "On" : "Off");
+    reflect(view.processingWord, "data-on", on);
   }
 }
 

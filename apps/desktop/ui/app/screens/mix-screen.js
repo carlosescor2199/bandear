@@ -11,7 +11,7 @@ import { editKey } from "../lib/mix.js";
 import { mixToolsView } from "../lib/mixes.js";
 import { mixToolCommands } from "../lib/mix-tools.js";
 import { musicianLabel } from "../lib/format.js";
-import { LOCAL_MIX, selectedMusician } from "../lib/console-state.js";
+import { LOCAL_MIX, channelStrip, selectedMusician } from "../lib/console-state.js";
 import {
   channelEdits,
   channelStrips,
@@ -185,7 +185,11 @@ export function mountMixScreen(main, app) {
       return;
     }
     parts.body.setAttribute("aria-label", local ? "Local mix" : `${musicianLabel(musician)}'s mix`);
-    const strips = channelStrips(state, address);
+    // Each strip links to its input's processing editor and says whether it is on.
+    const strips = channelStrips(state, address).map((strip) => ({
+      ...strip,
+      processing: channelStrip(state, strip.sides[0] + 1).active,
+    }));
     keyedChildren(
       parts.channels,
       strips,

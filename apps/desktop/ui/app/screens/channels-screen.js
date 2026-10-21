@@ -7,6 +7,7 @@
 
 import "../components/channel-table.js";
 import "../components/group-cards.js";
+import { channelStrip } from "../lib/console-state.js";
 import { KIND_OPTIONS, channelsScreenCommands } from "../lib/channels-view.js";
 
 const LAYOUT = `
@@ -59,7 +60,11 @@ export function mountChannelsScreen(main, app) {
     if (!view.known) {
       return;
     }
-    parts.table.data = { rows: view.rows, kinds: KIND_OPTIONS };
+    const state = app.store.getState();
+    parts.table.data = {
+      rows: view.rows.map((row) => ({ ...row, processing: channelStrip(state, row.number).active })),
+      kinds: KIND_OPTIONS,
+    };
     parts.groups.data = { cards: view.cards, canAdd: view.canAdd };
   }
 

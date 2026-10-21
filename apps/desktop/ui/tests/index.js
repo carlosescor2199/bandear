@@ -41,3 +41,4 @@ import "./processing-editor.test.js";
 import "./demo-source.test.js";
 import "./scheduling.test.js";
 import "./limiter.test.js";
+import "./effects.test.js";

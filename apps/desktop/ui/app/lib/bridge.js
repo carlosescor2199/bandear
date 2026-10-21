@@ -268,6 +268,25 @@ export function createEngineApi(bridge) {
      */
     setLocalLimiter: (settings) => bridge.invoke("set_local_limiter", { settings }),
     /**
+     * Sets input `channel`'s (1-based) send to `effect` ("reverb" or "delay") to `level` percent;
+     * answers as setChannelProcessing does (see effects.js).
+     */
+    setChannelSend: (channel, effect, level) => bridge.invoke("set_channel_send", { channel, effect, level }),
+    /**
+     * Sets the shared `effect`'s settings: `{ outcome, effect, effects, saved, saveError, message }`
+     * (formatEffectSet in effects.js). The status carries `effects`.
+     */
+    setEffect: (effect, settings) => bridge.invoke("set_effect", { effect, settings }),
+    /**
+     * Sets the return of `effect` in the mix of the musician `musicianKey` names to `level` percent:
+     * `{ musicianKey, outcome, effect, returns, saved, saveError, message }` (formatReturnSet). Status
+     * rows carry `fxReturns`.
+     */
+    setMusicianFxReturn: (musicianKey, effect, level) =>
+      bridge.invoke("set_musician_fx_return", { musicianKey, effect, level }),
+    /** Sets the return of `effect` in the local mix; the status carries `localFxReturns`. */
+    setLocalFxReturn: (effect, level) => bridge.invoke("set_local_fx_return", { effect, level }),
+    /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
      */

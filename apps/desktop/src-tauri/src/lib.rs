@@ -519,6 +519,54 @@ async fn set_local_limiter(
     commands::limiter::set_local_limiter(state.inner(), settings)
 }
 
+/// Sets input `channel`'s (1-based) send to the shared `effect` (`reverb` or `delay`) to `level`
+/// percent (held to 100); a linked pair shares it. Answers as [set_channel_processing] does (see
+/// [commands::processing::set_channel_send]).
+#[tauri::command]
+async fn set_channel_send(
+    state: State<'_, DesktopState>,
+    channel: usize,
+    effect: personal_monitoring::Effect,
+    level: u8,
+) -> Result<commands::processing::ProcessingSetDto, String> {
+    commands::processing::set_channel_send(state.inner(), channel, effect, level)
+}
+
+/// Sets the shared `effect`'s settings (see [commands::effects::set_effect]). Answers `{ outcome,
+/// effect, effects, saved, saveError, message }`.
+#[tauri::command]
+async fn set_effect(
+    state: State<'_, DesktopState>,
+    effect: personal_monitoring::Effect,
+    settings: serde_json::Value,
+) -> Result<dto::EffectSetDto, String> {
+    commands::effects::set_effect(state.inner(), effect, settings)
+}
+
+/// Sets the return of `effect` in the mix of the musician `musicianKey` names to `level` percent.
+/// Answers `{ musicianKey, outcome, effect, returns, saved, saveError, message }` (see
+/// [commands::effects::set_musician_fx_return]).
+#[tauri::command]
+async fn set_musician_fx_return(
+    state: State<'_, DesktopState>,
+    musician_key: String,
+    effect: personal_monitoring::Effect,
+    level: u8,
+) -> Result<dto::FxReturnSetDto, String> {
+    commands::effects::set_musician_fx_return(state.inner(), &musician_key, effect, level)
+}
+
+/// Sets the return of `effect` in the engineer's local mix (see
+/// [commands::effects::set_local_fx_return]).
+#[tauri::command]
+async fn set_local_fx_return(
+    state: State<'_, DesktopState>,
+    effect: personal_monitoring::Effect,
+    level: u8,
+) -> Result<dto::FxReturnSetDto, String> {
+    commands::effects::set_local_fx_return(state.inner(), effect, level)
+}
+
 /// Every channel's strip, CH 1 first: `[{ channel, settings, active }]`, `channel` 1-based and
 /// `settings` `{ eq: { highPass, bands }, gate, compressor }` (see
 /// [commands::processing::processing]): the running engine's, or with none what the session keeps.
@@ -728,6 +776,10 @@ pub fn run() {
             set_musician_redundancy,
             set_musician_limiter,
             set_local_limiter,
+            set_channel_send,
+            set_effect,
+            set_musician_fx_return,
+            set_local_fx_return,
             processing,
             channel_processing,
             set_channel_processing,

@@ -73,6 +73,7 @@ export function defaultStrip() {
       releaseMs: 150,
       makeupDb: 0,
     },
+    sends: { reverb: 0, delay: 0 },
   };
 }
 
@@ -129,6 +130,10 @@ export function clampStrip(settings = {}) {
       releaseMs: within(compressor.releaseMs, RANGES.compressorReleaseMs, 150),
       makeupDb: within(compressor.makeupDb, RANGES.compressorMakeupDb, 0),
     },
+    sends: {
+      reverb: Math.round(within(settings?.sends?.reverb, [0, 100], 0)),
+      delay: Math.round(within(settings?.sends?.delay, [0, 100], 0)),
+    },
   };
 }
 
@@ -145,6 +150,13 @@ export function isNeutralStrip(settings) {
   const compressorNeutral =
     !kept.compressor.enabled || (kept.compressor.ratio === 1 && kept.compressor.makeupDb === 0);
   return isNeutralEq(kept.eq) && gateNeutral && compressorNeutral;
+}
+
+/** True when the channel keeps nothing: a neutral strip that sends to no effect (the desk keeps
+ * every other channel in the session). */
+export function isUntouchedStrip(settings) {
+  const kept = clampStrip(settings);
+  return isNeutralStrip(kept) && kept.sends.reverb === 0 && kept.sends.delay === 0;
 }
 
 // The cookbook biquad of `shape` at 48 kHz, normalised: `[b0, b1, b2, a1, a2]`, as the engine

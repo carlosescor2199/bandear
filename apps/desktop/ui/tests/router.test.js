@@ -19,6 +19,7 @@ test("the sidebar holds the sections built so far, in the design's order, Mix fi
       ["record", "#/record", "Record"],
       ["channels", "#/channels", "Channels and groups"],
       ["processing", "#/processing", "Processing"],
+      ["effects", "#/effects", "Effects"],
       ["network", "#/network", "Network and system"],
     ],
   );
@@ -30,6 +31,7 @@ test("a hash opens its section", () => {
   assert.equal(resolveRoute("#/record").id, "record");
   assert.equal(resolveRoute("#/channels").id, "channels");
   assert.equal(resolveRoute("#/processing").id, "processing");
+  assert.equal(resolveRoute("#/effects").id, "effects");
   assert.equal(resolveRoute("#/network").id, "network");
 });
 
@@ -40,7 +42,7 @@ test("a hash written a little differently still opens its section", () => {
 });
 
 test("no hash, or one that names no section, opens the Mix", () => {
-  for (const hash of ["", "#", "#/", "#/effects", "#main", "#/mix/3", undefined]) {
+  for (const hash of ["", "#", "#/", "#/reverb", "#main", "#/mix/3", undefined]) {
     assert.equal(resolveRoute(hash).id, "mix", String(hash));
   }
 });

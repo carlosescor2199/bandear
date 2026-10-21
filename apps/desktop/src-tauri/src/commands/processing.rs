@@ -31,8 +31,8 @@
 use std::sync::Mutex;
 
 use personal_monitoring::{
-    log_info, log_warn, CompressorSettings, EngineHandle, EqBandSettings, EqSettings, GateSettings,
-    HighPassSettings, StripSettings,
+    log_info, log_warn, CompressorSettings, Effect, EffectLevels, EngineHandle, EqBandSettings,
+    EqSettings, GateSettings, HighPassSettings, StripSettings,
 };
 use serde::Serialize;
 
@@ -65,6 +65,14 @@ pub(crate) trait ProcessingEngine {
     fn processing(&self) -> Vec<StripSettings>;
     /// Replaces every channel's strip at once ([EngineHandle::replace_processing]).
     fn replace_processing(&self, settings: &[StripSettings]) -> Result<Vec<StripSettings>, String>;
+    /// Sets the send of `channel` to `effect` and answers its settings kept
+    /// ([EngineHandle::set_channel_send]).
+    fn set_channel_send(
+        &self,
+        channel: usize,
+        effect: Effect,
+        level: u8,
+    ) -> Result<StripSettings, String>;
 }
 
 impl ProcessingEngine for EngineHandle {
@@ -83,6 +91,16 @@ impl ProcessingEngine for EngineHandle {
 
     fn replace_processing(&self, settings: &[StripSettings]) -> Result<Vec<StripSettings>, String> {
         EngineHandle::replace_processing(self, settings).map_err(|error| error.to_string())
+    }
+
+    fn set_channel_send(
+        &self,
+        channel: usize,
+        effect: Effect,
+        level: u8,
+    ) -> Result<StripSettings, String> {
+        EngineHandle::set_channel_send(self, channel, effect, level)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -309,7 +327,7 @@ pub(crate) fn session_processing(list: &[StripSettings]) -> SessionProcessing {
     list.iter()
         .take(MIXER_CHANNELS)
         .enumerate()
-        .filter(|(_, settings)| !settings.is_neutral())
+        .filter(|(_, settings)| !settings.is_untouched())
         .map(|(index, settings)| (index + 1, *settings))
         .collect()
 }
@@ -590,9 +608,15 @@ fn apply_on<E: ProcessingEngine>(
     settings: StripSettings,
 ) -> Result<Vec<ChannelProcessingDto>, String> {
     let before = engine.processing();
-    let refused = targets
-        .iter()
-        .find_map(|&channel| engine.set_channel_processing(channel - 1, settings).err());
+    // The strip changes, each target's sends stay: only [set_channel_send] changes those.
+    let refused = targets.iter().find_map(|&channel| {
+        let sends = before
+            .get(channel - 1)
+            .map_or_else(EffectLevels::default, |kept| kept.sends);
+        engine
+            .set_channel_processing(channel - 1, StripSettings { sends, ..settings })
+            .err()
+    });
     let after = engine.processing();
     if after != before {
         // Marked only: the saver writes it after the engine lock is released.
@@ -625,6 +649,78 @@ fn set_with<E: ProcessingEngine>(
         "{} {} set to the new processing.",
         channel_list(&channels),
         verb(&channels)
+    );
+    Ok(ProcessingSetDto {
+        outcome: "set",
+        channels,
+        message,
+    })
+}
+
+/// Sets the send of input `channel` (1-based) to the shared `effect` to `level` percent (held to
+/// 100) from the engine's next block, where it glides; a linked pair's two sides share it. The
+/// send is kept with the channel's strip and saved as a strip change is. Answers as
+/// [set_channel_processing] does (`set`, or `invalid` past CH 32, with every channel that
+/// changed); an engine that is stopping, or none running, is an error and nothing changes.
+pub fn set_channel_send(
+    state: &DesktopState,
+    channel: usize,
+    effect: Effect,
+    level: u8,
+) -> Result<ProcessingSetDto, String> {
+    let outcome = send_with(
+        &state.engine,
+        &state.processing_saver,
+        channel,
+        effect,
+        level,
+    )?;
+    log_info!(
+        "desk",
+        "set_channel_send: CH {channel} {} {level}: {}",
+        effect.name(),
+        outcome.outcome
+    );
+    Ok(outcome)
+}
+
+/// [set_channel_send] over any engine slot and saver.
+fn send_with<E: ProcessingEngine>(
+    engine: &Mutex<Option<E>>,
+    saver: &ProcessingSaver,
+    channel: usize,
+    effect: Effect,
+    level: u8,
+) -> Result<ProcessingSetDto, String> {
+    if let Some(invalid) = invalid_channel(channel) {
+        return Ok(invalid);
+    }
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let engine = guard
+        .as_ref()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    let before = engine.processing();
+    let kept = engine.set_channel_send(channel - 1, effect, level)?;
+    let after = engine.processing();
+    if after != before {
+        saver.mark(session_processing(&after));
+    }
+    drop(guard);
+    let channels: Vec<ChannelProcessingDto> = after
+        .iter()
+        .take(MIXER_CHANNELS)
+        .enumerate()
+        .filter(|(index, kept)| index + 1 == channel || before.get(*index) != Some(*kept))
+        .map(|(index, kept)| ChannelProcessingDto::of(index + 1, *kept))
+        .collect();
+    let message = format!(
+        "{} {} sending {}% to the {}.",
+        channel_list(&channels),
+        verb(&channels),
+        kept.sends.get(effect),
+        effect.name()
     );
     Ok(ProcessingSetDto {
         outcome: "set",
@@ -769,7 +865,11 @@ fn save_preset_with(
     }
     let preset = SessionStripPreset {
         name: name.to_owned(),
-        settings: settings.clamped(),
+        // A preset is a strip: the sends belong to the channel it is applied to.
+        settings: StripSettings {
+            sends: EffectLevels::default(),
+            ..settings.clamped()
+        },
     };
     let mut presets = session.strip_presets();
     let replaced = match presets.iter_mut().find(|kept| same_name(&kept.name, name)) {
@@ -950,6 +1050,120 @@ mod tests {
             *self.strips.lock().expect("strips") = settings.to_vec();
             Ok(settings.to_vec())
         }
+
+        fn set_channel_send(
+            &self,
+            channel: usize,
+            effect: Effect,
+            level: u8,
+        ) -> Result<StripSettings, String> {
+            let current = self
+                .strips
+                .lock()
+                .expect("strips")
+                .get(channel)
+                .copied()
+                .ok_or_else(|| "no such channel".to_owned())?;
+            let settings = StripSettings {
+                sends: current.sends.with(effect, level),
+                ..current
+            };
+            self.set_channel_processing(channel, settings)
+        }
+    }
+
+    /// A send changes only the sends: the strip stays, a pair's other side takes it, the session
+    /// keeps a channel that only sends, and the strip changes made after it (a set, a reset, a
+    /// preset, a copy) keep each target's sends.
+    #[test]
+    fn a_send_is_set_on_its_own_and_every_strip_change_keeps_it() {
+        let session = Arc::new(SessionStore::open(&test_directory("sends")));
+        let saver = saver_into(&session);
+        let engine = running();
+
+        let sent = send_with(&engine, &saver, 3, Effect::Reverb, 140).expect("sent");
+        assert_eq!(sent.outcome, "set");
+        assert_eq!(
+            sent.message,
+            "CH 3 and CH 4 are sending 100% to the reverb."
+        );
+        let strips = strips_of(&engine);
+        assert_eq!(
+            strips[2].sends,
+            EffectLevels {
+                reverb: 100,
+                delay: 0
+            }
+        );
+        assert_eq!(strips[3].sends, strips[2].sends, "the pair shares it");
+        assert!(strips[2].is_neutral(), "the strip is still neutral");
+        saver.flush();
+        assert_eq!(
+            session.processing().keys().copied().collect::<Vec<_>>(),
+            vec![3, 4],
+            "a channel that only sends is kept"
+        );
+
+        set_with(&engine, &saver, 3, compressed(-25.0)).expect("set");
+        assert_eq!(
+            strips_of(&engine)[2].sends.reverb,
+            100,
+            "a strip change keeps the send"
+        );
+        send_with(&engine, &saver, 1, Effect::Delay, 30).expect("sent");
+        reset_with(&engine, &saver, 1).expect("reset");
+        assert_eq!(strips_of(&engine)[0].sends.delay, 30, "a reset keeps it");
+        copy_with(&engine, &saver, 3, &[1]).expect("copied");
+        let strips = strips_of(&engine);
+        assert_eq!(strips[0].compressor, compressed(-25.0).compressor);
+        assert_eq!(
+            strips[0].sends,
+            EffectLevels {
+                reverb: 0,
+                delay: 30
+            },
+            "a copy keeps the target's"
+        );
+
+        assert_eq!(
+            send_with(&engine, &saver, 33, Effect::Delay, 10)
+                .expect("answered")
+                .outcome,
+            "invalid"
+        );
+        let stopped: Mutex<Option<StandIn>> = Mutex::new(None);
+        assert!(send_with(&stopped, &saver, 1, Effect::Delay, 10).is_err());
+    }
+
+    /// A preset saved from a channel that sends keeps no send, and applying one keeps the target's.
+    #[test]
+    fn a_strip_preset_keeps_no_send_and_leaves_the_channels() {
+        let session = Arc::new(SessionStore::open(&test_directory("preset-sends")));
+        let saver = saver_into(&session);
+        let engine = running();
+        let sending = StripSettings {
+            sends: EffectLevels {
+                reverb: 40,
+                delay: 10,
+            },
+            ..compressed(-30.0)
+        };
+        save_preset_with(&session, "Wet vocal", sending).expect("saved");
+        assert_eq!(
+            session.strip_presets()[0].settings.sends,
+            EffectLevels::default()
+        );
+        send_with(&engine, &saver, 5, Effect::Reverb, 25).expect("sent");
+        apply_preset_with(&engine, &session, &saver, "Wet vocal", 5).expect("applied");
+        let strips = strips_of(&engine);
+        assert_eq!(strips[4].compressor, compressed(-30.0).compressor);
+        assert_eq!(
+            strips[4].sends,
+            EffectLevels {
+                reverb: 25,
+                delay: 0
+            }
+        );
     }
 
     fn test_directory(name: &str) -> PathBuf {

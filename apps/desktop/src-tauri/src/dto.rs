@@ -9,12 +9,13 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use personal_monitoring::{
-    CaptureFormat, EngineLoadStatus, EngineMeters, EngineStatus, EngineerControls, EngineerUpdate,
-    InputDevice, LimiterSettings, LinkHealth, LinkSample, LocalOutputState, LocalOutputStatus,
-    MirrorStatus, MixOrigin, MixUpdate, MixValues, MusicianKey, MusicianStatus, OutputDevice,
-    PlaybackBuffer, RecordingState, RecordingStatus, Redundancy, SampleFormat, SoundcheckClock,
-    SoundcheckState, SoundcheckStatus, TakeEnd, TakeMarker, TakeSummary, TakeTrack,
-    CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_HOLD, CAPABILITY_REDUNDANCY_RECOVERED,
+    CaptureFormat, Effect, EffectLevels, EffectSettings, EngineLoadStatus, EngineMeters,
+    EngineStatus, EngineerControls, EngineerUpdate, InputDevice, LimiterSettings, LinkHealth,
+    LinkSample, LocalOutputState, LocalOutputStatus, MirrorStatus, MixOrigin, MixUpdate, MixValues,
+    MusicianKey, MusicianStatus, OutputDevice, PlaybackBuffer, RecordingState, RecordingStatus,
+    Redundancy, SampleFormat, SoundcheckClock, SoundcheckState, SoundcheckStatus, TakeEnd,
+    TakeMarker, TakeSummary, TakeTrack, CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_HOLD,
+    CAPABILITY_REDUNDANCY_RECOVERED,
 };
 
 use crate::session::{
@@ -264,6 +265,9 @@ pub struct MusicianDto {
     /// The master limiter on the musician's mix (see [crate::commands::limiter]): `{ enabled,
     /// ceilingDb, releaseMs }`; off at 0 dBFS and 50 ms when the desk set none.
     pub limiter: LimiterSettings,
+    /// The shared effects' return levels in the musician's mix (see [crate::commands::effects]):
+    /// `{ reverb, delay }`, 0-100 each; nothing returned when the desk set none.
+    pub fx_returns: EffectLevels,
 }
 
 /// A musician's redundancy as the window reads and sets it: `on`, and the `delayBlocks` of the
@@ -297,6 +301,39 @@ pub struct LimiterSetDto {
     pub musician_key: Option<String>,
     pub outcome: &'static str,
     pub settings: LimiterSettings,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    pub message: String,
+}
+
+/// What [crate::commands::effects::set_effect] did, for the window: `outcome` `set` (in force
+/// from the next block, where the effect glides or crossfades to it) or `invalid` (settings this
+/// build cannot read; nothing changed), `effects` both effects' settings now in force, `saved`
+/// whether the session keeps them for the next start (a save that failed is in `saveError`) and
+/// `message` the outcome in words.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectSetDto {
+    pub outcome: &'static str,
+    pub effect: Effect,
+    pub effects: EffectSettings,
+    pub saved: bool,
+    pub save_error: Option<String>,
+    pub message: String,
+}
+
+/// What [crate::commands::effects::set_musician_fx_return] or
+/// [crate::commands::effects::set_local_fx_return] did: `outcome` `set`, `effect` the one
+/// changed, `returns` every return now in the mix (`{ reverb, delay }`, 0-100), `musicianKey` the
+/// key asked for (null for the local mix), `saved`, `saveError` and `message` as
+/// [LimiterSetDto] has them.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FxReturnSetDto {
+    pub musician_key: Option<String>,
+    pub outcome: &'static str,
+    pub effect: Effect,
+    pub returns: EffectLevels,
     pub saved: bool,
     pub save_error: Option<String>,
     pub message: String,
@@ -1015,6 +1052,7 @@ impl From<&MusicianStatus> for MusicianDto {
                 .iter()
                 .any(|name| name == CAPABILITY_REDUNDANCY_HOLD),
             limiter: musician.limiter,
+            fx_returns: musician.fx_returns,
         }
     }
 }
@@ -1152,6 +1190,12 @@ pub struct EngineStatusDto {
     pub load: EngineLoadDto,
     /// The master limiter on the engineer's local mix (see [crate::commands::limiter]).
     pub local_limiter: LimiterSettings,
+    /// The shared effects' return levels in the local mix (see [crate::commands::effects]).
+    pub local_fx_returns: EffectLevels,
+    /// The shared reverb's and delay's settings: `{ reverb: { sizePercent, dampingPercent,
+    /// preDelayMs, widthPercent }, delay: { timeMs, tempoBpm, note, feedbackPercent, highCutHz,
+    /// pingPong } }`.
+    pub effects: EffectSettings,
 }
 
 /// The engine thread's load on the status (`load`): each block's processing time in percent of
@@ -1242,6 +1286,8 @@ impl From<&EngineStatus> for EngineStatusDto {
             demo: status.demo,
             load: EngineLoadDto::from(&status.load),
             local_limiter: status.local_limiter,
+            local_fx_returns: status.local_fx_returns,
+            effects: status.effects,
         }
     }
 }

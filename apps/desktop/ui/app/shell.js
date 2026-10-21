@@ -22,6 +22,7 @@ import { mountChannelsScreen } from "./screens/channels-screen.js";
 import { mountMixScreen } from "./screens/mix-screen.js";
 import { mountNetworkScreen } from "./screens/network-screen.js";
 import { mountProcessingScreen } from "./screens/processing-screen.js";
+import { mountEffectsScreen } from "./screens/effects-screen.js";
 import { mountRecordScreen } from "./screens/record-screen.js";
 
 const ICONS = Object.freeze({
@@ -29,6 +30,7 @@ const ICONS = Object.freeze({
   record: `<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/>`,
   channels: `<path d="M4 6h16M4 12h16M4 18h10"/>`,
   processing: `<path d="M3 15c3 0 3-6 6-6s3 6 6 6 3-6 6-6"/>`,
+  effects: `<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6.5" opacity="0.6"/><circle cx="12" cy="12" r="10" opacity="0.3"/>`,
   network: `<path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1"/>`,
 });
 
@@ -37,6 +39,7 @@ const PLACEHOLDERS = Object.freeze({
   record: "Record every input to its own track while the show runs.",
   channels: "Name each input, pair stereo sources, hide spares and build groups.",
   processing: "Shape each input with a high-pass filter, an equaliser, a gate and a compressor.",
+  effects: "The shared reverb and delay every input sends to and every mix returns.",
   network: "Tune each phone's connection, watch its health and look after the server.",
 });
 
@@ -175,6 +178,7 @@ if (nav && main) {
       record: app ? (screenMain) => mountRecordScreen(screenMain, app) : unavailableScreen,
       channels: app ? (screenMain) => mountChannelsScreen(screenMain, app) : unavailableScreen,
       processing: app ? (screenMain) => mountProcessingScreen(screenMain, app) : unavailableScreen,
+      effects: app ? (screenMain) => mountEffectsScreen(screenMain, app) : unavailableScreen,
       network: app ? (screenMain) => mountNetworkScreen(screenMain, app) : unavailableScreen,
     },
   });

@@ -171,6 +171,15 @@
 //!   every strip neutral) leaves every strip neutral. A section that cannot be read is set aside
 //!   like any other. It was added within version 1: an earlier build reads the file and drops it
 //!   when it saves.
+//!   A strip also keeps the input's `sends` to the shared reverb and delay (`{ "reverb": 0-100,
+//!   "delay": 0-100 }`, percent; see [crate::commands::effects]): a strip that only sends is kept too.
+//! - `effects` is the shared reverb's and delay's settings (`reverb`: `sizePercent`,
+//!   `dampingPercent`, `preDelayMs`, `widthPercent`; `delay`: `timeMs`, `tempoBpm` (0 for none),
+//!   `note`, `feedbackPercent`, `highCutHz`, `pingPong`), absent until the engineer changed them.
+//!   A musician's entry and the `local` section keep `fxReturns`, their mix's return level of
+//!   each effect (`{ "reverb": 0-100, "delay": 0-100 }`), absent while nothing is returned. All
+//!   three are handed to every engine the desk starts and carried by named sessions; added within
+//!   version 1.
 //! - `stripPresets` are the engineer's own strip presets, in the order they were saved, each a
 //!   name and the strip it keeps (the built-in ones are never written). Like `recording` they
 //!   belong to this desk: a named session never carries them, and loading one keeps the desk's
@@ -204,7 +213,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use personal_monitoring::{log_warn, LimiterSettings, StripSettings};
+use personal_monitoring::{log_warn, EffectLevels, EffectSettings, LimiterSettings, StripSettings};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -252,6 +261,10 @@ pub struct Session {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub strip_presets: Vec<SessionStripPreset>,
+    /// The shared reverb's and delay's settings (see [crate::commands::effects]); absent until the
+    /// engineer changed them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<EffectSettings>,
 }
 
 impl Default for Session {
@@ -267,6 +280,7 @@ impl Default for Session {
             recording: None,
             processing: SessionProcessing::new(),
             strip_presets: Vec::new(),
+            effects: None,
         }
     }
 }
@@ -354,6 +368,15 @@ impl Session {
             .filter_map(|(key, entry)| Some((key.clone(), entry.limiter?)))
             .collect()
     }
+
+    /// Every musician's effect returns the session keeps, each with its musician's key, in key
+    /// order.
+    pub fn fx_returns(&self) -> Vec<(String, EffectLevels)> {
+        self.musicians
+            .iter()
+            .filter_map(|(key, entry)| Some((key.clone(), entry.fx_returns?)))
+            .collect()
+    }
 }
 
 /// The audio input the desk last ran with, as the window starts every engine from it.
@@ -414,6 +437,15 @@ pub struct SessionLocal {
         deserialize_with = "lenient_limiter"
     )]
     pub limiter: Option<LimiterSettings>,
+    /// The shared effects' return levels in the local mix (see [crate::commands::effects]); `None`
+    /// while nothing is returned.
+    #[serde(
+        default,
+        rename = "fxReturns",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_levels"
+    )]
+    pub fx_returns: Option<EffectLevels>,
 }
 
 /// An output the local mix plays on: the device by its exact name, and the first output of the
@@ -516,6 +548,15 @@ pub struct MusicianEntry {
         deserialize_with = "lenient_limiter"
     )]
     pub limiter: Option<LimiterSettings>,
+    /// The shared effects' return levels in this musician's mix (see [crate::commands::effects]);
+    /// `None` while nothing is returned.
+    #[serde(
+        default,
+        rename = "fxReturns",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_levels"
+    )]
+    pub fx_returns: Option<EffectLevels>,
 }
 
 /// The playback buffer the desk set for one musician's phone (see
@@ -550,6 +591,15 @@ pub struct SessionRedundancy {
 
 /// Reads a `limiter` (a musician's, or the local mix's) without ever failing what holds it, as
 /// [lenient_engineer] does.
+/// Reads a mix's `fxReturns` without ever failing what holds it, as [lenient_limiter] does.
+fn lenient_levels<'de, D>(deserializer: D) -> Result<Option<EffectLevels>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| EffectLevels::deserialize(value).ok()))
+}
+
 fn lenient_limiter<'de, D>(deserializer: D) -> Result<Option<LimiterSettings>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1167,6 +1217,64 @@ impl SessionStore {
         self.update_local(|local| local.output = output)
     }
 
+    /// Keeps the local mix's effect returns, or drops them with `None` (nothing returned). Saved as
+    /// [Self::set_local_mix] is.
+    pub fn set_local_fx_returns(&self, returns: Option<EffectLevels>) -> Result<(), String> {
+        self.update_local(|local| local.fx_returns = returns)
+    }
+
+    /// The shared effects' settings the session keeps; `None` before the engineer changed them.
+    pub fn effects(&self) -> Option<EffectSettings> {
+        self.lock().session.effects
+    }
+
+    /// Keeps the shared effects' settings, or drops them with `None` (the defaults). Saved as
+    /// [Self::set_processing] is.
+    pub fn set_effects(&self, effects: Option<EffectSettings>) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let session = Session {
+            effects,
+            ..loaded.session.clone()
+        };
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
+    /// Every musician's effect returns the session keeps, with their keys.
+    pub fn fx_returns(&self) -> Vec<(String, EffectLevels)> {
+        self.lock().session.fx_returns()
+    }
+
+    /// Keeps the effect returns of the musician `key` names, or drops them with `None`, as
+    /// [Self::set_limiter] keeps a limiter.
+    pub fn set_fx_returns(
+        &self,
+        key: &str,
+        address: &str,
+        returns: Option<EffectLevels>,
+    ) -> Result<(), String> {
+        let mut loaded = self.lock();
+        if let Some(refusal) = &loaded.refusal {
+            return Err(refusal.clone());
+        }
+        let mut session = loaded.session.clone();
+        if key.starts_with("client:") {
+            update_entry(&mut session, address_key(address), |entry| {
+                entry.fx_returns = None
+            });
+        }
+        update_entry(&mut session, key.to_owned(), |entry| {
+            entry.fx_returns = returns
+        });
+        write_atomically(&self.path, &session)?;
+        loaded.session = session;
+        Ok(())
+    }
+
     /// Keeps the local mix's master limiter, or drops it with `None` (the default); the mix and
     /// its output stay as kept. Saved as [Self::set_local_mix] is.
     pub fn set_local_limiter(&self, limiter: Option<LimiterSettings>) -> Result<(), String> {
@@ -1204,7 +1312,7 @@ impl SessionStore {
     /// written before success is reported; a save that fails, or is refused over a session this
     /// build must not replace, changes nothing.
     pub fn set_processing(&self, mut processing: SessionProcessing) -> Result<(), String> {
-        processing.retain(|_, strip| !strip.is_neutral());
+        processing.retain(|_, strip| !strip.is_untouched());
         let mut loaded = self.lock();
         if let Some(refusal) = &loaded.refusal {
             return Err(refusal.clone());
@@ -1363,6 +1471,7 @@ pub(crate) fn read_session(
     let recording = take_section(&mut fields, "recording", damaged);
     let processing = take_section(&mut fields, "processing", damaged);
     let strip_presets = take_section(&mut fields, "stripPresets", damaged);
+    let effects = take_section(&mut fields, "effects", damaged);
     serde_json::from_value::<Session>(Value::Object(fields))
         .map(|session| Session {
             groups,
@@ -1373,6 +1482,7 @@ pub(crate) fn read_session(
             recording,
             processing,
             strip_presets,
+            effects,
             ..session
         })
         .map_err(|error| format!("is not a session ({error})"))
@@ -2858,6 +2968,7 @@ mod tests {
         session.set_local_output(Some(volt_out(0))).expect("saved");
 
         let kept = SessionLocal {
+            fx_returns: None,
             limiter: None,
             mix: Some(local_mix()),
             output: Some(volt_out(0)),
@@ -2898,6 +3009,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: None,
                 output: Some(volt_out(2)),
@@ -2916,6 +3028,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: Some(local_mix()),
                 output: None,
@@ -2974,6 +3087,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: Some(SessionMix {
                     channels: vec![SessionPresetChannel {
@@ -3027,6 +3141,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: Some(local_mix()),
                 output: None,

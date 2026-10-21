@@ -69,19 +69,13 @@ pub(crate) fn describe_service(
 }
 
 /// The host name as a person reads it: control characters dropped, surrounding blanks trimmed, and
-/// a trailing `.local` removed (macOS's `hostname` reports `Studio-Mac.local`).
+/// only its first label kept. macOS's `hostname` reports `Studio-Mac.local` and some Linux machines
+/// report a full domain name such as `box.example.com`; a dot left in the instance name would split
+/// it into several DNS labels, so a phone could show the wrong name or fail to resolve the desk.
 fn display_host(host_name: &str) -> String {
     let cleaned: String = host_name.chars().filter(|c| !c.is_control()).collect();
-    let mut host = cleaned.trim().trim_end_matches('.');
-    // `get` rather than indexing: a non-ASCII name may not have a character boundary there.
-    let suffix_start = host.len().saturating_sub(6);
-    if host
-        .get(suffix_start..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".local"))
-    {
-        host = &host[..suffix_start];
-    }
-    host.trim().to_owned()
+    let first_label = cleaned.trim().split('.').next().unwrap_or_default();
+    first_label.trim().to_owned()
 }
 
 /// `BandEar on <host>`, cut to the 63-byte label limit on a character boundary, or just `BandEar`
@@ -310,6 +304,14 @@ mod tests {
 
         assert_eq!(description.instance_name, "BandEar on Studio-Mac");
         assert_eq!(description.host_name, "bandear-studio-mac.local.");
+    }
+
+    #[test]
+    fn a_full_domain_name_keeps_only_its_first_label() {
+        let description = described(Some("box.example.com"));
+
+        assert_eq!(description.instance_name, "BandEar on box");
+        assert_eq!(description.host_name, "bandear-box.local.");
     }
 
     #[test]

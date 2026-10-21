@@ -65,3 +65,9 @@ build the iOS app now.
   discovery tests unchanged.
 - Pending: manual `dns-sd -B _bandear._tcp` on the Mac mini.
 - Work-unit commit: `8b37cfd feat(server): announce the desk over Bonjour for iOS` (T1 + T2).
+- Native review review-264d0aa2cc03dd30 (medium, one lens): approved and acknowledged. Its WARNING
+  (dots inside a host name split the instance label) fixed on request: `display_host` keeps only
+  the first label; new test `a_full_domain_name_keeps_only_its_first_label`. Test-first exception:
+  one build only (no separate RED) to limit build load. `cargo test -p personal-monitoring`: 658
+  passed, 0 failed. Suggestions left open: all-non-ASCII host names share the `bandear.local.`
+  fallback; start/stop proved only by the manual check.

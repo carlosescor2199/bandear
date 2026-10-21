@@ -10,6 +10,7 @@ pub mod backups;
 pub mod link_history;
 pub mod local;
 pub mod playback_buffer;
+pub mod processing;
 pub mod recording;
 pub mod redundancy;
 pub mod soundcheck;
@@ -25,11 +26,12 @@ use personal_monitoring::{
     check_channels, check_groups, log_info, log_warn, start, AudioHost, ChannelKind, ChannelMeta,
     EngineConfig, EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition,
     MirrorOutcome, MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
-    PlaybackBuffer, PresetChannel, Redundancy,
+    PlaybackBuffer, PresetChannel, Redundancy, StripSettings,
 };
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
 use self::local::{apply_kept_local, kept_local, with_pending, LocalEngine};
+use self::processing::{ProcessingEngine, ProcessingSaver};
 use self::recording::{FolderOpener, RecordingsFolder, SystemFileManager};
 use crate::backups::{BackupStore, BACKUPS_DIRECTORY, KEPT_BACKUPS};
 use crate::dto::{
@@ -83,6 +85,9 @@ pub struct DesktopState {
     /// Keeps the local mix in the session off the engine lock (see [local::saver]). Paused inside
     /// the engine lock by a start and a load; it writes taking only the session's lock.
     local_saver: LocalMixSaver,
+    /// Keeps each input's channel processing in the session off the engine lock (see
+    /// [processing]), as [Self::local_saver] keeps the local mix, and paused the same way.
+    processing_saver: ProcessingSaver,
     /// The desk's default recordings folder (see [recording]).
     recordings: RecordingsFolder,
     /// Opens a take folder in the system's file manager (see [recording::open_take_folder]).
@@ -117,6 +122,14 @@ impl DesktopState {
                 SAVE_INTERVAL,
             )
         };
+        let processing_saver = {
+            let session = Arc::clone(&session);
+            ProcessingSaver::start(
+                move |kept| session.set_processing(kept.clone()),
+                |line| log_warn!("desk", "{line}"),
+                SAVE_INTERVAL,
+            )
+        };
         Self {
             engine: Mutex::new(None),
             run: AtomicU64::new(0),
@@ -126,6 +139,7 @@ impl DesktopState {
             snapshots,
             local_notice: Mutex::new(None),
             local_saver,
+            processing_saver,
             recordings,
             folder_opener: Box::new(SystemFileManager),
             mix_backups,
@@ -441,8 +455,10 @@ fn parse_host(value: Option<&str>) -> AudioHost {
 ///
 /// The engineer's groups come from the session: a request that names none (the window always sends
 /// none) gets the session's groups applied as soon as the engine runs (see [session_groups_for]).
-/// The session's channel details are applied the same way to every start ([session_channels]).
-/// Groups or details the engine refuses there (a hand-edited session) are logged and the engine
+/// The session's channel details are applied the same way to every start ([session_channels]),
+/// and then each input's channel processing the session keeps, a change not written yet included
+/// ([processing::hand_kept_processing]); one the engine refuses is logged and every strip stays
+/// neutral. Groups or details the engine refuses there (a hand-edited session) are logged and the engine
 /// runs without them: they are a convenience and must not stop the server. The engineer's controls
 /// the session keeps for each musician are given to the engine after them
 /// ([session_engineer_controls]): a configured target has them at once, and a phone gets them when
@@ -473,6 +489,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     // A local mix marked and not written yet is read with the session (it stays marked, and is
     // written later).
     let saved_local = kept_local(&state.session, &state.local_saver);
+    // So is a processing change marked and not written yet.
+    let saved_processing = processing::kept_processing(&state.session, &state.processing_saver);
     let config = to_engine_config(request);
     // Under the engine lock, so a snapshot can never pair the old engine with the new run.
     let run = state.run.fetch_add(1, Ordering::SeqCst) + 1;
@@ -486,6 +504,10 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     match start(config).map_err(|error| error.to_string())? {
         Some(mut handle) => {
             hand_session_layout(&mut handle, &state.session, saved_groups, saved_channels);
+            // After the channel layout, so a linked pair takes its first side's strip.
+            if let Some(refused) = processing::hand_kept_processing(&handle, &saved_processing) {
+                log_warn!("desk", "start_engine: {refused}");
+            }
             for (key, controls) in saved_controls {
                 if let Err(error) = handle.keep_engineer_controls(&key, controls) {
                     log_warn!(
@@ -1849,7 +1871,8 @@ fn edit_channels<E: ChannelEngine>(
 }
 
 /// Stops the engine's event pump, then the engine, and joins their threads; then, with the engine
-/// lock released, writes the local mix still waiting to be kept (see [local::saver]) and hands a
+/// lock released, writes the local mix and the channel processing still waiting to be kept (see
+/// [local::saver]) and hands a
 /// backup of the musicians' mixes as the engine left them to its writer (see [backups]). Stopping
 /// when idle is a no-op.
 pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
@@ -1870,6 +1893,7 @@ pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
     };
     drop(guard);
     state.local_saver.flush();
+    state.processing_saver.flush();
     if let Some(desk) = &desk {
         backups::back_up_desk(state, desk);
     }
@@ -2007,13 +2031,14 @@ pub fn sessions(state: &DesktopState) -> Result<Vec<SnapshotSummary>, String> {
 
 /// What a session save or load reads of the running engine: the device's input count, the ids of
 /// the live groups in their order (every musician's group levels are placed by them), every
-/// musician the engine lists, with their mix, their phone's client id and whom they follow, and the
-/// engineer's local mix.
+/// musician the engine lists, with their mix, their phone's client id and whom they follow, the
+/// engineer's local mix and every channel's strip (CH 1 first).
 struct DeskView {
     inputs: usize,
     groups: Vec<String>,
     musicians: Vec<MusicianStatus>,
     local: MixValues,
+    processing: Vec<StripSettings>,
 }
 
 /// Reads the running engine for a session save or load: the engine in the app, a stand-in in the
@@ -2030,13 +2055,14 @@ impl DeskReader for EngineHandle {
             groups: status.groups.into_iter().map(|group| group.id).collect(),
             musicians: status.musicians,
             local: status.local_mix,
+            processing: EngineHandle::processing(self),
         }
     }
 }
 
-/// What loading a session needs from the running engine, besides the group, channel and local mix
-/// edits every other command uses.
-trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine {
+/// What loading a session needs from the running engine, besides the group, channel, local mix and
+/// processing edits every other command uses.
+trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine + ProcessingEngine {
     /// Replaces every control and mirror the engine keeps ([EngineHandle::replace_kept]); answers
     /// the mirrors it refused.
     fn replace_kept(
@@ -2131,9 +2157,10 @@ fn session_mix_of(mix: &MixValues, desk: &DeskView) -> SessionMix {
 /// engine runs, and answers what was saved ([SessionSavedDto]).
 ///
 /// The session is everything the desk keeps (labels, the engineer's controls and mirrors, channel
-/// details, groups, presets, the audio input, and the local mix and its output); each musician's
-/// mix is read from the running engine under the key the desk keeps them by (see [saved_mixes]),
-/// and so is the local mix the engine plays. With no engine running the session is saved without
+/// details, groups, presets, the audio input, the local mix and its output, and each input's
+/// channel processing), but how this desk records and its strip presets; each musician's mix is
+/// read from the running engine under the key the desk keeps them by (see [saved_mixes]), and so
+/// are the local mix and the processing the engine plays. With no engine running the session is saved without
 /// mixes, with the local mix as the desk keeps it. A refused name, or a save that fails, saves
 /// nothing.
 pub fn save_session(state: &DesktopState, name: String) -> Result<SessionSavedDto, String> {
@@ -2163,9 +2190,12 @@ fn save_session_with<E: DeskReader>(
     let desk = guard.as_ref().map(DeskReader::desk);
     let mixes = desk.as_ref().map(saved_mixes).unwrap_or_default();
     let mut current = session.current();
-    // How this desk records belongs to the desk, not to a show.
+    // How this desk records, and its own strip presets, belong to the desk, not to a show.
     current.recording = None;
+    current.strip_presets = Vec::new();
     if let Some(desk) = &desk {
+        // The processing the engine plays: a change not written yet is the engine's already.
+        current.processing = processing::session_processing(&desk.processing);
         // The local mix the engine plays: an edit whose save failed, or levels a group or channel
         // change moved, are the engine's, not yet the session's.
         let kept = current.local.take().unwrap_or_default();
@@ -2225,7 +2255,9 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   playback buffers replace the engine's the same way ([EngineHandle::replace_playback_buffers]),
 ///   so a phone on a fixed buffer the loaded session does not keep goes back to Auto. Its redundancy
 ///   settings too ([EngineHandle::replace_redundancies]): a musician it does not keep goes back to
-///   being sent once. A
+///   being sent once. Its channel processing replaces every channel's strip
+///   ([EngineHandle::replace_processing]), right after the controls and mirrors: a channel it keeps
+///   none for goes back to no processing, and a change still waiting to be kept is dropped. A
 ///   mirror the engine refuses (on oneself, or closing a circle) is named in the answer; the
 ///   session keeps it, as a start would refuse it again.
 /// - With no engine running, the session is replaced and the saved mixes go to nobody (each is
@@ -2253,6 +2285,7 @@ pub fn load_session(state: &DesktopState, id: String) -> Result<SessionLoadedDto
         &state.session,
         &state.snapshots,
         &state.local_saver,
+        &state.processing_saver,
         &state.local_notice,
         &id,
     )?;
@@ -2321,13 +2354,14 @@ fn loaded_audio(
     }
 }
 
-/// [load_session] over any engine slot, session, folder of named sessions, local mix saver and
-/// notice.
+/// [load_session] over any engine slot, session, folder of named sessions, local mix and
+/// processing savers and notice.
 fn load_session_with<E: SessionEngine>(
     engine: &Mutex<Option<E>>,
     session: &SessionStore,
     snapshots: &SnapshotStore,
     saver: &LocalMixSaver,
+    processing_saver: &ProcessingSaver,
     notice: &Mutex<Option<String>>,
     id: &str,
 ) -> Result<SessionLoadedDto, String> {
@@ -2358,6 +2392,8 @@ fn load_session_with<E: SessionEngine>(
     // No local mix is written while the session is read and replaced: one still waiting is the
     // desk's own, newer than the session's.
     let paused = saver.pause();
+    // Nor any processing: the loaded session's replaces the change still waiting.
+    let processing_paused = processing_saver.pause();
     let previous = session.current();
     let (audio, audio_loaded, audio_skipped) =
         loaded_audio(snapshot.session.audio.clone(), previous.audio.clone());
@@ -2403,6 +2439,9 @@ fn load_session_with<E: SessionEngine>(
         paused.clear();
     }
     drop(paused);
+    // The session or the engine holds the loaded processing now.
+    processing_paused.clear();
+    drop(processing_paused);
     let (mixes, skipped, refused, local) = match live {
         Some(live) => (live.pushed, live.skipped, live.refused, live.local),
         None => (
@@ -2502,6 +2541,13 @@ fn apply_session<E: SessionEngine>(
             "the saved limits, locks and mirrors were not applied: {error}"
         )],
     };
+    // Every channel's strip, after the channel layout so a linked pair takes its first side's: a
+    // channel the loaded session keeps none for goes back to no processing.
+    if let Err(error) = engine.replace_processing(&processing::processing_list(&next.processing)) {
+        refused.push(format!(
+            "the saved channel processing was not applied: {error}"
+        ));
+    }
     // The loaded session's buffers replace the engine's whole too, so a phone set to a fixed
     // buffer the session does not keep goes back to Auto.
     if let Err(error) = engine.replace_playback_buffers(&playback_buffer::buffers_of(next)) {
@@ -3175,6 +3221,42 @@ mod tests {
         /// The outputs its driver offers, and where the local mix plays.
         outputs: Vec<personal_monitoring::OutputDevice>,
         output: personal_monitoring::LocalOutputStatus,
+        /// Every channel's strip, as the engine keeps them (none until it took any).
+        strips: Mutex<Vec<StripSettings>>,
+    }
+
+    impl ProcessingEngine for StandInEngine {
+        fn set_channel_processing(
+            &self,
+            channel: usize,
+            settings: StripSettings,
+        ) -> Result<StripSettings, String> {
+            let mut strips = self.strips.lock().expect("strips lock");
+            strips.resize(32, StripSettings::default());
+            strips[channel] = settings.clamped();
+            Ok(strips[channel])
+        }
+
+        fn processing(&self) -> Vec<StripSettings> {
+            self.strips.lock().expect("strips lock").clone()
+        }
+
+        fn replace_processing(
+            &self,
+            settings: &[StripSettings],
+        ) -> Result<Vec<StripSettings>, String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            self.note("replace_processing".to_owned());
+            *self.strips.lock().expect("strips lock") = settings.to_vec();
+            Ok(settings.to_vec())
+        }
+    }
+
+    /// A processing saver with nothing waiting that writes nowhere.
+    fn idle_processing_saver() -> ProcessingSaver {
+        ProcessingSaver::manual(|_| Ok(()), |_| {})
     }
 
     /// The engineer's controls and the mirrors an engine keeps, as a load hands them over.
@@ -3375,6 +3457,7 @@ mod tests {
                 ),
                 musicians: self.here.lock().expect("rows lock").clone(),
                 local: self.local,
+                processing: ProcessingEngine::processing(self),
             }
         }
     }
@@ -6200,7 +6283,15 @@ mod tests {
         id: &str,
     ) -> Result<SessionLoadedDto, String> {
         let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
-        load_session_with(engine, session, snapshots, &saver, &Mutex::new(None), id)
+        load_session_with(
+            engine,
+            session,
+            snapshots,
+            &saver,
+            &idle_processing_saver(),
+            &Mutex::new(None),
+            id,
+        )
     }
 
     #[test]
@@ -6411,8 +6502,16 @@ mod tests {
         let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
         let notice = Mutex::new(Some("said at start".to_owned()));
 
-        let outcome = load_session_with(&engine, &session, &snapshots, &saver, &notice, "show")
-            .expect("loaded");
+        let outcome = load_session_with(
+            &engine,
+            &session,
+            &snapshots,
+            &saver,
+            &idle_processing_saver(),
+            &notice,
+            "show",
+        )
+        .expect("loaded");
 
         let said = outcome.local_output_notice.expect("said");
         let status = status_dto(&engine_status_now(), 3, &session, &notice);
@@ -6465,7 +6564,16 @@ mod tests {
         saved_session(test, "newer", &snapshot(with_local.clone(), &[]));
 
         saver.mark(waiting.clone());
-        load_session_with(&engine, &session, &snapshots, &saver, &notice, "older").expect("loaded");
+        load_session_with(
+            &engine,
+            &session,
+            &snapshots,
+            &saver,
+            &idle_processing_saver(),
+            &notice,
+            "older",
+        )
+        .expect("loaded");
         assert_eq!(
             session.local().and_then(|local| local.mix),
             Some(waiting.clone()),
@@ -6478,13 +6586,197 @@ mod tests {
         );
 
         saver.mark(waiting);
-        load_session_with(&engine, &session, &snapshots, &saver, &notice, "newer").expect("loaded");
+        load_session_with(
+            &engine,
+            &session,
+            &snapshots,
+            &saver,
+            &idle_processing_saver(),
+            &notice,
+            "newer",
+        )
+        .expect("loaded");
         saver.flush();
         assert!(written.lock().expect("written").is_empty());
         assert_eq!(
             session.local(),
             with_local.local,
             "the loaded local mix replaced the one waiting"
+        );
+    }
+
+    /// A strip with its compressor on at `threshold_db`.
+    fn compressed_strip(threshold_db: f32) -> StripSettings {
+        StripSettings {
+            compressor: personal_monitoring::CompressorSettings {
+                enabled: true,
+                threshold_db,
+                ..personal_monitoring::CompressorSettings::default()
+            },
+            ..StripSettings::default()
+        }
+    }
+
+    fn strips_of(engine: &Mutex<Option<StandInEngine>>) -> Vec<StripSettings> {
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .map(ProcessingEngine::processing)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_load_replaces_every_strip_after_the_channel_layout_and_drops_a_change_waiting() {
+        let test = "session-load-processing";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 2,
+                ..StandInEngine::default()
+            }),
+        );
+        let strip = compressed_strip(-24.0);
+        let mut loaded = layout_session(&[], 2);
+        loaded.processing = BTreeMap::from([(2, strip)]);
+        saved_session(test, "show", &snapshot(loaded.clone(), &[]));
+        let mine = crate::session::SessionStripPreset {
+            name: "Mine".to_owned(),
+            settings: strip,
+        };
+        session.set_strip_presets(vec![mine.clone()]).expect("kept");
+        let written: Arc<Mutex<Vec<crate::session::SessionProcessing>>> = Arc::default();
+        let processing_saver = {
+            let written = Arc::clone(&written);
+            ProcessingSaver::manual(
+                move |kept: &crate::session::SessionProcessing| {
+                    written.lock().expect("written").push(kept.clone());
+                    Ok(())
+                },
+                |_| {},
+            )
+        };
+        processing_saver.mark(BTreeMap::from([(1, compressed_strip(-10.0))]));
+        let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
+
+        let outcome = load_session_with(
+            &engine,
+            &session,
+            &snapshots,
+            &saver,
+            &processing_saver,
+            &Mutex::new(None),
+            "show",
+        )
+        .expect("loaded");
+
+        assert!(outcome.applied && outcome.saved, "{outcome:?}");
+        let log = log_of(&engine);
+        let at = |step: &str| {
+            log.iter()
+                .position(|line| line.starts_with(step))
+                .unwrap_or_else(|| panic!("no {step} in {log:?}"))
+        };
+        assert!(at("set_channels") < at("replace_processing"), "{log:?}");
+        let strips = strips_of(&engine);
+        assert_eq!(strips.len(), 32, "every channel, CH 1 first");
+        assert_eq!(strips[1], strip);
+        assert_eq!(
+            strips[0],
+            StripSettings::default(),
+            "CH 1, which the show keeps nothing for, goes back to no processing"
+        );
+        assert_eq!(session.processing(), BTreeMap::from([(2, strip)]));
+        assert_eq!(
+            session.strip_presets(),
+            vec![mine],
+            "the desk's own strip presets stay"
+        );
+        processing_saver.flush();
+        assert!(
+            written.lock().expect("written").is_empty(),
+            "the change waiting is never written over the loaded processing"
+        );
+
+        let idle = "session-load-processing-idle";
+        let (session, snapshots, nothing) = desk(idle, None);
+        saved_session(idle, "show", &snapshot(loaded, &[]));
+        session
+            .set_processing(BTreeMap::from([(7, compressed_strip(-5.0))]))
+            .expect("kept");
+        load_into(&nothing, &session, &snapshots, "show").expect("loaded");
+        assert_eq!(
+            session.processing(),
+            BTreeMap::from([(2, strip)]),
+            "with no engine the next start takes the loaded processing"
+        );
+    }
+
+    #[test]
+    fn a_saved_session_keeps_the_processing_the_engine_plays_and_never_the_strip_presets() {
+        let test = "session-save-processing";
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 2,
+                ..StandInEngine::default()
+            }),
+        );
+        let strip = compressed_strip(-20.0);
+        // Behind the engine: its change is still waiting to be written.
+        session
+            .set_processing(BTreeMap::from([(5, compressed_strip(-3.0))]))
+            .expect("kept");
+        session
+            .set_strip_presets(vec![crate::session::SessionStripPreset {
+                name: "Mine".to_owned(),
+                settings: strip,
+            }])
+            .expect("kept");
+        engine
+            .lock()
+            .expect("engine lock")
+            .as_ref()
+            .expect("running")
+            .set_channel_processing(0, strip)
+            .expect("set");
+
+        let saved = save_session_with(&engine, &session, &snapshots, "Show").expect("saved");
+
+        let read = snapshots.read(&saved.session.id).expect("readable");
+        assert_eq!(
+            read.snapshot.session.processing,
+            BTreeMap::from([(1, strip)]),
+            "the engine's, by channel number"
+        );
+        assert!(read.snapshot.session.strip_presets.is_empty());
+        let file: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                session_directory_kept(test)
+                    .join(SESSIONS_DIRECTORY)
+                    .join(format!("{}.json", saved.session.id)),
+            )
+            .expect("written"),
+        )
+        .expect("JSON");
+        assert_eq!(file["processing"]["1"]["compressor"]["thresholdDb"], -20.0);
+        assert!(file.get("stripPresets").is_none(), "{file}");
+
+        let idle = "session-save-processing-idle";
+        let (session, snapshots, nothing) = desk(idle, None);
+        session
+            .set_processing(BTreeMap::from([(5, strip)]))
+            .expect("kept");
+        let saved = save_session_with(&nothing, &session, &snapshots, "Show").expect("saved");
+        assert_eq!(
+            snapshots
+                .read(&saved.session.id)
+                .expect("readable")
+                .snapshot
+                .session
+                .processing,
+            BTreeMap::from([(5, strip)]),
+            "with no engine, the session's"
         );
     }
 

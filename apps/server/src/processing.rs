@@ -564,7 +564,7 @@ impl Processing {
             )
         })?;
         settings.sends = settings.sends.with(effect, level);
-        self.set_channel(channel, settings)
+        self.write_channel(channel, settings)
     }
 
     /// Both effects' settings in force.
@@ -631,7 +631,21 @@ impl Processing {
     /// Sets the processing of `channel` (0 is CH 1) to `settings`, held in their ranges, and
     /// returns what is kept. For a linked pair both sides take them. The strip glides to them from
     /// the next block; a channel the device lacks keeps them for when it is back.
+    ///
+    /// The channel keeps its own sends: `settings.sends` is not read, so a strip from a preset, a
+    /// copy or a reset never silences a channel's reverb or delay. [Self::set_send] changes the
+    /// sends, and [Self::replace] (a session load) replaces them with the rest.
     pub(crate) fn set_channel(
+        &mut self,
+        channel: usize,
+        settings: StripSettings,
+    ) -> Result<StripSettings, String> {
+        let sends = self.channel(channel).unwrap_or_default().sends;
+        self.write_channel(channel, StripSettings { sends, ..settings })
+    }
+
+    /// [Self::set_channel] with the sends `settings` carries.
+    fn write_channel(
         &mut self,
         channel: usize,
         settings: StripSettings,
@@ -663,7 +677,8 @@ impl Processing {
     }
 
     /// Replaces every channel's settings at once (a session load): `table` from CH 1 on, the
-    /// channels past it neutral. A pair takes its first side's. Returns the settings now kept.
+    /// channels past it neutral, sends included (a session keeps them with the strip, so the show
+    /// loaded is the show heard). A pair takes its first side's. Returns the settings now kept.
     pub(crate) fn replace(
         &mut self,
         table: &[StripSettings],
@@ -1187,6 +1202,41 @@ pub(crate) mod tests {
         processing.follow(&metas(4, &[0, 2])).unwrap();
         assert_eq!(processing.settings()[1].sends.reverb, 20);
         assert!(processing.set_send(32, Effect::Reverb, 10).is_err());
+    }
+
+    /// A whole strip written over a channel (a preset's, a copy's or a reset's, all sending
+    /// nothing) keeps the channel's sends, a pair's included; only a send or a load changes them.
+    #[test]
+    fn a_strip_written_over_a_channel_keeps_its_sends() {
+        let (_stage, mut processing) = stage(&metas(4, &[2]), 64);
+        processing.set_send(0, Effect::Reverb, 40).unwrap();
+        processing.set_send(3, Effect::Delay, 25).unwrap();
+        let preset = StripSettings {
+            sends: EffectLevels::default(),
+            ..typical()
+        };
+        let kept = processing.set_channel(0, preset).unwrap();
+        assert_eq!(kept.sends.reverb, 40, "the answer carries the sends kept");
+        processing.set_channel(2, preset).unwrap();
+        processing.set_channel(1, StripSettings::default()).unwrap();
+        let settings = processing.settings();
+        assert_eq!(settings[0].compressor, typical().compressor);
+        assert_eq!(settings[0].sends.reverb, 40);
+        assert_eq!(settings[2].sends.delay, 25);
+        assert_eq!(settings[3].sends.delay, 25);
+        assert_eq!(settings[1].sends, EffectLevels::default());
+        // A strip that tries to send is not a send: the sends stay where they were.
+        let sending = StripSettings {
+            sends: EffectLevels {
+                reverb: 90,
+                delay: 90,
+            },
+            ..typical()
+        };
+        assert_eq!(processing.set_channel(0, sending).unwrap().sends.delay, 0);
+        // A load replaces them with the rest of the strip.
+        processing.replace(&[preset]).unwrap();
+        assert_eq!(processing.settings()[0].sends, EffectLevels::default());
     }
 
     /// The effects' settings are kept, held in range, and replaced whole by a load.

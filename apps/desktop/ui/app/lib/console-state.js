@@ -56,6 +56,14 @@
 //              in words ("settings", "start", "stop", "marker", "open", "soundcheck"), or null.
 //              Whether a take plays in place of the inputs is the status's `soundcheck`
 //              (soundcheckStatus), which a soundcheck command's answer updates at once.
+//   processing every channel's strip, `[{ channel, settings, active }]` CH 1 first (see
+//              processing.js), as the desk answered it, or null until read. It lives in the desk's
+//              session, so a run's end keeps it; a loaded session replaces it.
+//   processingPending { channel: settings }: a strip edit still waiting for the desk, which the
+//              screen shows over the kept one (channelStrip) until its answer settles it.
+//   processingError { channel, message } of the last refused strip edit, cleared by the next answer.
+//   stripPresets every strip preset, the built-in ones first (`strip_presets`), or null until read.
+//   eqCurves  { channel: [{ freqHz, db }] }: the equaliser response last worked out for a channel.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -77,6 +85,7 @@
 import { pairUnits } from "./channels.js";
 import { DEFAULT_AUDIO, audioChoice, restoredAudio } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
+import { STRIP_CHANNELS, defaultStrip, isNeutralStrip } from "./processing.js";
 import { isRecording, recordingOf } from "./recording.js";
 import { isSoundchecking, soundcheckOf } from "./soundcheck.js";
 import {
@@ -138,6 +147,11 @@ export const initialState = Object.freeze({
   takes: NO_TAKES,
   estimate: null,
   recordingOutcome: null,
+  processing: null,
+  processingPending: NO_EDITS,
+  processingError: null,
+  stripPresets: null,
+  eqCurves: NO_EDITS,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -254,6 +268,32 @@ export const actions = Object.freeze({
    * shown at once on that run's status, ahead of the next status.
    */
   soundcheck: (soundcheck, run) => ({ type: "soundcheck", soundcheck, run }),
+  /** Every channel's strip as `processing` answered it, `[{ channel, settings, active }]`. */
+  processing: (list) => ({ type: "processing", list }),
+  /** A strip edit of `channel` (1-based) on its way to the desk: the whole strip, `settings`. */
+  processingEdit: (channel, settings) => ({ type: "processing-edit", channel, settings }),
+  /**
+   * The desk answered a processing change (an edit of `channel` that carried `sent`, or a reset,
+   * copy or preset with `sent` null) with `answer`, `{ outcome, channels, message }`: every channel
+   * it names takes its strip, and the edit it carried is settled.
+   */
+  processingApplied: (channel, sent, answer) => ({
+    type: "processing-applied",
+    channel,
+    sent,
+    answer,
+  }),
+  /** A processing change of `channel` that carried `sent` was refused, for `message`. */
+  processingFailed: (channel, sent, message) => ({
+    type: "processing-failed",
+    channel,
+    sent,
+    message,
+  }),
+  /** Every strip preset as the desk listed it, the built-in ones first. */
+  stripPresets: (list) => ({ type: "strip-presets", list }),
+  /** The equaliser response `points` (`[{ freqHz, db }]`) worked out for `channel`. */
+  eqCurve: (channel, points) => ({ type: "eq-curve", channel, points }),
   /** The console is (re)connecting to the engine's events and status. */
   connecting: () => ({ type: "connection", connection: { status: "connecting", error: null } }),
   connected: () => ({ type: "connection", connection: READY }),
@@ -586,8 +626,47 @@ function sessionLoaded(state, outcome) {
   const next = dropEdits(state);
   return {
     ...next,
+    processingPending: NO_EDITS,
+    processingError: null,
     presets: outcome.presets ?? next.presets,
     audio: outcome.audioLoaded ? restoredAudio(outcome.audio) : next.audio,
+  };
+}
+
+// The strips as the console knows them, every channel listed: the ones read, or neutral ones until
+// the first read, so an answer that came first still lands.
+function knownStrips(state) {
+  if (state.processing) {
+    return state.processing;
+  }
+  return Array.from({ length: STRIP_CHANNELS }, (_, index) => ({
+    channel: index + 1,
+    settings: defaultStrip(),
+    active: false,
+  }));
+}
+
+// `pending` without the edit of `channel`, when the edit still waiting is the one `sent` (a later
+// one stays: it goes out next).
+function settleStrip(pending, channel, sent) {
+  if (sent === null || pending[channel] !== sent) {
+    return pending;
+  }
+  const { [channel]: _settled, ...rest } = pending;
+  return Object.keys(rest).length === 0 ? NO_EDITS : rest;
+}
+
+function processingApplied(state, { channel, sent, answer }) {
+  const changed = new Map((answer?.channels ?? []).map((strip) => [strip.channel, strip]));
+  const processing =
+    changed.size === 0
+      ? state.processing
+      : knownStrips(state).map((strip) => changed.get(strip.channel) ?? strip);
+  return {
+    ...state,
+    processing,
+    processingPending: settleStrip(state.processingPending, channel, sent),
+    processingError: null,
   };
 }
 
@@ -634,6 +713,25 @@ export function consoleReducer(state, action) {
         : state;
     case "presets":
       return { ...state, presets: action.presets };
+    case "processing":
+      return { ...state, processing: action.list ?? null };
+    case "processing-edit":
+      return {
+        ...state,
+        processingPending: { ...state.processingPending, [action.channel]: action.settings },
+      };
+    case "processing-applied":
+      return processingApplied(state, action);
+    case "processing-failed":
+      return {
+        ...state,
+        processingPending: settleStrip(state.processingPending, action.channel, action.sent),
+        processingError: { channel: action.channel, message: action.message },
+      };
+    case "strip-presets":
+      return { ...state, stripPresets: action.list ?? null };
+    case "eq-curve":
+      return { ...state, eqCurves: { ...state.eqCurves, [action.channel]: action.points } };
     case "sessions":
       return { ...state, sessions: action.sessions };
     case "sessions-failed":
@@ -666,6 +764,21 @@ export function consoleReducer(state, action) {
     default:
       return state;
   }
+}
+
+/**
+ * The strip a screen shows for `channel` (1-based): the edit still waiting, else the desk's, else a
+ * neutral one while the strips are not read yet. `{ channel, settings, active, pending }`.
+ */
+export function channelStrip(state, channel) {
+  const waiting = state.processingPending[channel];
+  if (waiting) {
+    return { channel, settings: waiting, active: !isNeutralStrip(waiting), pending: true };
+  }
+  const kept = state.processing?.find((strip) => strip.channel === channel);
+  return kept
+    ? { ...kept, pending: false }
+    : { channel, settings: defaultStrip(), active: false, pending: false };
 }
 
 export function musicianByAddress(state, address) {

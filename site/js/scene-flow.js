@@ -81,7 +81,7 @@ function particleMaterial() {
   });
 }
 
-export function mount(host, { onLost } = {}) {
+export function mount(host, { onRendered, onFail } = {}) {
   const canvas = host.querySelector("canvas");
   const labelLayer = host.querySelector(".flow-labels");
   const section = host.closest("section") ?? host;
@@ -311,7 +311,8 @@ export function mount(host, { onLost } = {}) {
   const stageHandle = createStage({
     host,
     renderer,
-    onLost,
+    onRendered,
+    onFail,
     onResize(width, height) {
       const name = width / height < 1.2 ? "tall" : "wide";
       if (name !== layoutName) applyLayout(name);

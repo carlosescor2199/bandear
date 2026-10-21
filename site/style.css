@@ -830,13 +830,49 @@ code {
 
 /* ---------- 3D layers ----------
    The inline script in <head> adds `.webgl` to <html> before first paint when WebGL 2 is
-   available. Only then are the canvas hosts shown; `.is-static` (set when a scene fails) or
-   the absence of `.webgl` keeps the static design. Canvases are decorative and never take
-   pointer events. */
+   available. Only then are the canvas hosts laid out, already at their final size so nothing
+   shifts later. Each figure's `data-scene` (js/scene-state.js) decides what shows:
+     absent    loading: the canvas is transparent and the static visual sits over it, centred;
+     "live"    the scene drew its first frame: the canvas fades in, the static visual out;
+     "static"  the scene failed: the canvas host is removed from the layout, static design back.
+   Without `.webgl` the static design stays. Canvases are decorative and never take pointer
+   events. */
 
 .hero-3d,
 .flow-3d {
   display: none;
+  opacity: 0;
+  transition: opacity 0.5s ease;
+}
+
+[data-scene="live"] .hero-3d,
+[data-scene="live"] .flow-3d {
+  opacity: 1;
+}
+
+/* The static visual, laid over the canvas host while the scene loads. */
+.webgl .hero-shot:not([data-scene="static"]) > .window,
+.webgl .diagram:not([data-scene="static"]) > svg {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  transition:
+    opacity 0.5s ease,
+    visibility 0s linear 0.5s;
+}
+
+/* Once the scene draws, the static visual fades out. */
+.webgl [data-scene="live"] > .window {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* The SVG diagram stays in the accessibility tree for screen readers. */
+.webgl .diagram[data-scene="live"] > svg {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .hero-3d canvas,
@@ -855,55 +891,34 @@ code {
   pointer-events: none;
 }
 
-.webgl .hero-shot:not(.is-static) .window {
-  display: none;
+.webgl .hero-shot:not([data-scene="static"]) {
+  position: relative;
 }
 
-.webgl .hero-shot:not(.is-static) .hero-3d {
+.webgl .hero-shot:not([data-scene="static"]) .hero-3d {
   display: block;
   position: relative;
   aspect-ratio: 1 / 0.86;
 }
 
 /* The 3D mark replaces the small static mark above the headline. */
-.webgl .hero-inner:has(.hero-shot:not(.is-static)) .hero-mark {
+.webgl .hero-inner:has(.hero-shot:not([data-scene="static"])) .hero-mark {
   display: none;
 }
 
-/* Flat mark shown until the first 3D frame, roughly where the 3D mark lands. */
-.hero-poster {
-  position: absolute;
-  left: 37%;
-  top: 64%;
-  width: auto;
-  height: 94%;
-  transform: translate(-50%, -50%);
-  opacity: 0.9;
-  transition: opacity 0.5s ease;
+.webgl .diagram:not([data-scene="static"]) {
+  position: relative;
 }
 
-.hero-3d[data-rendered="true"] .hero-poster {
-  opacity: 0;
-}
-
-.webgl .diagram:not(.is-static) .flow-3d {
+.webgl .diagram:not([data-scene="static"]) .flow-3d {
   display: block;
   position: relative;
   aspect-ratio: 16 / 7;
 }
 
-/* The SVG diagram stays for screen readers while the 3D version is shown. */
-.webgl .diagram:not(.is-static) > svg {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-.webgl .diagram:not(.is-static) {
-  position: relative;
+/* Inside the diagram's padding, like the 3D version. */
+.webgl .diagram:not([data-scene="static"]) > svg {
+  padding-inline: inherit;
 }
 
 .flow-labels {
@@ -981,18 +996,20 @@ code {
   }
 
   /* Single column: the 3D mark leads, above the headline. */
-  .webgl .hero-shot:not(.is-static) {
+  .webgl .hero-shot:not([data-scene="static"]) {
     order: -1;
   }
 
-  .webgl .hero-shot:not(.is-static) .hero-3d {
+  .webgl .hero-shot:not([data-scene="static"]) .hero-3d {
     aspect-ratio: 16 / 10;
     max-height: 360px;
     margin-inline: auto;
   }
 
-  .hero-poster {
-    left: 42%;
+  /* While loading, keep the screenshot about as tall as the 3D mark's box. */
+  .webgl .hero-shot:not([data-scene="static"]) > .window {
+    width: min(100%, 520px);
+    margin-inline: auto;
   }
 }
 
@@ -1051,7 +1068,7 @@ code {
     font-size: 22px;
   }
 
-  .webgl .diagram:not(.is-static) .flow-3d {
+  .webgl .diagram:not([data-scene="static"]) .flow-3d {
     aspect-ratio: 4 / 5;
   }
 

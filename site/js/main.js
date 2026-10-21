@@ -1,10 +1,13 @@
-// Boots the page: the language (i18n.js), the download links (downloads.js), then the decorative 3D layers. The inline script in <head> adds the `webgl` class to <html>
-// before first paint when WebGL 2 is available, so the CSS swaps the static visuals for canvas
-// hosts without layout shifts. Without that class this module does nothing and the static
-// design stays. three.js is only downloaded when a scene is about to become visible.
+// Boots the page. The language (i18n.js) and the download links (downloads.js) start on every
+// visit. The decorative 3D scenes start only when the inline script in <head> found WebGL 2 and
+// added the `webgl` class to <html>; three.js is downloaded when a scene is about to become
+// visible. Each figure keeps its static design until its scene has drawn a first frame, and goes
+// back to it for good if the scene fails (see scene-state.js), so a broken scene never leaves an
+// empty canvas behind.
 
 import { initDownloads } from "./downloads.js";
 import { initI18n } from "./i18n.js";
+import { nextSceneState } from "./scene-state.js";
 
 // Language first, so the copy is settled before anything else renders.
 try {
@@ -19,28 +22,42 @@ initDownloads().catch((error) => console.warn("BandEar: download links left on t
 const root = document.documentElement;
 const mounted = new Set();
 
-// Puts one host back to its static design (load failure or lost GPU context).
-function fallBack(host, error) {
+// Moves the figure around `host` to its next state (see scene-state.js).
+function setState(host, event) {
   const container = host.closest("[data-3d-host]");
-  if (container) container.classList.add("is-static");
-  else host.remove();
-  if (error) console.warn("BandEar: 3D scene disabled.", error);
+  if (!container) return;
+  const next = nextSceneState(container.dataset.scene, event);
+  if (next !== undefined) container.dataset.scene = next;
 }
 
 function start(host, load) {
+  let scene = null;
+  let failed = false;
+  // A load error, a mount error, a frame that throws or a lost GPU context.
+  const fail = (error) => {
+    if (failed) return;
+    failed = true;
+    if (scene) {
+      mounted.delete(scene);
+      scene.dispose();
+      scene = null;
+    }
+    setState(host, "failed");
+    // The page background has no static twin: just remove it.
+    if (!host.closest("[data-3d-host]")) host.remove();
+    console.warn("BandEar: 3D scene disabled.", error);
+  };
   return load()
     .then(({ mount }) => {
-      let scene = null;
-      scene = mount(host, {
-        onLost() {
-          scene?.dispose();
-          mounted.delete(scene);
-          fallBack(host);
-        },
-      });
-      mounted.add(scene);
+      const handle = mount(host, { onRendered: () => setState(host, "rendered"), onFail: fail });
+      // The first frame runs inside mount, so it may already have failed.
+      if (failed) handle.dispose();
+      else {
+        scene = handle;
+        mounted.add(scene);
+      }
     })
-    .catch((error) => fallBack(host, error));
+    .catch(fail);
 }
 
 // Lazy init: mount a scene once its host comes within reach of the viewport.

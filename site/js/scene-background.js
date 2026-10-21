@@ -75,7 +75,7 @@ const moteFragment = /* glsl */ `
     #include <colorspace_fragment>
   }`;
 
-export function mount(host, { onLost } = {}) {
+export function mount(host, { onRendered, onFail } = {}) {
   const canvas = host.querySelector("canvas");
   const renderer = createRenderer(canvas, { maxPixelRatio: 1 }); // soft content: 1x is plenty
   const scene = new THREE.Scene();
@@ -143,7 +143,8 @@ export function mount(host, { onLost } = {}) {
   const stageHandle = createStage({
     host,
     renderer,
-    onLost,
+    onRendered,
+    onFail,
     alwaysOn: true,
     fps: 30, // slow, soft motion: half rate is indistinguishable and halves the cost
     onResize(width, height) {

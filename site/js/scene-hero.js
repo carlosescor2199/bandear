@@ -152,7 +152,7 @@ function buildMark(phone) {
   return { mark, signalCore, signalHalo };
 }
 
-export function mount(host, { onLost } = {}) {
+export function mount(host, { onRendered, onFail } = {}) {
   const canvas = host.querySelector("canvas");
   const phone = isPhone();
   const still = prefersReducedMotion();
@@ -251,7 +251,8 @@ export function mount(host, { onLost } = {}) {
   const stageHandle = createStage({
     host,
     renderer,
-    onLost,
+    onRendered,
+    onFail,
     onResize(width, height) {
       const aspect = width / height;
       const fit = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));

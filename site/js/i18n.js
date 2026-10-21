@@ -124,7 +124,7 @@ export const DICTIONARY = Object.freeze({
     "downloads.intro": `The desk runs on a computer; musicians use the Android app. All files come from the <a href="${RELEASES_PAGE}">latest GitHub release</a>.`,
     "dl.windows.note": "First run: <em>More info → Run anyway</em> — the installer is not signed yet.",
     "dl.windows.btn": "Download .exe",
-    "dl.mac.note": "Drag to Applications. First run: right-click → <em>Open</em>.",
+    "dl.mac.note": "Drag to Applications. First run: open it once, then <em>System Settings → Privacy &amp; Security → Open Anyway</em>.",
     "dl.mac.btn": "Download .dmg",
     "dl.linux.note": "<code>chmod +x</code> the AppImage and run it, or install the .deb.",
     "dl.android.muted": "10+ · musicians' app",
@@ -150,7 +150,7 @@ export const DICTIONARY = Object.freeze({
     "faq.a5": "Not yet — an iOS app for musicians is on the roadmap.",
     "faq.q6": "Why does my computer show a security warning?",
     "faq.a6":
-      "The installers are not signed yet. On Windows choose <em>More info → Run anyway</em>; on macOS right-click the app and choose <em>Open</em> the first time. Signed installers are on the roadmap.",
+      "The Windows installer is not signed yet: choose <em>More info → Run anyway</em>. The Mac app is not notarized by Apple: open it once, then go to <em>System Settings → Privacy &amp; Security</em> and choose <em>Open Anyway</em>. Fully signed installers are on the roadmap.",
 
     "sponsor.title": "Free, open source, built in spare time",
     "sponsor.body":
@@ -270,7 +270,7 @@ export const DICTIONARY = Object.freeze({
     "downloads.intro": `La mesa funciona en una computadora; los músicos usan la app de Android. Todos los archivos vienen de la <a href="${RELEASES_PAGE}">última versión en GitHub</a>.`,
     "dl.windows.note": "Primera vez: <em>Más información → Ejecutar de todas formas</em>; el instalador aún no está firmado.",
     "dl.windows.btn": "Descargar .exe",
-    "dl.mac.note": "Arrástrala a Aplicaciones. Primera vez: clic derecho → <em>Abrir</em>.",
+    "dl.mac.note": "Arrástrala a Aplicaciones. Primera vez: ábrela una vez y luego ve a <em>Ajustes del Sistema → Privacidad y seguridad → Abrir igualmente</em>.",
     "dl.mac.btn": "Descargar .dmg",
     "dl.linux.note": "Dale permiso de ejecución al AppImage con <code>chmod +x</code> y ábrelo, o instala el .deb.",
     "dl.android.muted": "10+ · app para músicos",
@@ -296,7 +296,7 @@ export const DICTIONARY = Object.freeze({
     "faq.a5": "Todavía no; una app de iOS para músicos está en la hoja de ruta.",
     "faq.q6": "¿Por qué mi computadora muestra una advertencia de seguridad?",
     "faq.a6":
-      "Los instaladores aún no están firmados. En Windows elige <em>Más información → Ejecutar de todas formas</em>; en macOS haz clic derecho en la app y elige <em>Abrir</em> la primera vez. Los instaladores firmados están en la hoja de ruta.",
+      "El instalador de Windows aún no está firmado: elige <em>Más información → Ejecutar de todas formas</em>. La app de Mac no está notarizada por Apple: ábrela una vez y luego ve a <em>Ajustes del Sistema → Privacidad y seguridad</em> y elige <em>Abrir igualmente</em>. Los instaladores firmados por completo están en la hoja de ruta.",
 
     "sponsor.title": "Gratis, de código abierto y hecho en el tiempo libre",
     "sponsor.body":

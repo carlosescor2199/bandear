@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { ASSETS, RELEASES_PAGE, detectPlatform, heroChoice, matchAssets, versionOf } from "../js/downloads.js";
+import { DICTIONARY, LANGUAGES } from "../js/i18n.js";
 
 const UA = {
   windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
@@ -95,6 +96,41 @@ test("the hero offers each system its own installer", () => {
   const linux = heroChoice({ os: "linux", arch: null }, found);
   assert.equal(linux.href, found.appImage.url);
   assert.equal(linux.alt.href, found.deb.url);
+});
+
+test("reads an ARM CPU from a Linux user agent when client hints are missing", () => {
+  const firefoxArm = "Mozilla/5.0 (X11; Linux aarch64; rv:144.0) Gecko/20100101 Firefox/144.0";
+  assert.deepEqual(detectPlatform({ userAgent: firefoxArm }), { os: "linux", arch: "arm" });
+  assert.deepEqual(detectPlatform({ userAgent: UA.linux, platform: "Linux armv7l" }), { os: "linux", arch: "arm" });
+  assert.deepEqual(detectPlatform({ userAgent: UA.linux, uaPlatform: "Linux", architecture: "arm" }), { os: "linux", arch: "arm" });
+  // A client hint wins over the user agent.
+  assert.deepEqual(detectPlatform({ userAgent: firefoxArm, architecture: "x86" }), { os: "linux", arch: "x86" });
+});
+
+test("ARM Linux is sent to the releases page, never to the x86-64 AppImage", () => {
+  const found = matchAssets(RELEASE.assets);
+  const arm = heroChoice({ os: "linux", arch: "arm" }, found);
+  assert.equal(arm.href, RELEASES_PAGE);
+  assert.notEqual(arm.href, found.appImage.url);
+  assert.deepEqual(arm.label, ["dl.hero.generic", {}]);
+  assert.equal(arm.card, null);
+  assert.deepEqual(arm.alt, { text: "dl.alt.linuxArm" });
+  // x86-64 (or an unknown CPU) still gets the AppImage.
+  assert.equal(heroChoice({ os: "linux", arch: "x86" }, found).href, found.appImage.url);
+});
+
+test("every string the hero can show exists in both languages", () => {
+  const found = matchAssets(RELEASE.assets);
+  const platforms = ["windows", "mac", "linux", "android", "ios", "unknown"].flatMap((os) =>
+    [null, "arm", "x86"].map((arch) => ({ os, arch })),
+  );
+  for (const platform of platforms) {
+    const { label, alt } = heroChoice(platform, found);
+    const keys = [label[0], label[1].os, alt?.text, alt?.link].filter(Boolean);
+    for (const key of keys) {
+      for (const lang of LANGUAGES) assert.ok(key in DICTIONARY[lang], `${lang} lacks ${key} (${platform.os}/${platform.arch})`);
+    }
+  }
 });
 
 test("a Mac with an unknown chip gets Apple Silicon first and Intel right below", () => {

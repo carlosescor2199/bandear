@@ -41,7 +41,11 @@ export function detectPlatform({ userAgent = "", platform = "", maxTouchPoints =
   if (/CrOS/.test(ua) || hint === "chrome os") return { os: "unknown", arch: null };
   if (/Windows/.test(ua) || hint === "windows" || /^Win/.test(platform)) return { os: "windows", arch };
   if (/Macintosh|Mac OS X/.test(ua) || hint === "macos" || /^Mac/.test(platform)) return { os: "mac", arch };
-  if (/Linux|X11/.test(ua) || hint === "linux" || /Linux/.test(platform)) return { os: "linux", arch };
+  if (/Linux|X11/.test(ua) || hint === "linux" || /Linux/.test(platform)) {
+    // Firefox and others name an ARM CPU in the user agent ("Linux aarch64", "armv7l").
+    const armInUa = /\b(aarch64|arm64|armv\d+\w*)\b/i.test(`${ua} ${platform}`);
+    return { os: "linux", arch: arch ?? (armInUa ? "arm" : null) };
+  }
   return { os: "unknown", arch: null };
 }
 
@@ -57,7 +61,10 @@ export function matchAssets(assets = []) {
   return found;
 }
 
-// What the hero offers a platform: { label: [key, vars], href, alt?: { text, link, href } }.
+// What the hero offers a platform:
+//   { label: [key, vars], href, card: key | null, alt?: { text, link?, href? } }
+// `label` is a dictionary key and its placeholders, `card` the download card to highlight and
+// `alt` an optional line under the button (a text key, plus a link key and its href).
 // Without a matching file the button still names the system and opens the releases page.
 export function heroChoice({ os, arch }, found = {}) {
   const url = (key) => found[key]?.url ?? RELEASES_PAGE;
@@ -76,6 +83,10 @@ export function heroChoice({ os, arch }, found = {}) {
         alt: { text: "dl.alt.intel", link: "dl.alt.intelLink", href: url("macIntel") },
       };
     case "linux":
+      // Only x86-64 Linux builds exist: never hand an ARM machine the amd64 AppImage.
+      if (arch === "arm") {
+        return { label: ["dl.hero.generic", {}], href: RELEASES_PAGE, card: null, alt: { text: "dl.alt.linuxArm" } };
+      }
       return {
         label: forOs("dl.os.linux"),
         href: url("appImage"),

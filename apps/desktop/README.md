@@ -1,19 +1,22 @@
 # MixLink desktop
 
 The mixing console for the MixLink server. The engine (`apps/server`) captures the audio
-interface and sends each phone its own mix; this app runs that engine and shows three screens:
+interface and sends each phone its own mix; this app runs that engine and shows these screens:
 
 - **Mix**: every musician's mix: channel strips (group, input meter, pan, fader, Mute, Solo),
-  group levels and the master (level, level cap, Mute, output meters). A change on the desk
-  reaches the phone at once, and a change on the phone shows here. The last tab, **Local mix**,
-  is the engineer's own mix for this computer's output.
+  group levels and the master (level, level cap, Mute, limiter, effect returns, output meters).
+  A change on the desk reaches the phone at once, and a change on the phone shows here. The last
+  tab, **Local mix**, is the engineer's own mix for this computer's output.
 - **Record**: multitrack recording of the inputs, the takes, and the virtual soundcheck.
+- **Channels and groups**: the table of inputs and the group cards.
+- **Processing**: each input's channel strip (high-pass, EQ, gate, compressor, effect sends).
+- **Effects**: the shared reverb and delay.
 - **Network and system**: the phones (name, link health and its history, playback buffer,
   redundancy, remove, add by address), the session (named sessions and **Mix backups**) and the
-  audio setup (driver, device, buffer, and **Local mix out**).
+  audio setup (driver, device, buffer, engine load, and **Local mix out**).
 
 ASIO loads a kernel-mode driver, so the app never picks it: choose it under Network and system,
-then pick the driver and start on it.
+then pick the driver and start on it (see [ASIO safety](#asio-safety)).
 
 ## Network health
 
@@ -167,6 +170,116 @@ the meters hear it as they would hear the band, so mixes can be set with nobody 
 | End of take | Without loop it pauses at the end ("At the end"); Play again starts it from 0:00. A seek plays a take that stopped at its end and keeps a paused take paused. |
 | While it plays | Recording, a device switch and a driver change are refused, and the SOUNDCHECK chip shows on every screen. A soundcheck cannot start while a take records. |
 | Read error | The take falls silent and says why; only Back to live inputs is left. |
+
+## Channel processing
+
+Every input has a console-style channel strip, shared by every mix: the phones, the local output
+and the recorder's local mix all hear the processed channel. It is set at the desk only; the
+phones cannot change it.
+
+1. Open **Processing** in the sidebar, the **Processing** link of a row in Channels and groups,
+   or **Processing** on a channel strip of the Mix screen. A linked pair is one strip and opens on
+   its first side.
+2. Pick the channel (or step with previous and next), turn parts on and set them. Changes are
+   heard at once and glide, so they do not click.
+3. Use **Bypass** to compare with the channel unprocessed, and **Presets** to apply or save a
+   strip.
+
+| Part | What it does |
+| --- | --- |
+| Order | High-pass, gate, equaliser, compressor, as on a console. |
+| High-pass | 20-2,000 Hz (80 Hz by default), Q 0.5-2. |
+| Equaliser | A low shelf, two peaks and a high shelf: 20 Hz-20 kHz, ±18 dB, Q 0.3-10. Drag a handle on the curve to set its frequency and gain; the wheel or Page Up/Down change Q, the arrows move it (Shift for octaves and 3 dB), Home sets 0 dB, Enter turns it on or off. |
+| Gate | Threshold, range, attack, hold and release. |
+| Compressor | Threshold, ratio, knee, attack, release and makeup, with its transfer curve. No lookahead. |
+| Bypass (A/B) | Sends a neutral strip and keeps the settings in the editor; Bypass again puts them back (leaving the screen does too). A strip changed elsewhere while bypassed ends the bypass. |
+| Reset, Copy to… | Reset makes the strip neutral; Copy to… sets other channels to this strip. Both keep each channel's effect sends. |
+| Presets | Built-in: "Vocal", "Kick", "Bass DI", "Acoustic guitar", "Gentle compression" (marked "(built-in)", never deleted). Save your own under any other name; saving under one of your names replaces it. A preset keeps no sends: applying it leaves the channel's sends as they are. |
+| Kept | Each strip is kept in the session, and named sessions carry them. |
+
+| Meter | What it means |
+| --- | --- |
+| Input | The channel as captured, before the strip. |
+| Processed | The channel after the strip, as every mix hears it. |
+| Gate reduction | How far the gate turns the channel down now (40 dB full scale). |
+| Compressor reduction | How far the compressor turns the channel down now (20 dB full scale). |
+| Curve | The equaliser's response, worked out in the window as you edit and replaced by the desk's once the edits pause. |
+
+A strip with every part off leaves the samples bit for bit, so the phones receive exactly what
+they did without it. Processing adds no latency: the filters, gate and compressor work sample by
+sample, with no lookahead. The recorded input tracks stay as captured.
+
+## Master limiter
+
+Every mix (each musician's and the local mix) has a peak limiter on its master, after the sum
+and the effect returns, so peaks stay at a ceiling instead of clipping.
+
+1. On the Mix screen, in a musician's tab or the Local mix tab, turn **Limiter** on in the
+   master strip.
+2. Set **Ceiling** (-24 to 0 dBFS, 0 by default) and **Release** (1-1,000 ms, 50 by default).
+
+| Topic | Behaviour |
+| --- | --- |
+| Ceiling in force | The lower of the limiter's own and the mix's (the phone's level cap or the engineer's limit); the line under it says which wins. |
+| Meter | **Limiter gain reduction**, 12 dB full scale, 0 while off. |
+| Latency | None: instant attack, no lookahead. The clamp at the mix's ceiling stays as the last safety net. |
+| Who sets it | The engineer only, per mix; off by default, and then the mix is exactly as without it. |
+| Kept | Per musician (by phone, or by address), and the local mix's in the session; named sessions carry them. |
+
+## Effects
+
+One shared reverb and one shared delay. Each input sends to them, and each mix returns them at
+its own level.
+
+1. **Sends**: in the processing editor, set the channel's **Reverb** and **Delay** sends (0-100%);
+   **Effects…** opens the Effects screen.
+2. **Effects**: on the Effects screen, set the reverb (size, damping, pre-delay, width) and the
+   delay (time, feedback, high cut on the repeats, ping-pong).
+3. **Returns**: in each master strip (musicians and Local mix), set the **Reverb** and **Delay**
+   returns (0-100%).
+
+| Topic | Behaviour |
+| --- | --- |
+| Sends | Taken after the channel strip and before every fader; a pair shares them. Kept with the channel's strip; presets, Reset and Copy to… leave them alone. |
+| Tempo | Type a tempo (30-300 bpm) and pick a note (1/2, 1/4, dotted 1/8, 1/4 triplet, 1/8, 1/8 triplet, 1/16): the delay follows it ("Repeats every 375 ms (Dotted 1/8 at 120 bpm)") and the time slider is disabled. Clear the tempo to set the time in ms (1-2,000). |
+| Returns | Added to the mix at the return level times the mix's master level (nothing under the master Mute), before the limiter. The engineer sets them; the phones cannot. |
+| Changes | Settings glide; a new delay time or pre-delay crossfades over 20 ms, so a quick drag does not click. |
+| Latency | None on the dry path: the effects are wet returns. |
+| Kept | The effects in the session, each musician's returns per musician, the local mix's in the session; named sessions carry them. |
+
+An effect nothing sends to, with its tail gone, does not run, and a mix that returns nothing is
+exactly the dry mix.
+
+## Engine load
+
+Network and system, audio setup, **Engine load**: how long the engine takes to process each
+block, as a share of the block's period, for example "8% (peak 15%)".
+
+| Number | What it means |
+| --- | --- |
+| Average | Over about the last second of audio. |
+| Peak | The highest of the last two to four seconds. |
+| Late blocks | Blocks that took longer than their period, shown when there are any. |
+| Warning | Above 70% (average or peak): close to dropping audio. |
+
+A release build processing 32 strips for 16 musicians measured 17.6% on average and 25.9% at the
+99th percentile of the block, with no late block.
+
+## ASIO safety
+
+Some ASIO drivers can crash the whole computer when loaded, so the engine opens only the one
+driver you pick, by name, and never loads the others.
+
+- ASIO is never the default and never enumerated on its own: the driver list comes from the
+  Windows registry, without loading any driver.
+- A start (or `--host asio`) without a driver picked is refused instead of opening the first
+  installed one. A name that matches no driver, or more than one, is refused and lists the
+  candidates.
+- A driver that fails to load is reported; the engine never falls back to another host.
+- `vendor/cpal` is cpal 0.18.2 with a small patch (each change marked `MixLink patch`): cpal
+  lists ASIO devices by loading every installed driver in turn, and the first one on the
+  development PC (Realtek ASIO) bugchecked it. The patch opens one driver by name through
+  `device_by_id`. It goes once a cpal release opens one ASIO driver by name.
 
 ## Layout
 

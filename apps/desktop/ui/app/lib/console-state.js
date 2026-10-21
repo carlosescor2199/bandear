@@ -280,8 +280,12 @@ export const actions = Object.freeze({
   processingEdit: (channel, settings) => ({ type: "processing-edit", channel, settings }),
   /** A master limiter change sent for the mix `address`, shown until it is answered. */
   limiterEdit: (address, settings) => ({ type: "limiter-edit", address, settings }),
-  /** The answer (or failure) of the limiter change `sent` for `address`: a later one stays. */
-  limiterSettled: (address, sent) => ({ type: "limiter-settled", address, sent }),
+  /**
+   * The answer (or failure) of the limiter change `sent` for `address`: a later one stays. `kept`,
+   * when given, is what the desk answered it set, kept as the mix's limiter until the next status
+   * (the status could not be read after the set).
+   */
+  limiterSettled: (address, sent, kept = null) => ({ type: "limiter-settled", address, sent, kept }),
   /**
    * The desk answered a processing change (an edit of `channel` that carried `sent`, or a reset,
    * copy or preset with `sent` null) with `answer`, `{ outcome, channels, message }`: every channel
@@ -659,6 +663,22 @@ function settleStrip(pending, channel, sent) {
   return Object.keys(rest).length === 0 ? NO_EDITS : rest;
 }
 
+// The limiter `kept` as the mix `address`'s own (the local mix's in the status), when given.
+function limiterKept(state, address, kept) {
+  if (!kept) {
+    return state;
+  }
+  if (address === LOCAL_MIX) {
+    return state.engine.status
+      ? { ...state, engine: { ...state.engine, status: { ...state.engine.status, localLimiter: kept } } }
+      : state;
+  }
+  return {
+    ...state,
+    musicians: state.musicians.map((musician) => (musician.address === address ? { ...musician, limiter: kept } : musician)),
+  };
+}
+
 // An answer before the strips were ever read (or after they became unknown) settles the edit but
 // keeps them unknown: the other strips are not made up, and the read that follows brings them all.
 function processingApplied(state, { channel, sent, answer }) {
@@ -750,7 +770,7 @@ export function consoleReducer(state, action) {
       };
     case "limiter-settled":
       return {
-        ...state,
+        ...limiterKept(state, action.address, action.kept),
         limiterPending: settleStrip(state.limiterPending, action.address, action.sent),
       };
     case "sessions":

@@ -32,6 +32,8 @@ const LEAD = "192.168.1.3:50000";
 const BASS = "192.168.1.12:50000";
 const LEAD_KEY = "client:5f0c2a8e-1b7d-4c3a-9e6f-2d8b4a7c1e90";
 const BASS_KEY = "client:a3d9e7b1-6c2f-4e8a-b5d0-7f1c9e3a2b64";
+// What the master strip says of a slider moved by a key.
+const KEY = Object.freeze({ key: true });
 
 test("a limiter's settings are held in range, anything unreadable taking the default", () => {
   assert.deepEqual(defaultLimiter(), { enabled: false, ceilingDb: 0, releaseMs: 50 });
@@ -87,16 +89,43 @@ test("a control's change gives the whole limiter, and a slider always moves at l
   // An arrow key moves the position by one of 1,000 steps: less than the rounding, so it moves the
   // value by one unit (0.5 dB, 1 ms) in its direction instead of staying put.
   const ceilingAt = limiterPosition(CEILING_FIELD, -6);
-  assert.equal(limiterChange(settings, "ceilingDb", ceilingAt + 1).ceilingDb, -5.5);
-  assert.equal(limiterChange(settings, "ceilingDb", ceilingAt - 1).ceilingDb, -6.5);
+  assert.equal(limiterChange(settings, "ceilingDb", ceilingAt + 1, KEY).ceilingDb, -5.5);
+  assert.equal(limiterChange(settings, "ceilingDb", ceilingAt - 1, KEY).ceilingDb, -6.5);
   const short = { ...settings, releaseMs: 1 };
   const releaseAt = limiterPosition(RELEASE_FIELD, 1);
-  assert.equal(limiterChange(short, "releaseMs", releaseAt + 1).releaseMs, 2);
-  assert.equal(limiterChange(short, "releaseMs", releaseAt - 1).releaseMs, 1, "held at the end");
-  assert.equal(limiterChange({ ...settings, ceilingDb: 0 }, "ceilingDb", 1000).ceilingDb, 0);
+  assert.equal(limiterChange(short, "releaseMs", releaseAt + 1, KEY).releaseMs, 2);
+  assert.equal(limiterChange(short, "releaseMs", releaseAt - 1, KEY).releaseMs, 1, "held at the end");
+  assert.equal(limiterChange({ ...settings, ceilingDb: 0 }, "ceilingDb", 1000, KEY).ceilingDb, 0);
   // The same position changes nothing.
   assert.deepEqual(limiterChange(settings, "ceilingDb", ceilingAt), settings);
   assert.deepEqual(limiterChange(settings, "nothing", 3), settings);
+});
+
+test("a slow drag goes through the values in order and ends on the one it was let go at", () => {
+  // The pointer creeps one position at a time from -12 dBFS towards -11; each step goes through
+  // the limiter the strip shows, as the screen does.
+  const start = limiterPosition(CEILING_FIELD, -12);
+  let shown = { enabled: true, ceilingDb: -12, releaseMs: 50 };
+  const seen = [];
+  for (let position = start; position <= start + 50; position += 1) {
+    shown = limiterChange(shown, "ceilingDb", position);
+    seen.push(shown.ceilingDb);
+  }
+  for (let index = 1; index < seen.length; index += 1) {
+    assert.ok(seen[index] >= seen[index - 1], `flipped back at step ${index}: ${seen.join(", ")}`);
+  }
+  assert.equal(shown.ceilingDb, limiterChange(defaultLimiter(), "ceilingDb", start + 50).ceilingDb);
+  // A release dragged the same way.
+  const from = limiterPosition(RELEASE_FIELD, 20);
+  let release = { enabled: true, ceilingDb: 0, releaseMs: 20 };
+  const releases = [];
+  for (let position = from; position <= from + 30; position += 1) {
+    release = limiterChange(release, "releaseMs", position);
+    releases.push(release.releaseMs);
+  }
+  for (let index = 1; index < releases.length; index += 1) {
+    assert.ok(releases[index] >= releases[index - 1], `flipped back at step ${index}: ${releases.join(", ")}`);
+  }
 });
 
 test("the gain reduction comes from the meters of the open mix", () => {
@@ -294,5 +323,30 @@ test("the console says a limiter the desk refused and shows the status's again",
   const bass = masterLimiter(app.store.getState(), BASS);
   assert.equal(bass.pending, false);
   assert.equal(bass.enabled, false, "the desk's own again");
+  app.dispose?.();
+});
+
+test("a limiter the desk set stays set and shown when the status cannot be read after it", async () => {
+  const fake = createFakeBridge({ running: true, clock: () => NOW });
+  let statusFails = false;
+  const flaky = {
+    ...fake,
+    invoke: (command, args) =>
+      command === "engine_status" && statusFails ? Promise.reject("the window lost the desk") : fake.invoke(command, args),
+  };
+  const app = createConsoleApp({ bridge: flaky });
+  await app.ready;
+  statusFails = true;
+  const said = await app.editMixLimiter(BASS, { enabled: true, ceilingDb: -6, releaseMs: 80 });
+  assert.deepEqual(said, {
+    ok: true,
+    message: "Bass's limiter is on: peaks are held at −6 dBFS, released over 80 ms.",
+  });
+  const bass = masterLimiter(app.store.getState(), BASS);
+  assert.equal(bass.pending, false);
+  assert.deepEqual([bass.enabled, bass.ceilingDb, bass.releaseMs], [true, -6, 80], "the desk's answer, not the old status");
+  const local = await app.editMixLimiter(LOCAL_MIX, { enabled: true, ceilingDb: -3, releaseMs: 50 });
+  assert.equal(local.ok, true);
+  assert.equal(masterLimiter(app.store.getState(), LOCAL_MIX).ceilingDb, -3);
   app.dispose?.();
 });

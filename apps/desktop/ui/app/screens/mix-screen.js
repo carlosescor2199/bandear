@@ -286,7 +286,7 @@ export function mountMixScreen(main, app) {
     if (!shown) {
       return;
     }
-    const outcome = await app.editMixLimiter(address, limiterChange(shown, event.detail.field, event.detail.value));
+    const outcome = await app.editMixLimiter(address, limiterChange(shown, event.detail.field, event.detail.value, { key: Boolean(event.detail.key) }));
     if (!outcome.ok && !disposed) {
       toolsOutcome = outcome;
       renderTools(app.store.getState());

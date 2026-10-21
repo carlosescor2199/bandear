@@ -998,30 +998,35 @@ export function createConsoleApp({
   // The last answer to a limiter change of each mix, in words.
   const limiterSaid = new Map();
 
-  // Sends the limiter change `sent` of the mix `address` and reads the status after its answer;
-  // the change shown meanwhile is settled either way.
+  // Sends the limiter change `sent` of the mix `address`, then reads the status after its answer;
+  // the change shown meanwhile is settled either way. Only the command decides whether it was set:
+  // a status that cannot be read after a set leaves the set, and the strip shows what the desk
+  // answered until the next status.
   async function sendLimiter(address, sent) {
     const local = address === LOCAL_MIX;
     const musician = local ? null : musicianByAddress(store.getState(), address);
     const name = local ? "The local mix" : musician ? musicianLabel(musician) : address;
+    let answer;
     try {
       if (!local && !musician) {
         throw new Error(`${name} is not here`);
       }
-      const answer = local
+      answer = local
         ? await api.setLocalLimiter(sent)
         : await api.setMusicianLimiter(musicianKey(musician), sent);
-      await readStatus();
-      limiterSaid.set(address, formatLimiterSet(answer, name));
     } catch (error) {
       const whose = local ? "The local mix's" : `${name}'s`;
       limiterSaid.set(address, {
         ok: false,
         message: sentenceWithReason(`${whose} limiter was not set`, message(error)),
       });
-    } finally {
       store.dispatch(actions.limiterSettled(address, sent));
+      return;
     }
+    const said = formatLimiterSet(answer, name);
+    limiterSaid.set(address, said);
+    const unread = await readStatus();
+    store.dispatch(actions.limiterSettled(address, sent, unread && said.ok ? clampLimiter(answer.settings) : null));
   }
 
   const limiterSender = createCoalescer(sendLimiter);

@@ -1,3 +1,5 @@
+#[doc(hidden)]
+pub mod bench;
 mod capture;
 mod cli;
 mod control;
@@ -7,6 +9,7 @@ mod discovery;
 mod engine;
 mod health;
 mod link_history;
+mod load;
 pub mod logging;
 mod mix;
 mod network;
@@ -30,6 +33,7 @@ pub use engine::{
 };
 pub use health::{LinkHealth, LinkStatus};
 pub use link_history::{LinkHistoryRead, LinkSample, RoundTrip, HISTORY_SAMPLES};
+pub use load::EngineLoadStatus;
 pub use mix::{EngineerControls, EngineerUpdate, MixPreset, MixUpdate, MixValues, PresetChannel};
 pub use output::{LocalOutputRequest, LocalOutputState, LocalOutputStatus, OutputDevice};
 pub use playback::{

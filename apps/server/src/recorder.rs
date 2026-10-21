@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::engine::{ChannelKind, ChannelMeta};
-use crate::mix::{MixPlan, MixState, OUTPUT_CHANNELS};
+use crate::mix::{MixPlan, MixRamp, MixState, OUTPUT_CHANNELS};
 use crate::pipeline::{Block, Sink, MAX_BLOCK_FRAMES};
 use crate::wav::{SampleFormat, WavError, WavSpec, WavTarget, WavWriter, HEADER_BYTES};
 
@@ -718,6 +718,10 @@ pub(crate) struct RecorderSink {
     feed: Option<TakeFeed>,
     /// Room for the local mix of the longest block.
     stereo: Box<[f32]>,
+    /// The local mix's weights in the previous block mixed for a take, so a fader move glides
+    /// (see [MixRamp]). Its own, not the local output's: each is mixed on its own. Reset for every
+    /// take, whose first block has nothing before it.
+    ramp: MixRamp,
 }
 
 /// The engine's end of the recorder sink's lines: takes go to the sink, and the takes it lets go of
@@ -739,6 +743,7 @@ pub(crate) fn recorder_sink(mix: Arc<MixState>) -> (RecorderSink, RecorderLines)
         parked: None,
         feed: None,
         stereo: vec![0.0; MAX_BLOCK_FRAMES * usize::from(OUTPUT_CHANNELS)].into_boxed_slice(),
+        ramp: MixRamp::default(),
     };
     let lines = RecorderLines {
         commands: command_producer,
@@ -784,6 +789,7 @@ impl RecorderSink {
             self.hand_back(parked);
         }
         while let Ok(command) = self.commands.pop() {
+            self.ramp.reset();
             if let Some(previous) = std::mem::replace(&mut self.feed, command) {
                 previous.shared.close();
                 self.hand_back(previous);
@@ -802,7 +808,11 @@ impl Sink for RecorderSink {
     fn process(&mut self, block: &Block<'_>) {
         self.take_commands();
         let Self {
-            mix, feed, stereo, ..
+            mix,
+            feed,
+            stereo,
+            ramp,
+            ..
         } = self;
         let Some(feed) = feed else {
             return;
@@ -813,7 +823,7 @@ impl Sink for RecorderSink {
             .get_mut(..frames * usize::from(OUTPUT_CHANNELS))
             .unwrap_or_default();
         if feed.local && !stereo.is_empty() {
-            MixPlan::new(&mix.snapshot(), channels).mix_into(block.samples, stereo);
+            MixPlan::new(&mix.snapshot(), channels).mix_ramped(ramp, block.samples, stereo);
         }
         feed.record(block, stereo);
     }

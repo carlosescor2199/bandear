@@ -43,7 +43,7 @@ use crate::capture::{
     TARGET_SAMPLE_RATE,
 };
 use crate::engine::OutputMeter;
-use crate::mix::{MixPlan, MixState, OUTPUT_CHANNELS};
+use crate::mix::{MixPlan, MixRamp, MixState, OUTPUT_CHANNELS};
 use crate::pipeline::{Block, Sink, SourceFormat, DEFAULT_BLOCK_FRAMES, MAX_BLOCK_FRAMES};
 use crate::protocol::to_pcm16;
 use crate::soundcheck::PlaybackClock;
@@ -368,6 +368,8 @@ pub(crate) struct LocalOutputSink {
     /// Room for the stereo mix of the longest block.
     stereo: Box<[f32]>,
     block_frames: usize,
+    /// The local mix's weights in the previous block, so a fader move glides (see [MixRamp]).
+    ramp: MixRamp,
 }
 
 /// The engine's end of the local output sink's lines: feeds go to the sink, and the feeds it lets
@@ -399,6 +401,7 @@ pub(crate) fn local_output_sink(
         feed: None,
         stereo: vec![0.0; MAX_BLOCK_FRAMES * usize::from(OUTPUT_CHANNELS)].into_boxed_slice(),
         block_frames: DEFAULT_BLOCK_FRAMES,
+        ramp: MixRamp::default(),
     };
     let control = OutputControl {
         commands: command_producer,
@@ -465,7 +468,11 @@ impl Sink for LocalOutputSink {
         let Some(stereo) = self.stereo.get_mut(..frames * usize::from(OUTPUT_CHANNELS)) else {
             return;
         };
-        MixPlan::new(&self.mix.snapshot(), block.channels).mix_into(block.samples, stereo);
+        MixPlan::new(&self.mix.snapshot(), block.channels).mix_ramped(
+            &self.ramp,
+            block.samples,
+            stereo,
+        );
         self.meter.observe(stereo);
 
         if let Some(feed) = &mut self.feed {

@@ -19,6 +19,7 @@ use crate::demo::{DemoReader, DEMO_CHANNELS, DEMO_DEVICE_NAME};
 use crate::discovery::spawn_discovery_thread;
 use crate::health::{link_status, LinkStatus};
 use crate::link_history::LinkHistoryRead;
+use crate::load::{EngineLoad, EngineLoadStatus};
 use crate::mix::{
     group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
     MixPreset, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
@@ -404,6 +405,9 @@ pub struct EngineStatus {
     pub soundcheck: SoundcheckStatus,
     /// The engine runs on the demo source ([crate::demo]), not on an interface.
     pub demo: bool,
+    /// How long the engine thread takes for each block, as a share of the time the block lasts
+    /// (see [crate::load]): over 100% a block was late, and many late blocks drop audio.
+    pub load: EngineLoadStatus,
 }
 
 /// How many events a live subscriber may fall behind before it is told it lagged.
@@ -1521,6 +1525,8 @@ pub struct EngineHandle {
     /// The engine thread: it reads the current stream's ring and feeds the sinks, and keeps the
     /// block numbering going across device switches.
     pipeline: Option<PipelineHandle>,
+    /// The engine thread's load, as it publishes it (see [crate::load]).
+    load: Arc<EngineLoad>,
     control_thread: Option<JoinHandle<()>>,
     discovery_thread: Option<JoinHandle<()>>,
 }
@@ -1683,6 +1689,7 @@ impl EngineHandle {
             recording: self.recording(),
             soundcheck: self.soundcheck(),
             demo: self.is_demo(),
+            load: self.load.status(),
         }
     }
 
@@ -2833,10 +2840,12 @@ fn launch(
     let local_meter = OutputMeter::default();
     let (local, output_control) = local_output_sink(Arc::clone(&local_mix), local_meter.clone());
     let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
-    let pipeline = PipelineHandle::spawn(Pipeline::new(
+    let pipeline = Pipeline::new(
         vec![Box::new(network), Box::new(local), Box::new(recorder)],
         Arc::clone(&levels),
-    ))?;
+    );
+    let load = pipeline.load();
+    let pipeline = PipelineHandle::spawn(pipeline)?;
     let playback_clock = Arc::new(PlaybackClock::new());
     playback_clock.set_waker(pipeline.waker());
     let (stream, capture_device, device_name, capture_format, block_frames) = match capture {
@@ -2914,6 +2923,7 @@ fn launch(
         soundcheck: Soundcheck::default(),
         stream,
         pipeline: Some(pipeline),
+        load,
         control_thread: Some(control_thread),
         discovery_thread: Some(discovery_thread),
     })
@@ -5187,11 +5197,12 @@ mod tests {
         let (local, output_control) =
             local_output_sink(Arc::clone(&local_mix), local_meter.clone());
         let (recorder, recorder_lines) = recorder_sink(Arc::clone(&local_mix));
-        let pipeline = PipelineHandle::spawn(Pipeline::new(
+        let pipeline = Pipeline::new(
             vec![Box::new(network), Box::new(local), Box::new(recorder)],
             Arc::clone(&levels),
-        ))
-        .expect("the engine thread starts");
+        );
+        let load = pipeline.load();
+        let pipeline = PipelineHandle::spawn(pipeline).expect("the engine thread starts");
         let playback_clock = Arc::new(PlaybackClock::new());
         playback_clock.set_waker(pipeline.waker());
         let mut engine = EngineHandle {
@@ -5220,6 +5231,7 @@ mod tests {
             soundcheck: Soundcheck::default(),
             stream: None,
             pipeline: Some(pipeline),
+            load,
             control_thread: None,
             discovery_thread: None,
         };

@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use crate::engine::OutputMeter;
 use crate::health::{LatestLinkReport, LinkReport};
 use crate::link_history::{LinkHistory, LinkHistoryRead, LinkMoment, SharedLinkHistory};
-use crate::mix::{EngineerControls, EngineerUpdate, GroupLayout, Membership, MixState, MixValues};
+use crate::mix::{
+    EngineerControls, EngineerUpdate, GroupLayout, Membership, MixRamp, MixState, MixValues,
+};
 use crate::network::TargetCounters;
 use crate::playback::PlaybackBuffer;
 use crate::protocol::{StatsCommand, CAPABILITY_PLAYBACK_BUFFER, CAPABILITY_REDUNDANCY_HOLD};
@@ -346,6 +348,9 @@ pub(crate) struct TargetEntry {
     /// thread whenever the setting kept for whoever is on the row changes; only the network thread
     /// uses it.
     pub(crate) held: Option<Arc<HeldCopies>>,
+    /// The weights this musician's mix had in the previous block, so a fader move glides across
+    /// the next one (see [MixRamp]). Only the network thread uses it.
+    pub(crate) ramp: Arc<MixRamp>,
 }
 
 /// The live routing table: which UDP targets exist, each with its mix state and send counters.
@@ -424,6 +429,7 @@ impl TargetRegistry {
                 output_meter: OutputMeter::default(),
                 origin: TargetOrigin::Configured,
                 held: None,
+                ramp: Arc::default(),
             });
         }
         Ok(Self {
@@ -994,6 +1000,7 @@ impl TargetRegistry {
             output_meter: OutputMeter::default(),
             origin,
             held: new_held(redundancy),
+            ramp: Arc::default(),
         };
         let controls_changed = self.restore_kept_controls(&entry);
         let (mirror_changed, followed) = self.restore_mirror(&entries, &entry);
@@ -1094,6 +1101,7 @@ impl TargetRegistry {
                 None,
                 address.ip(),
             )),
+            ramp: Arc::default(),
         };
         self.restore_kept_controls(&entry);
         self.restore_mirror(&entries, &entry);

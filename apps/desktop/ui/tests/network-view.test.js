@@ -7,10 +7,12 @@ import {
   BUFFER_OPTIONS,
   CONFIRM_DELAY_MS,
   HOST_OPTIONS,
+  LOAD_WARNING_PERCENT,
   audioSetupView,
   confirmReady,
   deviceOptions,
   deviceSwitchPlan,
+  loadView,
   musicianRows,
   switchMethod,
   validateAddress,
@@ -178,6 +180,28 @@ test("the audio setup shows the applied choices, the device and the engine's num
     samplesReceived: "0",
     packets: "0 / 0",
   });
+});
+
+test("the engine's load shows its average and peak, and warns once either passes 70%", () => {
+  assert.deepEqual(audioSetupView(running, NO_DRAFT).load, {
+    text: "8% (peak 15%)",
+    warning: false,
+  });
+
+  const load = (averagePercent, peakPercent, lateBlocks = 0) =>
+    loadView({ load: { percent: averagePercent, averagePercent, peakPercent, lateBlocks } });
+  assert.equal(LOAD_WARNING_PERCENT, 70);
+  assert.deepEqual(load(70, 70), { text: "70% (peak 70%)", warning: false });
+  assert.deepEqual(load(40, 82), { text: "40% (peak 82%)", warning: true });
+  assert.deepEqual(load(71.2, 75), { text: "71% (peak 75%)", warning: true });
+  assert.deepEqual(load(55, 130, 1), { text: "55% (peak 130%) · 1 late block", warning: true });
+  assert.equal(load(55, 130, 1200).text, "55% (peak 130%) · 1,200 late blocks");
+});
+
+test("with no engine, or an engine that reports no load, the load is a dash", () => {
+  assert.deepEqual(loadView(null), { text: "—", warning: false });
+  assert.deepEqual(loadView({}), { text: "—", warning: false });
+  assert.deepEqual(audioSetupView(initialState, NO_DRAFT).load, { text: "—", warning: false });
 });
 
 test("choosing ASIO waits for an explicit driver before anything starts", () => {

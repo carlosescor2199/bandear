@@ -130,6 +130,33 @@ export function deviceSwitchPlan(state, devices, name) {
   };
 }
 
+/** Above this share of a block's time, on average or at the peak, the engine's load is a warning. */
+export const LOAD_WARNING_PERCENT = 70;
+
+/**
+ * The engine's load line: `{ text, warning }`, the text "12% (peak 30%)", the average and the
+ * peak of the last seconds as shares of the time a block lasts, then the late blocks when there
+ * are any ("· 3 late blocks"); a dash with no engine or no load reported. `warning` is true once
+ * the average or the peak passes LOAD_WARNING_PERCENT: the engine thread is close to running late,
+ * and late blocks drop audio.
+ */
+export function loadView(status) {
+  const load = status?.load;
+  if (!load) {
+    return { text: DASH, warning: false };
+  }
+  const average = Math.round(load.averagePercent ?? 0);
+  const peak = Math.round(load.peakPercent ?? 0);
+  const late = load.lateBlocks ?? 0;
+  const lateText = late > 0 ? ` · ${count(late)} late ${late === 1 ? "block" : "blocks"}` : "";
+  return {
+    text: `${average}% (peak ${peak}%)${lateText}`,
+    warning:
+      (load.averagePercent ?? 0) > LOAD_WARNING_PERCENT ||
+      (load.peakPercent ?? 0) > LOAD_WARNING_PERCENT,
+  };
+}
+
 /** "live" when the applied driver switches devices without a restart (WASAPI), else "restart". */
 export function switchMethod(audio) {
   return audio.host === "wasapi" ? "live" : "restart";
@@ -184,6 +211,7 @@ export function audioSetupView(state, local) {
       samplesReceived: status ? count(status.samplesReceived) : DASH,
       packets: status ? `${count(status.packetsSent)} / ${count(status.packetsDiscarded)}` : DASH,
     },
+    load: loadView(status),
   };
 }
 

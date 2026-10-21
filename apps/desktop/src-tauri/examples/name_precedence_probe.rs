@@ -73,6 +73,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         recording: Default::default(),
         soundcheck: Default::default(),
         demo: false,
+        load: Default::default(),
     }
 }
 

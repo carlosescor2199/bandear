@@ -117,6 +117,14 @@ const styles = sheet(`
     font-family: var(--ml-font-mono);
     font-size: var(--ml-text-md);
   }
+  dd[data-load][data-warning] {
+    justify-self: start;
+    padding: 0 6px;
+    border: 1px solid var(--ml-warn-border);
+    border-radius: var(--ml-radius-sm);
+    background: var(--ml-warn-bg);
+    color: var(--ml-accent);
+  }
   .hint {
     margin: 0;
     color: var(--ml-text-muted);
@@ -187,6 +195,7 @@ class MlAudioSetup extends HTMLElement {
           <dt>Control port</dt><dd data-port></dd>
           <dt>Samples received</dt><dd data-samples></dd>
           <dt>Packets sent / discarded</dt><dd data-packets></dd>
+          <dt>Engine load</dt><dd data-load></dd>
         </dl>
         <p class="hint">
           The driver, the buffer and, outside WASAPI, the device restart the capture engine, the
@@ -214,6 +223,7 @@ class MlAudioSetup extends HTMLElement {
       port: $("[data-port]"),
       samples: $("[data-samples]"),
       packets: $("[data-packets]"),
+      load: $("[data-load]"),
       localOut: $("#local-out"),
       localState: $("[data-local-state]"),
       localAlert: $("[data-local-alert]"),
@@ -272,6 +282,8 @@ class MlAudioSetup extends HTMLElement {
     setText(parts.port, data.readouts.controlPort);
     setText(parts.samples, data.readouts.samplesReceived);
     setText(parts.packets, data.readouts.packets);
+    setText(parts.load, data.load?.text ?? "—");
+    reflect(parts.load, "data-warning", Boolean(data.load?.warning));
     this.#showLocalOutput(data.localOutput);
   }
 

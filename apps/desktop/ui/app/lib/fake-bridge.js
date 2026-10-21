@@ -410,6 +410,8 @@ export function sampleStatus() {
     soundcheck: clone(IDLE_SOUNDCHECK),
     // On an interface, not the demo source.
     demo: false,
+    // The engine thread at a light load: well inside each block, never late.
+    load: { percent: 9.4, averagePercent: 8.2, peakPercent: 14.6, lateBlocks: 0 },
   };
 }
 

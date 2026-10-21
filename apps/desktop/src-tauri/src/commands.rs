@@ -2690,6 +2690,7 @@ mod tests {
                 &personal_monitoring::SoundcheckStatus::default(),
             ),
             demo: false,
+            load: Default::default(),
         }
     }
 
@@ -6388,6 +6389,7 @@ mod tests {
             recording: personal_monitoring::RecordingStatus::default(),
             soundcheck: Default::default(),
             demo: false,
+            load: Default::default(),
         }
     }
 

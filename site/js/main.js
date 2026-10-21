@@ -1,7 +1,16 @@
-// Boots the decorative 3D layers. The inline script in <head> adds the `webgl` class to <html>
+// Boots the page: the language (i18n.js), then the decorative 3D layers. The inline script in <head> adds the `webgl` class to <html>
 // before first paint when WebGL 2 is available, so the CSS swaps the static visuals for canvas
 // hosts without layout shifts. Without that class this module does nothing and the static
 // design stays. three.js is only downloaded when a scene is about to become visible.
+
+import { initI18n } from "./i18n.js";
+
+// Language first, so the copy is settled before anything else renders.
+try {
+  initI18n();
+} catch (error) {
+  console.warn("BandEar: language switch unavailable.", error);
+}
 
 const root = document.documentElement;
 const mounted = new Set();

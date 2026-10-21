@@ -5,6 +5,7 @@
 // accessible SVG diagram stays in the page for screen readers.
 
 import * as THREE from "../vendor/three/three.module.min.js";
+import { t } from "./i18n.js";
 import { buildMixer } from "./model-mixer.js";
 import { damp, lerp, particleBudget, sectionProgress } from "./motion.js";
 import {
@@ -47,7 +48,8 @@ const LAYOUTS = {
     ],
   },
 };
-const LABELS = ["Mixer · USB audio", "BandEar desktop", "Singer", "Drummer", "Keys"];
+// Dictionary keys (see i18n.js); the labels carry data-i18n so a language switch rewrites them.
+const LABELS = ["diagram.mixer", "diagram.desktop", "diagram.singer", "diagram.drummer", "diagram.keys"];
 
 function particleMaterial() {
   return new THREE.ShaderMaterial({
@@ -181,10 +183,11 @@ export function mount(host, { onLost } = {}) {
   });
 
   // HTML labels (decorative; the hidden SVG keeps the accessible description).
-  const labels = LABELS.map((text) => {
+  const labels = LABELS.map((key) => {
     const element = document.createElement("span");
     element.className = "flow-label";
-    element.textContent = text;
+    element.dataset.i18n = key;
+    element.textContent = t(key);
     labelLayer.append(element);
     return { element, last: "" };
   });

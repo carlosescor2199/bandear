@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BandEar — personal in-ear mixes on every musician's phone</title>
-  <meta name="description" content="BandEar is a free, open-source personal monitor system. A computer and your mixer's USB audio (or any audio interface) run the desk; every musician mixes their own in-ear sound on their own phone over Wi-Fi.">
+  <title data-i18n="meta.title">BandEar — personal in-ear mixes on every musician's phone</title>
+  <meta name="description" data-i18n-attr="content=meta.description" content="BandEar is a free, open-source personal monitor system. A computer and your mixer's USB audio (or any audio interface) run the desk; every musician mixes their own in-ear sound on their own phone over Wi-Fi.">
   <meta name="theme-color" content="#192223">
   <!-- Design preview: canonical and social URLs point at GitHub Pages until the custom domain is connected. -->
   <link rel="canonical" href="https://carlosescor2199.github.io/bandear/">
@@ -28,23 +28,23 @@
   </script>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
+  <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
 
   <header class="site-header">
     <div class="container header-inner">
-      <a class="brand" href="#top" aria-label="BandEar home">
+      <a class="brand" href="#top" aria-label="BandEar home" data-i18n-attr="aria-label=brand.home">
         <img src="assets/brand/bandear-mark.svg" alt="" width="32" height="32">
         <span>BandEar</span>
       </a>
-      <nav class="site-nav" aria-label="Main">
-        <a href="#how">How it works</a>
-        <a href="#features">Features</a>
-        <a href="#downloads">Download</a>
-        <a href="#faq">FAQ</a>
+      <nav class="site-nav" aria-label="Main" data-i18n-attr="aria-label=nav.label">
+        <a href="#how" data-i18n="nav.how">How it works</a>
+        <a href="#features" data-i18n="nav.features">Features</a>
+        <a href="#downloads" data-i18n="nav.download">Download</a>
+        <a href="#faq" data-i18n="nav.faq">FAQ</a>
       </nav>
       <div class="header-actions">
-        <button class="lang-toggle" type="button" aria-label="Cambiar a español">ES</button>
-        <a class="icon-link" href="https://github.com/carlosescor2199/bandear" aria-label="BandEar on GitHub">
+        <button class="lang-toggle" type="button" lang="es" aria-label="Cambiar a español" data-i18n="lang.toggle" data-i18n-attr="aria-label=lang.toggleLabel;lang=lang.toggleLang">ES</button>
+        <a class="icon-link" href="https://github.com/carlosescor2199/bandear" aria-label="BandEar on GitHub" data-i18n-attr="aria-label=github.label">
           <svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
       </div>
@@ -57,22 +57,22 @@
       <div class="container hero-inner">
         <div class="hero-copy">
           <img class="hero-mark" src="assets/brand/bandear-mark.svg" alt="" width="88" height="88">
-          <p class="eyebrow">Free · Open source · Personal monitoring</p>
-          <h1>Every musician gets their own in&#8209;ear mix, <span class="accent">on their own phone.</span></h1>
-          <p class="lede">Plug your mixer's USB audio — or any audio interface — into a computer running BandEar. Each musician joins the same Wi-Fi, opens the app and mixes their own ears — while the engineer keeps control from the desk.</p>
+          <p class="eyebrow" data-i18n="hero.eyebrow">Free · Open source · Personal monitoring</p>
+          <h1 data-i18n-html="hero.title">Every musician gets their own in&#8209;ear mix, <span class="accent">on their own phone.</span></h1>
+          <p class="lede" data-i18n="hero.lede">Plug your mixer's USB audio — or any audio interface — into a computer running BandEar. Each musician joins the same Wi-Fi, opens the app and mixes their own ears — while the engineer keeps control from the desk.</p>
           <div class="cta-row">
             <a class="btn btn-primary" href="https://github.com/carlosescor2199/bandear/releases/latest">
               <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg>
-              <span>Download for Windows</span>
+              <span data-i18n="dl.hero.generic">Download</span>
             </a>
-            <a class="btn btn-ghost" href="#downloads">Other platforms</a>
+            <a class="btn btn-ghost" href="#downloads" data-i18n="hero.other">Other platforms</a>
           </div>
-          <p class="cta-meta"><span class="chip">v0.2.0</span> Windows · macOS · Linux · Android 10+</p>
+          <p class="cta-meta"><span class="chip">v0.2.0</span> <span data-i18n="hero.platforms">Windows · macOS · Linux · Android 10+</span></p>
         </div>
         <figure class="hero-shot" data-3d-host>
           <div class="window">
             <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i></div>
-            <img src="assets/screenshots/mix.png" alt="The BandEar console: one tab per musician, channel strips, groups and the master with its limiter" width="1440" height="900" fetchpriority="high">
+            <img src="assets/screenshots/mix.png" alt="The BandEar console: one tab per musician, channel strips, groups and the master with its limiter" data-i18n-attr="alt=hero.shotAlt" width="1440" height="900" fetchpriority="high">
           </div>
           <!-- Decorative 3D mark; shown instead of the screenshot when WebGL 2 is available. -->
           <div class="hero-3d" aria-hidden="true">
@@ -81,11 +81,11 @@
           </div>
         </figure>
       </div>
-      <ul class="stats container" aria-label="At a glance">
-        <li><strong>0 ms</strong><span>added processing latency</span></li>
-        <li><strong>32</strong><span>inputs</span></li>
-        <li><strong>16</strong><span>musicians at ~18% engine load</span></li>
-        <li><strong>$0</strong><span>no extra hardware, MIT licensed</span></li>
+      <ul class="stats container" aria-label="At a glance" data-i18n-attr="aria-label=stats.label">
+        <li><strong>0 ms</strong><span data-i18n="stats.latency">added processing latency</span></li>
+        <li><strong>32</strong><span data-i18n="stats.inputs">inputs</span></li>
+        <li><strong>16</strong><span data-i18n="stats.musicians">musicians at ~18% engine load</span></li>
+        <li><strong>$0</strong><span data-i18n="stats.cost">no extra hardware, MIT licensed</span></li>
       </ul>
     </section>
 
@@ -93,8 +93,8 @@
     <section class="section" id="how" aria-labelledby="how-title">
       <div class="container">
         <header class="section-head">
-          <p class="eyebrow">How it works</p>
-          <h2 id="how-title">From your mixer to every pair of ears in three steps</h2>
+          <p class="eyebrow" data-i18n="how.eyebrow">How it works</p>
+          <h2 id="how-title" data-i18n="how.title">From your mixer to every pair of ears in three steps</h2>
         </header>
 
         <figure class="diagram" data-3d-host>
@@ -104,7 +104,7 @@
             <div class="flow-labels"></div>
           </div>
           <svg viewBox="0 0 920 260" role="img" aria-labelledby="diagram-title">
-            <title id="diagram-title">A mixer's built-in USB audio interface (or any audio interface) feeds a computer running BandEar, which sends one mix per musician to their phones over Wi-Fi.</title>
+            <title id="diagram-title" data-i18n="diagram.title">A mixer's built-in USB audio interface (or any audio interface) feeds a computer running BandEar, which sends one mix per musician to their phones over Wi-Fi.</title>
             <defs>
               <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                 <path d="M0 0 10 5 0 10z" fill="#FFBF43"/>
@@ -131,7 +131,7 @@
               <rect x="88" y="152" width="12" height="7" rx="2"/><rect x="110" y="140" width="12" height="7" rx="2"/>
               <rect x="132" y="130" width="12" height="7" rx="2"/><rect x="154" y="148" width="12" height="7" rx="2"/>
             </g>
-            <text x="125" y="216" class="d-label">Mixer · USB audio</text>
+            <text x="125" y="216" class="d-label" data-i18n="diagram.mixer">Mixer · USB audio</text>
             <!-- USB cable -->
             <path d="M228 130 H318" class="d-link" marker-end="url(#arrow)"/>
             <text x="270" y="118" class="d-small">USB</text>
@@ -146,7 +146,7 @@
               <rect x="424" y="128" width="6" height="36" rx="3"/><rect x="450" y="96" width="6" height="68" rx="3"/>
               <rect x="476" y="112" width="6" height="52" rx="3"/><rect x="502" y="122" width="6" height="42" rx="3"/>
             </g>
-            <text x="438" y="240" class="d-label">BandEar desktop</text>
+            <text x="438" y="240" class="d-label" data-i18n="diagram.desktop">BandEar desktop</text>
             <!-- Wi-Fi -->
             <g class="d-wifi" fill="none">
               <path d="M600 112 a26 26 0 0 1 0 36"/>
@@ -162,9 +162,9 @@
               <rect x="756" y="100" width="34" height="60" rx="7"/>
               <rect x="756" y="178" width="34" height="60" rx="7"/>
             </g>
-            <text x="804" y="58" class="d-label d-left">Singer</text>
-            <text x="804" y="136" class="d-label d-left">Drummer</text>
-            <text x="804" y="214" class="d-label d-left">Keys</text>
+            <text x="804" y="58" class="d-label d-left" data-i18n="diagram.singer">Singer</text>
+            <text x="804" y="136" class="d-label d-left" data-i18n="diagram.drummer">Drummer</text>
+            <text x="804" y="214" class="d-label d-left" data-i18n="diagram.keys">Keys</text>
             <!-- step badges -->
             <g class="d-badge"><circle cx="40" cy="48" r="18"/><text x="40" y="54">1</text></g>
             <g class="d-badge"><circle cx="348" cy="46" r="18"/><text x="348" y="52">2</text></g>
@@ -175,18 +175,18 @@
         <ol class="steps">
           <li class="card">
             <span class="step-num" aria-hidden="true">1</span>
-            <h3>Connect your mixer</h3>
-            <p>Most digital mixers have a USB audio interface built in — BandEar uses it. A standalone audio interface works too. Plug it into a Windows, macOS or Linux computer, open BandEar, pick it and press <em>Start engine</em>.</p>
+            <h3 data-i18n="step1.title">Connect your mixer</h3>
+            <p data-i18n-html="step1.body">Most digital mixers have a USB audio interface built in — BandEar uses it. A standalone audio interface works too. Plug it into a Windows, macOS or Linux computer, open BandEar, pick it and press <em>Start engine</em>.</p>
           </li>
           <li class="card">
             <span class="step-num" aria-hidden="true">2</span>
-            <h3>Run the desk</h3>
-            <p>The desktop app builds one mix per musician with channel processing, limits and presets. No mixer at hand? The demo source plays eight generated channels.</p>
+            <h3 data-i18n="step2.title">Run the desk</h3>
+            <p data-i18n="step2.body">The desktop app builds one mix per musician with channel processing, limits and presets. No mixer at hand? The demo source plays eight generated channels.</p>
           </li>
           <li class="card">
             <span class="step-num" aria-hidden="true">3</span>
-            <h3>Connect the phones</h3>
-            <p>Musicians join the same Wi-Fi and open the BandEar app. Their phones find the desk on their own — no IP addresses to type — and everyone mixes their own ears.</p>
+            <h3 data-i18n="step3.title">Connect the phones</h3>
+            <p data-i18n="step3.body">Musicians join the same Wi-Fi and open the BandEar app. Their phones find the desk on their own — no IP addresses to type — and everyone mixes their own ears.</p>
           </li>
         </ol>
       </div>
@@ -196,48 +196,48 @@
     <section class="section section-alt" id="features" aria-labelledby="features-title">
       <div class="container">
         <header class="section-head">
-          <p class="eyebrow">Features</p>
-          <h2 id="features-title">A real monitor desk, without the extra hardware</h2>
+          <p class="eyebrow" data-i18n="features.eyebrow">Features</p>
+          <h2 id="features-title" data-i18n="features.title">A real monitor desk, without the extra hardware</h2>
         </header>
         <div class="features">
           <article class="card feature">
             <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 5v22M16 5v22M24 5v22"/><rect x="5" y="17" width="6" height="5" rx="1.5"/><rect x="13" y="9" width="6" height="5" rx="1.5"/><rect x="21" y="14" width="6" height="5" rx="1.5"/></svg>
-            <h3>Personal mixes</h3>
+            <h3 data-i18n="f1.title">Personal mixes</h3>
             <ul>
-              <li>One mix per musician, from their phone or the desk</li>
-              <li>Up to 32 inputs, stereo pairs and groups</li>
-              <li>Engineer limits and locks, presets, copy and mirror mixes</li>
-              <li>Saved sessions and automatic mix backups</li>
+              <li data-i18n="f1.i1">One mix per musician, from their phone or the desk</li>
+              <li data-i18n="f1.i2">Up to 32 inputs, stereo pairs and groups</li>
+              <li data-i18n="f1.i3">Engineer limits and locks, presets, copy and mirror mixes</li>
+              <li data-i18n="f1.i4">Saved sessions and automatic mix backups</li>
             </ul>
           </article>
           <article class="card feature">
             <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true"><path d="M3 20c4 0 5-9 9-9s4 10 8 10 5-7 9-7"/><circle cx="12" cy="11" r="2.4"/><circle cx="20" cy="21" r="2.4"/></svg>
-            <h3>Processing</h3>
+            <h3 data-i18n="f2.title">Processing</h3>
             <ul>
-              <li>High-pass, 4-band EQ, gate and compressor on every input</li>
-              <li>A limiter on every musician's master</li>
-              <li>Shared reverb and delay with sends and per-mix returns</li>
-              <li>0 ms of added latency</li>
+              <li data-i18n="f2.i1">High-pass, 4-band EQ, gate and compressor on every input</li>
+              <li data-i18n="f2.i2">A limiter on every musician's master</li>
+              <li data-i18n="f2.i3">Shared reverb and delay with sends and per-mix returns</li>
+              <li data-i18n="f2.i4">0 ms of added latency</li>
             </ul>
           </article>
           <article class="card feature">
             <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="5" class="fill"/></svg>
-            <h3>Recording</h3>
+            <h3 data-i18n="f3.title">Recording</h3>
             <ul>
-              <li>Multitrack: every input on its own WAV track</li>
-              <li>Markers, disk-space estimate and crash-safe files</li>
-              <li>Virtual soundcheck: play a take back as if the band were playing</li>
-              <li>A local mix for the computer's own outputs</li>
+              <li data-i18n="f3.i1">Multitrack: every input on its own WAV track</li>
+              <li data-i18n="f3.i2">Markers, disk-space estimate and crash-safe files</li>
+              <li data-i18n="f3.i3">Virtual soundcheck: play a take back as if the band were playing</li>
+              <li data-i18n="f3.i4">A local mix for the computer's own outputs</li>
             </ul>
           </article>
           <article class="card feature">
             <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true"><path d="M4 13a17 17 0 0 1 24 0M8 17.5a11 11 0 0 1 16 0M12 22a5 5 0 0 1 8 0"/><circle cx="16" cy="26" r="1.6" class="fill"/></svg>
-            <h3>Network you can trust</h3>
+            <h3 data-i18n="f4.title">Network you can trust</h3>
             <ul>
-              <li>Link health per musician: loss, glitches and round trip</li>
-              <li>Set each phone's buffer from the desk</li>
-              <li>Redundancy: every packet sent twice when Wi-Fi gets rough</li>
-              <li>Engine load meter, log file and a demo source</li>
+              <li data-i18n="f4.i1">Link health per musician: loss, glitches and round trip</li>
+              <li data-i18n="f4.i2">Set each phone's buffer from the desk</li>
+              <li data-i18n="f4.i3">Redundancy: every packet sent twice when Wi-Fi gets rough</li>
+              <li data-i18n="f4.i4">Engine load meter, log file and a demo source</li>
             </ul>
           </article>
         </div>
@@ -248,32 +248,32 @@
     <section class="section" id="screenshots" aria-labelledby="shots-title">
       <div class="container">
         <header class="section-head">
-          <p class="eyebrow">A closer look</p>
-          <h2 id="shots-title">Built for the desk</h2>
+          <p class="eyebrow" data-i18n="shots.eyebrow">A closer look</p>
+          <h2 id="shots-title" data-i18n="shots.title">Built for the desk</h2>
         </header>
         <ul class="gallery">
           <li>
             <a class="shot" href="assets/screenshots/mix.png">
-              <img src="assets/screenshots/mix.png" alt="Mix view: one tab per musician, channel strips, groups and the master with its limiter" width="1440" height="900" loading="lazy">
-              <span class="shot-caption">Personal mixes</span>
+              <img src="assets/screenshots/mix.png" alt="Mix view: one tab per musician, channel strips, groups and the master with its limiter" data-i18n-attr="alt=shots.mixAlt" width="1440" height="900" loading="lazy">
+              <span class="shot-caption" data-i18n="shots.mix">Personal mixes</span>
             </a>
           </li>
           <li>
             <a class="shot" href="assets/screenshots/processing.png">
-              <img src="assets/screenshots/processing.png" alt="The processing editor with the equaliser curve, gate and compressor" width="1440" height="900" loading="lazy">
-              <span class="shot-caption">Channel processing</span>
+              <img src="assets/screenshots/processing.png" alt="The processing editor with the equaliser curve, gate and compressor" data-i18n-attr="alt=shots.processingAlt" width="1440" height="900" loading="lazy">
+              <span class="shot-caption" data-i18n="shots.processing">Channel processing</span>
             </a>
           </li>
           <li>
             <a class="shot" href="assets/screenshots/record.png">
-              <img src="assets/screenshots/record.png" alt="The Record screen with one track per input and the virtual soundcheck" width="1440" height="900" loading="lazy">
-              <span class="shot-caption">Recording and virtual soundcheck</span>
+              <img src="assets/screenshots/record.png" alt="The Record screen with one track per input and the virtual soundcheck" data-i18n-attr="alt=shots.recordAlt" width="1440" height="900" loading="lazy">
+              <span class="shot-caption" data-i18n="shots.record">Recording and virtual soundcheck</span>
             </a>
           </li>
           <li>
             <a class="shot" href="assets/screenshots/network.png">
-              <img src="assets/screenshots/network.png" alt="Network and system: link health, buffer and redundancy for every phone" width="1440" height="900" loading="lazy">
-              <span class="shot-caption">Network and system</span>
+              <img src="assets/screenshots/network.png" alt="Network and system: link health, buffer and redundancy for every phone" data-i18n-attr="alt=shots.networkAlt" width="1440" height="900" loading="lazy">
+              <span class="shot-caption" data-i18n="shots.network">Network and system</span>
             </a>
           </li>
         </ul>
@@ -284,49 +284,49 @@
     <section class="section section-alt" id="downloads" aria-labelledby="downloads-title">
       <div class="container">
         <header class="section-head">
-          <p class="eyebrow">Download · v0.2.0</p>
-          <h2 id="downloads-title">Get BandEar for every device in the band</h2>
-          <p>The desk runs on a computer; musicians use the Android app. All files come from the <a href="https://github.com/carlosescor2199/bandear/releases/latest">latest GitHub release</a>.</p>
+          <p class="eyebrow"><span data-i18n="downloads.eyebrow">Download</span> · <span>v0.2.0</span></p>
+          <h2 id="downloads-title" data-i18n="downloads.title">Get BandEar for every device in the band</h2>
+          <p data-i18n-html="downloads.intro">The desk runs on a computer; musicians use the Android app. All files come from the <a href="https://github.com/carlosescor2199/bandear/releases/latest">latest GitHub release</a>.</p>
         </header>
         <div class="downloads">
           <article class="card dl">
             <h3>Windows <span class="muted">10 / 11</span></h3>
             <p class="file">BandEar_0.2.0_x64-setup.exe</p>
-            <p class="note">First run: <em>More info → Run anyway</em> — the installer is not signed yet.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">Download .exe</a>
+            <p class="note" data-i18n-html="dl.windows.note">First run: <em>More info → Run anyway</em> — the installer is not signed yet.</p>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.windows.btn">Download .exe</a>
           </article>
           <article class="card dl">
             <h3>macOS <span class="muted">Apple Silicon</span></h3>
             <p class="file">BandEar_0.2.0_aarch64.dmg</p>
-            <p class="note">Drag to Applications. First run: right-click → <em>Open</em>.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">Download .dmg</a>
+            <p class="note" data-i18n-html="dl.mac.note">Drag to Applications. First run: right-click → <em>Open</em>.</p>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.mac.btn">Download .dmg</a>
           </article>
           <article class="card dl">
             <h3>macOS <span class="muted">Intel</span></h3>
             <p class="file">BandEar_0.2.0_x64.dmg</p>
-            <p class="note">Drag to Applications. First run: right-click → <em>Open</em>.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">Download .dmg</a>
+            <p class="note" data-i18n-html="dl.mac.note">Drag to Applications. First run: right-click → <em>Open</em>.</p>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.mac.btn">Download .dmg</a>
           </article>
           <article class="card dl">
             <h3>Linux <span class="muted">x86-64</span></h3>
             <p class="file">BandEar_0.2.0_amd64.AppImage<br>BandEar_0.2.0_amd64.deb</p>
-            <p class="note"><code>chmod +x</code> the AppImage and run it, or install the .deb.</p>
+            <p class="note" data-i18n-html="dl.linux.note"><code>chmod +x</code> the AppImage and run it, or install the .deb.</p>
             <div class="btn-pair">
               <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">AppImage</a>
               <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">.deb</a>
             </div>
           </article>
           <article class="card dl dl-phone">
-            <h3>Android <span class="muted">10+ · musicians' app</span></h3>
+            <h3>Android <span class="muted" data-i18n="dl.android.muted">10+ · musicians' app</span></h3>
             <p class="file">BandEar_0.2.0_android.apk</p>
-            <p class="note">Allow installs from your browser, then open the APK.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">Download .apk</a>
+            <p class="note" data-i18n="dl.android.note">Allow installs from your browser, then open the APK.</p>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.android.btn">Download .apk</a>
           </article>
           <article class="card dl dl-soon">
             <h3>iPhone <span class="muted">iOS</span></h3>
-            <p class="file">Coming soon</p>
-            <p class="note">An iOS app for musicians is on the roadmap.</p>
-            <a class="btn btn-small btn-ghost" href="https://github.com/carlosescor2199/bandear#%EF%B8%8F-roadmap">See the roadmap</a>
+            <p class="file" data-i18n="dl.ios.file">Coming soon</p>
+            <p class="note" data-i18n="dl.ios.note">An iOS app for musicians is on the roadmap.</p>
+            <a class="btn btn-small btn-ghost" href="https://github.com/carlosescor2199/bandear#%EF%B8%8F-roadmap" data-i18n="dl.ios.btn">See the roadmap</a>
           </article>
         </div>
       </div>
@@ -336,33 +336,33 @@
     <section class="section" id="faq" aria-labelledby="faq-title">
       <div class="container container-narrow">
         <header class="section-head">
-          <p class="eyebrow">FAQ</p>
-          <h2 id="faq-title">Questions musicians ask</h2>
+          <p class="eyebrow" data-i18n="faq.eyebrow">FAQ</p>
+          <h2 id="faq-title" data-i18n="faq.title">Questions musicians ask</h2>
         </header>
         <div class="faq">
           <details open>
-            <summary>Is it free?</summary>
-            <p>Yes. BandEar is free and open source under the MIT license — no subscriptions, no accounts, no ads.</p>
+            <summary data-i18n="faq.q1">Is it free?</summary>
+            <p data-i18n="faq.a1">Yes. BandEar is free and open source under the MIT license — no subscriptions, no accounts, no ads.</p>
           </details>
           <details>
-            <summary>Do I need special hardware?</summary>
-            <p>No. You need a computer, a mixer with USB audio (or any audio interface the computer sees as an input) and a Wi-Fi network. Musicians use their own phones and in-ear headphones. A dedicated 5 GHz access point close to the stage works best.</p>
+            <summary data-i18n="faq.q2">Do I need special hardware?</summary>
+            <p data-i18n="faq.a2">No. You need a computer, a mixer with USB audio (or any audio interface the computer sees as an input) and a Wi-Fi network. Musicians use their own phones and in-ear headphones. A dedicated 5 GHz access point close to the stage works best.</p>
           </details>
           <details>
-            <summary>Which phones work?</summary>
-            <p>Android 10 or newer. Each phone finds the desk on the same Wi-Fi by itself.</p>
+            <summary data-i18n="faq.q3">Which phones work?</summary>
+            <p data-i18n="faq.a3">Android 10 or newer. Each phone finds the desk on the same Wi-Fi by itself.</p>
           </details>
           <details>
-            <summary>What about latency?</summary>
-            <p>Processing adds 0 ms: filters and dynamics have no look-ahead and effects are wet returns. The engine builds every mix once per 5.3 ms block, and with 32 inputs and 16 musicians it uses about 18% of each block. The total delay you hear depends on your Wi-Fi and each phone's buffer, which you can set from the desk.</p>
+            <summary data-i18n="faq.q4">What about latency?</summary>
+            <p data-i18n="faq.a4">Processing adds 0 ms: filters and dynamics have no look-ahead and effects are wet returns. The engine builds every mix once per 5.3 ms block, and with 32 inputs and 16 musicians it uses about 18% of each block. The total delay you hear depends on your Wi-Fi and each phone's buffer, which you can set from the desk.</p>
           </details>
           <details>
-            <summary>Is there an iOS app?</summary>
-            <p>Not yet — an iOS app for musicians is on the roadmap.</p>
+            <summary data-i18n="faq.q5">Is there an iOS app?</summary>
+            <p data-i18n="faq.a5">Not yet — an iOS app for musicians is on the roadmap.</p>
           </details>
           <details>
-            <summary>Why does my computer show a security warning?</summary>
-            <p>The installers are not signed yet. On Windows choose <em>More info → Run anyway</em>; on macOS right-click the app and choose <em>Open</em> the first time. Signed installers are on the roadmap.</p>
+            <summary data-i18n="faq.q6">Why does my computer show a security warning?</summary>
+            <p data-i18n-html="faq.a6">The installers are not signed yet. On Windows choose <em>More info → Run anyway</em>; on macOS right-click the app and choose <em>Open</em> the first time. Signed installers are on the roadmap.</p>
           </details>
         </div>
       </div>
@@ -374,15 +374,15 @@
         <div class="sponsor">
           <img src="assets/brand/bandear-icon.svg" alt="" width="96" height="96">
           <div class="sponsor-copy">
-            <h2 id="sponsor-title">Free, open source, built in spare time</h2>
-            <p>If BandEar helps your band, church, studio or school, sponsoring helps keep it going. Starring the repo and sharing it with other musicians helps too.</p>
+            <h2 id="sponsor-title" data-i18n="sponsor.title">Free, open source, built in spare time</h2>
+            <p data-i18n="sponsor.body">If BandEar helps your band, church, studio or school, sponsoring helps keep it going. Starring the repo and sharing it with other musicians helps too.</p>
           </div>
           <div class="sponsor-actions">
             <a class="btn btn-primary" href="https://github.com/sponsors/carlosescor2199">
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.2 4.3 2.4.7-1.2 2.2-2.4 4.3-2.4 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg>
-              Sponsor on GitHub
+              <span data-i18n="sponsor.btn">Sponsor on GitHub</span>
             </a>
-            <a class="btn btn-ghost" href="https://github.com/carlosescor2199/bandear">View the source</a>
+            <a class="btn btn-ghost" href="https://github.com/carlosescor2199/bandear" data-i18n="sponsor.source">View the source</a>
           </div>
         </div>
       </div>
@@ -395,12 +395,12 @@
         <img src="assets/brand/bandear-mark.svg" alt="" width="24" height="24">
         <span>BandEar</span>
       </a>
-      <p>© 2026 Carlos Escudero · Released under the <a href="https://github.com/carlosescor2199/bandear/blob/main/LICENSE">MIT License</a></p>
-      <nav class="footer-links" aria-label="Footer">
+      <p data-i18n-html="footer.license">© 2026 Carlos Escudero · Released under the <a href="https://github.com/carlosescor2199/bandear/blob/main/LICENSE">MIT License</a></p>
+      <nav class="footer-links" aria-label="Footer" data-i18n-attr="aria-label=footer.label">
         <a href="https://github.com/carlosescor2199/bandear">GitHub</a>
-        <a href="https://github.com/carlosescor2199/bandear/releases">Releases</a>
-        <a href="https://github.com/carlosescor2199/bandear/issues">Issues</a>
-        <a href="https://github.com/sponsors/carlosescor2199">Sponsor</a>
+        <a href="https://github.com/carlosescor2199/bandear/releases" data-i18n="footer.releases">Releases</a>
+        <a href="https://github.com/carlosescor2199/bandear/issues" data-i18n="footer.issues">Issues</a>
+        <a href="https://github.com/sponsors/carlosescor2199" data-i18n="footer.sponsor">Sponsor</a>
       </nav>
     </div>
   </footer>

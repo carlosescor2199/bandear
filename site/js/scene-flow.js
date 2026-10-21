@@ -10,11 +10,11 @@ import { buildMixer } from "./model-mixer.js";
 import { damp, lerp, particleBudget, sectionProgress } from "./motion.js";
 import {
   AMBER,
-  createRenderer,
   createStage,
   disposeObject,
   isPhone,
   prefersReducedMotion,
+  withRenderer,
 } from "./three-setup.js";
 
 const BODY = 0x223031;
@@ -81,14 +81,17 @@ function particleMaterial() {
   });
 }
 
-export function mount(host, { onRendered, onFail } = {}) {
-  const canvas = host.querySelector("canvas");
+export function mount(host, callbacks = {}) {
   const labelLayer = host.querySelector(".flow-labels");
+  if (!labelLayer) throw new Error("the flow scene needs a .flow-labels layer");
+  return withRenderer(host, {}, (renderer) => build(host, renderer, labelLayer, callbacks));
+}
+
+function build(host, renderer, labelLayer, { onRendered, onFail }) {
   const section = host.closest("section") ?? host;
   const phone = isPhone();
   const still = prefersReducedMotion();
 
-  const renderer = createRenderer(canvas);
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 80);
 

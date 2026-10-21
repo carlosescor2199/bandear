@@ -26,6 +26,22 @@ export function createRenderer(canvas, { maxPixelRatio = Infinity } = {}) {
   return renderer;
 }
 
+// Creates the renderer for the canvas in `host` and returns `build(renderer)`. A host without a
+// canvas throws before any WebGL context exists; when `build` throws, the renderer and its
+// context are released before the error propagates, so a failed mount leaks no GPU context.
+export function withRenderer(host, options, build) {
+  const canvas = host.querySelector("canvas");
+  if (!canvas) throw new Error("the 3D host has no <canvas>");
+  const renderer = createRenderer(canvas, options);
+  try {
+    return build(renderer);
+  } catch (error) {
+    renderer.dispose();
+    renderer.forceContextLoss();
+    throw error;
+  }
+}
+
 // A white radial gradient on transparent, for additive "bloom" sprites and soft particles.
 export function glowTexture(size = 128) {
   const canvas = document.createElement("canvas");

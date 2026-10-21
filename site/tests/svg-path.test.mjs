@@ -61,6 +61,35 @@ test("arcToCenter scales up radii that are too small", () => {
   near(arc.cy, 0);
 });
 
+test("arcToCenter has no centre for the arcs SVG treats as lines or omits", () => {
+  assert.equal(arcToCenter([0, 0], 0, 10, 0, false, true, [10, 0]), null);
+  assert.equal(arcToCenter([0, 0], 10, 0, 0, false, true, [10, 0]), null);
+  assert.equal(arcToCenter([5, 5], 10, 10, 0, false, true, [5, 5]), null);
+});
+
+test("samplePath draws an arc with a zero radius as a straight line", () => {
+  for (const d of ["M0 0 A0 10 0 0 1 40 0", "M0 0 A10 0 30 1 0 40 0"]) {
+    const [points] = samplePath(d, { step: 8 });
+    assert.ok(points.length > 2, d);
+    for (const [x, y] of points) {
+      assert.ok(Number.isFinite(x) && Number.isFinite(y), `non-finite point in ${d}`);
+      near(y, 0, 1e-9);
+    }
+    assert.deepEqual(points.at(-1), [40, 0]);
+  }
+});
+
+test("samplePath skips an arc whose endpoints are the same", () => {
+  const [points] = samplePath("M0 0 A10 10 0 0 1 0 0 L20 0", { step: 8 });
+  for (const [x, y] of points) assert.ok(Number.isFinite(x) && Number.isFinite(y));
+  assert.deepEqual(points[0], [0, 0]);
+  assert.deepEqual(points.at(-1), [20, 0]);
+  // Only the line contributes points: no zero-length step at the start.
+  assert.ok(dist(points[0], points[1]) > 0.5);
+  // A path made only of such an arc has nothing to draw.
+  assert.deepEqual(samplePath("M3 3 A10 10 0 0 1 3 3"), []);
+});
+
 test("samplePath keeps every arc point on its circle", () => {
   const [points] = samplePath("M586 302 A92 92 0 0 1 662 386", { step: 6 });
   const arc = arcToCenter([586, 302], 92, 92, 0, false, true, [662, 386]);

@@ -5,7 +5,7 @@
 The product is called BandEar from now on: the desktop app, the phone app, the installers, the
 release and the docs. A desk that already ran as MixLink keeps its sessions, backups and takes.
 
-## Decisions (user, 2026-10-21)
+## Decisions (user, 2026-10-20)
 
 - Full rename, technical identifiers included: Tauri identifier `com.bandear.desktop`, crate
   `bandear-desktop`, Android `applicationId`/`namespace` `com.bandear.android`.
@@ -13,7 +13,8 @@ release and the docs. A desk that already ran as MixLink keeps its sessions, bac
 - The GitHub repository is now `carlosescor2199/bandear`.
 - The server crate `personal-monitoring` keeps its name (internal); only its user-facing text
   changes. No wire protocol byte or field changes.
-- Icons stay as they are; a new logo comes later. `vendor/cpal` is untouched.
+- ~~Icons stay as they are; a new logo comes later.~~ Superseded by T6: the approved BandEar logo
+  replaced the icons. `vendor/cpal` is untouched.
 
 ## Scope
 
@@ -46,8 +47,11 @@ release and the docs. A desk that already ran as MixLink keeps its sessions, bac
   +29/-26).
 - [x] T5 Full verification and leftover audit (see Verification).
 - [x] T6 Apply the approved BandEar logo (see Logo). Route: delegated writer. Commits `bfddda7`
-  (desktop icons, sidebar mark, favicon, brand sources), `8cec6c5` (Android adaptive icon) and
-  the README/doc commit.
+  (desktop icons, sidebar mark, favicon, brand sources), `8cec6c5` (Android adaptive icon),
+  `7583678` (README logo) and `fd6307d` (the mark on the phone's Connect screen).
+- [x] T7 Review findings (see Reviews). Route: delegated writer. Commits `ca773b4` (migration
+  retry), `0406ff2` (unused colour), `832ca4d` (brand copies documented), `1f9abd5` (sidebar mark
+  test) and this record's update.
 
 ## Migration design (T2)
 
@@ -55,8 +59,9 @@ release and the docs. A desk that already ran as MixLink keeps its sessions, bac
 
 - Old folders: the sibling of each new Tauri folder named `com.mixlink.desktop` (Tauri names the
   config and local data folders `<base>/<identifier>`).
-- Runs when the new config folder has no `session.json` and no `mixlink-migration.txt`, and the old
-  config folder exists.
+- Runs when the new config folder has no `mixlink-migration.txt` and the old config folder exists
+  (T7: it used to skip as soon as the new `session.json` existed, so a file that failed to copy was
+  never retried; a `session.json` already in the new folder is now kept like any other file).
 - Copies `musicians.json`, `sessions/`, `backups/`, then `session.json` last; each file through a
   `.migrating` temporary file and a rename; an existing new file is never replaced (listed as kept).
   Nothing else (damaged files set aside, logs) comes over. The old folders are only read.
@@ -67,7 +72,15 @@ release and the docs. A desk that already ran as MixLink keeps its sessions, bac
   the old folder (a minimal `{"version":1,"recording":{...}}` when the old desk had no session). A
   folder the engineer chose is kept as is.
 - Writes `mixlink-migration.txt` when it finished without a failure, so it runs once even for a
-  desk with no session; after a failure it runs again next start, still never replacing files.
+  desk with no session; after a failure it runs again next start, still never replacing files (the
+  session it copied, which the desk may have saved since, is kept). A backup the desk pruned in
+  between can come back on that run.
+
+T7 RED evidence: the new test `a_file_that_failed_to_copy_is_copied_on_the_next_start` (a folder
+at the backup's `.migrating` path makes its copy fail on start 1) failed at start 2 (`migrated
+again`: `bring_over` returned `None`), `11 passed; 1 failed`. GREEN: 13 passed (the old
+`nothing_happens_when_the_new_desk_already_has_a_session` became
+`a_session_the_new_desk_already_has_is_kept`, plus `nothing_happens_once_the_marker_is_there`).
 - Logs every copied and kept file, the recordings folder kept and any failure (area `migration`).
 
 RED evidence: with `bring_over` stubbed to `None`, `cargo test -p bandear-desktop --lib migration`
@@ -76,8 +89,9 @@ gave `8 failed, 3 passed` (the three that expect `None` or test the sibling path
 ## Acceptance criteria
 
 - `rg -i mixlink --glob '!target' --glob '!vendor' --glob '!odd'` shows only intentional leftovers.
-- Migration copies once, never overwrites, skips when the new session exists, leaves the old
-  folders untouched, and keeps takes in the old default recordings folder reachable.
+- Migration copies once (until a run without a failure), never overwrites (a session the new desk
+  has is kept), retries a file that failed to copy on the next start, leaves the old folders
+  untouched, and keeps takes in the old default recordings folder reachable.
 
 ## Checks
 
@@ -128,12 +142,32 @@ gave `8 failed, 3 passed` (the three that expect `None` or test the sibling path
   covers every launcher reference: manifest `icon` and `roundIcon`).
 - README: the header image is `docs/brand/bandear-mark.svg` at width 120.
 - The empty `com/mixlink` source folders (main and test) were deleted.
-- Not done (outside the logo task's edit surface): the phone's Connect screen
-  (`ConnectScreen.kt`, `BrandHeader`) still draws the amber square next to "BandEar".
+- The phone's Connect screen (`ConnectScreen.kt`, `BrandHeader`) draws the `bandear_mark`
+  drawable (the mark cropped to its strokes) next to "BandEar" instead of the amber square: commit
+  `fd6307d`; gradle `:app:assembleDebug` BUILD SUCCESSFUL after it (run by the parent).
+- Every copy of the mark and how to regenerate it: `docs/brand/README.md` (T7).
 - Checks: `node --test apps/desktop/ui/tests` 619 passed, 0 failed;
   `cargo build -p bandear-desktop` finished (icons embedded); gradle `:app:assembleDebug` BUILD
   SUCCESSFUL; browser (`desktop-ui`, `?fake`): the sidebar shows the mark beside "BandEar", the
   favicon loads (200), no console errors.
+
+## Reviews
+
+- `review-53cff06625b17127` (`7115279..eebb31e`, the desktop rename and migration; four lenses):
+  approved, with a WARNING fixed in T7 (`ca773b4`): the docs promised a failed migration is
+  retried, but the new `session.json` stopped every later run.
+- `review-984c1c5d004918b9` (`7b425c1..fd6307d`, server, CI, docs and logo; four lenses): approved,
+  with findings fixed in T7: this record (the Connect screen, the superseded icons decision, the
+  date), `KEPT` renamed `TO_COPY` (`ca773b4`), the unused `bandear_text` colour (`0406ff2`), the
+  brand copies, launcher stroke and sidebar margins documented (`832ca4d`) and a test of the
+  sidebar mark (`1f9abd5`).
+- `7b425c1` (the Android package move, 113 files) could not be reviewed natively
+  (`lens_context_budget_exceeded`, even alone); it rests on the Android unit tests (517 passed)
+  and `:app:assembleDebug`.
+
+T7 checks: `cargo test -p bandear-desktop` 354 passed, 0 failed (13 of them the migration);
+`node --test apps/desktop/ui/tests` 621 passed, 0 failed; gradle `:app:assembleDebug` BUILD
+SUCCESSFUL (after the colour and drawable changes).
 
 ## Notes
 
@@ -151,3 +185,4 @@ gave `8 failed, 3 passed` (the three that expect `None` or test the sibling path
 
 - 2026-10-20: feature document created; T1-T5 done; all checks green.
 - 2026-10-20: T6 done: the approved logo on desktop, console, Android and README; checks green.
+- 2026-10-20: both reviews approved; T7 fixed their findings; checks green.

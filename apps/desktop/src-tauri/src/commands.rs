@@ -7,6 +7,7 @@
 //! [soundcheck].
 
 pub mod backups;
+pub mod limiter;
 pub mod link_history;
 pub mod local;
 pub mod playback_buffer;
@@ -25,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use personal_monitoring::{
     check_channels, check_groups, log_info, log_warn, start, AudioHost, ChannelKind, ChannelMeta,
     EngineConfig, EngineEvent, EngineHandle, EngineerControls, EngineerUpdate, GroupDefinition,
-    MirrorOutcome, MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey, MusicianStatus,
-    PlaybackBuffer, PresetChannel, Redundancy, StripSettings,
+    LimiterSettings, MirrorOutcome, MirrorSource, MixPreset, MixUpdate, MixValues, MusicianKey,
+    MusicianStatus, PlaybackBuffer, PresetChannel, Redundancy, StripSettings,
 };
 
 use self::local::saver::{LocalMixSaver, SAVE_INTERVAL};
@@ -486,6 +487,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     let saved_mirrors = session_mirrors(&state.session);
     let saved_buffers = playback_buffer::buffers_of(&state.session.current());
     let saved_redundancies = redundancy::redundancies_of(&state.session.current());
+    let saved_limiters = limiter::limiters_of(&state.session.current());
+    let saved_local_limiter = limiter::local_limiter_of(&state.session.current());
     // A local mix marked and not written yet is read with the session (it stays marked, and is
     // written later).
     let saved_local = kept_local(&state.session, &state.local_saver);
@@ -529,6 +532,18 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                 log_warn!(
                     "desk",
                     "start_engine: the saved redundancy settings were not applied: {error}"
+                );
+            }
+            if let Err(error) = handle.replace_musician_limiters(&saved_limiters) {
+                log_warn!(
+                    "desk",
+                    "start_engine: the saved limiters were not applied: {error}"
+                );
+            }
+            if let Err(error) = handle.set_local_limiter(saved_local_limiter) {
+                log_warn!(
+                    "desk",
+                    "start_engine: the saved local mix limiter was not applied: {error}"
                 );
             }
             let local = saved_local.map(|kept| apply_kept_local(&mut handle, &kept));
@@ -2062,7 +2077,9 @@ impl DeskReader for EngineHandle {
 
 /// What loading a session needs from the running engine, besides the group, channel, local mix and
 /// processing edits every other command uses.
-trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine + ProcessingEngine {
+trait SessionEngine:
+    DeskReader + GroupEngine + ChannelEngine + LocalEngine + ProcessingEngine + limiter::LimiterEngine
+{
     /// Replaces every control and mirror the engine keeps ([EngineHandle::replace_kept]); answers
     /// the mirrors it refused.
     fn replace_kept(
@@ -2077,6 +2094,12 @@ trait SessionEngine: DeskReader + GroupEngine + ChannelEngine + LocalEngine + Pr
     ) -> Result<(), String>;
     /// Replaces every redundancy setting the engine keeps ([EngineHandle::replace_redundancies]).
     fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) -> Result<(), String>;
+    /// Replaces every musician's master limiter the engine keeps
+    /// ([EngineHandle::replace_musician_limiters]).
+    fn replace_musician_limiters(
+        &self,
+        kept: &[(MusicianKey, LimiterSettings)],
+    ) -> Result<(), String>;
     /// Changes the mix of the musician at `address` from the desk ([EngineHandle::set_mix]).
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String>;
 }
@@ -2099,6 +2122,15 @@ impl SessionEngine for EngineHandle {
 
     fn replace_redundancies(&self, kept: &[(MusicianKey, Redundancy)]) -> Result<(), String> {
         EngineHandle::replace_redundancies(self, kept).map_err(|error| error.to_string())
+    }
+
+    fn replace_musician_limiters(
+        &self,
+        kept: &[(MusicianKey, LimiterSettings)],
+    ) -> Result<(), String> {
+        EngineHandle::replace_musician_limiters(self, kept)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn push_mix(&mut self, address: &str, update: &MixUpdate) -> Result<MixValues, String> {
@@ -2575,6 +2607,19 @@ fn apply_session<E: SessionEngine>(
             "the saved redundancy settings were not applied: {error}"
         ));
     }
+    // And its limiters: a musician whose mix the session keeps no limiter for goes back to none,
+    // and the local mix takes the saved one when the saved session has a local section.
+    if let Err(error) = engine.replace_musician_limiters(&limiter::limiters_of(next)) {
+        refused.push(format!("the saved limiters were not applied: {error}"));
+    }
+    if let Some(kept) = local {
+        let settings = kept.limiter.unwrap_or_else(LimiterSettings::master);
+        if let Err(error) = engine.set_local_limiter(settings) {
+            refused.push(format!(
+                "the saved local mix limiter was not applied: {error}"
+            ));
+        }
+    }
     let desk = engine.desk();
     let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
     let local = local.map(|kept| apply_kept_local(engine, kept));
@@ -2689,6 +2734,7 @@ mod tests {
 
     fn status_with_musicians(addresses: &[&str]) -> EngineStatusDto {
         EngineStatusDto {
+            local_limiter: LimiterSettings::master(),
             run: 1,
             device_name: "Test device".to_owned(),
             capture_format: CaptureFormatDto {
@@ -2709,6 +2755,7 @@ mod tests {
             musicians: addresses
                 .iter()
                 .map(|address| MusicianDto {
+                    limiter: LimiterSettings::master(),
                     address: (*address).to_owned(),
                     client_name: None,
                     client_id: None,
@@ -3227,6 +3274,9 @@ mod tests {
         buffers: Mutex<Option<Vec<(MusicianKey, PlaybackBuffer)>>>,
         /// The redundancy settings it took whole last.
         redundancies: Mutex<Option<Vec<(MusicianKey, Redundancy)>>>,
+        /// The musicians' limiters it took whole last, and the local mix's it took last.
+        limiters: Mutex<Option<Vec<(MusicianKey, LimiterSettings)>>>,
+        local_limiter: Mutex<Option<LimiterSettings>>,
         /// The musician whose mix it refuses to change, when it does.
         refuses_push_to: Option<String>,
         /// The engineer's local mix as a session save or load reads it.
@@ -3527,7 +3577,33 @@ mod tests {
         }
     }
 
+    impl limiter::LimiterEngine for StandInEngine {
+        fn set_musician_limiter(
+            &self,
+            key: &MusicianKey,
+            _settings: LimiterSettings,
+        ) -> Result<(MusicianKey, String, LimiterSettings), String> {
+            Err(format!("{key:?} is not here"))
+        }
+
+        fn set_local_limiter(&self, settings: LimiterSettings) -> Result<LimiterSettings, String> {
+            self.note("set_local_limiter".to_owned());
+            let kept = settings.clamped();
+            *self.local_limiter.lock().expect("local limiter lock") = Some(kept);
+            Ok(kept)
+        }
+    }
+
     impl SessionEngine for StandInEngine {
+        fn replace_musician_limiters(
+            &self,
+            kept: &[(MusicianKey, LimiterSettings)],
+        ) -> Result<(), String> {
+            self.note("replace_musician_limiters".to_owned());
+            *self.limiters.lock().expect("limiters lock") = Some(kept.to_vec());
+            Ok(())
+        }
+
         fn replace_playback_buffers(
             &self,
             kept: &[(MusicianKey, PlaybackBuffer)],
@@ -5795,6 +5871,7 @@ mod tests {
             read.snapshot.session,
             Session {
                 local: Some(SessionLocal {
+                    limiter: None,
                     mix: Some(saved_mix(&[30, 20], &[("kit", 40), ("vox", 50)], 75, false)),
                     output: Some(speakers),
                 }),
@@ -5851,6 +5928,11 @@ mod tests {
         loaded.musicians.insert(
             client_key(PHONE),
             crate::session::MusicianEntry {
+                limiter: Some(LimiterSettings {
+                    enabled: true,
+                    ceiling_db: -6.0,
+                    release_ms: 80.0,
+                }),
                 label: Some("Ana".to_owned()),
                 engineer: Some(kept_controls(70, &[2])),
                 mirror: None,
@@ -5866,6 +5948,7 @@ mod tests {
         loaded.musicians.insert(
             address_key(RACK),
             crate::session::MusicianEntry {
+                limiter: None,
                 label: Some("Rack".to_owned()),
                 engineer: None,
                 mirror: Some(kept_mirror(client_key(PHONE), "Ana", Some(ANA), None)),
@@ -5938,6 +6021,35 @@ mod tests {
                 Redundancy::On { delay_blocks: 3 }
             )]),
             "the loaded redundancy settings replace the engine's"
+        );
+        assert!(
+            at("replace_redundancies") < at("replace_musician_limiters"),
+            "{log:?}"
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .and_then(|engine| engine.limiters.lock().expect("limiters lock").clone()),
+            Some(vec![(
+                MusicianKey::Client(PHONE.to_owned()),
+                LimiterSettings {
+                    enabled: true,
+                    ceiling_db: -6.0,
+                    release_ms: 80.0,
+                }
+            )]),
+            "the loaded limiters replace the engine's"
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .as_ref()
+                .and_then(|engine| *engine.local_limiter.lock().expect("local limiter lock")),
+            None,
+            "a saved session with no local section leaves the local mix's limiter alone"
         );
         let (controls, mirrors) = kept_books(&engine);
         assert_eq!(
@@ -6866,6 +6978,7 @@ mod tests {
 
     fn local_section(output: Option<(&str, u16)>) -> SessionLocal {
         SessionLocal {
+            limiter: None,
             mix: Some(saved_mix(&[40], &[("kit", 25)], 65, false)),
             output: output.map(|(device, first_channel)| crate::session::SessionOutput {
                 device: device.to_owned(),
@@ -7229,6 +7342,7 @@ mod tests {
         loaded.musicians.insert(
             address_key(RACK),
             crate::session::MusicianEntry {
+                limiter: None,
                 label: Some("Rack".to_owned()),
                 engineer: None,
                 // A hand-edited session: a mirror on oneself, which the engine refuses.

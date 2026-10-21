@@ -254,6 +254,20 @@ export function createEngineApi(bridge) {
     setMusicianRedundancy: (musicianKey, on, delayBlocks = null) =>
       bridge.invoke("set_musician_redundancy", { musicianKey, on, delayBlocks }),
     /**
+     * Sets the master limiter on the mix of the musician `musicianKey` names: `settings` `{
+     * enabled, ceilingDb, releaseMs }` (held to -24-0 dBFS and 1-1,000 ms). Resolves to `{
+     * musicianKey, outcome: "set", settings, saved, saveError, message }`, `settings` what the mix
+     * has now; see formatLimiterSet in limiter.js. A key that names nobody, or no engine, rejects.
+     * Status rows carry `limiter` and the meters each musician's `limiterReductionDb`.
+     */
+    setMusicianLimiter: (musicianKey, settings) =>
+      bridge.invoke("set_musician_limiter", { musicianKey, settings }),
+    /**
+     * Sets the master limiter on the engineer's local mix, as setMusicianLimiter does (`musicianKey`
+     * null in the answer). The status carries `localLimiter` and the meters `local.limiterReductionDb`.
+     */
+    setLocalLimiter: (settings) => bridge.invoke("set_local_limiter", { settings }),
+    /**
      * How the desk records takes (see recording.js): `{ folder, defaultFolder, folderIsDefault,
      * format, includeLocal, armed, notice }`, the folder whole, the inputs 1-based.
      */

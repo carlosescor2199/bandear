@@ -448,6 +448,11 @@ mod tests {
         musicians.insert(
             "client:phone-ana".to_owned(),
             MusicianEntry {
+                limiter: Some(personal_monitoring::LimiterSettings {
+                    enabled: true,
+                    ceiling_db: -6.0,
+                    release_ms: 80.0,
+                }),
                 label: Some("Ana".to_owned()),
                 engineer: Some(SessionEngineer {
                     limit_percent: 60,
@@ -461,6 +466,7 @@ mod tests {
         musicians.insert(
             "address:192.168.1.40:50000".to_owned(),
             MusicianEntry {
+                limiter: None,
                 label: Some("Rack A".to_owned()),
                 engineer: None,
                 mirror: Some(SessionMirror {
@@ -501,6 +507,11 @@ mod tests {
                 asio_driver: None,
             }),
             local: Some(SessionLocal {
+                limiter: Some(personal_monitoring::LimiterSettings {
+                    enabled: true,
+                    ceiling_db: -1.5,
+                    release_ms: 50.0,
+                }),
                 mix: Some(SessionMix {
                     channels: vec![channel(90, 30, false, false)],
                     groups: BTreeMap::from([("kit".to_owned(), 60)]),
@@ -590,9 +601,15 @@ mod tests {
                     "volumePercent": 70,
                     "muted": false
                 },
-                "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 2 }
+                "output": { "device": "OUTPUT 1/2 (Volt 4)", "firstChannel": 2 },
+                "limiter": { "enabled": true, "ceilingDb": -1.5, "releaseMs": 50.0 }
             }),
             "the local mix and its output are kept beside the other sections"
+        );
+        assert_eq!(
+            file["musicians"]["client:phone-ana"]["limiter"],
+            serde_json::json!({ "enabled": true, "ceilingDb": -6.0, "releaseMs": 80.0 }),
+            "each musician's limiter is kept with them"
         );
     }
 

@@ -11,6 +11,9 @@ use crate::targets::TargetRegistry;
 ///
 /// This is a separate, tiny protocol. It is neither PMON nor the control channel, so it cannot
 /// break either of them.
+///
+/// The magic `MLNK` is from the product's earlier name, MixLink. It stays as it is on the wire, so
+/// phones and desks from before and after the rename to BandEar still find each other.
 pub(crate) const DISCOVERY_MAGIC: [u8; 4] = *b"MLNK";
 pub(crate) const DISCOVERY_VERSION: u8 = 1;
 const BEACON_LENGTH: usize = 4 + 1 + 2 + 4;
@@ -39,7 +42,7 @@ pub(crate) fn encode_beacon(beacon: Beacon) -> [u8; BEACON_LENGTH] {
     bytes
 }
 
-/// Parses a beacon datagram. Returns `None` for anything that is not a version-1 MixLink beacon:
+/// Parses a beacon datagram. Returns `None` for anything that is not a version-1 BandEar beacon:
 /// a short datagram, a wrong magic or a wrong version. It never panics on untrusted input.
 ///
 /// The server only ever sends beacons, so the reader exists to prove the encoding round trip. It is

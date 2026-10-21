@@ -47,12 +47,20 @@ function icon(id) {
   return `<svg class="nav-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[id]}</svg>`;
 }
 
+/**
+ * The sidebar's brand row: the mark, decorative (empty alt) since the name beside it says it, and
+ * the name. The mark's file is relative to index.html, the page the shell runs in.
+ */
+export function brandMarkup() {
+  return `<div class="brand"><img class="brand-mark" src="app/brand/bandear-mark.svg" alt="" /><span class="brand-name">BandEar</span></div>`;
+}
+
 function renderSidebar(nav) {
   const links = ROUTES.map(
     (route) =>
       `<li><a class="nav-link" href="${route.hash}" data-route="${route.id}" title="${route.label}">${icon(route.id)}<span class="nav-label">${route.label}</span></a></li>`,
   ).join("");
-  nav.innerHTML = `<div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">BandEar</span></div><ul class="nav-list">${links}</ul>`;
+  nav.innerHTML = `${brandMarkup()}<ul class="nav-list">${links}</ul>`;
 }
 
 /** The stand-in for a section whose screen is not built yet. */

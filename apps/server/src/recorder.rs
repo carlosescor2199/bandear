@@ -1571,7 +1571,7 @@ pub(crate) mod tests {
     /// An empty scratch folder for one test's files.
     pub(crate) fn scratch_directory(test: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-recorder-tests")
+            .join("bandear-recorder-tests")
             .join(test);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();

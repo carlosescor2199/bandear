@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!--
-        The colours Android draws before and outside Compose (the window, the launcher icon); the same
-        as BandEarColors' ground, accent and text.
+        The colours Android draws before and outside Compose, the same as BandEarColors' ground
+        and accent: Theme.BandEar (values/styles.xml) uses the ground for the window, its
+        background and the system bars, and the accent as the platform accent colour.
     -->
     <color name="bandear_ground">#FF0D1117</color>
     <color name="bandear_accent">#FFF5A524</color>
-    <color name="bandear_text">#FFE6EDF3</color>
+    <!--
+        The BandEar mark's colours, from docs/brand/bandear-icon.svg: the launcher icon's ground
+        (the adaptive icon's background in mipmap-anydpi-v26) and the mark's strokes (the launcher
+        foreground and drawable/bandear_mark, the Connect screen's header).
+    -->
+    <color name="bandear_icon_ground">#FF192223</color>
+    <color name="bandear_mark">#FFFFBF43</color>
 </resources>

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>BandEar</title>
+  <!-- A copy of docs/brand/bandear-mark.svg, the source of truth, shipped with the console (the
+       sidebar mark and the favicon). Change the source and copy it here; docs/brand/README.md lists
+       every copy. -->
+  <g fill="none" stroke="#FFBF43" stroke-width="44" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Outer B: top bar, stem, bottom bar and the lower bowl -->
+    <path d="M520 224 H344 A48 48 0 0 0 296 272 V738 A70 70 0 0 0 366 808 H556 A186 186 0 0 0 692 528"/>
+    <!-- Notch where the upper arc meets the lower bowl -->
+    <path d="M736 446 Q720 486 678 514"/>
+    <!-- Top of the lower bowl, rising from the stem -->
+    <path d="M314 522 C354 482 404 470 476 470 H606"/>
+    <!-- Inner loop -->
+    <path d="M402 708 H562 A71 71 0 0 0 562 566 H474 A72 72 0 0 0 402 638"/>
+    <!-- Signal arcs -->
+    <path d="M586 302 A92 92 0 0 1 662 386"/>
+    <path d="M584 224 A162 162 0 0 1 738 386"/>
+  </g>
+</svg>

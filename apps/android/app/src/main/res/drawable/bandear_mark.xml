@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The BandEar mark on its own, cropped to its strokes (the 1024 design grid shifted so the
+    drawing starts at 0,0), for in-app headers. The same six paths as the launcher icon.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="31dp"
+    android:viewportWidth="486"
+    android:viewportHeight="628">
+    <group
+        android:translateX="-274"
+        android:translateY="-202">
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="@color/bandear_mark"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M520,224 H344 A48,48 0 0,0 296,272 V738 A70,70 0 0,0 366,808 H556 A186,186 0 0,0 692,528" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="@color/bandear_mark"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M736,446 Q720,486 678,514" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="@color/bandear_mark"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M314,522 C354,482 404,470 476,470 H606" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="@color/bandear_mark"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M402,708 H562 A71,71 0 0,0 562,566 H474 A72,72 0 0,0 402,638" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="@color/bandear_mark"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M586,302 A92,92 0 0,1 662,386" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="@color/bandear_mark"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M584,224 A162,162 0 0,1 738,386" />
+    </group>
+</vector>

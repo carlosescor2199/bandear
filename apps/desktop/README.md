@@ -105,11 +105,12 @@ desk over (see `src/migration.rs`):
 
 | Topic | Behaviour |
 | --- | --- |
-| When | Once: when BandEar's config folder has no `session.json` yet and the old `com.mixlink.desktop` folder beside it exists. A `mixlink-migration.txt` in BandEar's config folder says it ran. |
-| What | `session.json`, `musicians.json`, `sessions/` and `backups/`, each file through a temporary file. A file BandEar already has is never replaced. Logs and anything else stay where they were. |
+| When | At start, while the old `com.mixlink.desktop` folder exists beside BandEar's config folder and BandEar's config folder has no `mixlink-migration.txt`. That file is written when a run finishes without a failure, so after a clean run it never runs again. |
+| What | `musicians.json`, `sessions/`, `backups/` and, last, `session.json`, each file through a temporary file. A file BandEar already has (its own session, or one an earlier run copied) is never replaced. Logs and anything else stay where they were. |
 | Old folders | Only read: nothing in them is changed or removed. The old MixLink app, if still installed, keeps working with them. |
 | Takes | Never copied. When the old desk recorded into its default folder (Music + `MixLink\Recordings`), that folder has takes and `BandEar\Recordings` does not exist yet, the migrated session names the old folder, so every take stays listed and new ones go beside them. Choose another folder in the recording settings at any time. |
-| Log | Each copied file, each file kept, the recordings folder chosen and any failure go to `bandear.log` under `migration`. A failure is tried again on the next start. |
+| Log | Each copied file, each file kept, the recordings folder chosen and any failure go to `bandear.log` under `migration`. |
+| After a failure | No `mixlink-migration.txt` is written, so the next start copies the files still missing (the session the desk saved meanwhile is kept). A backup or named session deleted in between can come back on that run. |
 
 ## Demo source
 

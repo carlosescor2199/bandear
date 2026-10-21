@@ -1,5 +1,6 @@
 package com.bandear.android.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -33,6 +35,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import com.bandear.android.R
 import com.bandear.android.ui.components.FieldLabel
 import com.bandear.android.ui.components.LineIcons
 import com.bandear.android.ui.components.BandEarTextField
@@ -91,10 +94,10 @@ private fun BrandHeader() {
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier
-                .size(14.dp)
-                .background(colors.accent, BandEarShapes.Tag),
+        Image(
+            painter = painterResource(R.drawable.bandear_mark),
+            contentDescription = null,
+            modifier = Modifier.size(width = 22.dp, height = 28.dp),
         )
         Text(
             text = "BandEar",

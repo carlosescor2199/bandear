@@ -19,7 +19,7 @@ Low-latency personal monitoring over the Wi-Fi you already have — no extra har
 ![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)
 ![Tauri](https://img.shields.io/badge/Tauri-24C8DB?style=flat-square&logo=tauri&logoColor=white)
 
-[**🌐 Website**](https://carlosescor2199.github.io/bandear/) · [**Download**](#-download) · [**Quick start**](#-quick-start) · [**Features**](#-features) · [**How it works**](#-how-it-works) · [**Build from source**](#-build-from-source) · [**Support**](#-support-the-project)
+[**🌐 Website**](https://bandear.com/) · [**Download**](#-download) · [**Quick start**](#-quick-start) · [**Features**](#-features) · [**How it works**](#-how-it-works) · [**Build from source**](#-build-from-source) · [**Support**](#-support-the-project)
 
 <br />
 

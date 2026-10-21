@@ -57,11 +57,13 @@
 //              Whether a take plays in place of the inputs is the status's `soundcheck`
 //              (soundcheckStatus), which a soundcheck command's answer updates at once.
 //   processing every channel's strip, `[{ channel, settings, active }]` CH 1 first (see
-//              processing.js), as the desk answered it, or null until read. It lives in the desk's
-//              session, so a run's end keeps it; a loaded session replaces it.
+//              processing.js), as the desk answered it, or null until read (and again once a loaded
+//              session's strips could not be read). It lives in the desk's session, so a run's end
+//              keeps it; a loaded session replaces it.
 //   processingPending { channel: settings }: a strip edit still waiting for the desk, which the
 //              screen shows over the kept one (channelStrip) until its answer settles it.
-//   processingError { channel, message } of the last refused strip edit, cleared by the next answer.
+//   processingError { channel, message } of the last refused strip edit (channel null: the strips
+//              could not be read after a load), cleared by the next answer or read.
 //   stripPresets every strip preset, the built-in ones first (`strip_presets`), or null until read.
 //   eqCurves  { channel: [{ freqHz, db }] }: the equaliser response last worked out for a channel.
 //
@@ -85,7 +87,7 @@
 import { pairUnits } from "./channels.js";
 import { DEFAULT_AUDIO, audioChoice, restoredAudio } from "./engine-config.js";
 import { musicianLabel, needsAttention } from "./format.js";
-import { STRIP_CHANNELS, defaultStrip, isNeutralStrip } from "./processing.js";
+import { defaultStrip, isNeutralStrip } from "./processing.js";
 import { isRecording, recordingOf } from "./recording.js";
 import { isSoundchecking, soundcheckOf } from "./soundcheck.js";
 import {
@@ -290,6 +292,11 @@ export const actions = Object.freeze({
     sent,
     message,
   }),
+  /**
+   * The strips the console showed are no longer known (a loaded session whose strips could not be
+   * read), for `message`, until the next read.
+   */
+  processingUnknown: (message) => ({ type: "processing-unknown", message }),
   /** Every strip preset as the desk listed it, the built-in ones first. */
   stripPresets: (list) => ({ type: "strip-presets", list }),
   /** The equaliser response `points` (`[{ freqHz, db }]`) worked out for `channel`. */
@@ -633,19 +640,6 @@ function sessionLoaded(state, outcome) {
   };
 }
 
-// The strips as the console knows them, every channel listed: the ones read, or neutral ones until
-// the first read, so an answer that came first still lands.
-function knownStrips(state) {
-  if (state.processing) {
-    return state.processing;
-  }
-  return Array.from({ length: STRIP_CHANNELS }, (_, index) => ({
-    channel: index + 1,
-    settings: defaultStrip(),
-    active: false,
-  }));
-}
-
 // `pending` without the edit of `channel`, when the edit still waiting is the one `sent` (a later
 // one stays: it goes out next).
 function settleStrip(pending, channel, sent) {
@@ -656,12 +650,14 @@ function settleStrip(pending, channel, sent) {
   return Object.keys(rest).length === 0 ? NO_EDITS : rest;
 }
 
+// An answer before the strips were ever read (or after they became unknown) settles the edit but
+// keeps them unknown: the other strips are not made up, and the read that follows brings them all.
 function processingApplied(state, { channel, sent, answer }) {
   const changed = new Map((answer?.channels ?? []).map((strip) => [strip.channel, strip]));
   const processing =
-    changed.size === 0
+    changed.size === 0 || !state.processing
       ? state.processing
-      : knownStrips(state).map((strip) => changed.get(strip.channel) ?? strip);
+      : state.processing.map((strip) => changed.get(strip.channel) ?? strip);
   return {
     ...state,
     processing,
@@ -714,7 +710,13 @@ export function consoleReducer(state, action) {
     case "presets":
       return { ...state, presets: action.presets };
     case "processing":
-      return { ...state, processing: action.list ?? null };
+      return { ...state, processing: action.list ?? null, processingError: null };
+    case "processing-unknown":
+      return {
+        ...state,
+        processing: null,
+        processingError: { channel: null, message: action.message },
+      };
     case "processing-edit":
       return {
         ...state,

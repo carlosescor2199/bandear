@@ -10,6 +10,8 @@
 // from 1, as the desk numbers them: CH 1 is `1`. A linked pair is one strip: setting either side
 // sets both, and the answer names both.
 
+import { pairUnits } from "./channels.js";
+
 /** The mixer's channels, each with its strip. */
 export const STRIP_CHANNELS = 32;
 
@@ -257,4 +259,20 @@ export function formatStripPresetsSet(answer) {
   const ok = ["saved", "replaced", "deleted"].includes(answer?.outcome);
   const fallback = ok ? "The strip presets were changed." : "The strip presets were not changed.";
   return { ok, message: answer?.message || fallback };
+}
+
+/**
+ * `channels` (1-based) with the other side of each one's stereo pair among `table` (a status's
+ * channels in channel order), each once, in the order met: the strips a change to them touches.
+ */
+export function stripUnitChannels(table, channels) {
+  const units = pairUnits(table ?? []);
+  const touched = new Set();
+  for (const channel of channels) {
+    touched.add(channel);
+    for (const index of units.find((unit) => unit.includes(channel - 1)) ?? []) {
+      touched.add(index + 1);
+    }
+  }
+  return [...touched];
 }

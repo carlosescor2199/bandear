@@ -450,3 +450,128 @@ test("a loaded session replaces the strips the console shows and drops the strip
   assert.deepEqual(next.processingPending, {}, "a load drops the strip edits waiting");
   app.dispose();
 });
+
+test("a strip edit made while a session loads is said to be dropped, or sent once the load is refused", async () => {
+  const fake = createFakeBridge({ running: true, clock: () => 1_000 });
+  const api = createEngineApi(fake);
+  const saved = await api.saveSession("Show");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  await settle();
+  const sends = () => fake.calls.filter((call) => call.command === "set_channel_processing");
+  fake.holdAnswers("load_session");
+
+  const loading = app.loadSession(saved.session.id);
+  await settle();
+  const dropped = app.editProcessing(1, boosted(2));
+  fake.releaseAnswers();
+  assert.equal((await loading).ok, true);
+  const said = await dropped;
+  assert.equal(said.ok, false, "an edit the load dropped was never sent");
+  assert.equal(said.message, "CH 1's processing was not changed: a session was loaded meanwhile.");
+  assert.equal(sends().length, 0);
+  assert.equal(channelStrip(app.store.getState(), 1).pending, false);
+
+  fake.failNext("load_session", "the session is damaged");
+  const refused = app.loadSession(saved.session.id);
+  await settle();
+  const kept = app.editProcessing(1, boosted(3));
+  fake.releaseAnswers();
+  assert.equal((await refused).ok, false);
+  assert.deepEqual(await kept, { ok: true, message: "CH 1 is set to the new processing." });
+  assert.equal(sends().length, 1, "a refused load changed nothing, so the edit goes out");
+  app.dispose();
+});
+
+test("a strip answer that comes before the first read neither makes up the other strips nor stops the read", () => {
+  const next = consoleReducer(
+    initialState,
+    actions.processingApplied(1, null, {
+      outcome: "set",
+      channels: [{ channel: 1, settings: boosted(2), active: true }],
+    }),
+  );
+  assert.equal(next.processing, null, "the other 31 strips are still unknown");
+});
+
+test("a strip edit before the strips were ever read reads them all, as the desk keeps them", async () => {
+  const fake = createFakeBridge({ running: true, savedProcessing: { 5: compressed(-12) } });
+  fake.failNext("processing", "the desk is busy");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  await settle();
+  assert.equal(app.store.getState().processing, null);
+
+  assert.equal((await app.editProcessing(1, boosted(2))).ok, true);
+  await settle();
+
+  const state = app.store.getState();
+  assert.equal(state.processing?.length, STRIP_CHANNELS);
+  assert.deepEqual(channelStrip(state, 5).settings, compressed(-12), "CH 5 as the desk keeps it");
+  assert.deepEqual(channelStrip(state, 1).settings, boosted(2));
+  app.dispose();
+});
+
+test("a loaded session whose strips cannot be read says so and leaves them unknown", async () => {
+  const fake = createFakeBridge({ running: true, clock: () => 1_000 });
+  const api = createEngineApi(fake);
+  await api.setChannelProcessing(3, compressed(-20));
+  const saved = await api.saveSession("Show");
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  await settle();
+  fake.failNext("processing", "the desk is busy");
+
+  const loaded = await app.loadSession(saved.session.id);
+
+  assert.equal(loaded.ok, true, "the session itself loaded");
+  assert.ok(
+    loaded.message.includes("Its channel processing could not be read: the desk is busy."),
+    loaded.message,
+  );
+  const state = app.store.getState();
+  assert.equal(state.processing, null, "the strips shown before the load are no longer known");
+  assert.deepEqual(state.processingError, {
+    channel: null,
+    message: "The loaded session's channel processing could not be read: the desk is busy.",
+  });
+  assert.equal((await app.loadProcessing()), null);
+  assert.deepEqual(channelStrip(app.store.getState(), 3).settings, compressed(-20));
+  assert.equal(app.store.getState().processingError, null, "a read settles it");
+  app.dispose();
+});
+
+test("a reset, a copy or a preset waits for the strip edit still going to a linked partner", async () => {
+  const fake = createFakeBridge({ running: true });
+  const api = createEngineApi(fake);
+  await linkThreeAndFour(api);
+  const app = createConsoleApp({ bridge: fake });
+  await app.ready;
+  await settle();
+  const order = () =>
+    fake.calls
+      .map((call) => call.command)
+      .filter((command) => command.endsWith("_processing") || command === "apply_strip_preset");
+  fake.holdAnswers("set_channel_processing");
+
+  const edit = app.editProcessing(4, compressed(-30));
+  const reset = app.resetChannelProcessing(3);
+  const preset = app.applyStripPreset("Kick", 3);
+  const copy = app.copyChannelProcessing(1, [3]);
+  await settle();
+  assert.deepEqual(order(), ["set_channel_processing"], "CH 4's edit goes first");
+
+  fake.releaseAnswers();
+  assert.equal((await reset).ok, true);
+  assert.equal((await preset).ok, true);
+  assert.equal((await copy).ok, true);
+  await edit;
+  assert.deepEqual(order(), [
+    "set_channel_processing",
+    "reset_channel_processing",
+    "apply_strip_preset",
+    "copy_channel_processing",
+  ]);
+  assert.equal(channelStrip(app.store.getState(), 4).active, false, "CH 1's neutral strip, as CH 3's");
+  app.dispose();
+});

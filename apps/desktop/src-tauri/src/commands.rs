@@ -2257,9 +2257,10 @@ pub fn delete_session(state: &DesktopState, id: String) -> Result<(), String> {
 ///   settings too ([EngineHandle::replace_redundancies]): a musician it does not keep goes back to
 ///   being sent once. Its channel processing replaces every channel's strip
 ///   ([EngineHandle::replace_processing]), right after the controls and mirrors: a channel it keeps
-///   none for goes back to no processing, and a change still waiting to be kept is dropped. A
-///   mirror the engine refuses (on oneself, or closing a circle) is named in the answer; the
-///   session keeps it, as a start would refuse it again.
+///   none for goes back to no processing, and a change still waiting to be kept is dropped. An
+///   engine that refuses them keeps playing its own strips, and the session is to keep those
+///   instead. A mirror the engine refuses (on oneself, or closing a circle) is named in the
+///   answer; the session keeps it, as a start would refuse it again.
 /// - With no engine running, the session is replaced and the saved mixes go to nobody (each is
 ///   named in the answer as not pushed); the rest applies at the next start.
 /// - The audio input of the saved session applies only at the next start: the running engine is
@@ -2439,8 +2440,12 @@ fn load_session_with<E: SessionEngine>(
         paused.clear();
     }
     drop(paused);
-    // The session or the engine holds the loaded processing now.
-    processing_paused.clear();
+    // The session or the engine holds the loaded processing now. When the engine refused it, it
+    // still plays its own strips (a change waiting included), so the session is to keep those.
+    match live.as_ref().and_then(|live| live.processing_kept.clone()) {
+        Some(kept) => processing_saver.mark(kept),
+        None => processing_paused.clear(),
+    }
     drop(processing_paused);
     let (mixes, skipped, refused, local) = match live {
         Some(live) => (live.pushed, live.skipped, live.refused, live.local),
@@ -2493,6 +2498,9 @@ struct LiveLoad {
     refused: Vec<String>,
     /// What it did with the saved local section; `None` when the saved session had none.
     local: Option<local::LocalApplied>,
+    /// The processing the engine still plays when it refused the loaded one, for the session to
+    /// keep instead; `None` when it took the loaded processing.
+    processing_kept: Option<crate::session::SessionProcessing>,
 }
 
 /// A saved mix that went to nobody, named by the musician's key and the label `session` keeps for
@@ -2543,11 +2551,16 @@ fn apply_session<E: SessionEngine>(
     };
     // Every channel's strip, after the channel layout so a linked pair takes its first side's: a
     // channel the loaded session keeps none for goes back to no processing.
-    if let Err(error) = engine.replace_processing(&processing::processing_list(&next.processing)) {
-        refused.push(format!(
-            "the saved channel processing was not applied: {error}"
-        ));
-    }
+    let processing_kept =
+        match engine.replace_processing(&processing::processing_list(&next.processing)) {
+            Ok(_) => None,
+            Err(error) => {
+                refused.push(format!(
+                    "the saved channel processing was not applied: {error}"
+                ));
+                Some(processing::session_processing(&engine.processing()))
+            }
+        };
     // The loaded session's buffers replace the engine's whole too, so a phone set to a fixed
     // buffer the session does not keep goes back to Auto.
     if let Err(error) = engine.replace_playback_buffers(&playback_buffer::buffers_of(next)) {
@@ -2571,6 +2584,7 @@ fn apply_session<E: SessionEngine>(
         skipped,
         refused,
         local,
+        processing_kept,
     })
 }
 
@@ -3223,6 +3237,8 @@ mod tests {
         output: personal_monitoring::LocalOutputStatus,
         /// Every channel's strip, as the engine keeps them (none until it took any).
         strips: Mutex<Vec<StripSettings>>,
+        /// Why it refuses to take every strip whole, when it does.
+        refuses_processing: Option<String>,
     }
 
     impl ProcessingEngine for StandInEngine {
@@ -3247,6 +3263,9 @@ mod tests {
         ) -> Result<Vec<StripSettings>, String> {
             if self.stopping {
                 return Err("the engine is stopping".to_owned());
+            }
+            if let Some(why) = &self.refuses_processing {
+                return Err(why.clone());
             }
             self.note("replace_processing".to_owned());
             *self.strips.lock().expect("strips lock") = settings.to_vec();
@@ -6709,6 +6728,67 @@ mod tests {
             session.processing(),
             BTreeMap::from([(2, strip)]),
             "with no engine the next start takes the loaded processing"
+        );
+    }
+
+    /// An engine that refuses the loaded strips keeps playing its own, the change waiting
+    /// included: the change is not dropped, so the session ends with what the engine plays.
+    #[test]
+    fn a_load_whose_strips_the_engine_refuses_keeps_the_strips_it_plays() {
+        let test = "session-load-processing-refused";
+        let waiting = compressed_strip(-10.0);
+        let mut playing = vec![StripSettings::default(); 32];
+        playing[0] = waiting;
+        let (session, snapshots, engine) = desk(
+            test,
+            Some(StandInEngine {
+                inputs: 2,
+                refuses_processing: Some("the engine is stopping".to_owned()),
+                strips: Mutex::new(playing.clone()),
+                ..StandInEngine::default()
+            }),
+        );
+        let mut loaded = layout_session(&[], 2);
+        loaded.processing = BTreeMap::from([(2, compressed_strip(-24.0))]);
+        saved_session(test, "show", &snapshot(loaded, &[]));
+        let written: Arc<Mutex<Vec<crate::session::SessionProcessing>>> = Arc::default();
+        let processing_saver = {
+            let written = Arc::clone(&written);
+            ProcessingSaver::manual(
+                move |kept: &crate::session::SessionProcessing| {
+                    written.lock().expect("written").push(kept.clone());
+                    Ok(())
+                },
+                |_| {},
+            )
+        };
+        processing_saver.mark(BTreeMap::from([(1, waiting)]));
+        let saver = LocalMixSaver::manual(|_| Ok(()), |_| {});
+
+        let outcome = load_session_with(
+            &engine,
+            &session,
+            &snapshots,
+            &saver,
+            &processing_saver,
+            &Mutex::new(None),
+            "show",
+        )
+        .expect("loaded");
+
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .any(|line| line.contains("channel processing was not applied")),
+            "{outcome:?}"
+        );
+        assert_eq!(strips_of(&engine), playing, "the engine keeps its strips");
+        processing_saver.flush();
+        assert_eq!(
+            *written.lock().expect("written"),
+            vec![BTreeMap::from([(1, waiting)])],
+            "the session is to keep what the engine plays, not the refused strips"
         );
     }
 

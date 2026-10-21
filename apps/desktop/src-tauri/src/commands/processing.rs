@@ -477,8 +477,11 @@ pub fn apply_strip_preset(
 /// The response of the equaliser `settings` describes, the high-pass filter included: `points`
 /// gains (128 when none is asked for, held to 2-1,024) at frequencies spaced evenly on a
 /// logarithmic scale from 20 Hz to 20 kHz, both ends included. Worked out here, never on the
-/// engine's thread.
+/// engine's thread. The settings are held in range first, as the engine holds them (each filter's
+/// design holds its own too), so a frequency or Q of zero, a negative one or a NaN still gives
+/// finite numbers.
 pub fn eq_response(settings: &EqSettings, points: Option<usize>) -> Vec<EqPointDto> {
+    let settings = settings.clamped();
     let count = points
         .unwrap_or(EQ_RESPONSE_POINTS)
         .clamp(MIN_EQ_RESPONSE_POINTS, MAX_EQ_RESPONSE_POINTS);
@@ -571,6 +574,17 @@ fn apply_to<E: ProcessingEngine>(
     let engine = guard
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
+    apply_on(engine, saver, targets, settings)
+}
+
+/// [apply_to] on an engine whose lock the caller holds, so a caller can read the engine and change
+/// it as one step.
+fn apply_on<E: ProcessingEngine>(
+    engine: &E,
+    saver: &ProcessingSaver,
+    targets: &[usize],
+    settings: StripSettings,
+) -> Result<Vec<ChannelProcessingDto>, String> {
     let before = engine.processing();
     let refused = targets
         .iter()
@@ -662,20 +676,21 @@ fn copy_with<E: ProcessingEngine>(
             format!("There is no channel to copy CH {from}'s processing to; nothing changed."),
         ));
     }
-    let settings = {
-        let guard = engine
-            .lock()
-            .map_err(|_| "engine state lock was poisoned".to_owned())?;
-        let engine = guard
-            .as_ref()
-            .ok_or_else(|| "the engine is not running".to_owned())?;
-        engine
-            .processing()
-            .get(from - 1)
-            .copied()
-            .unwrap_or_default()
-    };
-    let channels = apply_to(engine, saver, &targets, settings)?;
+    // The source is read and the targets are written under one hold of the engine lock, so a
+    // change to the source sent meanwhile lands after the copy, never between its read and write.
+    let guard = engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let engine = guard
+        .as_ref()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    let settings = engine
+        .processing()
+        .get(from - 1)
+        .copied()
+        .unwrap_or_default();
+    let channels = apply_on(engine, saver, &targets, settings)?;
+    drop(guard);
     let message = format!(
         "CH {from}'s processing is on {} now.",
         channel_list(&channels)
@@ -855,6 +870,10 @@ mod tests {
         stopping: bool,
         /// Every list it took whole.
         replaced: Mutex<Vec<Vec<StripSettings>>>,
+        /// Holds the next read of every strip, when set (see [ReadPark]).
+        park: Mutex<Option<ReadPark>>,
+        /// Every strip it set, in order: the channel (0-based), what it kept and what CH 1 held then.
+        writes: Mutex<Vec<(usize, StripSettings, StripSettings)>>,
     }
 
     impl Default for StandIn {
@@ -863,11 +882,38 @@ mod tests {
                 strips: Mutex::new(vec![StripSettings::default(); MIXER_CHANNELS]),
                 stopping: false,
                 replaced: Mutex::default(),
+                park: Mutex::default(),
+                writes: Mutex::default(),
             }
         }
     }
 
     const PAIR: [usize; 2] = [2, 3];
+
+    /// Holds one read of the strips while another change runs: it says it is parked, then waits
+    /// until CH 1's strip changes (a change landed while the read was half done) or `wait`
+    /// passes, and notes which.
+    struct ReadPark {
+        parked: std::sync::mpsc::Sender<()>,
+        wait: std::time::Duration,
+        changed_meanwhile: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ReadPark {
+        fn hold(self, engine: &StandIn) {
+            let before = engine.strips.lock().expect("strips")[0];
+            self.parked.send(()).expect("the test waits for the park");
+            let deadline = std::time::Instant::now() + self.wait;
+            while std::time::Instant::now() < deadline {
+                if engine.strips.lock().expect("strips")[0] != before {
+                    self.changed_meanwhile
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 
     impl ProcessingEngine for StandIn {
         fn set_channel_processing(
@@ -880,6 +926,10 @@ mod tests {
             }
             let kept = settings.clamped();
             let mut strips = self.strips.lock().expect("strips");
+            self.writes
+                .lock()
+                .expect("writes")
+                .push((channel, kept, strips[0]));
             if PAIR.contains(&channel) {
                 for side in PAIR {
                     strips[side] = kept;
@@ -891,6 +941,10 @@ mod tests {
         }
 
         fn processing(&self) -> Vec<StripSettings> {
+            let park = self.park.lock().expect("park").take();
+            if let Some(park) = park {
+                park.hold(self);
+            }
             self.strips.lock().expect("strips").clone()
         }
 
@@ -1408,5 +1462,119 @@ mod tests {
         let json = serde_json::to_value(eq_response(&peak, Some(2))).expect("serializes");
         assert_eq!(json[0]["freqHz"], 20.0);
         assert!(json[0]["db"].is_number());
+    }
+
+    /// The response is asked for with the settings being edited, which the engine has not held in
+    /// range yet: a frequency or Q of zero, a negative one or a NaN must still answer numbers (a
+    /// non-finite one would reach the window as JSON `null`).
+    #[test]
+    fn the_equaliser_response_of_settings_out_of_range_is_finite() {
+        let mut wild = EqSettings::default();
+        wild.high_pass = HighPassSettings {
+            enabled: true,
+            frequency_hz: 0.0,
+            q: 0.0,
+        };
+        let shapes = [
+            (0.0, 12.0, 0.0),
+            (-100.0, -6.0, -1.0),
+            (f32::NAN, f32::NAN, f32::NAN),
+        ];
+        for (band, (frequency_hz, gain_db, q)) in shapes.into_iter().enumerate() {
+            wild.bands[band] = EqBandSettings {
+                enabled: true,
+                frequency_hz,
+                gain_db,
+                q,
+            };
+        }
+        wild.bands[3] = EqBandSettings {
+            enabled: true,
+            frequency_hz: 1e9,
+            gain_db: 400.0,
+            q: 1e6,
+        };
+        let points = eq_response(&wild, Some(64));
+        assert!(
+            points.iter().all(|point| point.db.is_finite()),
+            "{points:?}"
+        );
+        let json = serde_json::to_value(&points).expect("serializes");
+        assert!(
+            json.as_array()
+                .expect("a list")
+                .iter()
+                .all(|point| point["db"].is_number()),
+            "{json}"
+        );
+    }
+
+    /// A copy reads its source and writes its targets as one step. Every round forces the overlap:
+    /// the copy is parked while it reads CH 1, and a change to CH 1 is sent meanwhile. The change
+    /// waits for the copy to be done, so when the copy writes CH 5 and CH 6 CH 1 still holds what it
+    /// read, and CH 1 ends with the change.
+    #[test]
+    fn a_change_to_the_source_sent_during_a_copy_lands_after_the_copy() {
+        for round in 0..8 {
+            let session = Arc::new(SessionStore::open(&test_directory(&format!(
+                "copy-{round}"
+            ))));
+            let saver = saver_into(&session);
+            let engine = running();
+            set_with(&engine, &saver, 1, compressed(-20.0)).expect("set");
+            let (parked, parked_signal) = std::sync::mpsc::channel();
+            let changed_meanwhile = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let guard = engine.lock().expect("engine");
+                let stand_in = guard.as_ref().expect("running");
+                stand_in.writes.lock().expect("writes").clear();
+                *stand_in.park.lock().expect("park") = Some(ReadPark {
+                    parked,
+                    wait: std::time::Duration::from_millis(50),
+                    changed_meanwhile: Arc::clone(&changed_meanwhile),
+                });
+            }
+
+            std::thread::scope(|scope| {
+                let (engine, saver) = (&engine, &saver);
+                scope.spawn(move || {
+                    let copied = copy_with(engine, saver, 1, &[5, 6]).expect("copied");
+                    assert_eq!(copied.outcome, "set", "{copied:?}");
+                });
+                parked_signal
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the copy reached its read");
+                // The change to the source runs while the copy is between its read and its write.
+                scope.spawn(move || {
+                    set_with(engine, saver, 1, compressed(-40.0)).expect("set");
+                });
+            });
+
+            assert!(
+                !changed_meanwhile.load(std::sync::atomic::Ordering::SeqCst),
+                "round {round}: CH 1 changed while the copy was reading it"
+            );
+            let guard = engine.lock().expect("engine");
+            let writes = guard
+                .as_ref()
+                .expect("running")
+                .writes
+                .lock()
+                .expect("writes")
+                .clone();
+            drop(guard);
+            for (channel, kept, source) in writes.iter().filter(|(channel, ..)| *channel != 0) {
+                assert_eq!(
+                    kept,
+                    source,
+                    "round {round}: CH {} took a strip CH 1 no longer held: {writes:?}",
+                    channel + 1
+                );
+            }
+            let strips = strips_of(&engine);
+            assert_eq!(strips[0], compressed(-40.0).clamped(), "round {round}");
+            assert_eq!(strips[4], compressed(-20.0).clamped(), "round {round}");
+            assert_eq!(strips[5], compressed(-20.0).clamped(), "round {round}");
+        }
     }
 }

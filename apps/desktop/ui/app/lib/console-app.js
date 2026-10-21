@@ -141,7 +141,7 @@ import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
 import { formatBufferSet, nameForKey } from "./playback-buffer.js";
-import { formatProcessingSet, formatStripPresetsSet } from "./processing.js";
+import { formatProcessingSet, formatStripPresetsSet, stripUnitChannels } from "./processing.js";
 import { blockMsOf, formatRedundancySet } from "./redundancy.js";
 import { formatSessionLoaded, formatSessionSaved, skippedName } from "./sessions.js";
 import { createStore } from "./store.js";
@@ -187,6 +187,8 @@ export function createConsoleApp({
   // While a saved session is loading, the waiting edits stay where they are: none goes out over
   // the loaded session; they are dropped once it loaded, and sent as usual if it was refused.
   let loading = false;
+  // Resolves once the load running now is over, its held edits dropped or sent; null when none runs.
+  let loadEnded = null;
 
   // Sends `address`'s pending mix edits as they are when the send goes out: a musician's with
   // `set_mix`, the local mix's (LOCAL_MIX) with `set_local_mix`. The coalescer calls it at most
@@ -247,6 +249,7 @@ export function createConsoleApp({
       processingSaid.set(channel, said);
       if (said.ok) {
         store.dispatch(actions.processingApplied(channel, sent, answer));
+        await readStripsIfUnknown();
       } else {
         store.dispatch(actions.processingFailed(channel, sent, said.message));
       }
@@ -261,6 +264,14 @@ export function createConsoleApp({
   }
 
   const processingSender = createCoalescer(sendProcessing);
+
+  // Reads every strip once a change was answered while they were unknown (never read yet, or not
+  // read after a load): the answer names only the strips it changed.
+  async function readStripsIfUnknown() {
+    if (store.getState().processing === null) {
+      await loadProcessing();
+    }
+  }
 
   // Puts the engine's answer to `engine_status` in the store: its status when it runs, idle when
   // it says no engine runs.
@@ -1000,6 +1011,10 @@ export function createConsoleApp({
   function loadSession(id) {
     return inTurn(async () => {
       loading = true;
+      let endLoad;
+      loadEnded = new Promise((resolve) => {
+        endLoad = resolve;
+      });
       let loaded = false;
       try {
         return await sessionCommand(async () => {
@@ -1011,21 +1026,47 @@ export function createConsoleApp({
             choiceKnown = true;
             choiceUnsaved = false;
           }
+          // The strip edits waiting were meant for the session before: they are dropped, and so said.
+          for (const channel of Object.keys(store.getState().processingPending)) {
+            processingSaid.set(Number(channel), {
+              ok: false,
+              message: sentenceWithReason(
+                `CH ${channel}'s processing was not changed`,
+                "a session was loaded meanwhile",
+              ),
+            });
+          }
           store.dispatch(actions.sessionLoaded(outcome));
           await readStatus();
-          // The loaded session's processing replaced every strip.
-          await loadProcessing();
+          // The loaded session's processing replaced every strip; strips that cannot be read are
+          // no longer known, and the answer says so.
+          const unread = await loadProcessing();
+          if (unread) {
+            store.dispatch(
+              actions.processingUnknown(
+                sentenceWithReason(
+                  "The loaded session's channel processing could not be read",
+                  message(unread),
+                ),
+              ),
+            );
+          }
           const musicians = store.getState().musicians;
-          return formatSessionLoaded(outcome, {
+          const words = formatSessionLoaded(outcome, {
             labelAt,
             nameOf: (skipped) => skippedName(skipped, musicians),
           });
+          return unread
+            ? `${words} ${sentenceWithReason("Its channel processing could not be read", message(unread))}`
+            : words;
         }, `"${sessionName(id)}" was not loaded`);
       } finally {
         loading = false;
-        if (!loaded) {
-          sendWaiting();
-        }
+        // A refused load changed nothing, so the edits held back go out; after a load only the
+        // edits made once it landed are left, meant for the loaded session.
+        sendWaiting();
+        loadEnded = null;
+        endLoad();
       }
     });
   }
@@ -1065,25 +1106,39 @@ export function createConsoleApp({
   // Edits `channel`'s strip to `settings`, the whole strip: shown at once (channelStrip) and sent
   // through the channel's coalescer, so a knob dragged sends only its latest value after the one in
   // flight. Resolves to the last answer in words once the channel has nothing left to send.
-  function editProcessing(channel, settings) {
+  // A session load holds the edit back: it is dropped once the load lands (and so said), or sent
+  // once it was refused, so the answer waits for the load too and is never a success not sent.
+  async function editProcessing(channel, settings) {
+    processingSaid.delete(channel);
     store.dispatch(actions.processingEdit(channel, settings));
     processingSender.push(channel, null);
-    return processingSender
-      .idle(channel)
-      .then(() => processingSaid.get(channel) ?? { ok: true, message: "" });
+    await processingSender.idle(channel);
+    while (loadEnded) {
+      await loadEnded;
+      await processingSender.idle(channel);
+    }
+    return (
+      processingSaid.get(channel) ?? {
+        ok: false,
+        message: sentenceWithReason(`CH ${channel}'s processing was not changed`, "it was not sent"),
+      }
+    );
   }
 
   // Runs a processing change that is not an edit (a reset, a copy, a preset) once every desk edit
-  // and load asked for before it was answered and the strip edits of `channels` went out, so it
-  // lands after them. Answers `{ ok, message }` (formatProcessingSet).
+  // and load asked for before it was answered and the strip edits of `channels` and of their
+  // linked partners went out, so it lands after them. Answers `{ ok, message }`
+  // (formatProcessingSet).
   function processingCommand(channels, send, refused) {
     return inTurn(async () => {
-      await Promise.all(channels.map((channel) => processingSender.idle(channel)));
+      const touched = stripUnitChannels(store.getState().engine.status?.channels, channels);
+      await Promise.all(touched.map((channel) => processingSender.idle(channel)));
       try {
         const answer = await send();
         const said = formatProcessingSet(answer);
         if (said.ok) {
           store.dispatch(actions.processingApplied(null, null, answer));
+          await readStripsIfUnknown();
         }
         return said;
       } catch (error) {

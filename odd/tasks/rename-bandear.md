@@ -45,6 +45,9 @@ release and the docs. A desk that already ran as MixLink keeps its sessions, bac
   Route: inline. Commits `3dd472b` (server, +9/-6), `6f5a111` (CI, +4/-4), `75b3515` (docs,
   +29/-26).
 - [x] T5 Full verification and leftover audit (see Verification).
+- [x] T6 Apply the approved BandEar logo (see Logo). Route: delegated writer. Commits `bfddda7`
+  (desktop icons, sidebar mark, favicon, brand sources), `8cec6c5` (Android adaptive icon) and
+  the README/doc commit.
 
 ## Migration design (T2)
 
@@ -105,6 +108,33 @@ gave `8 failed, 3 passed` (the three that expect `None` or test the sibling path
   the control messages carry no product name.
 - Root `README.md`: the note that BandEar used to be called MixLink.
 
+## Logo (T6)
+
+- Sources in `docs/brand/`: `bandear-mark.svg` (the mark: six round-capped strokes, `#FFBF43`),
+  `bandear-icon.svg` (the app icon: the mark on a `#192223` rounded square) and
+  `bandear-preview.png` (sizes preview). The in-context mockup was not kept.
+- Desktop icons: `cargo tauri icon ../../docs/brand/bandear-icon.svg` from `apps/desktop`
+  (tauri-cli 2.12.1 reads SVG) regenerated `icon.ico`, `icon.icns`, `icon.png`, `32x32.png`,
+  `128x128.png`, `128x128@2x.png` and the Windows Store `Square*Logo.png`/`StoreLogo.png`. The
+  CLI's extra `64x64.png` and its `android/` and `ios/` folders were deleted (the phone app is
+  native). `icon.png` stays: it was already tracked and is Tauri's fallback window icon off Windows.
+- Console: `apps/desktop/ui/app/brand/bandear-mark.svg` (a copy of the mark, shipped with
+  `frontendDist`) replaces the amber square in the sidebar brand row and is the favicon of
+  `index.html` and `dev/gallery.html` (no more `/favicon.ico` 404 on the dev server).
+- Android: the adaptive icon's foreground and monochrome layers are the mark's six paths in a
+  1024 viewport, scaled 0.82 around the mark's centre into the 66 dp safe circle (farthest point
+  ~303 of 313 units), stroke 46, on the new `bandear_icon_ground` (`#192223`); the mark's colour
+  is `bandear_mark` (`#FFBF43`). There are no legacy PNG mipmaps (minSdk 29, `mipmap-anydpi-v26`
+  covers every launcher reference: manifest `icon` and `roundIcon`).
+- README: the header image is `docs/brand/bandear-mark.svg` at width 120.
+- The empty `com/mixlink` source folders (main and test) were deleted.
+- Not done (outside the logo task's edit surface): the phone's Connect screen
+  (`ConnectScreen.kt`, `BrandHeader`) still draws the amber square next to "BandEar".
+- Checks: `node --test apps/desktop/ui/tests` 619 passed, 0 failed;
+  `cargo build -p bandear-desktop` finished (icons embedded); gradle `:app:assembleDebug` BUILD
+  SUCCESSFUL; browser (`desktop-ui`, `?fake`): the sidebar shows the mark beside "BandEar", the
+  favicon loads (200), no console errors.
+
 ## Notes
 
 - Android: the new `applicationId` makes BandEar a new app beside MixLink on a phone; Android keeps
@@ -113,10 +143,11 @@ gave `8 failed, 3 passed` (the three that expect `None` or test the sibling path
   `bandear_identity` and `bandear_banks` for the same reason: there is nothing to carry over.
 - Windows: the new identifier installs BandEar as a separate app; an old MixLink install stays
   until it is uninstalled.
-- Empty `com/mixlink` source folders may remain in the working tree after the `git mv` (git does
-  not track folders); they are harmless and can be deleted by hand.
+- Empty `com/mixlink` source folders remained in the working tree after the `git mv` (git does
+  not track folders); they were deleted in T6.
 - The optional one-line rename note in older `odd/tasks/*.md` was skipped (28 files, noisy).
 
 ## Progress
 
 - 2026-10-20: feature document created; T1-T5 done; all checks green.
+- 2026-10-20: T6 done: the approved logo on desktop, console, Android and README; checks green.

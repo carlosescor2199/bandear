@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="apps/desktop/src-tauri/icons/128x128@2x.png" alt="BandEar logo" width="112" />
+<img src="docs/brand/bandear-mark.svg" alt="BandEar logo" width="120" />
 
 # BandEar
 

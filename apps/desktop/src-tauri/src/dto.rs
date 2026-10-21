@@ -1597,6 +1597,8 @@ mod tests {
     fn status_with(groups: Vec<GroupStatus>, channel_levels: Vec<u8>) -> EngineStatus {
         EngineStatus {
             local_limiter: Default::default(),
+            local_fx_returns: Default::default(),
+            effects: Default::default(),
             device_name: "Test device".to_owned(),
             capture_format: CaptureFormat {
                 channels: 2,
@@ -1705,6 +1707,7 @@ mod tests {
     fn the_engine_name_becomes_the_client_name_and_the_label_is_left_to_the_command_layer() {
         let musician = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: Some("Ana".to_owned()),
             client_id: None,
@@ -1729,6 +1732,7 @@ mod tests {
     fn a_musician_that_never_announced_a_name_reports_no_client_name() {
         let musician = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: None,
             client_id: None,
@@ -1753,6 +1757,7 @@ mod tests {
     fn the_last_send_error_reaches_the_window_and_is_null_without_one() {
         let failing = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             counters: personal_monitoring::MusicianCounters {
                 packets_discarded: 3,
                 last_send_error: Some("network unreachable"),
@@ -1775,6 +1780,7 @@ mod tests {
     fn the_phones_client_id_reaches_the_window_and_is_null_without_one() {
         let phone = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             client_id: Some("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
             ..musician_with_link(LinkStatus::default())
         };
@@ -1797,6 +1803,7 @@ mod tests {
     fn a_row_says_whose_mix_the_musician_follows_and_whether_the_leader_is_here() {
         let follower = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             capabilities: Vec::new(),
             mirror: Some(MirrorStatus {
                 leader: MusicianKey::Client("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
@@ -1807,6 +1814,7 @@ mod tests {
         };
         let away = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             capabilities: Vec::new(),
             mirror: Some(MirrorStatus {
                 leader: MusicianKey::Address("192.168.1.40:50000".parse().expect("test address")),
@@ -1846,6 +1854,7 @@ mod tests {
     fn musician_with_link(link: LinkStatus) -> MusicianStatus {
         MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: None,
             client_id: None,
@@ -2116,6 +2125,7 @@ mod tests {
         mix.group_levels[0] = 70;
         let musician = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             mix,
             ..musician_with_link(LinkStatus::default())
         };
@@ -2148,6 +2158,7 @@ mod tests {
         };
         let musician = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             mix,
             ..musician_with_link(LinkStatus::default())
         };
@@ -2175,6 +2186,7 @@ mod tests {
         };
         let musician = MusicianStatus {
             limiter: Default::default(),
+            fx_returns: Default::default(),
             mix,
             ..musician_with_link(LinkStatus::default())
         };

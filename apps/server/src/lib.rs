@@ -9,6 +9,7 @@ mod discovery;
 // Channel processing. The master limiter is not on the audio path yet.
 #[allow(dead_code)]
 mod dsp;
+mod effects;
 mod engine;
 mod health;
 mod link_history;
@@ -30,13 +31,17 @@ mod wav;
 pub use capture::{list_input_devices, list_input_devices_for, AudioHost, InputDevice};
 pub use cli::{check_groups, parse_arguments, EngineConfig, GroupDefinition};
 pub use demo::{DEMO_CHANNELS, DEMO_DEVICE_NAME, DEMO_VOICES};
+pub use dsp::delay::{DelayNote, DelaySettings};
 pub use dsp::dynamics::{CompressorSettings, GateSettings, LimiterSettings};
 pub use dsp::eq::{EqBandSettings, EqSettings, HighPassSettings};
+pub use dsp::reverb::ReverbSettings;
 pub use dsp::strip::StripSettings;
+pub use effects::{Effect, EffectLevels, EffectSettings};
 pub use engine::{
     check_channels, start, CaptureFormat, ChannelKind, ChannelMeta, EngineEvent, EngineHandle,
-    EngineMeters, EngineStatus, GroupStatus, LimiterSetting, MirrorOutcome, MirrorSource,
-    MixOrigin, MusicianCounters, MusicianMeters, MusicianStatus, MAX_CHANNEL_NAME_LENGTH,
+    EngineMeters, EngineStatus, FxReturnsSetting, GroupStatus, LimiterSetting, MirrorOutcome,
+    MirrorSource, MixOrigin, MusicianCounters, MusicianMeters, MusicianStatus,
+    MAX_CHANNEL_NAME_LENGTH,
 };
 pub use health::{LinkHealth, LinkStatus};
 pub use link_history::{LinkHistoryRead, LinkSample, RoundTrip, HISTORY_SAMPLES};

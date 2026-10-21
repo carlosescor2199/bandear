@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
 use std::sync::{Arc, Mutex};
 
 use crate::dsp::dynamics::{Limiter, LimiterDesign, LimiterSettings};
+use crate::effects::{add_return, Effect, EffectLevels, Wet};
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
 pub(crate) const MAX_GROUPS: usize = 16;
@@ -402,6 +403,9 @@ pub(crate) struct MixState {
     /// The master limiter the engineer set for this mix (see [LimiterControl]): engineer-only, and
     /// apart from the mix's values, so no copy, mirror or `mix` of the values touches it.
     limiter: LimiterControl,
+    /// The return level of each shared effect in this mix, 0-100% (see [crate::effects]):
+    /// engineer-only and apart from the mix's values, like the limiter.
+    fx_returns: [AtomicU8; 2],
 }
 
 /// A partial change to one client's mix: every absent field keeps its current value.
@@ -527,6 +531,7 @@ impl Default for MixState {
             published: AtomicU64::new(revision),
             following: Mutex::new(None),
             limiter: LimiterControl::default(),
+            fx_returns: [AtomicU8::new(0), AtomicU8::new(0)],
         }
     }
 }
@@ -577,6 +582,23 @@ impl MixState {
     /// The master limiter's settings in force.
     pub(crate) fn limiter_settings(&self) -> LimiterSettings {
         self.limiter.settings()
+    }
+
+    /// This mix's effect return levels, for the engine thread and the status.
+    pub(crate) fn fx_returns(&self) -> EffectLevels {
+        EffectLevels {
+            reverb: self.fx_returns[0].load(Ordering::Relaxed),
+            delay: self.fx_returns[1].load(Ordering::Relaxed),
+        }
+    }
+
+    /// Sets this mix's effect return levels (each held to 100%) from the next block, where they
+    /// glide; answers what is kept. Engineer-only: never from a phone.
+    pub(crate) fn set_fx_returns(&self, levels: EffectLevels) -> EffectLevels {
+        let levels = levels.clamped();
+        self.fx_returns[0].store(levels.reverb, Ordering::Relaxed);
+        self.fx_returns[1].store(levels.delay, Ordering::Relaxed);
+        levels
     }
 
     /// Builds a state that carries the given group membership. Each client's group levels start
@@ -1106,6 +1128,8 @@ pub(crate) struct MixPlan {
     /// of 0), for [MixPlan::mix_ramped] to compare with the previous block's.
     weights: [Weights; MAX_MIX_CHANNELS],
     active: usize,
+    /// What the effects' returns are scaled by: the master volume, 0 under the master mute.
+    returns_gain: f32,
 }
 
 /// What one source channel is weighted with in a mix: its gain, 0 when it is not heard (muted,
@@ -1165,6 +1189,9 @@ pub(crate) struct MixRamp {
     limiter_active: AtomicBool,
     /// How far the master limiter turned the last block down, in dB as `f32` bits (0: not at all).
     limiter_reduction_db: AtomicU32,
+    /// Each effect's return gain in the previous block (`f32` bits; NaN before the first, so a
+    /// first block takes its gain as it is), for [MixPlan::mix_master] to glide from.
+    returns: [AtomicU32; 2],
 }
 
 impl Default for MixRamp {
@@ -1175,6 +1202,7 @@ impl Default for MixRamp {
             limiter_attenuation: AtomicU32::new(0),
             limiter_active: AtomicBool::new(false),
             limiter_reduction_db: AtomicU32::new(0),
+            returns: std::array::from_fn(|_| AtomicU32::new(f32::NAN.to_bits())),
         }
     }
 }
@@ -1185,12 +1213,29 @@ impl MixRamp {
     pub(crate) fn reset(&self) {
         self.channels.store(0, Ordering::Relaxed);
         self.keep_limiter(0.0, false, 0.0);
+        for value in &self.returns {
+            value.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        }
     }
 
     /// How far the master limiter turned the last block of this mix down, in dB (0: not at all,
     /// or off). A read for the meters, from any thread.
     pub(crate) fn limiter_reduction_db(&self) -> f32 {
         f32::from_bits(self.limiter_reduction_db.load(Ordering::Relaxed))
+    }
+
+    /// The returns' gains of the previous block, keeping `to` for the next; a gain not known yet
+    /// is taken as `to`.
+    fn take_returns(&self, to: [f32; 2]) -> [f32; 2] {
+        std::array::from_fn(|effect| {
+            let from =
+                f32::from_bits(self.returns[effect].swap(to[effect].to_bits(), Ordering::Relaxed));
+            if from.is_nan() {
+                to[effect]
+            } else {
+                from
+            }
+        })
     }
 
     fn keep_limiter(&self, attenuation: f32, active: bool, reduction_db: f32) {
@@ -1318,6 +1363,7 @@ impl MixPlan {
             ceiling,
             weights: [Weights::default(); MAX_MIX_CHANNELS],
             active,
+            returns_gain: if values.muted { 0.0 } else { master },
         };
 
         for channel in 0..active {
@@ -1467,10 +1513,18 @@ impl MixPlan {
     /// ceiling held to this mix's, and then through the clamp as before. The limiter carries on
     /// from the state `ramp` kept and keeps its state and its gain reduction there. While the
     /// limiter is off and done, this is [Self::mix_ramped], bit for bit. Allocation-free.
+    ///
+    /// Before the limiter, each effect that ran this block (`wet`, see [crate::effects]) is added
+    /// at the mix's return level `returns`, scaled by the master volume (nothing under the master
+    /// mute); a return that changed glides across the block. An effect that did not run, or a
+    /// return at 0 in this block and the one before, adds nothing, so with no effect returned and
+    /// the limiter off the mix is [Self::mix_ramped], bit for bit.
     pub(crate) fn mix_master(
         &self,
         ramp: &MixRamp,
         limiter: &LimiterControl,
+        returns: EffectLevels,
+        wet: &Wet<'_>,
         source: &[f32],
         stereo: &mut [f32],
     ) -> usize {
@@ -1481,12 +1535,33 @@ impl MixPlan {
             f32::from_bits(ramp.limiter_attenuation.load(Ordering::Relaxed)),
             ramp.limiter_active.load(Ordering::Relaxed),
         );
-        if !running.is_active() {
+        let to = Effect::ALL
+            .map(|effect| f32::from(returns.get(effect).min(100)) / 100.0 * self.returns_gain);
+        let from = ramp.take_returns(to);
+        let returned = Effect::ALL.map(|effect| {
+            let index = effect as usize;
+            wet.get(effect)
+                .filter(|_| from[index] != 0.0 || to[index] != 0.0)
+        });
+        let returning = returned.iter().any(Option::is_some);
+        if !running.is_active() && !returning {
             ramp.keep_limiter(0.0, false, 0.0);
             return self.mix_ramped(ramp, source, stereo);
         }
         let frames = self.mix_ramped_at(f32::INFINITY, ramp, source, stereo);
         let mixed = &mut stereo[..frames * usize::from(OUTPUT_CHANNELS)];
+        for (index, wet) in returned.iter().enumerate() {
+            if let Some(wet) = wet {
+                add_return(mixed, wet, from[index], to[index]);
+            }
+        }
+        if !running.is_active() {
+            for sample in mixed.iter_mut() {
+                *sample = sample.clamp(-self.ceiling, self.ceiling);
+            }
+            ramp.keep_limiter(0.0, false, 0.0);
+            return frames;
+        }
         running.process(mixed, usize::from(OUTPUT_CHANNELS), 0);
         // The clamp stays the last word, though the limiter already held every sample under it.
         for sample in mixed.iter_mut() {
@@ -1892,6 +1967,134 @@ mod tests {
         assert_eq!((allocations, frees), (0, 0));
     }
 
+    /// The effects' returns: nothing returned (no effect ran, or every return at 0) is the
+    /// ramped mix bit for bit; a return adds the wet at its level times the master volume, before
+    /// the clamp; the master mute silences it; a return that moves glides across the block.
+    #[test]
+    fn a_mix_returns_the_effects_at_its_level_and_the_master_and_nothing_else() {
+        use golden::Noise;
+
+        let limiter = LimiterControl::default();
+        let mut noise = Noise(0x5eed_f00d_1234_5678);
+        let (plain, unreturned, unran) =
+            (MixRamp::default(), MixRamp::default(), MixRamp::default());
+        let wet: Vec<f32> = (0..2 * 64)
+            .map(|n| ((n * 37 % 101) as f32 - 50.0) / 400.0)
+            .collect();
+        for block in 0..300 {
+            let values = noise.mix();
+            let source: Vec<f32> = (0..4 * 64)
+                .map(|_| f32::from(noise.sample()) / 32_768.0)
+                .collect();
+            let plan = MixPlan::new(&values, 4);
+            let mut expected = vec![0.0; 128];
+            plan.mix_ramped(&plain, &source, &mut expected);
+            // The effects ran, but this mix returns nothing of them.
+            let mut stereo = vec![0.0; 128];
+            let ran = Wet::of(Some(&wet), Some(&wet));
+            plan.mix_master(
+                &unreturned,
+                &limiter,
+                EffectLevels::default(),
+                &ran,
+                &source,
+                &mut stereo,
+            );
+            assert!(
+                crate::dsp::tests::same_bits(&stereo, &expected),
+                "returned, block {block}"
+            );
+            // This mix returns both, but neither effect ran.
+            let levels = EffectLevels {
+                reverb: 70,
+                delay: 30,
+            };
+            plan.mix_master(&unran, &limiter, levels, &Wet::NONE, &source, &mut stereo);
+            assert!(
+                crate::dsp::tests::same_bits(&stereo, &expected),
+                "ran, block {block}"
+            );
+        }
+
+        let mut values = MixValues {
+            volume_percent: 80,
+            ..MixValues::default()
+        };
+        values.channel_gains = [0; MAX_MIX_CHANNELS];
+        let silent = vec![0.0f32; 2 * 64];
+        let levels = EffectLevels {
+            reverb: 50,
+            delay: 25,
+        };
+        let flat = vec![0.5f32; 2 * 64];
+        let ramp = MixRamp::default();
+        let mut stereo = vec![0.0; 128];
+        MixPlan::new(&values, 2).mix_master(
+            &ramp,
+            &limiter,
+            levels,
+            &Wet::of(Some(&flat), Some(&flat)),
+            &silent,
+            &mut stereo,
+        );
+        // 0.5 × (50% + 25%) × 80% of the master, from the first block (nothing to glide from).
+        assert!(
+            stereo.iter().all(|s| (s - 0.3).abs() < 1e-6),
+            "{:?}",
+            &stereo[..4]
+        );
+
+        // The reverb's return moves to 100%: it glides there across the block.
+        MixPlan::new(&values, 2).mix_master(
+            &ramp,
+            &limiter,
+            EffectLevels {
+                reverb: 100,
+                delay: 25,
+            },
+            &Wet::of(Some(&flat), Some(&flat)),
+            &silent,
+            &mut stereo,
+        );
+        assert!(
+            (stereo[0] - (0.3 + 0.2 / 64.0)).abs() < 1e-6,
+            "{}",
+            stereo[0]
+        );
+        assert!((stereo[126] - 0.5).abs() < 1e-6, "{}", stereo[126]);
+
+        // Held at the mix's ceiling, as the dry mix is.
+        values.max_level_percent = 20;
+        let loud = vec![4.0f32; 2 * 64];
+        MixPlan::new(&values, 2).mix_master(
+            &ramp,
+            &limiter,
+            EffectLevels {
+                reverb: 100,
+                delay: 25,
+            },
+            &Wet::of(Some(&loud), None),
+            &silent,
+            &mut stereo,
+        );
+        let ceiling = (i32::from(i16::MAX) * 20 / 100) as f32 / 32_768.0;
+        assert!(stereo.iter().all(|s| *s == ceiling), "{}", stereo[0]);
+
+        // Under the master mute, the returns go: they glide out, then add nothing.
+        values.muted = true;
+        for _ in 0..2 {
+            MixPlan::new(&values, 2).mix_master(
+                &ramp,
+                &limiter,
+                levels,
+                &Wet::of(Some(&flat), Some(&flat)),
+                &silent,
+                &mut stereo,
+            );
+        }
+        assert!(stereo.iter().all(|s| *s == 0.0));
+    }
+
     fn limiter_on(ceiling_db: f32, release_ms: f32) -> LimiterControl {
         let control = LimiterControl::default();
         control.set(LimiterSettings {
@@ -1910,7 +2113,14 @@ mod tests {
         channels: usize,
     ) -> Vec<f32> {
         let mut stereo = vec![0.0; source.len() / channels * 2];
-        plan.mix_master(ramp, limiter, source, &mut stereo);
+        plan.mix_master(
+            ramp,
+            limiter,
+            EffectLevels::default(),
+            &Wet::NONE,
+            source,
+            &mut stereo,
+        );
         stereo
     }
 
@@ -2096,7 +2306,14 @@ mod tests {
                         release_ms: 20.0,
                     });
                 }
-                MixPlan::new(&values, 32).mix_master(&ramp, &limiter, &source, &mut stereo);
+                MixPlan::new(&values, 32).mix_master(
+                    &ramp,
+                    &limiter,
+                    EffectLevels::default(),
+                    &Wet::NONE,
+                    &source,
+                    &mut stereo,
+                );
             }
         });
 

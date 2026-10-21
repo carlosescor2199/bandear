@@ -278,6 +278,9 @@ pub(crate) struct Block<'a> {
     pub(crate) samples: &'a [f32],
     /// The block as captured, before any processing: what the recorder's input tracks keep.
     pub(crate) raw: &'a [f32],
+    /// What the shared reverb and delay gave this block, for the mixes to return (see
+    /// [crate::effects]); nothing while they rest.
+    pub(crate) wet: crate::effects::Wet<'a>,
     pub(crate) channels: usize,
     /// The block's number: consecutive from the engine's start, across device switches.
     pub(crate) sequence: u64,
@@ -605,10 +608,11 @@ fn deliver(
     channels: usize,
     sequence: u64,
 ) {
-    let samples = stage.process(raw, channels).unwrap_or(raw);
+    let (samples, wet) = stage.run(raw, channels);
     let block = Block {
         samples,
         raw,
+        wet,
         channels,
         sequence,
     };

@@ -828,6 +828,8 @@ impl Sink for RecorderSink {
             MixPlan::new(&mix.snapshot(), channels).mix_master(
                 ramp,
                 mix.limiter(),
+                mix.fx_returns(),
+                &block.wet,
                 block.samples,
                 stereo,
             );
@@ -1612,6 +1614,7 @@ pub(crate) mod tests {
         Block {
             samples,
             raw: samples,
+            wet: crate::effects::Wet::NONE,
             channels,
             sequence: 0,
         }
@@ -1939,6 +1942,7 @@ pub(crate) mod tests {
         bench.sink.process(&Block {
             samples: &processed,
             raw: &raw,
+            wet: crate::effects::Wet::NONE,
             channels: 4,
             sequence: 0,
         });

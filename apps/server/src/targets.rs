@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use crate::dsp::dynamics::LimiterSettings;
+use crate::effects::{Effect, EffectLevels};
 use crate::engine::OutputMeter;
 use crate::health::{LatestLinkReport, LinkReport};
 use crate::link_history::{LinkHistory, LinkHistoryRead, LinkMoment, SharedLinkHistory};
@@ -395,6 +396,9 @@ pub(crate) struct TargetRegistry {
     /// [LimiterSettings::master] (off). Kept like the playback buffers, put in force on the mix of
     /// whoever registers on a row, and taken after the table's lock, never with another book's.
     limiters: Mutex<HashMap<BookKey, LimiterSettings>>,
+    /// The effect return levels the desk set per musician's mix (see [crate::effects]), kept like
+    /// the limiters; a musician with none kept returns nothing.
+    fx_returns: Mutex<HashMap<BookKey, EffectLevels>>,
     propagation: Mutex<()>,
     /// The link histories of phones whose rows were removed (the grace period ran out, or the
     /// engineer removed them), by client id, the most recent last; at most
@@ -445,6 +449,7 @@ impl TargetRegistry {
             buffers: Mutex::new(HashMap::new()),
             redundancies: Mutex::new(HashMap::new()),
             limiters: Mutex::new(HashMap::new()),
+            fx_returns: Mutex::new(HashMap::new()),
             propagation: Mutex::new(()),
             departed_histories: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1445,7 +1450,8 @@ impl TargetRegistry {
             .unwrap_or_else(LimiterSettings::master)
     }
 
-    /// Puts the limiter kept for `entry`'s musician (or the master default) in force on its mix.
+    /// Puts the limiter and the effect returns kept for `entry`'s musician (or the defaults: off,
+    /// nothing returned) in force on its mix.
     fn restore_limiter(&self, entry: &TargetEntry) {
         let kept = Self::kept_limiter(
             &self.limiter_book(),
@@ -1453,6 +1459,98 @@ impl TargetRegistry {
             entry.address.ip(),
         );
         entry.mix_state.set_limiter(kept);
+        let returns = Self::kept_fx_returns(
+            &self.fx_return_book(),
+            entry.origin.client_id(),
+            entry.address.ip(),
+        );
+        entry.mix_state.set_fx_returns(returns);
+    }
+
+    fn fx_return_book(&self) -> MutexGuard<'_, HashMap<BookKey, EffectLevels>> {
+        self.fx_returns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The effect returns kept for the musician with this client id at this IP, as
+    /// [Self::kept_limiter] finds a limiter; none when nothing is kept.
+    fn kept_fx_returns(
+        book: &HashMap<BookKey, EffectLevels>,
+        client_id: Option<&str>,
+        ip: IpAddr,
+    ) -> EffectLevels {
+        client_id
+            .and_then(|id| book.get(&BookKey::Client(id.to_owned())).copied())
+            .or_else(|| book.get(&BookKey::Ip(ip)).copied())
+            .unwrap_or_default()
+    }
+
+    /// Sets the return of `effect` in the mix of the musician `key` names to `level` percent (held
+    /// to 100) from their next block, and keeps their returns for them as [Self::set_limiter] keeps
+    /// a limiter. Answers the key they are kept under, the row and every return now kept.
+    pub(crate) fn set_fx_return(
+        &self,
+        key: &MusicianKey,
+        effect: Effect,
+        level: u8,
+    ) -> Result<(MusicianKey, SocketAddr, EffectLevels), String> {
+        let entries = self.read();
+        let entry = entries
+            .iter()
+            .find(|entry| names(key, entry))
+            .ok_or_else(|| format!("{} is not here", describe_key(key)))?;
+        let kept_for = musician_key(entry);
+        let kept = entry
+            .mix_state
+            .set_fx_returns(entry.mix_state.fx_returns().with(effect, level));
+        let mut book = self.fx_return_book();
+        if matches!(kept_for, MusicianKey::Client(_)) {
+            book.remove(&BookKey::Ip(entry.address.ip()));
+        }
+        if kept.is_off() {
+            book.remove(&BookKey::from(&kept_for));
+        } else {
+            book.insert(BookKey::from(&kept_for), kept);
+        }
+        Ok((kept_for, entry.address, kept))
+    }
+
+    /// The effect returns of the musician `key` names: theirs when they are here, else the ones kept
+    /// for them, else `None`.
+    pub(crate) fn fx_returns_of(&self, key: &MusicianKey) -> Option<EffectLevels> {
+        let entries = self.read();
+        if let Some(entry) = entries.iter().find(|entry| names(key, entry)) {
+            return Some(entry.mix_state.fx_returns());
+        }
+        self.fx_return_book().get(&BookKey::from(key)).copied()
+    }
+
+    /// Replaces every musician's effect returns kept with `kept`, as [Self::replace_limiters]
+    /// replaces the limiters; answers the levels kept, each held to 100%, in the order given.
+    pub(crate) fn replace_fx_returns(
+        &self,
+        kept: &[(MusicianKey, EffectLevels)],
+    ) -> Vec<EffectLevels> {
+        let entries = self.entries.write().expect("target registry lock poisoned");
+        let (book, held) = {
+            let mut book = self.fx_return_book();
+            book.clear();
+            let mut held = Vec::with_capacity(kept.len());
+            for (key, levels) in kept {
+                let levels = levels.clamped();
+                held.push(levels);
+                if !levels.is_off() {
+                    book.insert(BookKey::from(key), levels);
+                }
+            }
+            (book.clone(), held)
+        };
+        for entry in entries.iter() {
+            let levels = Self::kept_fx_returns(&book, entry.origin.client_id(), entry.address.ip());
+            entry.mix_state.set_fx_returns(levels);
+        }
+        held
     }
 
     /// Sets the master limiter of the musician `key` names (by their phone's client id, or an
@@ -3717,5 +3815,85 @@ mod tests {
         );
         register_phone(&registry, "192.168.1.11", 50000, "Eva", Some(PHONE_B));
         assert_eq!(limiter_at(&registry, "192.168.1.11"), limiter(-12.0));
+    }
+
+    fn returns_at(registry: &TargetRegistry, peer: &str) -> EffectLevels {
+        let entries = registry.read();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.address.ip() == ip(peer))
+            .expect("the row");
+        entry.mix_state.fx_returns()
+    }
+
+    /// A musician's effect returns are kept for their phone as their limiter is: they follow them
+    /// to a new IP, are kept while they are away, and never go to whoever takes their old row; a
+    /// replace (a start or a load) puts each row's in force and forgets the rest.
+    #[test]
+    fn effect_returns_are_kept_for_the_phone_and_replaced_whole() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        register_phone(&registry, "192.168.1.10", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(
+            returns_at(&registry, "192.168.1.10"),
+            EffectLevels::default()
+        );
+
+        let ana = MusicianKey::Client(PHONE_A.to_owned());
+        let (kept_for, row, kept) = registry
+            .set_fx_return(&ana, Effect::Reverb, 250)
+            .expect("Ana is here");
+        assert_eq!(
+            (kept_for, row),
+            (ana.clone(), address("192.168.1.10:50000"))
+        );
+        assert_eq!(
+            kept,
+            EffectLevels {
+                reverb: 100,
+                delay: 0
+            },
+            "held to 100%"
+        );
+        let (_, _, kept) = registry
+            .set_fx_return(&ana, Effect::Delay, 30)
+            .expect("Ana is here");
+        assert_eq!(
+            kept,
+            EffectLevels {
+                reverb: 100,
+                delay: 30
+            }
+        );
+
+        register_phone(&registry, "192.168.1.3", 50000, "Ana", Some(PHONE_A));
+        assert_eq!(returns_at(&registry, "192.168.1.3"), kept);
+        registry.remove("192.168.1.3:50000").expect("removed");
+        assert_eq!(registry.fx_returns_of(&ana), Some(kept), "kept while away");
+        register_phone(&registry, "192.168.1.3", 50000, "Eva", Some(PHONE_B));
+        assert_eq!(
+            returns_at(&registry, "192.168.1.3"),
+            EffectLevels::default(),
+            "Eva gets none of Ana's"
+        );
+
+        let eva = MusicianKey::Client(PHONE_B.to_owned());
+        registry.replace_fx_returns(&[(
+            eva,
+            EffectLevels {
+                reverb: 10,
+                delay: 20,
+            },
+        )]);
+        assert_eq!(
+            returns_at(&registry, "192.168.1.3"),
+            EffectLevels {
+                reverb: 10,
+                delay: 20
+            }
+        );
+        assert_eq!(registry.fx_returns_of(&ana), None, "forgotten");
+        assert!(registry
+            .set_fx_return(&MusicianKey::Client("nobody".to_owned()), Effect::Reverb, 5)
+            .is_err());
     }
 }

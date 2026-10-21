@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::dsp::strip::StripSettings;
+use crate::effects::EffectLevels;
 use crate::engine::{ChannelMeta, LevelMeter, OutputMeter};
 use crate::load::EngineLoadStatus;
 use crate::mix::{GroupLayout, MixState, MAX_MIX_CHANNELS};
@@ -38,6 +39,9 @@ pub struct LoadBenchOptions {
     /// A typical channel strip working on every input ([typical_strip]), so the cost of the
     /// channel processing is in the measure; off, every strip is neutral and out of the path.
     pub strips: bool,
+    /// The shared reverb and delay running: every input sends to both and every mix (each
+    /// musician's and the local one) returns both ([crate::effects]), so their cost is in the measure.
+    pub fx: bool,
 }
 
 /// The most musicians the bench runs: each is a socket on its own loopback address.
@@ -86,6 +90,7 @@ impl Default for LoadBenchOptions {
             seconds: 10.0,
             block_frames: 256,
             strips: false,
+            fx: false,
         }
     }
 }
@@ -192,8 +197,29 @@ pub fn run_engine_load(options: &LoadBenchOptions) -> Result<LoadBenchReport, St
     // One strip per input, as the engine lays them out; typical ones when asked, else neutral.
     let mut processing = Processing::new(processing_control);
     processing.follow(&vec![ChannelMeta::default(); inputs])?;
-    if options.strips {
-        processing.replace(&vec![typical_strip(); inputs])?;
+    if options.strips || options.fx {
+        let mut strip = if options.strips {
+            typical_strip()
+        } else {
+            StripSettings::default()
+        };
+        if options.fx {
+            strip.sends = EffectLevels {
+                reverb: 30,
+                delay: 20,
+            };
+        }
+        processing.replace(&vec![strip; inputs])?;
+    }
+    if options.fx {
+        let returns = EffectLevels {
+            reverb: 40,
+            delay: 30,
+        };
+        for entry in targets.read().iter() {
+            entry.mix_state.set_fx_returns(returns);
+        }
+        local_mix.set_fx_returns(returns);
     }
 
     let period = Duration::from_secs_f64(block_frames as f64 / f64::from(TARGET_SAMPLE_RATE));

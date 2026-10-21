@@ -44,7 +44,7 @@ Grab the file for your system from the [**latest release**](https://github.com/c
 | You have | Download | Then |
 |---|---|---|
 | 🪟 **Windows** 10/11 | `BandEar_<version>_x64-setup.exe` | Run it. First time: *More info → Run anyway* (the installer is not signed yet). |
-| 🍎 **macOS**, Apple Silicon (M1–M4) | `BandEar_<version>_aarch64.dmg` | Drag BandEar to Applications. First time: right-click → *Open*. |
+| 🍎 **macOS**, Apple Silicon (M1–M4) | `BandEar_<version>_aarch64.dmg` | Drag BandEar to Applications. First time: open it once, then *System Settings → Privacy & Security → Open Anyway*. |
 | 🍎 **macOS**, Intel | `BandEar_<version>_x64.dmg` | Same as above. |
 | 🐧 **Linux** | `BandEar_<version>_amd64.AppImage` or `.deb` | `chmod +x` the AppImage and run it, or install the `.deb`. |
 | 🤖 **Android** 10+ (the musicians' app) | `BandEar_<version>_android.apk` | Allow installs from your browser, then open the APK. |

@@ -65,8 +65,9 @@ jobs:
           tagName: v__VERSION__
           releaseName: BandEar v__VERSION__
           releaseBody: |
-            Unsigned builds. On Windows choose "More info" then "Run anyway" the first time;
-            on macOS right-click the app and choose "Open" the first time.
+            The Windows installer is not signed yet: choose "More info" then "Run anyway" the
+            first time. The macOS app is ad-hoc signed but not notarized: open it once, then go
+            to System Settings > Privacy & Security and choose "Open Anyway".
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

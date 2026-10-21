@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Page not found · BandEar</title>
+  <meta name="theme-color" content="#192223">
+  <!--
+    GitHub Pages serves this page for any missing path, at any depth, so it is self-contained:
+    inline styles, inline mark, system fonts and no relative links that would break below the root.
+  -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024'%3E%3Crect width='1024' height='1024' rx='228' fill='%23192223'/%3E%3Cg transform='translate(512 512) scale(1.16) translate(-517 -516)' fill='none' stroke='%23FFBF43' stroke-width='46' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M520 224 H344 A48 48 0 0 0 296 272 V738 A70 70 0 0 0 366 808 H556 A186 186 0 0 0 692 528'/%3E%3Cpath d='M736 446 Q720 486 678 514'/%3E%3Cpath d='M314 522 C354 482 404 470 476 470 H606'/%3E%3Cpath d='M402 708 H562 A71 71 0 0 0 562 566 H474 A72 72 0 0 0 402 638'/%3E%3Cpath d='M586 302 A92 92 0 0 1 662 386'/%3E%3Cpath d='M584 224 A162 162 0 0 1 738 386'/%3E%3C/g%3E%3C/svg%3E">
+  <style>
+    :root {
+      --bg: #192223;
+      --bg-deep: #0f1416;
+      --surface-2: #253233;
+      --line-strong: rgba(255, 255, 255, 0.16);
+      --text: #f1f4f3;
+      --text-muted: #a9b7b6;
+      --accent: #ffbf43;
+      --accent-ink: #1a1405;
+      color-scheme: dark;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 32px 16px;
+      background:
+        radial-gradient(60% 50% at 50% 20%, rgba(255, 191, 67, 0.10), transparent 70%),
+        linear-gradient(180deg, var(--bg-deep), var(--bg) 85%);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      line-height: 1.55;
+      text-align: center;
+    }
+    main {
+      max-width: 34rem;
+    }
+    svg {
+      width: 112px;
+      height: 112px;
+      filter: drop-shadow(0 0 18px rgba(255, 191, 67, 0.4));
+    }
+    .code {
+      margin: 20px 0 8px;
+      font: 600 0.875rem ui-monospace, "Cascadia Code", Consolas, monospace;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(1.75rem, 6vw, 2.5rem);
+      line-height: 1.15;
+    }
+    p {
+      margin: 0 0 28px;
+      color: var(--text-muted);
+      font-size: 1.0625rem;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+    }
+    a.btn {
+      display: inline-flex;
+      align-items: center;
+      min-height: 48px;
+      padding: 12px 22px;
+      border-radius: 12px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-2);
+      color: var(--text);
+      font-weight: 600;
+      text-decoration: none;
+    }
+    a.btn:hover {
+      border-color: var(--accent);
+    }
+    a.btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+    }
+    a:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 3px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <svg viewBox="0 0 1024 1024" aria-hidden="true">
+      <g fill="none" stroke="#FFBF43" stroke-width="44" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M520 224 H344 A48 48 0 0 0 296 272 V738 A70 70 0 0 0 366 808 H556 A186 186 0 0 0 692 528"/>
+        <path d="M736 446 Q720 486 678 514"/>
+        <path d="M314 522 C354 482 404 470 476 470 H606"/>
+        <path d="M402 708 H562 A71 71 0 0 0 562 566 H474 A72 72 0 0 0 402 638"/>
+        <path d="M586 302 A92 92 0 0 1 662 386"/>
+        <path d="M584 224 A162 162 0 0 1 738 386"/>
+      </g>
+    </svg>
+    <p class="code">404</p>
+    <h1 data-text="title">This page is off the mix</h1>
+    <p data-text="body">The link may be old or mistyped. Everything about BandEar is one click away.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/bandear/" data-home data-text="home">Back to BandEar</a>
+      <a class="btn" href="https://github.com/carlosescor2199/bandear/releases/latest" data-text="download">Download</a>
+    </div>
+  </main>
+  <script>
+    // Home is /bandear/ on carlosescor2199.github.io and / on a custom domain.
+    (function () {
+      var home = /\.github\.io$/.test(location.hostname) ? "/bandear/" : "/";
+      document.querySelector("[data-home]").setAttribute("href", home);
+
+      // Same language choice as the main page (js/i18n.js): stored choice, else the browser.
+      var lang = "en";
+      try {
+        var stored = localStorage.getItem("bandear.lang");
+        if (stored === "es" || stored === "en") lang = stored;
+        else if (/^es/i.test((navigator.languages && navigator.languages[0]) || navigator.language || "")) lang = "es";
+      } catch (error) {
+        if (/^es/i.test(navigator.language || "")) lang = "es";
+      }
+      if (lang !== "es") return;
+      var es = {
+        title: "Esta página no está en la mezcla",
+        body: "Puede que el enlace sea antiguo o tenga un error. Todo sobre BandEar está a un clic.",
+        home: "Volver a BandEar",
+        download: "Descargar",
+      };
+      document.documentElement.lang = "es";
+      document.title = "Página no encontrada · BandEar";
+      var nodes = document.querySelectorAll("[data-text]");
+      for (var i = 0; i < nodes.length; i++) nodes[i].textContent = es[nodes[i].getAttribute("data-text")];
+    })();
+  </script>
+</body>
+</html>

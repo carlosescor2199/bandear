@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>BandEar social card</title>
+  <!--
+    Source of assets/og.png (1200×630) and assets/brand/apple-touch-icon.png (180×180).
+    Development only, not published. To regenerate: serve the site (node site/dev/serve.mjs),
+    open http://127.0.0.1:5300/dev/og-card.html at device pixel ratio 1 and screenshot
+    the #og and #touch elements at their CSS size.
+  -->
+  <style>
+    @font-face {
+      font-family: "IBM Plex Sans";
+      src: url("../assets/fonts/ibm_plex_sans_variable.ttf") format("truetype");
+      font-weight: 100 700;
+    }
+    @font-face {
+      font-family: "JetBrains Mono";
+      src: url("../assets/fonts/jetbrains_mono_variable.ttf") format("truetype");
+      font-weight: 100 800;
+    }
+    :root {
+      --bg: #192223;
+      --bg-deep: #0f1416;
+      --text: #f1f4f3;
+      --text-muted: #a9b7b6;
+      --accent: #ffbf43;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #000;
+      display: grid;
+      gap: 24px;
+      justify-items: start;
+    }
+    #og {
+      box-sizing: border-box;
+      width: 1200px;
+      height: 630px;
+      padding: 72px 88px;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      align-items: center;
+      gap: 48px;
+      overflow: hidden;
+      color: var(--text);
+      font-family: "IBM Plex Sans", system-ui, sans-serif;
+      background:
+        radial-gradient(55% 70% at 82% 45%, rgba(255, 191, 67, 0.16), transparent 70%),
+        linear-gradient(160deg, var(--bg-deep), var(--bg) 70%);
+    }
+    .eyebrow {
+      margin: 0 0 22px;
+      font: 600 20px "JetBrains Mono", monospace;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    h1 {
+      margin: 0 0 22px;
+      font-size: 104px;
+      font-weight: 650;
+      line-height: 1;
+      letter-spacing: -0.02em;
+    }
+    .tagline {
+      margin: 0 0 34px;
+      font-size: 38px;
+      line-height: 1.25;
+      font-weight: 500;
+    }
+    .tagline span {
+      color: var(--accent);
+    }
+    .platforms {
+      margin: 0;
+      font-size: 24px;
+      color: var(--text-muted);
+    }
+    .mark {
+      width: 380px;
+      height: 380px;
+      filter: drop-shadow(0 0 28px rgba(255, 191, 67, 0.45));
+    }
+    #touch {
+      width: 180px;
+      height: 180px;
+      background: var(--bg);
+    }
+    #touch img {
+      display: block;
+      width: 180px;
+      height: 180px;
+    }
+  </style>
+</head>
+<body>
+  <div id="og">
+    <div>
+      <p class="eyebrow">Free · Open source</p>
+      <h1>BandEar</h1>
+      <p class="tagline">Personal in-ear mixes <span>on every musician's phone.</span></p>
+      <p class="platforms">Windows · macOS · Linux · Android</p>
+    </div>
+    <img class="mark" src="../assets/brand/bandear-mark.svg" alt="">
+  </div>
+  <!-- Square background: iOS rounds the corners itself. -->
+  <div id="touch"><img src="../assets/brand/bandear-icon.svg" alt=""></div>
+</body>
+</html>

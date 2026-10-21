@@ -153,4 +153,14 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   document ships with the first task rather than as a commit of its own. Noted, not split.
 - Risk: none. A new isolated package nothing depends on yet; the `.gitignore` additions are all
   scoped to the new `apps/ios/**` tree.
+- Work-unit commit: `e519a53 feat(ios): decode the PMON audio datagram in a new BandEarKit
+  package` (T1).
+- Native review assessment of e519a53 against base 07a8711: `medium`, `review_due: false`,
+  reason `under_budget` (5 paths, 503 lines). No review for this commit; the slice stays open and
+  accumulates until a later commit reaches the budget, then the slice is assessed as a whole. The
+  first assess attempt returned `unassessable` with `changed_paths: 0` because the pre-existing
+  untracked `.atl/` directory needs an explicit declaration; rerun with
+  `--untracked-scope=exclude` and the expected inventory hash, which is what produced the verdict
+  above. At `medium` with `Risk: none`, writer self-verification stands and no independent
+  verifier runs.
 - Pending: T2 onward. The `.xcodeproj` decision is still open and belongs to T6.

@@ -24,6 +24,7 @@ export const ASSETS = Object.freeze({
 const CACHE_KEY = "bandear.release";
 const CACHE_MS = 30 * 60 * 1000; // The API allows 60 anonymous requests per hour per address.
 const TIMEOUT_MS = 6000;
+const HINTS_TIMEOUT_MS = 800; // client hints usually answer at once; never hold the button back
 
 // Which system the visitor is on, from navigator-like data:
 //   { userAgent, platform, maxTouchPoints, uaPlatform, architecture }
@@ -109,18 +110,28 @@ export function versionOf(release) {
   return tag.startsWith("v") ? tag : `v${tag}`;
 }
 
+// The CPU architecture from client hints ("arm", "x86"…), or "" when the browser has none,
+// declines or takes longer than `timeoutMs` to answer. Takes navigator.userAgentData.
+export async function readArchitecture(userAgentData, timeoutMs = HINTS_TIMEOUT_MS) {
+  if (typeof userAgentData?.getHighEntropyValues !== "function") return "";
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    const hints = await Promise.race([userAgentData.getHighEntropyValues(["architecture"]), timeout]);
+    return typeof hints?.architecture === "string" ? hints.architecture : "";
+  } catch {
+    return ""; // The browser declined: the hero offers both Mac builds.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------- Browser side ----------
 
-async function readPlatform() {
+function readPlatform(architecture = "") {
   const data = navigator.userAgentData;
-  let architecture = "";
-  if (data?.getHighEntropyValues) {
-    try {
-      ({ architecture = "" } = await data.getHighEntropyValues(["architecture"]));
-    } catch {
-      // The browser declined: the hero offers both Mac builds.
-    }
-  }
   return detectPlatform({
     userAgent: navigator.userAgent,
     platform: navigator.platform,
@@ -210,13 +221,24 @@ function markCard(card) {
 }
 
 export async function initDownloads() {
-  const platform = await readPlatform();
+  // Name the visitor's system straight away from the user agent; the client hints (the Mac
+  // chip, an ARM Linux) and the release data refine the choice when they arrive.
+  let platform = readPlatform();
   let found = {};
   let choice = heroChoice(platform, found);
-  const render = () => renderHero(choice);
+  const render = () => {
+    renderHero(choice);
+    markCard(choice.card);
+  };
   render();
-  markCard(choice.card);
-  document.addEventListener(LANGUAGE_EVENT, render);
+  document.addEventListener(LANGUAGE_EVENT, () => renderHero(choice));
+
+  const refined = readArchitecture(navigator.userAgentData).then((architecture) => {
+    if (!architecture) return;
+    platform = readPlatform(architecture);
+    choice = heroChoice(platform, found);
+    render();
+  });
 
   try {
     const release = await fetchRelease();
@@ -228,4 +250,5 @@ export async function initDownloads() {
     // Every link already opens the releases page.
     console.info("BandEar: using the releases page for downloads.", error?.message ?? error);
   }
+  await refined;
 }

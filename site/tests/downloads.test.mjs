@@ -6,7 +6,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { ASSETS, RELEASES_PAGE, detectPlatform, heroChoice, matchAssets, versionOf } from "../js/downloads.js";
+import {
+  ASSETS,
+  RELEASES_PAGE,
+  detectPlatform,
+  heroChoice,
+  matchAssets,
+  readArchitecture,
+  versionOf,
+} from "../js/downloads.js";
 import { DICTIONARY, LANGUAGES } from "../js/i18n.js";
 
 const UA = {
@@ -152,6 +160,26 @@ test("without release data every choice opens the releases page", () => {
     assert.equal(heroChoice({ os, arch: null }).href, RELEASES_PAGE, os);
   }
   assert.deepEqual(heroChoice({ os: "unknown", arch: null }).label, ["dl.hero.generic", {}]);
+});
+
+test("readArchitecture returns the client hint, or nothing rather than waiting", async () => {
+  assert.equal(await readArchitecture(undefined), "");
+  assert.equal(await readArchitecture({}), "");
+  assert.equal(await readArchitecture({ getHighEntropyValues: async () => ({ architecture: "arm" }) }), "arm");
+  assert.equal(await readArchitecture({ getHighEntropyValues: async () => ({}) }), "");
+  assert.equal(await readArchitecture({ getHighEntropyValues: () => Promise.reject(new Error("denied")) }), "");
+  assert.equal(
+    await readArchitecture({
+      getHighEntropyValues() {
+        throw new Error("sync failure");
+      },
+    }),
+    "",
+  );
+  const started = Date.now();
+  const never = { getHighEntropyValues: () => new Promise(() => {}) };
+  assert.equal(await readArchitecture(never, 30), "");
+  assert.ok(Date.now() - started < 1000, "the timeout did not cut the wait short");
 });
 
 test("reads the version from the release tag", () => {

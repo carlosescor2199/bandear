@@ -1,0 +1,55 @@
+# Publishes the website in site/ to GitHub Pages.
+#
+# The page scripts' tests run first. Only the public files are deployed: site/ is copied to a staging folder without dev/ (local
+# preview server and the social-card source), tests/ and README.md, and that folder becomes
+# the Pages artifact. Pages must use "GitHub Actions" as its source (Settings → Pages).
+
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; let a running one finish rather than cancelling it halfway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test the page scripts
+        run: node --test 'site/tests/*.test.mjs'
+
+      - name: Stage the public files
+        run: |
+          rsync -a --delete --exclude '/dev/' --exclude '/tests/' --exclude '/README.md' site/ "$RUNNER_TEMP/site/"
+          find "$RUNNER_TEMP/site" -type f | sort
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

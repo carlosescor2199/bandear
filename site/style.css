@@ -319,6 +319,17 @@ code {
   color: var(--text-muted);
 }
 
+/* Second choice under the download button (Intel Mac, .deb), filled in by js/downloads.js. */
+.cta-alt {
+  margin: -4px 0 14px;
+  font-size: 0.9375rem;
+  color: var(--text-muted);
+}
+
+.cta-alt a {
+  color: var(--accent);
+}
+
 .chip {
   font-family: var(--font-mono);
   font-size: 0.8125rem;
@@ -691,6 +702,12 @@ code {
 
 .dl-soon .file {
   color: var(--text-muted);
+}
+
+/* The visitor's own system, as detected by js/downloads.js. */
+.dl.is-yours {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 18px 40px -24px rgba(255, 191, 67, 0.6);
 }
 
 /* ---------- FAQ ---------- */

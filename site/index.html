@@ -61,13 +61,15 @@
           <h1 data-i18n-html="hero.title">Every musician gets their own in&#8209;ear mix, <span class="accent">on their own phone.</span></h1>
           <p class="lede" data-i18n="hero.lede">Plug your mixer's USB audio — or any audio interface — into a computer running BandEar. Each musician joins the same Wi-Fi, opens the app and mixes their own ears — while the engineer keeps control from the desk.</p>
           <div class="cta-row">
-            <a class="btn btn-primary" href="https://github.com/carlosescor2199/bandear/releases/latest">
+            <!-- js/downloads.js points this at the visitor's installer and names their system. -->
+            <a class="btn btn-primary" href="https://github.com/carlosescor2199/bandear/releases/latest" data-download-hero>
               <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg>
-              <span data-i18n="dl.hero.generic">Download</span>
+              <span data-download-label>Download</span>
             </a>
             <a class="btn btn-ghost" href="#downloads" data-i18n="hero.other">Other platforms</a>
           </div>
-          <p class="cta-meta"><span class="chip">v0.2.0</span> <span data-i18n="hero.platforms">Windows · macOS · Linux · Android 10+</span></p>
+          <p class="cta-alt" data-download-alt hidden></p>
+          <p class="cta-meta"><span class="chip" data-version>v0.2.0</span> <span data-i18n="hero.platforms">Windows · macOS · Linux · Android 10+</span></p>
         </div>
         <figure class="hero-shot" data-3d-host>
           <div class="window">
@@ -284,45 +286,47 @@
     <section class="section section-alt" id="downloads" aria-labelledby="downloads-title">
       <div class="container">
         <header class="section-head">
-          <p class="eyebrow"><span data-i18n="downloads.eyebrow">Download</span> · <span>v0.2.0</span></p>
+          <p class="eyebrow"><span data-i18n="downloads.eyebrow">Download</span> · <span data-version>v0.2.0</span></p>
           <h2 id="downloads-title" data-i18n="downloads.title">Get BandEar for every device in the band</h2>
           <p data-i18n-html="downloads.intro">The desk runs on a computer; musicians use the Android app. All files come from the <a href="https://github.com/carlosescor2199/bandear/releases/latest">latest GitHub release</a>.</p>
         </header>
         <div class="downloads">
-          <article class="card dl">
+          <!-- js/downloads.js fills in the latest file names and direct links; until then (or if
+               GitHub cannot be reached) every button opens the latest release page. -->
+          <article class="card dl" data-card="windows">
             <h3>Windows <span class="muted">10 / 11</span></h3>
-            <p class="file">BandEar_0.2.0_x64-setup.exe</p>
+            <p class="file" data-asset-name="windows">BandEar_0.2.0_x64-setup.exe</p>
             <p class="note" data-i18n-html="dl.windows.note">First run: <em>More info → Run anyway</em> — the installer is not signed yet.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.windows.btn">Download .exe</a>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-asset="windows" data-i18n="dl.windows.btn">Download .exe</a>
           </article>
-          <article class="card dl">
+          <article class="card dl" data-card="macArm">
             <h3>macOS <span class="muted">Apple Silicon</span></h3>
-            <p class="file">BandEar_0.2.0_aarch64.dmg</p>
+            <p class="file" data-asset-name="macArm">BandEar_0.2.0_aarch64.dmg</p>
             <p class="note" data-i18n-html="dl.mac.note">Drag to Applications. First run: right-click → <em>Open</em>.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.mac.btn">Download .dmg</a>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-asset="macArm" data-i18n="dl.mac.btn">Download .dmg</a>
           </article>
-          <article class="card dl">
+          <article class="card dl" data-card="macIntel">
             <h3>macOS <span class="muted">Intel</span></h3>
-            <p class="file">BandEar_0.2.0_x64.dmg</p>
+            <p class="file" data-asset-name="macIntel">BandEar_0.2.0_x64.dmg</p>
             <p class="note" data-i18n-html="dl.mac.note">Drag to Applications. First run: right-click → <em>Open</em>.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.mac.btn">Download .dmg</a>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-asset="macIntel" data-i18n="dl.mac.btn">Download .dmg</a>
           </article>
-          <article class="card dl">
+          <article class="card dl" data-card="appImage">
             <h3>Linux <span class="muted">x86-64</span></h3>
-            <p class="file">BandEar_0.2.0_amd64.AppImage<br>BandEar_0.2.0_amd64.deb</p>
+            <p class="file"><span data-asset-name="appImage">BandEar_0.2.0_amd64.AppImage</span><br><span data-asset-name="deb">BandEar_0.2.0_amd64.deb</span></p>
             <p class="note" data-i18n-html="dl.linux.note"><code>chmod +x</code> the AppImage and run it, or install the .deb.</p>
             <div class="btn-pair">
-              <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">AppImage</a>
-              <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest">.deb</a>
+              <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-asset="appImage">AppImage</a>
+              <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-asset="deb">.deb</a>
             </div>
           </article>
-          <article class="card dl dl-phone">
+          <article class="card dl dl-phone" data-card="android">
             <h3>Android <span class="muted" data-i18n="dl.android.muted">10+ · musicians' app</span></h3>
-            <p class="file">BandEar_0.2.0_android.apk</p>
+            <p class="file" data-asset-name="android">BandEar_0.2.0_android.apk</p>
             <p class="note" data-i18n="dl.android.note">Allow installs from your browser, then open the APK.</p>
-            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-i18n="dl.android.btn">Download .apk</a>
+            <a class="btn btn-small" href="https://github.com/carlosescor2199/bandear/releases/latest" data-asset="android" data-i18n="dl.android.btn">Download .apk</a>
           </article>
-          <article class="card dl dl-soon">
+          <article class="card dl dl-soon" data-card="ios">
             <h3>iPhone <span class="muted">iOS</span></h3>
             <p class="file" data-i18n="dl.ios.file">Coming soon</p>
             <p class="note" data-i18n="dl.ios.note">An iOS app for musicians is on the roadmap.</p>

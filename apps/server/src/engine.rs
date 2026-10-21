@@ -26,6 +26,7 @@ use crate::effects::{Effect, EffectLevels, EffectSettings};
 use crate::health::{link_status, LinkStatus};
 use crate::link_history::LinkHistoryRead;
 use crate::load::{EngineLoad, EngineLoadStatus};
+use crate::mdns::{start_bonjour, BonjourAdvertiser};
 use crate::mix::{
     group_sources, ChannelFlags, EngineerControls, EngineerUpdate, Group, GroupLayout, Membership,
     MixPreset, MixRamp, MixState, MixUpdate, MixValues, MAX_MIX_CHANNELS,
@@ -1621,6 +1622,9 @@ pub struct EngineHandle {
     processing_meters: Arc<ProcessingMeters>,
     control_thread: Option<JoinHandle<()>>,
     discovery_thread: Option<JoinHandle<()>>,
+    /// The Bonjour announcement for iPhones, next to the beacon (see [crate::mdns]). `None` when it
+    /// could not start, which never stops the engine.
+    bonjour: Option<BonjourAdvertiser>,
 }
 
 /// A capture source opened and started, not yet the engine's: what [EngineHandle::install_capture]
@@ -3127,6 +3131,11 @@ impl EngineHandle {
                 .join()
                 .map_err(|_| "discovery beacon thread panicked")?;
         }
+        // Withdraws the record and ends the daemon, each step bounded, so a stop never hangs on
+        // the network.
+        if let Some(mut bonjour) = self.bonjour.take() {
+            bonjour.stop();
+        }
         Ok(())
     }
 }
@@ -3266,6 +3275,9 @@ fn launch(
         TARGET_SAMPLE_RATE,
         Arc::clone(&stopped),
     );
+    // Bonjour for iPhones, which cannot hear the beacon: the same control port and sample rate.
+    // A failure is logged inside and leaves the engine and the beacon running.
+    let bonjour = start_bonjour(config.control_port, TARGET_SAMPLE_RATE);
     let packet_stats = Arc::new(PacketStats {
         sent: AtomicU64::new(0),
         discarded: AtomicU64::new(0),
@@ -3376,6 +3388,7 @@ fn launch(
         processing_meters,
         control_thread: Some(control_thread),
         discovery_thread: Some(discovery_thread),
+        bonjour,
     })
 }
 
@@ -5738,6 +5751,7 @@ mod tests {
             processing_meters,
             control_thread: None,
             discovery_thread: None,
+            bonjour: None,
         };
         let (capture, opened) = test_capture(&engine, 2);
         engine

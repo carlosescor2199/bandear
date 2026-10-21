@@ -555,6 +555,8 @@ mod tests {
 
     fn idle_status() -> EngineStatusDto {
         EngineStatusDto {
+            local_fx_returns: Default::default(),
+            effects: Default::default(),
             local_limiter: personal_monitoring::LimiterSettings::master(),
             run: 0,
             device_name: "Test device".to_owned(),

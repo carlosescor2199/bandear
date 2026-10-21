@@ -586,6 +586,7 @@ mod tests {
         assert_eq!(
             session.local(),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: Some(SessionMix {
                     channels: vec![channel(80), channel(40)],
@@ -728,6 +729,7 @@ mod tests {
     #[test]
     fn a_pending_local_mix_joins_the_kept_section_and_keeps_its_output() {
         let kept = SessionLocal {
+            fx_returns: None,
             limiter: None,
             mix: None,
             output: Some(output(VOLT, 2)),
@@ -743,6 +745,7 @@ mod tests {
         assert_eq!(
             with_pending(Some(kept), Some(marked.clone())),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: Some(marked.clone()),
                 output: Some(output(VOLT, 2)),
@@ -751,6 +754,7 @@ mod tests {
         assert_eq!(
             with_pending(None, Some(marked.clone())),
             Some(SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: Some(marked),
                 output: None,
@@ -892,6 +896,7 @@ mod tests {
 
     fn kept_local(output: Option<SessionOutput>) -> SessionLocal {
         SessionLocal {
+            fx_returns: None,
             limiter: None,
             mix: Some(SessionMix {
                 channels: vec![channel(80)],
@@ -1046,6 +1051,7 @@ mod tests {
         let applied = apply_kept_local(
             &mut engine,
             &SessionLocal {
+                fx_returns: None,
                 limiter: None,
                 mix: None,
                 output: Some(output(SPEAKERS, 0)),

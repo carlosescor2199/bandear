@@ -448,6 +448,7 @@ mod tests {
         musicians.insert(
             "client:phone-ana".to_owned(),
             MusicianEntry {
+                fx_returns: None,
                 limiter: Some(personal_monitoring::LimiterSettings {
                     enabled: true,
                     ceiling_db: -6.0,
@@ -466,6 +467,7 @@ mod tests {
         musicians.insert(
             "address:192.168.1.40:50000".to_owned(),
             MusicianEntry {
+                fx_returns: None,
                 limiter: None,
                 label: Some("Rack A".to_owned()),
                 engineer: None,
@@ -507,6 +509,7 @@ mod tests {
                 asio_driver: None,
             }),
             local: Some(SessionLocal {
+                fx_returns: None,
                 limiter: Some(personal_monitoring::LimiterSettings {
                     enabled: true,
                     ceiling_db: -1.5,

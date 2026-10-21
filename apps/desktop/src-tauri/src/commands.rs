@@ -7,6 +7,7 @@
 //! [soundcheck].
 
 pub mod backups;
+pub mod effects;
 pub mod limiter;
 pub mod link_history;
 pub mod local;
@@ -535,6 +536,9 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
                 );
             }
             for refused in limiter::hand_kept_limiters(&handle, &kept_session) {
+                log_warn!("desk", "start_engine: {refused}");
+            }
+            for refused in effects::hand_kept_effects(&handle, &kept_session) {
                 log_warn!("desk", "start_engine: {refused}");
             }
             let local = saved_local.map(|kept| apply_kept_local(&mut handle, &kept));
@@ -2069,7 +2073,13 @@ impl DeskReader for EngineHandle {
 /// What loading a session needs from the running engine, besides the group, channel, local mix and
 /// processing edits every other command uses.
 trait SessionEngine:
-    DeskReader + GroupEngine + ChannelEngine + LocalEngine + ProcessingEngine + limiter::LimiterEngine
+    DeskReader
+    + GroupEngine
+    + ChannelEngine
+    + LocalEngine
+    + ProcessingEngine
+    + limiter::LimiterEngine
+    + effects::EffectsEngine
 {
     /// Replaces every control and mirror the engine keeps ([EngineHandle::replace_kept]); answers
     /// the mirrors it refused.
@@ -2587,6 +2597,8 @@ fn apply_session<E: SessionEngine>(
     // and the local mix takes the one `next` keeps: the saved one, or the desk's own when the
     // saved session has no local section (see [limiter::hand_kept_limiters]).
     refused.extend(limiter::hand_kept_limiters(engine, next));
+    // And its effects and every mix's returns of them, the same way.
+    refused.extend(effects::hand_kept_effects(engine, next));
     let desk = engine.desk();
     let (pushed, skipped) = push_saved_mixes(engine, &desk, next, mixes);
     let local = local.map(|kept| apply_kept_local(engine, kept));
@@ -2702,6 +2714,8 @@ mod tests {
 
     fn status_with_musicians(addresses: &[&str]) -> EngineStatusDto {
         EngineStatusDto {
+            local_fx_returns: Default::default(),
+            effects: Default::default(),
             local_limiter: LimiterSettings::master(),
             run: 1,
             device_name: "Test device".to_owned(),
@@ -2723,6 +2737,7 @@ mod tests {
             musicians: addresses
                 .iter()
                 .map(|address| MusicianDto {
+                    fx_returns: Default::default(),
                     limiter: LimiterSettings::master(),
                     address: (*address).to_owned(),
                     client_name: None,
@@ -3246,6 +3261,10 @@ mod tests {
         /// The musicians' limiters it took whole last, and the local mix's it took last.
         limiters: Mutex<Option<Vec<(MusicianKey, LimiterSettings)>>>,
         local_limiter: Mutex<Option<LimiterSettings>>,
+        /// The effects it took, the musicians' returns it took whole last and the local mix's.
+        effects: Mutex<personal_monitoring::EffectSettings>,
+        fx_returns: Mutex<Option<Vec<(MusicianKey, personal_monitoring::EffectLevels)>>>,
+        local_fx_returns: Mutex<Option<personal_monitoring::EffectLevels>>,
         /// The musician whose mix it refuses to change, when it does.
         refuses_push_to: Option<String>,
         /// The engineer's local mix as a session save or load reads it.
@@ -3290,6 +3309,89 @@ mod tests {
             self.note("replace_processing".to_owned());
             *self.strips.lock().expect("strips lock") = settings.to_vec();
             Ok(settings.to_vec())
+        }
+
+        fn set_channel_send(
+            &self,
+            channel: usize,
+            effect: personal_monitoring::Effect,
+            level: u8,
+        ) -> Result<StripSettings, String> {
+            let current = self.processing().get(channel).copied().unwrap_or_default();
+            self.set_channel_processing(
+                channel,
+                StripSettings {
+                    sends: current.sends.with(effect, level),
+                    ..current
+                },
+            )
+        }
+    }
+
+    impl effects::EffectsEngine for StandInEngine {
+        fn set_reverb(
+            &self,
+            settings: personal_monitoring::ReverbSettings,
+        ) -> Result<personal_monitoring::EffectSettings, String> {
+            let mut effects = self.effects.lock().expect("effects lock");
+            effects.reverb = settings.clamped();
+            Ok(*effects)
+        }
+
+        fn set_delay(
+            &self,
+            settings: personal_monitoring::DelaySettings,
+        ) -> Result<personal_monitoring::EffectSettings, String> {
+            let mut effects = self.effects.lock().expect("effects lock");
+            effects.delay = settings.clamped();
+            Ok(*effects)
+        }
+
+        fn replace_effects(
+            &self,
+            settings: personal_monitoring::EffectSettings,
+        ) -> Result<personal_monitoring::EffectSettings, String> {
+            self.note("replace_effects".to_owned());
+            *self.effects.lock().expect("effects lock") = settings.clamped();
+            Ok(settings.clamped())
+        }
+
+        fn set_musician_fx_return(
+            &self,
+            key: &MusicianKey,
+            _effect: personal_monitoring::Effect,
+            _level: u8,
+        ) -> Result<(MusicianKey, String, personal_monitoring::EffectLevels), String> {
+            Err(format!("{key:?} is not here"))
+        }
+
+        fn replace_musician_fx_returns(
+            &self,
+            kept: &[(MusicianKey, personal_monitoring::EffectLevels)],
+        ) -> Result<(), String> {
+            self.note("replace_musician_fx_returns".to_owned());
+            *self.fx_returns.lock().expect("returns lock") = Some(kept.to_vec());
+            Ok(())
+        }
+
+        fn set_local_fx_return(
+            &self,
+            effect: personal_monitoring::Effect,
+            level: u8,
+        ) -> Result<personal_monitoring::EffectLevels, String> {
+            let mut local = self.local_fx_returns.lock().expect("returns lock");
+            let next = local.unwrap_or_default().with(effect, level);
+            *local = Some(next);
+            Ok(next)
+        }
+
+        fn replace_local_fx_returns(
+            &self,
+            levels: personal_monitoring::EffectLevels,
+        ) -> Result<personal_monitoring::EffectLevels, String> {
+            self.note("replace_local_fx_returns".to_owned());
+            *self.local_fx_returns.lock().expect("returns lock") = Some(levels);
+            Ok(levels)
         }
     }
 
@@ -5841,6 +5943,7 @@ mod tests {
             read.snapshot.session,
             Session {
                 local: Some(SessionLocal {
+                    fx_returns: None,
                     limiter: None,
                     mix: Some(saved_mix(&[30, 20], &[("kit", 40), ("vox", 50)], 75, false)),
                     output: Some(speakers),
@@ -5898,6 +6001,7 @@ mod tests {
         loaded.musicians.insert(
             client_key(PHONE),
             crate::session::MusicianEntry {
+                fx_returns: None,
                 limiter: Some(LimiterSettings {
                     enabled: true,
                     ceiling_db: -6.0,
@@ -5918,6 +6022,7 @@ mod tests {
         loaded.musicians.insert(
             address_key(RACK),
             crate::session::MusicianEntry {
+                fx_returns: None,
                 limiter: None,
                 label: Some("Rack".to_owned()),
                 engineer: None,
@@ -6713,6 +6818,83 @@ mod tests {
         );
     }
 
+    /// A loaded session's effects and returns replace the engine's, after its limiters; one saved
+    /// without them sets the effects back to their defaults and returns nothing.
+    #[test]
+    fn a_load_replaces_the_effects_and_every_mixs_returns() {
+        let test = "session-load-effects";
+        let (session, snapshots, engine) = desk(test, Some(StandInEngine::default()));
+        let wet = personal_monitoring::EffectLevels {
+            reverb: 30,
+            delay: 10,
+        };
+        let mut loaded = layout_session(&[], 1);
+        loaded.effects = Some(personal_monitoring::EffectSettings {
+            delay: personal_monitoring::DelaySettings {
+                time_ms: 480.0,
+                ..personal_monitoring::DelaySettings::default()
+            },
+            ..personal_monitoring::EffectSettings::default()
+        });
+        loaded.musicians.insert(
+            client_key(PHONE),
+            crate::session::MusicianEntry {
+                fx_returns: Some(wet),
+                ..crate::session::MusicianEntry::default()
+            },
+        );
+        loaded.local = Some(SessionLocal {
+            fx_returns: Some(wet),
+            ..local_section(None)
+        });
+        saved_session(test, "wet", &snapshot(loaded, &[]));
+        saved_session(test, "dry", &snapshot(layout_session(&[], 1), &[]));
+
+        load_into(&engine, &session, &snapshots, "wet").expect("loaded");
+        let log = log_of(&engine);
+        let at = |step: &str| log.iter().position(|line| line == step);
+        assert!(
+            at("replace_musician_limiters") < at("replace_effects"),
+            "{log:?}"
+        );
+        let guard = engine.lock().expect("engine lock");
+        let stand_in = guard.as_ref().expect("running");
+        assert_eq!(
+            stand_in.effects.lock().expect("effects lock").delay.time_ms,
+            480.0
+        );
+        assert_eq!(
+            *stand_in.fx_returns.lock().expect("returns lock"),
+            Some(vec![(MusicianKey::Client(PHONE.to_owned()), wet)])
+        );
+        assert_eq!(
+            *stand_in.local_fx_returns.lock().expect("returns lock"),
+            Some(wet)
+        );
+        drop(guard);
+        assert_eq!(
+            session.current().effects.map(|kept| kept.delay.time_ms),
+            Some(480.0)
+        );
+
+        load_into(&engine, &session, &snapshots, "dry").expect("loaded");
+        let guard = engine.lock().expect("engine lock");
+        let stand_in = guard.as_ref().expect("running");
+        assert_eq!(
+            *stand_in.effects.lock().expect("effects lock"),
+            personal_monitoring::EffectSettings::default()
+        );
+        assert_eq!(
+            *stand_in.fx_returns.lock().expect("returns lock"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            *stand_in.local_fx_returns.lock().expect("returns lock"),
+            Some(wet),
+            "no local section saved: the desk's own returns"
+        );
+    }
+
     /// The local mix's limiter after a load is always the one the session keeps then: a saved
     /// local section's limiter, the default when the section keeps none, and the desk's own when
     /// the saved session has no local section (the desk keeps its whole local section).
@@ -7006,6 +7188,7 @@ mod tests {
 
     fn local_section(output: Option<(&str, u16)>) -> SessionLocal {
         SessionLocal {
+            fx_returns: None,
             limiter: None,
             mix: Some(saved_mix(&[40], &[("kit", 25)], 65, false)),
             output: output.map(|(device, first_channel)| crate::session::SessionOutput {
@@ -7175,8 +7358,9 @@ mod tests {
         assert_eq!(session.local(), Some(own), "the desk's own stays");
         let log = log_of(&engine);
         assert!(
-            !log.iter()
-                .any(|line| line.contains("local") && line != "set_local_limiter"),
+            !log.iter().any(|line| line.contains("local")
+                && line != "set_local_limiter"
+                && line != "replace_local_fx_returns"),
             "the engine's local mix and output are left alone: {log:?}"
         );
         assert_eq!(
@@ -7381,6 +7565,7 @@ mod tests {
         loaded.musicians.insert(
             address_key(RACK),
             crate::session::MusicianEntry {
+                fx_returns: None,
                 limiter: None,
                 label: Some("Rack".to_owned()),
                 engineer: None,

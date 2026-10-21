@@ -117,6 +117,33 @@ const FIELDS = Object.freeze({ ceilingDb: CEILING_FIELD, releaseMs: RELEASE_FIEL
 // The smallest change each slider makes, as the strip rounds it.
 const UNITS = Object.freeze({ ceilingDb: 0.5, releaseMs: 1 });
 
+// The keys a range input moves on.
+const SLIDER_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"]);
+
+/**
+ * Which slider a key is moving, for the master strip's limiter: a slider's `input` event says
+ * `{ key: true }` to limiterChange only while a slider key (an arrow, Page Up/Down, Home or End)
+ * is held down on that slider. `keydown(slider, key)` and `keyup()` follow the keyboard,
+ * `pointerdown()` a drag (never a key), `keyed(slider)` answers for an `input` event.
+ */
+export function createSliderKeys() {
+  let keyed = null;
+  return {
+    keydown(slider, key) {
+      keyed = SLIDER_KEYS.has(key) ? slider : null;
+    },
+    keyup() {
+      keyed = null;
+    },
+    pointerdown() {
+      keyed = null;
+    },
+    keyed(slider) {
+      return keyed !== null && keyed === slider;
+    },
+  };
+}
+
 /**
  * The whole limiter after a control of the master strip changed: `field` "enabled" with `value`
  * true or false, or "ceilingDb" / "releaseMs" with `value` the slider's position (0-1,000). When

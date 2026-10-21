@@ -16,6 +16,7 @@ import {
   LIMITER_REDUCTION_SCALE_DB,
   RELEASE_FIELD,
   clampLimiter,
+  createSliderKeys,
   defaultLimiter,
   formatCeiling,
   formatLimiterSet,
@@ -349,4 +350,57 @@ test("a limiter the desk set stays set and shown when the status cannot be read 
   assert.equal(local.ok, true);
   assert.equal(masterLimiter(app.store.getState(), LOCAL_MIX).ceilingDb, -3);
   app.dispose?.();
+});
+
+test("a limiter change is settled even when the desk's answer cannot be read", async () => {
+  const fake = createFakeBridge({ running: true, clock: () => NOW });
+  const unreadable = {
+    ...fake,
+    invoke: (command, args) =>
+      command === "set_musician_limiter"
+        ? fake.invoke(command, args).then((answer) => ({
+            ...answer,
+            get settings() {
+              throw new Error("the answer was cut short");
+            },
+          }))
+        : fake.invoke(command, args),
+  };
+  const app = createConsoleApp({ bridge: unreadable });
+  await app.ready;
+  const said = await app.editMixLimiter(BASS, { enabled: true, ceilingDb: -6, releaseMs: 80 });
+  assert.deepEqual(said, { ok: false, message: "Bass's limiter was not set: the answer was cut short." });
+  const bass = masterLimiter(app.store.getState(), BASS);
+  assert.equal(bass.pending, false, "no change is left on its way");
+  app.dispose?.();
+});
+
+test("only a slider key held on a limiter slider makes its change a key step", () => {
+  const keys = createSliderKeys();
+  const [ceiling, release] = [{ name: "ceiling" }, { name: "release" }];
+  assert.equal(keys.keyed(ceiling), false, "nothing pressed");
+  keys.keydown(ceiling, "ArrowUp");
+  assert.equal(keys.keyed(ceiling), true);
+  assert.equal(keys.keyed(release), false, "another slider's input is not that key's");
+  // The arrow's one step of 1,000 rounds back to -12 dBFS: as a key step it moves 0.5 dB up.
+  const settings = { enabled: true, ceilingDb: -12, releaseMs: 50 };
+  const from = limiterPosition(CEILING_FIELD, -12);
+  const stepped = limiterChange(settings, "ceilingDb", from + 1, { key: keys.keyed(ceiling) });
+  assert.equal(stepped.ceilingDb, -11.5);
+  keys.keyup();
+  assert.equal(keys.keyed(ceiling), false, "released");
+  const dragged = limiterChange(settings, "ceilingDb", from + 1, { key: keys.keyed(ceiling) });
+  assert.equal(dragged.ceilingDb, -12, "the same position from the pointer stays put");
+
+  for (const key of ["PageDown", "Home", "End", "ArrowLeft"]) {
+    keys.keydown(release, key);
+    assert.equal(keys.keyed(release), true, key);
+  }
+  keys.keydown(release, "Tab");
+  assert.equal(keys.keyed(release), false, "Tab moves no slider");
+  keys.keydown(release, "ArrowDown");
+  keys.pointerdown();
+  assert.equal(keys.keyed(release), false, "a drag is never a key");
+  const down = limiterChange(settings, "releaseMs", limiterPosition(RELEASE_FIELD, 50) - 1, { key: true });
+  assert.equal(down.releaseMs, 49, "an arrow down moves one millisecond");
 });

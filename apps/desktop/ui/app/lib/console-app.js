@@ -1007,31 +1007,36 @@ export function createConsoleApp({
   // the change shown meanwhile is settled either way. Only the command decides whether it was set:
   // a status that cannot be read after a set leaves the set, and the strip shows what the desk
   // answered until the next status.
+  //
+  // The change is settled on every path (in `finally`), even when the answer cannot be read, so
+  // the strip never stays on a change that is no longer on its way.
   async function sendLimiter(address, sent) {
     const local = address === LOCAL_MIX;
-    const musician = local ? null : musicianByAddress(store.getState(), address);
-    const name = local ? "The local mix" : musician ? musicianLabel(musician) : address;
-    let answer;
+    let name = local ? "The local mix" : address;
+    let kept = null;
     try {
+      const musician = local ? null : musicianByAddress(store.getState(), address);
+      name = local ? name : musician ? musicianLabel(musician) : address;
       if (!local && !musician) {
         throw new Error(`${name} is not here`);
       }
-      answer = local
+      const answer = local
         ? await api.setLocalLimiter(sent)
         : await api.setMusicianLimiter(musicianKey(musician), sent);
+      const said = formatLimiterSet(answer, name);
+      const settings = said.ok ? clampLimiter(answer.settings) : null;
+      limiterSaid.set(address, said);
+      const unread = await readStatus();
+      kept = unread ? settings : null;
     } catch (error) {
       const whose = local ? "The local mix's" : `${name}'s`;
       limiterSaid.set(address, {
         ok: false,
         message: sentenceWithReason(`${whose} limiter was not set`, message(error)),
       });
-      store.dispatch(actions.limiterSettled(address, sent));
-      return;
+    } finally {
+      store.dispatch(actions.limiterSettled(address, sent, kept));
     }
-    const said = formatLimiterSet(answer, name);
-    limiterSaid.set(address, said);
-    const unread = await readStatus();
-    store.dispatch(actions.limiterSettled(address, sent, unread && said.ok ? clampLimiter(answer.settings) : null));
   }
 
   const limiterSender = createCoalescer(sendLimiter);

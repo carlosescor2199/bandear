@@ -337,7 +337,7 @@ mod tests {
     /// An empty scratch directory for one test.
     fn scratch(test: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-soundcheck-tests")
+            .join("bandear-soundcheck-tests")
             .join(test);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("scratch directory");
@@ -359,7 +359,7 @@ mod tests {
             let config = root.join("config");
             let session = SessionStore::open(&config);
             let default = RecordingsFolder {
-                folder: root.join("Music").join("MixLink").join("Recordings"),
+                folder: root.join("Music").join("BandEar").join("Recordings"),
                 notice: None,
             };
             Self {

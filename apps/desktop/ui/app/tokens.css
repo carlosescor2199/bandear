@@ -1,5 +1,5 @@
 /*
- * MixLink console design tokens and base element styles.
+ * BandEar console design tokens and base element styles.
  *
  * Every colour, size and radius the console uses is a custom property here; components read them
  * through their Shadow DOM, since custom properties inherit across it. Text colours keep at least

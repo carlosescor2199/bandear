@@ -9,13 +9,13 @@
 use std::thread::sleep;
 use std::time::Duration;
 
-use mixlink_desktop::commands::{self, DesktopState};
-use mixlink_desktop::dto::StartRequest;
-use mixlink_desktop::session::SessionStore;
+use bandear_desktop::commands::{self, DesktopState};
+use bandear_desktop::dto::StartRequest;
+use bandear_desktop::session::SessionStore;
 
 fn main() {
     // A scratch config directory: the probe must not disturb the real app's session.
-    let directory = std::env::temp_dir().join("mixlink-desktop-probe");
+    let directory = std::env::temp_dir().join("bandear-desktop-probe");
     let state = DesktopState::new(SessionStore::open(&directory));
 
     let summary =

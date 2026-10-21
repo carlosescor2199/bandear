@@ -1545,7 +1545,7 @@ impl From<&TakeSummary> for TakeSummaryDto {
 pub struct RecordingSettingsDto {
     /// The folder takes are made in, whole: the kept one, or the default.
     pub folder: String,
-    /// The desk's default folder (the user's Music folder + `MixLink\Recordings`).
+    /// The desk's default folder (the user's Music folder + `BandEar\Recordings`).
     pub default_folder: String,
     /// Whether `folder` is the default.
     pub folder_is_default: bool,

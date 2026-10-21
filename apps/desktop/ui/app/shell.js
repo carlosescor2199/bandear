@@ -8,7 +8,7 @@
 // once for the window, and compose the organisms. Until a section has its screen, a placeholder
 // heading stands in.
 //
-// In the MixLink app the console talks to the engine through Tauri. Opened in a browser as
+// In the BandEar app the console talks to the engine through Tauri. Opened in a browser as
 // `index.html?fake` (served by dev/serve.mjs), it runs against the simulated engine of
 // lib/fake-bridge.js instead.
 
@@ -52,7 +52,7 @@ function renderSidebar(nav) {
     (route) =>
       `<li><a class="nav-link" href="${route.hash}" data-route="${route.id}" title="${route.label}">${icon(route.id)}<span class="nav-label">${route.label}</span></a></li>`,
   ).join("");
-  nav.innerHTML = `<div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">MixLink</span></div><ul class="nav-list">${links}</ul>`;
+  nav.innerHTML = `<div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">BandEar</span></div><ul class="nav-list">${links}</ul>`;
 }
 
 /** The stand-in for a section whose screen is not built yet. */
@@ -129,7 +129,7 @@ function unavailableScreen(main) {
   heading.textContent = "No engine to talk to";
   const note = document.createElement("p");
   note.append(
-    "This console runs inside the MixLink app. To preview it in a browser with a simulated " +
+    "This console runs inside the BandEar app. To preview it in a browser with a simulated " +
       "engine, open ",
   );
   const link = document.createElement("a");

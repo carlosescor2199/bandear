@@ -1,4 +1,4 @@
-//! The MixLink desktop shell.
+//! The BandEar desktop shell.
 //!
 //! This crate is deliberately thin: it owns the window and the JSON contract, and delegates every
 //! engine call to [commands]. The engine lives in `personal-monitoring` and knows nothing of Tauri,
@@ -426,7 +426,7 @@ async fn stop_soundcheck(state: State<'_, DesktopState>) -> Result<SoundcheckDto
     commands::soundcheck::stop_soundcheck(state.inner())
 }
 
-/// Where the log is: `{ directory, file, failedLines }`, the folder, the current `mixlink.log` and
+/// Where the log is: `{ directory, file, failedLines }`, the folder, the current `bandear.log` and
 /// the lines it could not take since the start (see [logfile]); an error when the app could not
 /// set its log file up and logs to stderr only.
 #[tauri::command]
@@ -684,7 +684,7 @@ pub fn run() {
                     let log_file = logfile::install(log_directory);
                     log_info!(
                         "app",
-                        "MixLink desktop {} on {} {}; log file \"{}\"",
+                        "BandEar desktop {} on {} {}; log file \"{}\"",
                         app.package_info().version,
                         std::env::consts::OS,
                         std::env::consts::ARCH,
@@ -699,7 +699,7 @@ pub fn run() {
             // engine or any client protocol. Opening it never fails: a damaged file is set aside
             // and logged. The engineer's named sessions live beside it, in `sessions`.
             let directory = app.path().app_config_dir()?;
-            // Takes go to the user's Music folder + MixLink\Recordings by default; when it cannot
+            // Takes go to the user's Music folder + BandEar\Recordings by default; when it cannot
             // be found, to the app's own data folder, and the recording settings say so. Never
             // inside the config folder, which the data folder is on macOS: then the next place.
             let recordings = commands::recording::default_recordings_folder(
@@ -792,7 +792,7 @@ pub fn run() {
             eq_response
         ])
         .build(tauri::generate_context!())
-        .expect("error while building the MixLink desktop shell")
+        .expect("error while building the BandEar desktop shell")
         .run(|app, event| {
             let state = app.try_state::<DesktopState>();
             on_run_event(state.as_deref(), &event);
@@ -839,7 +839,7 @@ mod tests {
     #[test]
     fn only_quitting_the_app_writes_the_local_mix_still_waiting() {
         let directory = std::env::temp_dir()
-            .join("mixlink-run-event-tests")
+            .join("bandear-run-event-tests")
             .join("exit");
         let _ = std::fs::remove_dir_all(&directory);
         // The state's saver writes only when flushed, so no interval can write the mix behind the

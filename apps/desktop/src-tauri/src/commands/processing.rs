@@ -106,7 +106,7 @@ impl ProcessingEngine for EngineHandle {
 
 impl Kept for SessionProcessing {
     const WHAT: &'static str = "the channel processing";
-    const THREAD: &'static str = "mixlink-processing-saver";
+    const THREAD: &'static str = "bandear-processing-saver";
 }
 
 /// Keeps the channel processing in the session off the engine lock (see the module documentation).
@@ -1168,7 +1168,7 @@ mod tests {
 
     fn test_directory(name: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-desktop-tests")
+            .join("bandear-desktop-tests")
             .join(format!("processing-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("test directory");

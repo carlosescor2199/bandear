@@ -43,7 +43,7 @@ const NOTICES = Object.freeze({
   "no-musicians": {
     title: "No phones yet",
     text:
-      "Musicians appear here when they open MixLink on their phone and join this computer. " +
+      "Musicians appear here when they open BandEar on their phone and join this computer. " +
       "You can also add a phone by address in ",
     link: { href: "#/network", label: "Network and system" },
   },

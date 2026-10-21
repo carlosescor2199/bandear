@@ -891,7 +891,7 @@ test("the window is titled after the input device, and plainly when no engine ru
   const { fake, app } = await connected();
   await app.stop();
 
-  assert.deepEqual(fake.titles, ["MixLink Server — Demo interface", "MixLink Server"]);
+  assert.deepEqual(fake.titles, ["BandEar Server — Demo interface", "BandEar Server"]);
   app.dispose();
 });
 

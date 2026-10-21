@@ -34,7 +34,7 @@ function reduce(list, state = initialState) {
 
 const SETTINGS = Object.freeze({
   folder: "D:\\Recordings",
-  defaultFolder: "C:\\Users\\Demo\\Music\\MixLink\\Recordings",
+  defaultFolder: "C:\\Users\\Demo\\Music\\BandEar\\Recordings",
   folderIsDefault: false,
   format: "int24",
   includeLocal: false,
@@ -524,7 +524,7 @@ test("the settings show the folder, its default and notice, the format and the l
   assert.deepEqual(view, {
     known: true,
     folder: "D:\\Recordings",
-    defaultFolder: "C:\\Users\\Demo\\Music\\MixLink\\Recordings",
+    defaultFolder: "C:\\Users\\Demo\\Music\\BandEar\\Recordings",
     isDefault: false,
     notice: "The Music folder…",
     format: "int24",

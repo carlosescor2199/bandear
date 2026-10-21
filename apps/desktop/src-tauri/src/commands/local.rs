@@ -356,7 +356,7 @@ mod tests {
 
     /// An empty scratch config directory for one test's session.
     fn session_directory(test: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join("mixlink-local-tests").join(test);
+        let directory = std::env::temp_dir().join("bandear-local-tests").join(test);
         let _ = std::fs::remove_dir_all(&directory);
         directory
     }

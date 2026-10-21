@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MixLink",
+  "productName": "BandEar",
   "version": "0.1.0",
-  "identifier": "com.mixlink.desktop",
+  "identifier": "com.bandear.desktop",
   "build": {
     "frontendDist": "../ui"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "MixLink Server",
+        "title": "BandEar Server",
         "width": 1180,
         "height": 780,
         "minWidth": 820,

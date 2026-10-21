@@ -40,7 +40,7 @@ pub(crate) trait Kept: Clone + Send + 'static {
 
 impl Kept for SessionMix {
     const WHAT: &'static str = "the local mix";
-    const THREAD: &'static str = "mixlink-local-mix-saver";
+    const THREAD: &'static str = "bandear-local-mix-saver";
 }
 
 /// The saver of the engineer's local mix.
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "said once: {lines:?}");
 
         *outcome.lock().expect("outcome") =
-            Err("the session was written by a newer MixLink".to_owned());
+            Err("the session was written by a newer BandEar".to_owned());
         saver.flush();
         let lines = said.lock().expect("said").clone();
         assert_eq!(lines.len(), 2, "a new failure is said: {lines:?}");

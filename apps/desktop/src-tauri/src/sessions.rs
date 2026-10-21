@@ -114,7 +114,7 @@ pub struct SnapshotSummary {
     pub saved_at: Option<u64>,
     /// How many musicians' mixes it keeps.
     pub mixes: usize,
-    /// Why it cannot be loaded (it cannot be read, or a newer MixLink wrote it); null when it can.
+    /// Why it cannot be loaded (it cannot be read, or a newer BandEar wrote it); null when it can.
     pub problem: Option<String>,
 }
 
@@ -154,7 +154,7 @@ impl SnapshotStore {
     }
 
     /// Reads the session saved as `id` for loading. A session that cannot be read, or that a newer
-    /// MixLink wrote, is an error saying so.
+    /// BandEar wrote, is an error saying so.
     pub fn read(&self, id: &str) -> Result<SnapshotRead, String> {
         let _files = self.lock();
         let bytes = self.bytes(id)?;
@@ -353,7 +353,7 @@ fn parse_snapshot(id: &str, bytes: &[u8]) -> Result<(Snapshot, Vec<String>), Str
         Versioned::Current(fields) => fields,
         Versioned::Newer(version) => {
             return Err(format!(
-                "it was saved by a newer MixLink (version {version})"
+                "it was saved by a newer BandEar (version {version})"
             ))
         }
         Versioned::Invalid(problem) => return Err(format!("the file {problem}")),
@@ -416,7 +416,7 @@ mod tests {
     /// An empty scratch folder for one test's named sessions.
     fn test_directory(test: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-sessions-tests")
+            .join("bandear-sessions-tests")
             .join(test);
         let _ = fs::remove_dir_all(&directory);
         directory

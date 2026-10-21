@@ -78,7 +78,7 @@ test("the badge and the title say Demo source only while the demo plays", () => 
   const live = withStatus(sampleStatus());
   assert.equal(isDemoRunning(live), false);
   assert.equal(demoChip(live), null, "an interface");
-  assert.equal(windowTitle(live), "MixLink Server — Demo interface");
+  assert.equal(windowTitle(live), "BandEar Server — Demo interface");
 
   const demo = withStatus(demoStatus());
   assert.equal(isDemoRunning(demo), true);
@@ -92,7 +92,7 @@ test("the badge and the title say Demo source only while the demo plays", () => 
       "system to choose an interface",
     href: "#/network",
   });
-  assert.equal(windowTitle(demo), "MixLink Server — Demo source");
+  assert.equal(windowTitle(demo), "BandEar Server — Demo source");
 
   const stopped = withStatus({ ...demoStatus(), stopped: true });
   assert.equal(demoChip(stopped), null, "a stopped engine plays nothing");
@@ -203,6 +203,6 @@ test("the console starts the demo by its driver and keeps the choice", async () 
   const state = app.store.getState();
   assert.equal(state.audio.host, "demo");
   assert.equal(isDemoRunning(state), true);
-  assert.equal(windowTitle(state), "MixLink Server — Demo source");
+  assert.equal(windowTitle(state), "BandEar Server — Demo source");
   app.dispose();
 });

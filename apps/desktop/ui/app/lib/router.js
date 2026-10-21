@@ -71,7 +71,7 @@ export function canonicalHash(hash) {
   return channel === null ? route.hash : processingHash(channel);
 }
 
-/** The window title for a section: "Mix · MixLink". */
+/** The window title for a section: "Mix · BandEar". */
 export function documentTitle(route) {
-  return `${route.title} · MixLink`;
+  return `${route.title} · BandEar`;
 }

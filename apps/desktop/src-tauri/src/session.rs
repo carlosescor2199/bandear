@@ -155,7 +155,7 @@
 //!   absent until something was kept: an earlier build reads the file and drops it when it saves.
 //! - `recording` is how this desk records takes (see [crate::commands::recording]): the folder the
 //!   take folders are made in (absent or null for the desk's default, the user's Music folder +
-//!   `MixLink\Recordings`), the WAV format (`int24`, the default, or `float32`), whether the local
+//!   `BandEar\Recordings`), the WAV format (`int24`, the default, or `float32`), whether the local
 //!   mix is recorded too, and the armed inputs as 1-based channel numbers (arming either side of a
 //!   linked pair records the pair). Any field may be left out and then has its default. It belongs
 //!   to this desk: a named session never carries it, and loading one keeps the desk's own. Like
@@ -1394,7 +1394,7 @@ fn load(path: &Path, legacy: &Path) -> Loaded {
             Parsed::Current(session, damaged) => set_sections_aside(path, session, damaged),
             Parsed::Newer(version) => {
                 let refusal = format!(
-                    "the session file {} was written by a newer MixLink (version {version}); it is \
+                    "the session file {} was written by a newer BandEar (version {version}); it is \
                      left untouched, the desk starts with an empty session and changes are not saved",
                     path.display()
                 );
@@ -1447,7 +1447,7 @@ pub(crate) fn versioned_fields(bytes: &[u8]) -> Versioned {
         return Versioned::Newer(version);
     }
     if version != SESSION_VERSION {
-        return Versioned::Invalid(format!("has version {version}, which no MixLink writes"));
+        return Versioned::Invalid(format!("has version {version}, which no BandEar writes"));
     }
     match value {
         Value::Object(fields) => Versioned::Current(fields),
@@ -1709,7 +1709,7 @@ mod tests {
     /// An empty scratch config directory for one test.
     fn test_directory(test: &str) -> PathBuf {
         let directory = std::env::temp_dir()
-            .join("mixlink-session-tests")
+            .join("bandear-session-tests")
             .join(test);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("test directory should be created");

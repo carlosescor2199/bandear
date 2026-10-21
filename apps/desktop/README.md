@@ -1,6 +1,6 @@
-# MixLink desktop
+# BandEar desktop
 
-The mixing console for the MixLink server. The engine (`apps/server`) captures the audio
+The mixing console for the BandEar server. The engine (`apps/server`) captures the audio
 interface and sends each phone its own mix; this app runs that engine and shows these screens:
 
 - **Mix**: every musician's mix: channel strips (group, input meter, pan, fader, Mute, Solo),
@@ -78,9 +78,9 @@ diagnosed.
 
 | Topic | Behaviour |
 | --- | --- |
-| Where | `mixlink.log` in the app's log folder: on Windows `%LOCALAPPDATA%\com.mixlink.desktop\logs\`, on macOS `~/Library/Logs/com.mixlink.desktop/`. The `log_location` command answers `{ directory, file, failedLines }`, and the file's path is the log's first line. |
+| Where | `bandear.log` in the app's log folder: on Windows `%LOCALAPPDATA%\com.bandear.desktop\logs\`, on macOS `~/Library/Logs/com.bandear.desktop/`. The `log_location` command answers `{ directory, file, failedLines }`, and the file's path is the log's first line. |
 | Line | `2026-10-18T19:04:05.123Z WARN  [control] message`: UTC time, level, area (`engine`, `control`, `session`, ...). |
-| Rotation | At 5 MB the file moves to `mixlink.log.1` (older ones to `.2` ... `.5`); five old files are kept. |
+| Rotation | At 5 MB the file moves to `bandear.log.1` (older ones to `.2` ... `.5`); five old files are kept. |
 | Failure | A line the file cannot take goes to stderr, and is counted in `failedLines`. A rotation that fails keeps writing to the current file. |
 | Development | Debug lines are written only in a development build, which also mirrors every line to stderr. |
 
@@ -91,7 +91,7 @@ The musicians' live mixes are backed up as they change, so a crash loses at most
 | Topic | Behaviour |
 | --- | --- |
 | When | 3 s after the mixes go still (at most 20 s after the first change), on engine stop and on exit. An unchanged backup is not written again. |
-| Where | `backups/mixes-<UTC stamp>.json` in the app's config folder (on Windows `%APPDATA%\com.mixlink.desktop\`), written through a temporary file. The newest 10 are kept. |
+| Where | `backups/mixes-<UTC stamp>.json` in the app's config folder (on Windows `%APPDATA%\com.bandear.desktop\`), written through a temporary file. The newest 10 are kept. |
 | What | Each musician's name, client id, address and mix. Locks and limits are not in it: the session keeps them. |
 | Restore | Network and system, **Mix backups**: pick a backup, **Restore**, confirm. Each mix goes to that musician if they are connected now; the others keep their own. A damaged backup is listed with its problem and cannot be restored. |
 
@@ -141,7 +141,7 @@ heard before.
 
 | Topic | Behaviour |
 | --- | --- |
-| Where takes go | The recordings folder in Settings. The default is your Music folder + `MixLink\Recordings` (if there is no Music folder, the app's data folder; never inside the app's config folder). |
+| Where takes go | The recordings folder in Settings. The default is your Music folder + `BandEar\Recordings` (if there is no Music folder, the app's data folder; never inside the app's config folder). |
 | Take folder | `<YYYY-MM-DD_HHMMSS>_<take name>`, in local time; ` (2)`, ` (3)`... when that name exists. A blank name is `Take`. |
 | Files | One mono file per armed input (`01 Vocal.wav`), one stereo file per linked pair (`03-04 Keys.wav`, either side arms it) and `Local mix.wav` when asked. Tracks are written before any processing. |
 | `take.json` | Written when the take starts and again when it ends (through a temporary file and a rename): tracks with their frames, start time, device, rate, format, markers, dropped frames and how the take ended. |
@@ -276,7 +276,7 @@ driver you pick, by name, and never loads the others.
   installed one. A name that matches no driver, or more than one, is refused and lists the
   candidates.
 - A driver that fails to load is reported; the engine never falls back to another host.
-- `vendor/cpal` is cpal 0.18.2 with a small patch (each change marked `MixLink patch`): cpal
+- `vendor/cpal` is cpal 0.18.2 with a small patch (each change marked `MixLink patch`, the product's earlier name): cpal
   lists ASIO devices by loading every installed driver in turn, and the first one on the
   development PC (Realtek ASIO) bugchecked it. The patch opens one driver by name through
   `device_by_id`. It goes once a cpal release opens one ASIO driver by name.
@@ -297,7 +297,7 @@ driver you pick, by name, and never loads the others.
 From the repository root:
 
 ```sh
-cargo run -p mixlink-desktop
+cargo run -p bandear-desktop
 ```
 
 The engine is built with ASIO support by default, which needs LLVM/Clang at build time; on a
@@ -321,7 +321,7 @@ browser shows that the console needs the app.
 
 ```sh
 node --test apps/desktop/ui/tests      # the console's logic
-cargo test -p mixlink-desktop          # the desktop commands, DTOs and event pump
+cargo test -p bandear-desktop          # the desktop commands, DTOs and event pump
 cargo test -p personal-monitoring      # the engine
 ```
 

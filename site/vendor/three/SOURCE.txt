@@ -1,0 +1,2 @@
+three.js 0.186.1 (MIT) from the official npm package https://registry.npmjs.org/three/-/three-0.186.1.tgz
+(integrity verified against the registry sha512). build/three.module.js + three.core.js bundled and minified with `bun build --minify --format esm` into three.module.min.js.

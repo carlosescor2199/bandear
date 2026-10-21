@@ -689,6 +689,8 @@ fn copy_with<E: ProcessingEngine>(
         .get(from - 1)
         .copied()
         .unwrap_or_default();
+    #[cfg(test)]
+    tests::between_read_and_write();
     let channels = apply_on(engine, saver, &targets, settings)?;
     drop(guard);
     let message = format!(
@@ -870,8 +872,6 @@ mod tests {
         stopping: bool,
         /// Every list it took whole.
         replaced: Mutex<Vec<Vec<StripSettings>>>,
-        /// Holds the next read of every strip, when set (see [ReadPark]).
-        park: Mutex<Option<ReadPark>>,
         /// Every strip it set, in order: the channel (0-based), what it kept and what CH 1 held then.
         writes: Mutex<Vec<(usize, StripSettings, StripSettings)>>,
     }
@@ -882,7 +882,6 @@ mod tests {
                 strips: Mutex::new(vec![StripSettings::default(); MIXER_CHANNELS]),
                 stopping: false,
                 replaced: Mutex::default(),
-                park: Mutex::default(),
                 writes: Mutex::default(),
             }
         }
@@ -890,27 +889,17 @@ mod tests {
 
     const PAIR: [usize; 2] = [2, 3];
 
-    /// Holds one read of the strips while another change runs: it says it is parked, waits for the
-    /// competing change to say it is about to take the engine lock, and notes whether CH 1's strip
-    /// changed meanwhile (a change landed while the read was half done). No fixed wait: the read
-    /// goes on only once the competitor is at the lock.
-    struct ReadPark {
-        parked: std::sync::mpsc::Sender<()>,
-        competitor: std::sync::mpsc::Receiver<()>,
-        changed_meanwhile: Arc<std::sync::atomic::AtomicBool>,
+    thread_local! {
+        /// What [between_read_and_write] runs once on this thread, when set.
+        static BETWEEN_READ_AND_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
     }
 
-    impl ReadPark {
-        fn hold(self, engine: &StandIn) {
-            let before = engine.strips.lock().expect("strips")[0];
-            self.parked.send(()).expect("the test waits for the park");
-            self.competitor
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("the competing change reached the engine lock");
-            if engine.strips.lock().expect("strips")[0] != before {
-                self.changed_meanwhile
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+    /// Where a copy stands between reading its source and writing its targets: runs the hold a
+    /// test set on this thread, once.
+    pub(super) fn between_read_and_write() {
+        if let Some(hold) = BETWEEN_READ_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
+            hold();
         }
     }
 
@@ -940,10 +929,6 @@ mod tests {
         }
 
         fn processing(&self) -> Vec<StripSettings> {
-            let park = self.park.lock().expect("park").take();
-            if let Some(park) = park {
-                park.hold(self);
-            }
             self.strips.lock().expect("strips").clone()
         }
 
@@ -1508,74 +1493,104 @@ mod tests {
         );
     }
 
-    /// A copy reads its source and writes its targets as one step. Every round forces the overlap:
-    /// the copy is parked while it reads CH 1, and a change to CH 1 is sent meanwhile. The change
-    /// waits for the copy to be done, so when the copy writes CH 5 and CH 6 CH 1 still holds what it
-    /// read, and CH 1 ends with the change.
+    /// A copy reads its source and writes its targets under one hold of the engine lock. The copy
+    /// is parked between its read and its write, and a change to the source is sent meanwhile: the
+    /// engine lock is still held, the change is blocked on it and does not land, and once the copy
+    /// goes on it writes the strip it read and the change lands after it.
     #[test]
     fn a_change_to_the_source_sent_during_a_copy_lands_after_the_copy() {
-        for round in 0..8 {
-            let session = Arc::new(SessionStore::open(&test_directory(&format!(
-                "copy-{round}"
-            ))));
-            let saver = saver_into(&session);
-            let engine = running();
-            set_with(&engine, &saver, 1, compressed(-20.0)).expect("set");
-            let (parked, parked_signal) = std::sync::mpsc::channel();
-            let (at_lock, competitor) = std::sync::mpsc::channel();
-            let changed_meanwhile = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            {
-                let guard = engine.lock().expect("engine");
-                let stand_in = guard.as_ref().expect("running");
-                stand_in.writes.lock().expect("writes").clear();
-                *stand_in.park.lock().expect("park") = Some(ReadPark {
-                    parked,
-                    competitor,
-                    changed_meanwhile: Arc::clone(&changed_meanwhile),
-                });
-            }
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::Duration;
 
-            std::thread::scope(|scope| {
-                let (engine, saver) = (&engine, &saver);
-                scope.spawn(move || {
-                    let copied = copy_with(engine, saver, 1, &[5, 6]).expect("copied");
-                    assert_eq!(copied.outcome, "set", "{copied:?}");
+        let session = Arc::new(SessionStore::open(&test_directory("copy-race")));
+        let saver = saver_into(&session);
+        let engine = running();
+        set_with(&engine, &saver, 1, compressed(-20.0)).expect("set");
+        engine
+            .lock()
+            .expect("engine")
+            .as_ref()
+            .expect("running")
+            .writes
+            .lock()
+            .expect("writes")
+            .clear();
+        let (parked, parked_signal) = channel::<()>();
+        let (release, released) = channel::<()>();
+        let (attempting, attempt_signal) = channel::<()>();
+        let (landed, landed_signal) = channel::<()>();
+
+        std::thread::scope(|scope| {
+            let (engine, saver) = (&engine, &saver);
+            let copy = scope.spawn(move || {
+                BETWEEN_READ_AND_WRITE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        parked.send(()).expect("the test waits for the park");
+                        released
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("the test lets the copy go on");
+                    }));
                 });
-                parked_signal
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .expect("the copy reached its read");
-                // The change to the source runs while the copy is between its read and its write.
-                scope.spawn(move || {
-                    at_lock.send(()).expect("the park waits for the change");
-                    set_with(engine, saver, 1, compressed(-40.0)).expect("set");
-                });
+                copy_with(engine, saver, 1, &[5, 6]).expect("copied")
             });
+            parked_signal
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the copy parked between its read and its write");
+            let change = scope.spawn(move || {
+                attempting.send(()).expect("the test waits for the attempt");
+                let set = set_with(engine, saver, 1, compressed(-40.0)).expect("set");
+                // The test may have stopped listening; the change landed either way.
+                let _ = landed.send(());
+                set
+            });
+            attempt_signal
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the change was sent");
 
+            let held = matches!(engine.try_lock(), Err(std::sync::TryLockError::WouldBlock));
             assert!(
-                !changed_meanwhile.load(std::sync::atomic::Ordering::SeqCst),
-                "round {round}: CH 1 changed while the copy was reading it"
+                held,
+                "the engine lock was free between the copy's read and its write"
             );
-            let guard = engine.lock().expect("engine");
-            let writes = guard
-                .as_ref()
-                .expect("running")
-                .writes
-                .lock()
-                .expect("writes")
-                .clone();
-            drop(guard);
-            for (channel, kept, source) in writes.iter().filter(|(channel, ..)| *channel != 0) {
-                assert_eq!(
-                    kept,
-                    source,
-                    "round {round}: CH {} took a strip CH 1 no longer held: {writes:?}",
-                    channel + 1
-                );
-            }
-            let strips = strips_of(&engine);
-            assert_eq!(strips[0], compressed(-40.0).clamped(), "round {round}");
-            assert_eq!(strips[4], compressed(-20.0).clamped(), "round {round}");
-            assert_eq!(strips[5], compressed(-20.0).clamped(), "round {round}");
+            assert_eq!(
+                landed_signal.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout),
+                "the change landed while the copy was between its read and its write"
+            );
+
+            release.send(()).expect("the copy waits");
+            let copied = copy.join().expect("the copy ran");
+            assert_eq!(copied.outcome, "set", "{copied:?}");
+            let changed = change.join().expect("the change ran");
+            assert_eq!(changed.outcome, "set", "{changed:?}");
+        });
+
+        let guard = engine.lock().expect("engine");
+        let writes = guard
+            .as_ref()
+            .expect("running")
+            .writes
+            .lock()
+            .expect("writes")
+            .clone();
+        drop(guard);
+        let channels: Vec<usize> = writes.iter().map(|(channel, ..)| *channel).collect();
+        assert_eq!(
+            channels,
+            vec![4, 5, 0],
+            "the copy's writes, then the change: {writes:?}"
+        );
+        for (channel, kept, source) in &writes[..2] {
+            assert_eq!(
+                (kept, source),
+                (&compressed(-20.0).clamped(), &compressed(-20.0).clamped()),
+                "CH {} took the strip the copy read, and CH 1 still held it",
+                channel + 1
+            );
         }
+        let strips = strips_of(&engine);
+        assert_eq!(strips[0], compressed(-40.0).clamped());
+        assert_eq!(strips[4], compressed(-20.0).clamped());
+        assert_eq!(strips[5], compressed(-20.0).clamped());
     }
 }

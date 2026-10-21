@@ -2,9 +2,9 @@
 <resources>
     <!--
         The colours Android draws before and outside Compose (the window, the launcher icon); the same
-        as MixLinkColors' ground, accent and text.
+        as BandEarColors' ground, accent and text.
     -->
-    <color name="mixlink_ground">#FF0D1117</color>
-    <color name="mixlink_accent">#FFF5A524</color>
-    <color name="mixlink_text">#FFE6EDF3</color>
+    <color name="bandear_ground">#FF0D1117</color>
+    <color name="bandear_accent">#FFF5A524</color>
+    <color name="bandear_text">#FFE6EDF3</color>
 </resources>

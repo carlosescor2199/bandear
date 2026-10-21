@@ -9,7 +9,7 @@
         android:label="@string/app_name"
         android:usesCleartextTraffic="true"
         android:supportsRtl="true"
-        android:theme="@style/Theme.MixLink">
+        android:theme="@style/Theme.BandEar">
         <!-- adjustResize: the keyboard is an inset the Compose UI pads for, so a field stays in view. -->
         <activity
             android:name=".MainActivity"

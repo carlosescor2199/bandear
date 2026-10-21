@@ -305,19 +305,19 @@ mod tests {
     /// loopback addresses. Linux and Windows answer on all of 127/8, so there a failed bind is a
     /// real failure and the test fails. macOS only configures 127.0.0.1 unless told otherwise
     /// (`sudo ifconfig lo0 alias 127.0.0.2`): there the test reports itself skipped and returns,
-    /// unless `MIXLINK_REQUIRE_LOOPBACK_ALIASES` is set, which makes the gap a failure too.
+    /// unless `BANDEAR_REQUIRE_LOOPBACK_ALIASES` is set, which makes the gap a failure too.
     fn musician_phone(host: u8) -> Option<UdpSocket> {
         match UdpSocket::bind(format!("127.0.0.{host}:0")) {
             Ok(socket) => Some(socket),
             Err(error) => {
                 let required = cfg!(any(target_os = "windows", target_os = "linux"))
-                    || std::env::var_os("MIXLINK_REQUIRE_LOOPBACK_ALIASES").is_some();
+                    || std::env::var_os("BANDEAR_REQUIRE_LOOPBACK_ALIASES").is_some();
                 assert!(
                     !required,
                     "127.0.0.{host} cannot be bound ({error}); this test needs it for a second musician"
                 );
                 eprintln!(
-                    "SKIPPED: 127.0.0.{host} cannot be bound ({error}); add the loopback alias or set MIXLINK_REQUIRE_LOOPBACK_ALIASES to make this a failure"
+                    "SKIPPED: 127.0.0.{host} cannot be bound ({error}); add the loopback alias or set BANDEAR_REQUIRE_LOOPBACK_ALIASES to make this a failure"
                 );
                 None
             }

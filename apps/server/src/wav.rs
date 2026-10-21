@@ -1078,7 +1078,7 @@ mod tests {
 
     /// An empty scratch folder for one test's files.
     fn scratch_directory(test: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join("mixlink-wav-tests").join(test);
+        let directory = std::env::temp_dir().join("bandear-wav-tests").join(test);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         directory

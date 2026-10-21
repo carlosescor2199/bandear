@@ -70,7 +70,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   Rejects a wrong magic, an unknown version, a truncated header, a payload that disagrees with
   `sample_count`, and an odd sample count against a stereo stream. Golden bytes from the Rust test
   at `protocol.rs:665-672`.
-- [ ] T2 — Control-message codecs both directions (route: inline). `register`, `mix`, `stats` out;
+- [x] T2 — Control-message codecs both directions (route: inline). `register`, `mix`, `stats` out;
   `config`, `mix_ack`, `mix_state`, `playback`, `redundancy`, `error` in. Field-for-field against
   `apps/server/src/protocol.rs`, with the `register` name truncation at 64 characters and the
   `client_id` character rule.
@@ -163,4 +163,53 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   `--untracked-scope=exclude` and the expected inventory hash, which is what produced the verdict
   above. At `medium` with `Risk: none`, writer self-verification stands and no independent
   verifier runs.
-- Pending: T2 onward. The `.xcodeproj` decision is still open and belongs to T6.
+- T2 done in two work units (route: inline). Delegation was considered and declined: the two
+  directions are independent units with disjoint files, which does fire the parallel-writer
+  trigger on shape, but they share the conventions that matter (snake_case `CodingKeys`, omit
+  rather than send null, the `type` tag, the lenient-default policy) and a writer cannot see its
+  sibling. Explaining those invariants twice in two prompts costs more than writing them once,
+  and the whole of `protocol.rs` was already read for T1.
+  - T2a `Sources/BandEarProtocol/ClientMessage.swift` (+ tests): `ClientMessage` with
+    `register`, `mix` and `stats`. A `ControlPayload` protocol keeps each `type` string in exactly
+    one place. `Registration` normalises the way the desk does, so what the phone shows is what
+    the desk stores: the name trimmed and capped, a client id the desk would discard dropped here
+    rather than sent, capabilities deduplicated in order, and a zero UDP port refused outright.
+    `MixCommand` leaves an unset list out of the JSON instead of sending null, because the desk
+    reads an absent list as unchanged and sending a whole mix to move one fader would fight every
+    other socket of the same musician. `LinkStats` validates the interval and sanitises the
+    optional measurements on the way in.
+  - T2b `Sources/BandEarProtocol/ServerMessage.swift` (+ tests): `ServerMessage` decoding
+    `config`, `mix_ack`, `mix_state`, `playback`, `redundancy` and `error`. An unknown `type`
+    becomes `unrecognized(type:)` rather than an error, which is the desk's own repeated contract,
+    and keeping the name lets a diagnostics screen say what arrived. Fields added after a message
+    shipped are read with the documented fallback (`engineer_limit_percent` 100, `locked` all
+    false at the channel count, `following` nil) so an older desk still drives this client. One
+    `translatingMissingFields(in:)` turns a missing required key into `missingField` for every
+    message instead of each one catching for itself.
+- Two decisions worth naming:
+  - The name is cut to 64 **Unicode scalars**, not 64 Swift `Character`s, because the desk cuts
+    with Rust's `chars().take(64)` and `char` is a scalar. Counting graphemes would keep more
+    scalars than the desk stores and the phone would display a name the desk does not have.
+    Pinned by `truncatesNameByScalar` with a five-scalar ZWJ emoji.
+  - `LinkStats` drops a non-finite measurement. `JSONEncoder` *throws* on a non-finite double, so
+    a NaN jitter reading would lose the whole report mid-send over a value the desk was going to
+    discard anyway. Pinned by `dropsNonFiniteMeasurement`.
+- Test-first: RED observed before each implementation. T2a: 39 tests, 37 failed expectations
+  against a stub holding the API with no behaviour, then 39 passed. T2b: 63 tests, 37 failed
+  expectations, then 63 passed.
+- One self-correction during T2b: the first routing attempt passed a closure into the
+  missing-field translator so the string `config` could live in "one place"
+  (`case payloadType(DeskConfiguration.self):`). That is cleverness that costs readability for
+  nothing; the literal now sits in the switch where a reader expects it. A separate compile error
+  came from a `...` range operator opening a continuation line, where Swift reads it as a prefix
+  operator; the bounds are named locals now.
+- Checks: `swift test --package-path apps/ios/BandEarKit`: 63 passed, 0 failed.
+  `swift build`: clean, no warnings. No SwiftUI, UIKit or AVFoundation import in `Sources`.
+  Neither work unit touched a file from an earlier task, so no existing behaviour is in reach.
+- Risk: none. Additive files in a package nothing depends on yet.
+- Work-unit commits: `7345c11 feat(ios): encode the register, mix and stats control messages`
+  (T2a) and `fe64a44 feat(ios): decode the desk's config, mix, playback and error messages`
+  (T2b).
+- Native review assessment of the T2 slice against base 9b0fd19: `medium`, `review_due: false`,
+  reason `under_budget` (4 paths, 1282 lines). No review for this slice yet; it stays open.
+- Pending: T3 onward. The `.xcodeproj` decision is still open and belongs to T6.

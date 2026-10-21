@@ -71,6 +71,9 @@ pub struct RecordingsFolder {
     pub notice: Option<String>,
 }
 
+/// The name of the folder the desk's takes go in by default, inside the user's Music folder.
+pub const PRODUCT_FOLDER: &str = "BandEar";
+
 /// The default recordings folder: `music` (the user's Music folder) + `BandEar\Recordings`; when it
 /// is not known, `fallback` (the app's own data folder) + `Recordings`, and when neither is, the
 /// system's temporary folder + `BandEar\Recordings`, each saying so. Like any recordings folder it
@@ -82,8 +85,20 @@ pub fn default_recordings_folder(
     fallback: Option<PathBuf>,
     config: &Path,
 ) -> RecordingsFolder {
+    default_recordings_folder_for(PRODUCT_FOLDER, music, fallback, config)
+}
+
+/// [default_recordings_folder] for a desk whose product folder is `product`: `BandEar` for this
+/// desk, `MixLink` for the one it was called before (see [crate::migration]), whose takes may still
+/// be in that folder.
+pub fn default_recordings_folder_for(
+    product: &str,
+    music: Option<PathBuf>,
+    fallback: Option<PathBuf>,
+    config: &Path,
+) -> RecordingsFolder {
     let outside = |folder: &PathBuf| !inside(folder, config);
-    let music_folder = music.map(|music| music.join("BandEar").join("Recordings"));
+    let music_folder = music.map(|music| music.join(product).join("Recordings"));
     if let Some(folder) = music_folder.clone().filter(outside) {
         return RecordingsFolder {
             folder,
@@ -94,15 +109,17 @@ pub fn default_recordings_folder(
     let folder = data_folder
         .clone()
         .filter(outside)
-        .or_else(|| Some(std::env::temp_dir().join("BandEar").join("Recordings")).filter(outside))
-        .unwrap_or_else(|| beside(config));
+        .or_else(|| Some(std::env::temp_dir().join(product).join("Recordings")).filter(outside))
+        .unwrap_or_else(|| beside(product, config));
     let mut why = if music_folder.is_some() {
-        "Your Music folder is inside BandEar's own settings folder".to_owned()
+        format!("Your Music folder is inside {product}'s own settings folder")
     } else {
         "Your Music folder could not be found".to_owned()
     };
     if data_folder.is_some_and(|data| !outside(&data)) {
-        why.push_str(" and BandEar's data folder is inside its settings folder");
+        why.push_str(&format!(
+            " and {product}'s data folder is inside its settings folder"
+        ));
     }
     RecordingsFolder {
         notice: Some(format!(
@@ -113,10 +130,13 @@ pub fn default_recordings_folder(
     }
 }
 
-/// `BandEar Recordings` beside the `config` folder, which is never inside it (but for a config
+/// `<product> Recordings` beside the `config` folder, which is never inside it (but for a config
 /// folder that is a whole drive, which has nothing beside it).
-fn beside(config: &Path) -> PathBuf {
-    config.parent().unwrap_or(config).join("BandEar Recordings")
+fn beside(product: &str, config: &Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or(config)
+        .join(format!("{product} Recordings"))
 }
 
 /// Where recording looks for its folders: the default recordings folder and the app's own config

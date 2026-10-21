@@ -9,6 +9,7 @@ pub mod commands;
 pub mod dto;
 pub mod events;
 pub mod logfile;
+pub mod migration;
 pub mod session;
 pub mod sessions;
 
@@ -702,14 +703,25 @@ pub fn run() {
             // Takes go to the user's Music folder + BandEar\Recordings by default; when it cannot
             // be found, to the app's own data folder, and the recording settings say so. Never
             // inside the config folder, which the data folder is on macOS: then the next place.
+            let music = app.path().audio_dir().ok();
+            let local_data = app.path().app_local_data_dir().ok();
             let recordings = commands::recording::default_recordings_folder(
-                app.path().audio_dir().ok(),
-                app.path().app_local_data_dir().ok(),
+                music.clone(),
+                local_data.clone(),
                 &directory,
             );
             if let Some(notice) = &recordings.notice {
                 log_warn!("app", "{notice}");
             }
+            // A desk that ran as MixLink (identifier com.mixlink.desktop) has its session, named
+            // sessions and backups in the old folders: on the first start they are copied here,
+            // before the session is opened, and takes in its default folder stay listed.
+            migration::bring_over_and_log(&migration::DeskFolders {
+                config: directory.clone(),
+                local_data,
+                music,
+                recordings: recordings.folder.clone(),
+            });
             // Every engine the window starts streams its meters, status and mix changes as events
             // (see [events]); the app handle is both where the pump reads and where it emits.
             let handle = app.handle().clone();

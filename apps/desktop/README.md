@@ -97,6 +97,20 @@ The musicians' live mixes are backed up as they change, so a crash loses at most
 
 A phone that reconnects keeps its own opening mix: restoring is always the engineer's choice.
 
+## Coming from MixLink
+
+BandEar was called MixLink, with the identifier `com.mixlink.desktop`, so its folders were named
+after that (`%APPDATA%\com.mixlink.desktop\` on Windows). On its first start BandEar brings that
+desk over (see `src/migration.rs`):
+
+| Topic | Behaviour |
+| --- | --- |
+| When | Once: when BandEar's config folder has no `session.json` yet and the old `com.mixlink.desktop` folder beside it exists. A `mixlink-migration.txt` in BandEar's config folder says it ran. |
+| What | `session.json`, `musicians.json`, `sessions/` and `backups/`, each file through a temporary file. A file BandEar already has is never replaced. Logs and anything else stay where they were. |
+| Old folders | Only read: nothing in them is changed or removed. The old MixLink app, if still installed, keeps working with them. |
+| Takes | Never copied. When the old desk recorded into its default folder (Music + `MixLink\Recordings`), that folder has takes and `BandEar\Recordings` does not exist yet, the migrated session names the old folder, so every take stays listed and new ones go beside them. Choose another folder in the recording settings at any time. |
+| Log | Each copied file, each file kept, the recordings folder chosen and any failure go to `bandear.log` under `migration`. A failure is tried again on the next start. |
+
 ## Demo source
 
 The engine can run with no audio interface, to show the app or test phones.

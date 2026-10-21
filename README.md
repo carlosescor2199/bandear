@@ -1,14 +1,14 @@
 <div align="center">
 
-<img src="apps/desktop/src-tauri/icons/128x128@2x.png" alt="MixLink logo" width="112" />
+<img src="apps/desktop/src-tauri/icons/128x128@2x.png" alt="BandEar logo" width="112" />
 
-# MixLink
+# BandEar
 
 **Every musician gets their own in-ear mix, on their own phone.**
 Low-latency personal monitoring over the Wi-Fi you already have — no extra hardware.
 
-[![Latest release](https://img.shields.io/github/v/release/carlosescor2199/mixlink?style=for-the-badge&color=f5a524&label=release)](https://github.com/carlosescor2199/mixlink/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/carlosescor2199/mixlink/total?style=for-the-badge&color=2ea44f)](https://github.com/carlosescor2199/mixlink/releases)
+[![Latest release](https://img.shields.io/github/v/release/carlosescor2199/bandear?style=for-the-badge&color=f5a524&label=release)](https://github.com/carlosescor2199/bandear/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/carlosescor2199/bandear/total?style=for-the-badge&color=2ea44f)](https://github.com/carlosescor2199/bandear/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-4c8bf5?style=for-the-badge)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-db61a2?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/carlosescor2199)
 
@@ -23,41 +23,44 @@ Low-latency personal monitoring over the Wi-Fi you already have — no extra har
 
 <br />
 
-<img src="docs/screenshots/mix.png" alt="The MixLink console: one tab per musician, channel strips, groups and the master with its limiter" width="100%" />
+<img src="docs/screenshots/mix.png" alt="The BandEar console: one tab per musician, channel strips, groups and the master with its limiter" width="100%" />
 
 </div>
 
 ---
 
-## Why MixLink
+## Why BandEar
 
 On stage and in rehearsal, everyone wants to hear something different: the singer wants more voice, the drummer more bass, the keys player more click. Traditional personal monitor systems solve that with dedicated mixers and wired receivers that cost a lot.
 
-**MixLink turns a computer and the musicians' own phones into a personal monitor system.** Your audio interface feeds the desktop app; each musician opens the MixLink app on their phone, joins the same Wi-Fi, and mixes their own ears — while the engineer keeps full control from the desk.
+**BandEar turns a computer and the musicians' own phones into a personal monitor system.** Your audio interface feeds the desktop app; each musician opens the BandEar app on their phone, joins the same Wi-Fi, and mixes their own ears — while the engineer keeps full control from the desk.
 
 ---
 
 ## 📦 Download
 
-Grab the file for your system from the [**latest release**](https://github.com/carlosescor2199/mixlink/releases/latest).
+Grab the file for your system from the [**latest release**](https://github.com/carlosescor2199/bandear/releases/latest).
 
 | You have | Download | Then |
 |---|---|---|
-| 🪟 **Windows** 10/11 | `MixLink_<version>_x64-setup.exe` | Run it. First time: *More info → Run anyway* (the installer is not signed yet). |
-| 🍎 **macOS**, Apple Silicon (M1–M4) | `MixLink_<version>_aarch64.dmg` | Drag MixLink to Applications. First time: right-click → *Open*. |
-| 🍎 **macOS**, Intel | `MixLink_<version>_x64.dmg` | Same as above. |
-| 🐧 **Linux** | `MixLink_<version>_amd64.AppImage` or `.deb` | `chmod +x` the AppImage and run it, or install the `.deb`. |
-| 🤖 **Android** 10+ (the musicians' app) | `MixLink_<version>_android.apk` | Allow installs from your browser, then open the APK. |
+| 🪟 **Windows** 10/11 | `BandEar_<version>_x64-setup.exe` | Run it. First time: *More info → Run anyway* (the installer is not signed yet). |
+| 🍎 **macOS**, Apple Silicon (M1–M4) | `BandEar_<version>_aarch64.dmg` | Drag BandEar to Applications. First time: right-click → *Open*. |
+| 🍎 **macOS**, Intel | `BandEar_<version>_x64.dmg` | Same as above. |
+| 🐧 **Linux** | `BandEar_<version>_amd64.AppImage` or `.deb` | `chmod +x` the AppImage and run it, or install the `.deb`. |
+| 🤖 **Android** 10+ (the musicians' app) | `BandEar_<version>_android.apk` | Allow installs from your browser, then open the APK. |
 
 > [!NOTE]
 > An iOS app for musicians is on the roadmap.
+
+> [!TIP]
+> BandEar used to be called MixLink. The desktop app brings a MixLink desk's sessions, backups and recordings folder over on its first start. On Android, BandEar installs as a new app beside MixLink, so the phone's saved mixes start fresh. Phones and desks of either name still find each other.
 
 ---
 
 ## 🚀 Quick start
 
-1. **Plug in your audio interface** and open **MixLink** on the computer. Pick the interface in *Network and system → Audio input* and press **Start engine**.
-2. **Connect the phones** to the same Wi-Fi as the computer and open the **MixLink** app on each one. They find the desk on their own — no IP addresses to type.
+1. **Plug in your audio interface** and open **BandEar** on the computer. Pick the interface in *Network and system → Audio input* and press **Start engine**.
+2. **Connect the phones** to the same Wi-Fi as the computer and open the **BandEar** app on each one. They find the desk on their own — no IP addresses to type.
 3. **Mix.** Each musician moves their own faders on the phone. From the desk you see every mix, set limits, copy mixes, add processing and record the show.
 
 > [!TIP]
@@ -129,7 +132,7 @@ Grab the file for your system from the [**latest release**](https://github.com/c
 ```mermaid
 flowchart LR
     A[🎤 Audio interface] --> B
-    subgraph B[💻 MixLink desktop]
+    subgraph B[💻 BandEar desktop]
         direction LR
         C[Capture<br/>48 kHz float] --> D[Channel strips<br/>HPF · EQ · gate · comp]
         D --> E[One mix per musician<br/>+ reverb and delay returns]
@@ -161,9 +164,9 @@ flowchart LR
 Requirements: [Rust](https://rustup.rs) (stable) and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS.
 
 ```bash
-git clone https://github.com/carlosescor2199/mixlink.git
-cd mixlink
-cargo run -p mixlink-desktop
+git clone https://github.com/carlosescor2199/bandear.git
+cd bandear
+cargo run -p bandear-desktop
 ```
 
 Build an installer with the [Tauri CLI](https://tauri.app/reference/cli/):
@@ -200,7 +203,7 @@ gradle -p apps/android :app:assembleDebug
 
 ```bash
 cargo test -p personal-monitoring        # audio engine
-cargo test -p mixlink-desktop            # desktop commands
+cargo test -p bandear-desktop            # desktop commands
 node --test apps/desktop/ui/tests        # desktop UI logic
 gradle -p apps/android :app:testDebugUnitTest
 ```
@@ -229,7 +232,7 @@ Every push of a `v*` tag builds the installers for all platforms with [GitHub Ac
 - [ ] iOS app for musicians
 - [ ] Signed installers for Windows and macOS
 
-Ideas and bug reports are welcome in [Issues](https://github.com/carlosescor2199/mixlink/issues).
+Ideas and bug reports are welcome in [Issues](https://github.com/carlosescor2199/bandear/issues).
 
 ---
 
@@ -237,7 +240,7 @@ Ideas and bug reports are welcome in [Issues](https://github.com/carlosescor2199
 
 Contributions are welcome! A good way to start:
 
-1. Open an [issue](https://github.com/carlosescor2199/mixlink/issues) to discuss the change.
+1. Open an [issue](https://github.com/carlosescor2199/bandear/issues) to discuss the change.
 2. Fork the repo and create a branch.
 3. Keep tests green (`cargo test`, `node --test`) and use [Conventional Commits](https://www.conventionalcommits.org).
 4. Open a pull request.
@@ -246,7 +249,7 @@ Contributions are welcome! A good way to start:
 
 ## 💖 Support the project
 
-MixLink is free and open source, built in spare time. If it helps your band, church, studio or school, you can help keep it going:
+BandEar is free and open source, built in spare time. If it helps your band, church, studio or school, you can help keep it going:
 
 <div align="center">
 
@@ -260,7 +263,7 @@ Starring the repo ⭐ and sharing it with other musicians helps too.
 
 ## 📄 License
 
-MixLink is released under the [MIT License](LICENSE).
+BandEar is released under the [MIT License](LICENSE).
 
 It includes a modified copy of [cpal](https://github.com/RustAudio/cpal) in [`vendor/cpal`](vendor/cpal), which keeps its own license (Apache-2.0), and is built with [Tauri](https://tauri.app).
 

@@ -63,7 +63,7 @@ jobs:
         with:
           projectPath: apps/desktop
           tagName: v__VERSION__
-          releaseName: MixLink v__VERSION__
+          releaseName: BandEar v__VERSION__
           releaseBody: |
             Unsigned builds. On Windows choose "More info" then "Run anyway" the first time;
             on macOS right-click the app and choose "Open" the first time.
@@ -95,7 +95,7 @@ jobs:
       - name: Keep the APK as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mixlink-android
+          name: bandear-android
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Attach the APK to the draft release
@@ -104,5 +104,5 @@ jobs:
         shell: bash
         run: |
           version=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
-          cp apps/android/app/build/outputs/apk/debug/app-debug.apk "MixLink_${version}_android.apk"
-          gh release upload "v${version}" "MixLink_${version}_android.apk" --clobber --repo "${{ github.repository }}"
+          cp apps/android/app/build/outputs/apk/debug/app-debug.apk "BandEar_${version}_android.apk"
+          gh release upload "v${version}" "BandEar_${version}_android.apk" --clobber --repo "${{ github.repository }}"

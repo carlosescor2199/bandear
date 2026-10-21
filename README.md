@@ -147,7 +147,7 @@ flowchart LR
 - **Engine** — written in Rust. Capture runs in a lock-free, allocation-free audio path; every mix is built once per block (5.3 ms at 256 frames) and sent as 16-bit PCM over UDP.
 - **Desktop app** — [Tauri](https://tauri.app) with a plain web-components UI (no bundler, no npm dependencies).
 - **Phone app** — native Android (Kotlin + Jetpack Compose), with an adaptive jitter buffer and packet reordering.
-- **Control** — a WebSocket channel carries mixes, link statistics and settings; phones find the desk through a discovery beacon.
+- **Control** — a WebSocket channel carries mixes, link statistics and settings; phones find the desk through a discovery beacon, and iPhones through its Bonjour announcement (`_bandear._tcp`).
 
 **Performance** — with 32 processed inputs and 16 musicians, the engine uses about **18 % of each block** on average (release build). Processing adds **no latency**: filters and dynamics have no look-ahead, and effects are wet returns.
 

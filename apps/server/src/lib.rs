@@ -13,6 +13,7 @@ mod health;
 mod link_history;
 mod load;
 pub mod logging;
+mod mdns;
 mod mix;
 mod network;
 mod output;

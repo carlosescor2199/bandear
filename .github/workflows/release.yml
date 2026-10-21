@@ -1,0 +1,108 @@
+name: Release
+
+# Builds the desktop app for Windows, macOS and Linux and the Android app, and puts them in a draft
+# GitHub Release. Runs by hand from the Actions tab, or when a tag such as v0.1.0 is pushed.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            rust_targets: ""
+            args: "--bundles nsis"
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            rust_targets: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin --bundles app,dmg"
+          - name: macOS Intel
+            runner: macos-latest
+            rust_targets: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin --bundles app,dmg"
+          - name: Linux
+            runner: ubuntu-22.04
+            rust_targets: ""
+            args: "--bundles appimage,deb"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build and attach to the draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: v__VERSION__
+          releaseName: MixLink v__VERSION__
+          releaseBody: |
+            Unsigned builds. On Windows choose "More info" then "Run anyway" the first time;
+            on macOS right-click the app and choose "Open" the first time.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  android:
+    name: Android
+    needs: desktop
+    # Still builds the APK when one desktop platform failed; the release exists once any of them ran.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.6.0"
+
+      - name: Build the APK
+        run: gradle -p apps/android :app:assembleDebug --no-daemon
+
+      - name: Keep the APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixlink-android
+          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Attach the APK to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          version=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
+          cp apps/android/app/build/outputs/apk/debug/app-debug.apk "MixLink_${version}_android.apk"
+          gh release upload "v${version}" "MixLink_${version}_android.apk" --clobber --repo "${{ github.repository }}"

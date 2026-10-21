@@ -1,6 +1,6 @@
 # BandEar website
 
-The landing page published at **https://carlosescor2199.github.io/bandear/**. Plain HTML, CSS and
+The landing page published at **https://bandear.com/**. Plain HTML, CSS and
 JavaScript modules: no build step, no package manager, no external requests except the GitHub
 API call that finds the latest release.
 
@@ -57,23 +57,23 @@ README to a staging folder and uploads that folder as the Pages artifact.
 
 One-time setup: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
 
-## Connecting a custom domain later
+## Custom domain
 
-1. Add `site/CNAME` containing just the domain, e.g. `bandear.app` (the workflow deploys it with
-   the rest of the site).
-2. DNS at your registrar:
-   - apex domain: four `A` records to `185.199.108.153`, `185.199.109.153`, `185.199.110.153`,
-     `185.199.111.153` (optionally `AAAA` to `2606:50c0:8000::153`, `2606:50c0:8001::153`,
-     `2606:50c0:8002::153`, `2606:50c0:8003::153`);
-   - `www`: a `CNAME` record to `carlosescor2199.github.io`.
-3. **Settings → Pages → Custom domain**: enter the domain, wait for the DNS check, then tick
-   **Enforce HTTPS** once the certificate is issued.
-4. Update the absolute URLs that still name GitHub Pages: the `canonical`, `og:url`, `og:image`
-   and `twitter:image` tags in `index.html`, and the root `README.md` link. `404.html` already
-   links home to `/` on any host that is not `*.github.io`.
-5. The download links stay on github.com and need no change. Only if the repository itself is
-   renamed or moved, update `js/links.js` and the fallback `href`s that repeat the releases page
-   in `index.html` and `404.html` (the tests fail until they all match).
+The site is served at `bandear.com` (registered at Hostinger). An Actions-deployed Pages site
+ignores a `CNAME` file: the domain lives in **Settings → Pages → Custom domain**.
+
+- DNS at the registrar:
+  - apex: four `A` records to `185.199.108.153`, `185.199.109.153`, `185.199.110.153`,
+    `185.199.111.153`, and four `AAAA` records to `2606:50c0:8000::153`, `2606:50c0:8001::153`,
+    `2606:50c0:8002::153`, `2606:50c0:8003::153`;
+  - `www`: a `CNAME` record to `carlosescor2199.github.io`.
+- Tick **Enforce HTTPS** once GitHub has issued the certificate.
+- If the domain ever changes, update the `canonical`, `og:url`, `og:image` and `twitter:image`
+  tags in `index.html` and the root `README.md` link. `404.html` links home to `/` on any host
+  that is not `*.github.io`.
+- The download links stay on github.com. Only if the repository itself is renamed or moved,
+  update `js/links.js` and the fallback `href`s that repeat the releases page in `index.html` and
+  `404.html` (the tests fail until they all match).
 
 ## Vendored three.js
 

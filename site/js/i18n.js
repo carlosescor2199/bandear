@@ -9,15 +9,14 @@
 //
 // This module touches nothing on import, so node tests can load the dictionary.
 
+import { LICENSE_PAGE, RELEASES_PAGE } from "./links.js";
+
 export const LANGUAGES = Object.freeze(["en", "es"]);
 export const DEFAULT_LANGUAGE = "en";
 // 404.html repeats STORAGE_KEY and pickLanguage inline (it loads no modules); change both
 // together. tests/i18n.test.mjs fails when they drift apart.
 export const STORAGE_KEY = "bandear.lang";
 export const LANGUAGE_EVENT = "bandear:language";
-
-const RELEASES = "https://github.com/carlosescor2199/bandear/releases/latest";
-const LICENSE = "https://github.com/carlosescor2199/bandear/blob/main/LICENSE";
 
 export const DICTIONARY = Object.freeze({
   en: {
@@ -122,7 +121,7 @@ export const DICTIONARY = Object.freeze({
 
     "downloads.eyebrow": "Download",
     "downloads.title": "Get BandEar for every device in the band",
-    "downloads.intro": `The desk runs on a computer; musicians use the Android app. All files come from the <a href="${RELEASES}">latest GitHub release</a>.`,
+    "downloads.intro": `The desk runs on a computer; musicians use the Android app. All files come from the <a href="${RELEASES_PAGE}">latest GitHub release</a>.`,
     "dl.windows.note": "First run: <em>More info → Run anyway</em> — the installer is not signed yet.",
     "dl.windows.btn": "Download .exe",
     "dl.mac.note": "Drag to Applications. First run: right-click → <em>Open</em>.",
@@ -159,7 +158,7 @@ export const DICTIONARY = Object.freeze({
     "sponsor.btn": "Sponsor on GitHub",
     "sponsor.source": "View the source",
 
-    "footer.license": `© 2026 Carlos Escudero · Released under the <a href="${LICENSE}">MIT License</a>`,
+    "footer.license": `© 2026 Carlos Escudero · Released under the <a href="${LICENSE_PAGE}">MIT License</a>`,
     "footer.label": "Footer",
     "footer.releases": "Releases",
     "footer.issues": "Issues",
@@ -268,7 +267,7 @@ export const DICTIONARY = Object.freeze({
 
     "downloads.eyebrow": "Descarga",
     "downloads.title": "Descarga BandEar para cada dispositivo de la banda",
-    "downloads.intro": `La mesa funciona en una computadora; los músicos usan la app de Android. Todos los archivos vienen de la <a href="${RELEASES}">última versión en GitHub</a>.`,
+    "downloads.intro": `La mesa funciona en una computadora; los músicos usan la app de Android. Todos los archivos vienen de la <a href="${RELEASES_PAGE}">última versión en GitHub</a>.`,
     "dl.windows.note": "Primera vez: <em>Más información → Ejecutar de todas formas</em>; el instalador aún no está firmado.",
     "dl.windows.btn": "Descargar .exe",
     "dl.mac.note": "Arrástrala a Aplicaciones. Primera vez: clic derecho → <em>Abrir</em>.",
@@ -305,7 +304,7 @@ export const DICTIONARY = Object.freeze({
     "sponsor.btn": "Patrocinar en GitHub",
     "sponsor.source": "Ver el código fuente",
 
-    "footer.license": `© 2026 Carlos Escudero · Publicado bajo la <a href="${LICENSE}">licencia MIT</a>`,
+    "footer.license": `© 2026 Carlos Escudero · Publicado bajo la <a href="${LICENSE_PAGE}">licencia MIT</a>`,
     "footer.label": "Pie de página",
     "footer.releases": "Versiones",
     "footer.issues": "Problemas",

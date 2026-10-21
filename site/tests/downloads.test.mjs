@@ -8,7 +8,6 @@ import { readFileSync } from "node:fs";
 
 import {
   ASSETS,
-  RELEASES_PAGE,
   detectPlatform,
   heroChoice,
   matchAssets,
@@ -16,6 +15,7 @@ import {
   versionOf,
 } from "../js/downloads.js";
 import { DICTIONARY, LANGUAGES } from "../js/i18n.js";
+import { RELEASES_PAGE } from "../js/links.js";
 
 const UA = {
   windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
@@ -198,4 +198,13 @@ test("index.html tags a link and a file name for every installer", () => {
   }
   assert.match(html, /data-download-hero/);
   assert.match(html, /data-download-label/);
+});
+
+test("the markup's fallback download links are the releases page from links.js", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const notFound = readFileSync(new URL("../404.html", import.meta.url), "utf8");
+  const fallbacks = [...html.matchAll(/<a [^>]*\b(?:data-asset|data-download-hero)\b[^>]*>/g)].map((match) => match[0]);
+  assert.ok(fallbacks.length >= Object.keys(ASSETS).length + 1, "download links not found");
+  for (const tag of fallbacks) assert.match(tag, new RegExp(`href="${RELEASES_PAGE}"`), tag);
+  assert.ok(notFound.includes(`href="${RELEASES_PAGE}"`), "404.html download link differs from links.js");
 });

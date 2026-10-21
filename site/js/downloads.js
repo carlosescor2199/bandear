@@ -7,9 +7,7 @@
 // globals and are tested with node.
 
 import { LANGUAGE_EVENT, t } from "./i18n.js";
-
-export const RELEASES_PAGE = "https://github.com/carlosescor2199/bandear/releases/latest";
-export const RELEASE_API = "https://api.github.com/repos/carlosescor2199/bandear/releases/latest";
+import { RELEASES_PAGE, RELEASE_API } from "./links.js";
 
 // One entry per installer, keyed by the suffix of its file name.
 export const ASSETS = Object.freeze({

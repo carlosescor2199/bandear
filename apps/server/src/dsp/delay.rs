@@ -216,6 +216,7 @@ impl Delay {
     }
 
     /// The memory its lines take, in floats.
+    #[cfg(test)]
     pub(crate) fn floats(&self) -> usize {
         self.left.len() + self.right.len()
     }

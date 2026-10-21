@@ -6,8 +6,6 @@ mod control;
 mod decimate;
 mod demo;
 mod discovery;
-// Channel processing. The master limiter is not on the audio path yet.
-#[allow(dead_code)]
 mod dsp;
 mod effects;
 mod engine;

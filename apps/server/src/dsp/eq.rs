@@ -267,6 +267,7 @@ impl Eq {
     }
 
     /// Runs the high-pass filter, then the bands.
+    #[cfg(test)]
     pub(crate) fn process(&mut self, block: &mut [f32], stride: usize, first: usize) {
         self.process_high_pass(block, stride, first);
         self.process_bands(block, stride, first);

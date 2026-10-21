@@ -340,6 +340,7 @@ impl Side {
         self.allpasses.iter_mut().for_each(AllPass::clear);
     }
 
+    #[cfg(test)]
     fn floats(&self) -> usize {
         self.combs.iter().map(|comb| comb.line.len()).sum::<usize>()
             + self
@@ -396,6 +397,7 @@ impl Reverb {
     }
 
     /// The memory its lines take, in floats.
+    #[cfg(test)]
     pub(crate) fn floats(&self) -> usize {
         self.pre_delay.len() + self.left.floats() + self.right.floats()
     }

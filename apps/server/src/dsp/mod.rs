@@ -160,11 +160,6 @@ impl Glide {
         }
     }
 
-    /// Jumps to `value` with no glide.
-    pub(crate) fn jump(&mut self, value: f32) {
-        *self = Self::new(value);
-    }
-
     /// Advances one frame and returns the value for it; the last frame lands on the target.
     #[inline]
     pub(crate) fn next(&mut self) -> f32 {

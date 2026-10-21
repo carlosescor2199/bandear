@@ -29,8 +29,10 @@ pub struct EngineConfig {
     pub control_port: u16,
     pub groups: Vec<GroupDefinition>,
     pub buffer_frames: Option<u32>,
-    /// The capture backend. `Auto` prefers ASIO where it is available; the window lets the engineer
-    /// pick a concrete one.
+    /// The capture backend. `Auto` resolves to the platform's own host and never loads ASIO, which is
+    /// a kernel-mode driver; ASIO is only used when asked for explicitly, and only with a named
+    /// driver in `device_filter`: the engine refuses to open the first installed one on its own. The
+    /// window lets the engineer pick a concrete one.
     pub host: AudioHost,
 }
 

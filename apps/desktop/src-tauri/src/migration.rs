@@ -6,11 +6,12 @@
 //! `%APPDATA%\com.mixlink.desktop` on Windows, the same under `~/Library/Application Support` on
 //! macOS and `~/.config` on Linux. [bring_over] runs at start, before the session is opened:
 //!
-//! - It runs only when this desk's config folder has no `session.json` and no [MIGRATION_MARKER],
-//!   and the old desk's config folder (the sibling named [LEGACY_IDENTIFIER]) exists.
+//! - It runs only when this desk's config folder has no [MIGRATION_MARKER] and the old desk's
+//!   config folder (the sibling named [LEGACY_IDENTIFIER]) exists.
 //! - It copies what the old desk kept there: the legacy labels (`musicians.json`), the named
 //!   sessions (`sessions/`), the mix backups (`backups/`) and, last, `session.json`. Each file goes
-//!   through a temporary file beside it, and a file already in the new folder is never replaced.
+//!   through a temporary file beside it, and a file already in the new folder (this desk's own
+//!   session, say, or one an earlier run copied) is never replaced.
 //!   Anything else in the old folder (a damaged file set aside, say) stays where it is, and so do
 //!   the logs, which are in another folder.
 //! - The old folders are only read: nothing in them is changed, moved or removed.
@@ -20,8 +21,11 @@
 //!   `recording.folder` names the old folder explicitly, so every take stays listed and new takes
 //!   go beside them. The engineer can choose another folder at any time.
 //! - When it finished without a failure it writes [MIGRATION_MARKER], so it runs once even for a
-//!   desk that had no session. After a failure it runs again on the next start and copies what is
-//!   still missing, never replacing what it copied before.
+//!   desk that had no session. After a failure (a file that could not be copied, say) there is no
+//!   marker, so it runs again on the next start and copies what is still missing, never replacing
+//!   what is already in the new folder: the session it copied, which the desk may have saved
+//!   since, is kept as it is. A file the desk removed in between (a pruned backup) can come back
+//!   on that run; once a run finishes without a failure, nothing is copied again.
 
 use std::fs;
 use std::io;
@@ -44,9 +48,9 @@ pub const LEGACY_PRODUCT_FOLDER: &str = "MixLink";
 /// The file in this desk's config folder that says the migration already ran.
 pub const MIGRATION_MARKER: &str = "mixlink-migration.txt";
 
-/// What the old desk kept in its config folder, in the order it is copied (the session last, so a
-/// migration cut short runs again).
-const KEPT: [&str; 3] = [LEGACY_LABELS_FILE, SESSIONS_DIRECTORY, BACKUPS_DIRECTORY];
+/// What is copied from the old desk's config folder as it is, in this order. `session.json` is
+/// not in it: [bring_session_over] copies it after these, adjusting its recordings folder.
+const TO_COPY: [&str; 3] = [LEGACY_LABELS_FILE, SESSIONS_DIRECTORY, BACKUPS_DIRECTORY];
 
 /// The folders this desk has, as Tauri resolves them for its identifier.
 #[derive(Clone, Debug)]
@@ -86,7 +90,7 @@ pub fn legacy_folder(folder: &Path) -> Option<PathBuf> {
 /// there was nothing to do.
 pub fn bring_over(desk: &DeskFolders) -> Option<Migration> {
     let config = &desk.config;
-    if config.join(SESSION_FILE).exists() || config.join(MIGRATION_MARKER).exists() {
+    if config.join(MIGRATION_MARKER).exists() {
         return None;
     }
     let old_config = legacy_folder(config)?;
@@ -104,7 +108,7 @@ pub fn bring_over(desk: &DeskFolders) -> Option<Migration> {
         ));
         return Some(migration);
     }
-    for name in KEPT {
+    for name in TO_COPY {
         copy_tree(
             &old_config.join(name),
             &config.join(name),
@@ -131,10 +135,17 @@ pub fn bring_over(desk: &DeskFolders) -> Option<Migration> {
 }
 
 /// Copies the old session, last, naming the old default recordings folder in it when its takes
-/// would otherwise no longer be listed (see the module notes).
+/// would otherwise no longer be listed (see the module notes). A session this desk already has
+/// (copied by an earlier run, or its own) is kept as it is.
 fn bring_session_over(desk: &DeskFolders, old_config: &Path, migration: &mut Migration) {
     let source = old_config.join(SESSION_FILE);
     let target = desk.config.join(SESSION_FILE);
+    if target.exists() {
+        if source.exists() {
+            migration.kept.push(PathBuf::from(SESSION_FILE));
+        }
+        return;
+    }
     let session = match fs::read(&source) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -506,6 +517,51 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_failed_to_copy_is_copied_on_the_next_start() {
+        let home = Home::new("retried");
+        old_desk(&home);
+        let desk = home.desk();
+        let backup = Path::new(BACKUPS_DIRECTORY).join("mixes-20261020T101500Z.json");
+        // A folder where the backup's temporary file would go makes its copy fail.
+        let mut blocker = home.config().join(&backup).into_os_string();
+        blocker.push(".migrating");
+        let blocker = PathBuf::from(blocker);
+        fs::create_dir_all(&blocker).expect("blocker");
+
+        // Start 1: the backup fails; the rest, the session included, comes over.
+        let first = bring_over(&desk).expect("migrated");
+        assert_eq!(first.failures.len(), 1, "{:?}", first.failures);
+        assert!(!home.config().join(&backup).exists());
+        assert!(home.config().join(SESSION_FILE).exists());
+        assert!(!home.config().join(MIGRATION_MARKER).exists());
+
+        // The desk runs and saves its session before the next start.
+        write(
+            &home.config().join(SESSION_FILE),
+            r#"{"version":1,"saved":true}"#,
+        );
+        fs::remove_dir(&blocker).expect("unblocked");
+
+        // Start 2: only the missed backup is copied; what the desk has is kept.
+        let second = bring_over(&desk).expect("migrated again");
+        assert!(second.failures.is_empty(), "{:?}", second.failures);
+        assert_eq!(second.copied, vec![backup.clone()]);
+        assert!(second.kept.contains(&PathBuf::from(SESSION_FILE)));
+        assert_eq!(
+            read(&home.config().join(&backup)),
+            read(&home.old_config().join(&backup))
+        );
+        assert_eq!(
+            read(&home.config().join(SESSION_FILE)),
+            r#"{"version":1,"saved":true}"#
+        );
+        assert!(home.config().join(MIGRATION_MARKER).exists());
+
+        // Start 3: the marker says it is done.
+        assert_eq!(bring_over(&desk), None);
+    }
+
+    #[test]
     fn a_file_the_new_desk_already_has_is_never_replaced() {
         let home = Home::new("never-overwrites");
         old_desk(&home);
@@ -524,16 +580,40 @@ mod tests {
     }
 
     #[test]
-    fn nothing_happens_when_the_new_desk_already_has_a_session() {
+    fn a_session_the_new_desk_already_has_is_kept() {
         let home = Home::new("new-session");
         old_desk(&home);
+        let old_takes = home.music().join(LEGACY_PRODUCT_FOLDER).join("Recordings");
+        write(&old_takes.join("Take 1").join(TAKE_FILE), "{}");
         write(&home.config().join(SESSION_FILE), r#"{"version":1}"#);
+
+        let migration = bring_over(&home.desk()).expect("migrated");
+
+        assert!(migration.failures.is_empty(), "{:?}", migration.failures);
+        assert_eq!(read(&home.config().join(SESSION_FILE)), r#"{"version":1}"#);
+        assert_eq!(migration.kept, vec![PathBuf::from(SESSION_FILE)]);
+        assert_eq!(
+            migration.recordings_folder, None,
+            "the session is not touched"
+        );
+        assert!(home
+            .config()
+            .join(SESSIONS_DIRECTORY)
+            .join("show.json")
+            .exists());
+        assert!(home.config().join(MIGRATION_MARKER).exists());
+    }
+
+    #[test]
+    fn nothing_happens_once_the_marker_is_there() {
+        let home = Home::new("marker");
+        old_desk(&home);
+        write(&home.config().join(MIGRATION_MARKER), "done");
 
         assert_eq!(bring_over(&home.desk()), None);
 
-        assert_eq!(read(&home.config().join(SESSION_FILE)), r#"{"version":1}"#);
+        assert!(!home.config().join(SESSION_FILE).exists());
         assert!(!home.config().join(SESSIONS_DIRECTORY).exists());
-        assert!(!home.config().join(MIGRATION_MARKER).exists());
     }
 
     #[test]

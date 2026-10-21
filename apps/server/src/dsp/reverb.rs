@@ -17,7 +17,8 @@
 //! **Real time.** Every line is allocated in [Reverb::new] at its full size; processing indexes
 //! into them and never allocates. Feedback, damping and width glide to new values over
 //! [GLIDE_FRAMES]; a new pre-delay crossfades from the old tap to the new one over
-//! [CROSSFADE_FRAMES], so no change clicks.
+//! [CROSSFADE_FRAMES], and one that comes during a crossfade follows once it ends ([MovingTap]),
+//! so no change clicks, however quickly they come.
 //!
 //! **Silence.** Every value written into a line or a filter's state below [SILENCE_FLOOR] (about
 //! -200 dBFS) is written as zero, so a dying tail ends in exact zeros instead of sinking into
@@ -50,6 +51,69 @@ pub const MAX_PRE_DELAY_MS: f32 = 200.0;
 pub(crate) const CROSSFADE_FRAMES: u32 = 960;
 /// Values written into the lines below this magnitude (about -200 dBFS) are written as zero.
 pub(crate) const SILENCE_FLOOR: f32 = 1e-10;
+
+/// Where a line is read this frame: one tap, or two crossfading, `way` (0 to 1) of the way from
+/// `from` to `to`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Taps {
+    One(u32),
+    Two { from: u32, to: u32, way: f32 },
+}
+
+/// The read position of a delay line (the reverb's pre-delay, the delay's time) that moves to a
+/// new length by crossfading from the old tap to the new one over [CROSSFADE_FRAMES].
+///
+/// A length that comes while a crossfade runs waits for it to end, then crossfades on from where
+/// the output is (the last length asked for wins): the output always moves between two taps along
+/// one straight fade, never jumping to a third, so a time dragged or typed quickly never clicks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MovingTap {
+    /// The tap faded to (the one read alone once no crossfade runs).
+    tap: u32,
+    /// The tap faded from while `fade` runs.
+    previous: u32,
+    /// The length last asked for; the next crossfade goes there.
+    pending: u32,
+    /// Frames left in the crossfade.
+    fade: u32,
+}
+
+impl MovingTap {
+    pub(crate) const fn new(frames: u32) -> Self {
+        Self {
+            tap: frames,
+            previous: frames,
+            pending: frames,
+            fade: 0,
+        }
+    }
+
+    /// Moves to `frames`: at once into a crossfade when none runs, after the running one if one
+    /// does.
+    pub(crate) fn set(&mut self, frames: u32) {
+        self.pending = frames;
+    }
+
+    /// Where to read this frame; then steps on a frame.
+    #[inline]
+    pub(crate) fn next(&mut self) -> Taps {
+        if self.fade == 0 && self.pending != self.tap {
+            self.previous = self.tap;
+            self.tap = self.pending;
+            self.fade = CROSSFADE_FRAMES;
+        }
+        if self.fade == 0 {
+            return Taps::One(self.tap);
+        }
+        let way = 1.0 - self.fade as f32 / CROSSFADE_FRAMES as f32;
+        self.fade -= 1;
+        Taps::Two {
+            from: self.previous,
+            to: self.tap,
+            way,
+        }
+    }
+}
 
 /// The ranges [ReverbSettings::clamped] holds the settings to.
 pub const REVERB_SIZE_RANGE: RangeInclusive<f32> = 0.0..=100.0;
@@ -290,10 +354,8 @@ impl Side {
 pub(crate) struct Reverb {
     pre_delay: Vec<f32>,
     write: usize,
-    /// The pre-delay tap in use, and the one it crossfades from while `fade` runs.
-    tap: u32,
-    previous_tap: u32,
-    fade: u32,
+    /// The pre-delay's read position.
+    tap: MovingTap,
     left: Side,
     right: Side,
     feedback: Glide,
@@ -320,9 +382,7 @@ impl Reverb {
         Self {
             pre_delay,
             write: 0,
-            tap: design.pre_delay_frames,
-            previous_tap: design.pre_delay_frames,
-            fade: 0,
+            tap: MovingTap::new(design.pre_delay_frames),
             left,
             right,
             feedback: Glide::new(design.feedback),
@@ -346,21 +406,8 @@ impl Reverb {
         self.damping.set(design.damping, GLIDE_FRAMES);
         self.direct.set(design.direct, GLIDE_FRAMES);
         self.cross.set(design.cross, GLIDE_FRAMES);
-        let tap = design.pre_delay_frames.min(self.pre_delay.len() as u32 - 1);
-        if tap != self.tap {
-            self.previous_tap = self.current_tap();
-            self.tap = tap;
-            self.fade = CROSSFADE_FRAMES;
-        }
-    }
-
-    /// The tap the output is closest to now (the new one once a crossfade passed halfway).
-    fn current_tap(&self) -> u32 {
-        if self.fade > CROSSFADE_FRAMES / 2 {
-            self.previous_tap
-        } else {
-            self.tap
-        }
+        self.tap
+            .set(design.pre_delay_frames.min(self.pre_delay.len() as u32 - 1));
     }
 
     /// True while the reverb holds nothing but zeros: its output is silence until a sample comes.
@@ -379,12 +426,9 @@ impl Reverb {
         for (&sample, frame) in input.iter().zip(output.chunks_exact_mut(2)) {
             let sample = if sample.is_finite() { sample } else { 0.0 };
             self.pre_delay[self.write] = quiet(sample);
-            let delayed = if self.fade > 0 {
-                let way = 1.0 - self.fade as f32 / CROSSFADE_FRAMES as f32;
-                self.fade -= 1;
-                self.read(self.previous_tap) * (1.0 - way) + self.read(self.tap) * way
-            } else {
-                self.read(self.tap)
+            let delayed = match self.tap.next() {
+                Taps::One(tap) => self.read(tap),
+                Taps::Two { from, to, way } => self.read(from) * (1.0 - way) + self.read(to) * way,
             };
             self.write += 1;
             if self.write == self.pre_delay.len() {
@@ -580,6 +624,36 @@ mod tests {
             steepest(around),
             bound
         );
+    }
+
+    /// A tap asked to move again and again within one crossfade: where it reads (the blend of its
+    /// two taps, as a position) moves at most one crossfade's step a frame, never jumping, and
+    /// lands on the last length asked for.
+    #[test]
+    fn a_tap_moved_during_a_crossfade_never_jumps() {
+        let mut tap = MovingTap::new(480);
+        let position = |taps: Taps| match taps {
+            Taps::One(at) => at as f32,
+            Taps::Two { from, to, way } => from as f32 * (1.0 - way) + to as f32 * way,
+        };
+        let mut last = position(tap.next());
+        let mut steepest = 0.0f32;
+        for frame in 0..4 * CROSSFADE_FRAMES {
+            // A new length every 5 ms for the first 20 ms, as a dragged pre-delay sends them.
+            if frame < CROSSFADE_FRAMES && frame % 240 == 0 {
+                tap.set(if frame % 480 == 0 { 7_200 } else { 480 });
+            }
+            let now = position(tap.next());
+            steepest = steepest.max((now - last).abs());
+            last = now;
+        }
+        let one_fade_step = (7_200.0 - 480.0) / CROSSFADE_FRAMES as f32;
+        assert!(
+            steepest <= one_fade_step * 1.01,
+            "moved {steepest} in a frame against {one_fade_step}"
+        );
+        // The last length asked for (480, at 15 ms) is where it reads in the end.
+        assert_eq!(tap.next(), Taps::One(480));
     }
 
     #[test]

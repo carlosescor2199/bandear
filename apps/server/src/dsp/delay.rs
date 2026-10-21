@@ -14,8 +14,9 @@
 //!
 //! **Real time.** Both lines are allocated in [Delay::new] for the longest time; processing never
 //! allocates. The feedback and the high cut glide over [GLIDE_FRAMES]; a new time crossfades from
-//! the old read position to the new one over [CROSSFADE_FRAMES] (20 ms), so a change neither
-//! clicks nor sweeps the pitch.
+//! the old read position to the new one over [CROSSFADE_FRAMES](super::reverb::CROSSFADE_FRAMES)
+//! (20 ms), so a change neither clicks nor sweeps the pitch; a time that comes during a crossfade
+//! follows once it ends ([MovingTap]), so a time dragged quickly never clicks either.
 //!
 //! **Silence.** As the reverb's: values below [SILENCE_FLOOR] are written as zero, and once the
 //! lines hold nothing else the delay is [idle](Delay::is_idle), its output exact silence.
@@ -24,7 +25,7 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
-use super::reverb::{CROSSFADE_FRAMES, SILENCE_FLOOR};
+use super::reverb::{MovingTap, Taps, SILENCE_FLOOR};
 use super::{clamp_to, Glide, GLIDE_FRAMES, SAMPLE_RATE};
 
 /// The longest delay time, in milliseconds.
@@ -183,9 +184,8 @@ pub(crate) struct Delay {
     left: Vec<f32>,
     right: Vec<f32>,
     write: usize,
-    frames: u32,
-    previous_frames: u32,
-    fade: u32,
+    /// The lines' read position, `frames` behind the write position.
+    tap: MovingTap,
     feedback: Glide,
     high_cut: Glide,
     ping_pong: bool,
@@ -204,9 +204,7 @@ impl Delay {
             left: vec![0.0; line_frames()],
             right: vec![0.0; line_frames()],
             write: 0,
-            frames: design.frames,
-            previous_frames: design.frames,
-            fade: 0,
+            tap: MovingTap::new(design.frames),
             feedback: Glide::new(design.feedback),
             high_cut: Glide::new(design.high_cut),
             ping_pong: design.ping_pong,
@@ -229,15 +227,7 @@ impl Delay {
         self.feedback.set(design.feedback, GLIDE_FRAMES);
         self.high_cut.set(design.high_cut, GLIDE_FRAMES);
         self.ping_pong = design.ping_pong;
-        if design.frames != self.frames {
-            self.previous_frames = if self.fade > CROSSFADE_FRAMES / 2 {
-                self.previous_frames
-            } else {
-                self.frames
-            };
-            self.frames = design.frames;
-            self.fade = CROSSFADE_FRAMES;
-        }
+        self.tap.set(design.frames);
     }
 
     /// True while both lines hold nothing but zeros.
@@ -254,26 +244,25 @@ impl Delay {
     pub(crate) fn process(&mut self, input: &[f32], output: &mut [f32]) {
         for (&sample, frame) in input.iter().zip(output.chunks_exact_mut(2)) {
             let sample = if sample.is_finite() { sample } else { 0.0 };
-            let (left, right) = if self.fade > 0 {
-                let way = 1.0 - self.fade as f32 / CROSSFADE_FRAMES as f32;
-                self.fade -= 1;
-                let old = (
-                    Self::read(&self.left, self.write, self.previous_frames),
-                    Self::read(&self.right, self.write, self.previous_frames),
-                );
-                let new = (
-                    Self::read(&self.left, self.write, self.frames),
-                    Self::read(&self.right, self.write, self.frames),
-                );
-                (
-                    old.0 * (1.0 - way) + new.0 * way,
-                    old.1 * (1.0 - way) + new.1 * way,
-                )
-            } else {
-                (
-                    Self::read(&self.left, self.write, self.frames),
-                    Self::read(&self.right, self.write, self.frames),
-                )
+            let (left, right) = match self.tap.next() {
+                Taps::One(frames) => (
+                    Self::read(&self.left, self.write, frames),
+                    Self::read(&self.right, self.write, frames),
+                ),
+                Taps::Two { from, to, way } => {
+                    let old = (
+                        Self::read(&self.left, self.write, from),
+                        Self::read(&self.right, self.write, from),
+                    );
+                    let new = (
+                        Self::read(&self.left, self.write, to),
+                        Self::read(&self.right, self.write, to),
+                    );
+                    (
+                        old.0 * (1.0 - way) + new.0 * way,
+                        old.1 * (1.0 - way) + new.1 * way,
+                    )
+                }
             };
             let (feedback, high_cut) = (self.feedback.next(), self.high_cut.next());
             self.low_left = quiet(left * (1.0 - high_cut) + self.low_left * high_cut);
@@ -487,6 +476,54 @@ mod tests {
             "a jump of {around} against {before}"
         );
         assert!(rms(&output[2 * 60_000..]) > 0.05, "still repeating");
+    }
+
+    /// Times dragged quickly: four come within one crossfade (every 5 ms), between two taps that
+    /// read the tone in opposite phases. The output never jumps, and it ends on the last time
+    /// asked for.
+    #[test]
+    fn times_that_come_during_a_crossfade_never_click() {
+        // 220 Hz: 375 ms is 82.5 periods, 100 ms is 22, so the two taps read opposite phases.
+        let tone = sine(220.0, 0.5, 48_000 * 2);
+        let steepest = |output: &[f32]| {
+            output
+                .chunks_exact(2)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|pair| (pair[1][0] - pair[0][0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let at = |time_ms: f32| {
+            DelaySettings {
+                time_ms,
+                feedback_percent: 0.0,
+                high_cut_hz: 20_000.0,
+                ..DelaySettings::default()
+            }
+            .design()
+        };
+        let mut delay = Delay::new(&at(375.0));
+        let mut output = run(&mut delay, &tone[..48_000]);
+        let mut from = 48_000;
+        for time_ms in [100.0, 375.0, 100.0, 375.0, 100.0] {
+            delay.apply(&at(time_ms));
+            output.extend(run(&mut delay, &tone[from..from + 240]));
+            from += 240;
+        }
+        output.extend(run(&mut delay, &tone[from..]));
+        let before = steepest(&output[2 * 20_000..2 * 47_000]);
+        let around = steepest(&output[2 * 47_000..2 * 56_000]);
+        assert!(
+            around <= before * 1.5,
+            "a jump of {around} against {before}"
+        );
+        // Settled on 100 ms: the output is the tone 4,800 frames late.
+        let settled = &output[2 * 70_000..2 * 70_100];
+        let expected = &tone[70_000 - 4_800..70_100 - 4_800];
+        assert!(settled
+            .chunks_exact(2)
+            .zip(expected)
+            .all(|(frame, want)| (frame[0] - want).abs() < 0.02));
     }
 
     #[test]

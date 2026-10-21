@@ -42,3 +42,4 @@ import "./demo-source.test.js";
 import "./scheduling.test.js";
 import "./limiter.test.js";
 import "./effects.test.js";
+import "./shell.test.js";

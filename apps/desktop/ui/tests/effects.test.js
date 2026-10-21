@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { createEngineApi } from "../app/lib/bridge.js";
 import { createConsoleApp } from "../app/lib/console-app.js";
-import { LOCAL_MIX } from "../app/lib/console-state.js";
+import { LOCAL_MIX, actions, consoleReducer, initialState } from "../app/lib/console-state.js";
 import {
   channelSends,
   clampDelay,
@@ -167,6 +167,16 @@ test("the fake sets the effects and each mix's returns as the desk does, and a n
   assert.equal(lead.message, "This musician's mix returns the reverb at 45%.");
   const local = await api.setLocalFxReturn("delay", 20);
   assert.equal(local.message, "The local mix returns the delay at 20%.");
+  // An effect the desk does not have is refused as the desk refuses it, and nothing is kept.
+  await assert.rejects(api.setMusicianFxReturn(key, "chorus", 30), /unknown variant "chorus"/);
+  await assert.rejects(api.setLocalFxReturn("chorus", 30), /unknown variant "chorus"/);
+  const unchanged = await api.status();
+  assert.deepEqual(unchanged.musicians.find((musician) => musician.address === LEAD).fxReturns, {
+    reverb: 45,
+    delay: 0,
+  });
+  assert.deepEqual(unchanged.localFxReturns, { reverb: 0, delay: 20 });
+  assert.equal("chorus" in unchanged.localFxReturns, false);
   const status = await api.status();
   assert.deepEqual(status.musicians.find((musician) => musician.address === LEAD).fxReturns, { reverb: 45, delay: 0 });
   assert.deepEqual(status.localFxReturns, { reverb: 0, delay: 20 });
@@ -216,4 +226,30 @@ test("the console shows a send, an effect and a return at once and settles them 
   const gone = await app.editMixReturn("10.0.0.9:50000", "reverb", 5);
   assert.deepEqual(gone, { ok: false, message: "10.0.0.9:50000's reverb return was not set: 10.0.0.9:50000 is not here." });
   app.dispose?.();
+});
+
+test("an older answer about one effect or return never undoes the other's newer one", () => {
+  const effects = defaultEffects();
+  const returns = { reverb: 10, delay: 20 };
+  let state = {
+    ...initialState,
+    engine: { ...initialState.engine, status: { effects, localFxReturns: returns } },
+    musicians: [{ address: LEAD, fxReturns: returns }],
+  };
+  const reverb = { ...effects.reverb, sizePercent: 80 };
+  const delay = { ...effects.delay, feedbackPercent: 60 };
+  // The delay's answer comes first; the reverb's, sent before it, carries the delay as it was.
+  state = consoleReducer(state, actions.effectSettled("delay", delay, { reverb: effects.reverb, delay }));
+  state = consoleReducer(state, actions.effectSettled("reverb", reverb, { reverb, delay: effects.delay }));
+  assert.deepEqual(state.engine.status.effects, { reverb, delay }, "each effect as its own answer left it");
+
+  for (const address of [LEAD, LOCAL_MIX]) {
+    state = consoleReducer(state, actions.returnSettled(address, "delay", 70, { reverb: 10, delay: 70 }));
+    state = consoleReducer(state, actions.returnSettled(address, "reverb", 45, { reverb: 45, delay: 20 }));
+  }
+  assert.deepEqual(state.musicians[0].fxReturns, { reverb: 45, delay: 70 });
+  assert.deepEqual(state.engine.status.localFxReturns, { reverb: 45, delay: 70 });
+  // A refusal (no answer to keep) leaves what is kept alone.
+  const refused = consoleReducer(state, actions.returnSettled(LEAD, "reverb", 99));
+  assert.deepEqual(refused.musicians[0].fxReturns, { reverb: 45, delay: 70 });
 });

@@ -644,6 +644,7 @@ impl Limiter {
     }
 
     /// The samples that were not finite numbers (NaN or an infinity), sent on as silence.
+    #[cfg(test)]
     pub(crate) fn non_finite_samples(&self) -> u64 {
         self.non_finite
     }

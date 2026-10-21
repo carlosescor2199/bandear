@@ -27,7 +27,7 @@ import "./fader.js";
 import "./reduction-meter.js";
 import "./meter.js";
 import "./toggle.js";
-import { LIMITER_REDUCTION_SCALE_DB } from "../lib/limiter.js";
+import { LIMITER_REDUCTION_SCALE_DB, createSliderKeys } from "../lib/limiter.js";
 import { showMasterValues, wireMasterControls } from "../lib/master-controls.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
@@ -118,9 +118,6 @@ const styles = sheet(`
   }
 `);
 
-// The keys a range input moves by.
-const SLIDER_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"]);
-
 class MlMasterStrip extends HTMLElement {
   #data = null;
   #parts;
@@ -128,8 +125,8 @@ class MlMasterStrip extends HTMLElement {
   #returns;
   // The limiter slider under the pointer, if any.
   #dragging = null;
-  // The limiter slider a key is moving, until its `input` event.
-  #keyed = null;
+  // The limiter slider a key is moving (createSliderKeys).
+  #keys = createSliderKeys();
 
   constructor() {
     super();
@@ -332,18 +329,16 @@ class MlMasterStrip extends HTMLElement {
     });
     for (const { input, key } of limiter.fields) {
       input.addEventListener("keydown", (event) => {
-        this.#keyed = SLIDER_KEYS.has(event.key) ? input : null;
+        this.#keys.keydown(input, event.key);
       });
-      input.addEventListener("keyup", () => {
-        this.#keyed = null;
-      });
+      input.addEventListener("keyup", () => this.#keys.keyup());
       input.addEventListener("input", (event) => {
         event.stopPropagation();
-        this.#limiterEdit(key, Number(input.value), this.#keyed === input);
+        this.#limiterEdit(key, Number(input.value), this.#keys.keyed(input));
       });
       input.addEventListener("pointerdown", () => {
         this.#dragging = input;
-        this.#keyed = null;
+        this.#keys.pointerdown();
       });
       const release = () => {
         if (this.#dragging === input) {

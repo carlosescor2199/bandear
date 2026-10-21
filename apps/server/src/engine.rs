@@ -2071,6 +2071,11 @@ impl EngineHandle {
     /// channel the device lacks keeps them for when it is back. Neutral settings take the strip
     /// out of the audio path entirely.
     ///
+    /// The channel keeps its sends to the reverb and delay: `settings.sends` is not read (the
+    /// answer carries the sends kept), so a preset, a copy or a reset never silences them. Only
+    /// [Self::set_channel_send] changes them, and [Self::replace_processing] (a session load)
+    /// replaces them with the strips.
+    ///
     /// An error past the mixer's 32 channels, when the engine is stopping, or when settings come
     /// faster than the engine thread takes them; nothing changes then.
     pub fn set_channel_processing(
@@ -2106,9 +2111,10 @@ impl EngineHandle {
     }
 
     /// Replaces every channel's processing settings at once, as a session load does: `settings`
-    /// from CH 1 on (at most 32), the channels past the list neutral; a linked pair takes its first
-    /// side's. Returns every channel's settings now kept, as [Self::processing] does. Refused, with
-    /// nothing changed, as [Self::set_channel_processing] is.
+    /// from CH 1 on (at most 32), sends included, the channels past the list neutral; a linked
+    /// pair takes its first side's. Returns every channel's settings now kept, as
+    /// [Self::processing] does. Refused, with nothing changed, as [Self::set_channel_processing]
+    /// is.
     pub fn replace_processing(
         &self,
         settings: &[StripSettings],
@@ -3067,9 +3073,7 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        Ok(self
-            .local_mix
-            .set_fx_returns(self.local_mix.fx_returns().with(effect, level)))
+        Ok(self.local_mix.set_fx_return(effect, level))
     }
 
     /// Replaces the local mix's effect returns at once (a start or a session load).

@@ -100,11 +100,6 @@ impl StripProcessor {
         }
     }
 
-    /// The channels it processes: 1, or 2 for a linked pair.
-    pub(crate) fn channels(&self) -> usize {
-        self.channels
-    }
-
     /// Takes `design`; every part glides or moves to it without a click.
     pub(crate) fn apply(&mut self, design: &StripDesign) {
         self.eq.apply(&design.eq);
@@ -128,6 +123,7 @@ impl StripProcessor {
     }
 
     /// The samples that were not finite numbers (NaN or an infinity), processed as silence.
+    #[cfg(test)]
     pub(crate) fn non_finite_samples(&self) -> u64 {
         self.non_finite
     }
@@ -153,6 +149,7 @@ impl StripProcessor {
     }
 
     /// Processes frames holding just this strip's channels.
+    #[cfg(test)]
     pub(crate) fn process_frames(&mut self, frames: &mut [f32]) {
         self.process(frames, self.channels, 0);
     }

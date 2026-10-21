@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex};
 
 use crate::dsp::dynamics::{Limiter, LimiterDesign, LimiterSettings};
@@ -404,8 +406,11 @@ pub(crate) struct MixState {
     /// apart from the mix's values, so no copy, mirror or `mix` of the values touches it.
     limiter: LimiterControl,
     /// The return level of each shared effect in this mix, 0-100% (see [crate::effects]):
-    /// engineer-only and apart from the mix's values, like the limiter.
-    fx_returns: [AtomicU8; 2],
+    /// engineer-only and apart from the mix's values, like the limiter. Both in one atomic (the
+    /// reverb in the low byte, the delay in the high one), so a change to one effect's return is a
+    /// single compare-and-swap that never loses a change made meanwhile to the other's, and the
+    /// engine thread reads both from one moment.
+    fx_returns: AtomicU16,
 }
 
 /// A partial change to one client's mix: every absent field keeps its current value.
@@ -531,7 +536,7 @@ impl Default for MixState {
             published: AtomicU64::new(revision),
             following: Mutex::new(None),
             limiter: LimiterControl::default(),
-            fx_returns: [AtomicU8::new(0), AtomicU8::new(0)],
+            fx_returns: AtomicU16::new(0),
         }
     }
 }
@@ -567,6 +572,17 @@ fn store_all_flags(slots: &[AtomicBool; MAX_MIX_CHANNELS], values: &[bool; MAX_M
     }
 }
 
+/// Both effect returns in the bits of one atomic: the reverb low, the delay high.
+fn pack_fx_returns(levels: EffectLevels) -> u16 {
+    u16::from(levels.reverb) | u16::from(levels.delay) << 8
+}
+
+/// The effect returns [pack_fx_returns] packed.
+fn unpack_fx_returns(bits: u16) -> EffectLevels {
+    let [reverb, delay] = bits.to_le_bytes();
+    EffectLevels { reverb, delay }
+}
+
 impl MixState {
     /// The master limiter of this mix, for the engine thread's [MixPlan::mix_master].
     pub(crate) fn limiter(&self) -> &LimiterControl {
@@ -586,19 +602,28 @@ impl MixState {
 
     /// This mix's effect return levels, for the engine thread and the status.
     pub(crate) fn fx_returns(&self) -> EffectLevels {
-        EffectLevels {
-            reverb: self.fx_returns[0].load(Ordering::Relaxed),
-            delay: self.fx_returns[1].load(Ordering::Relaxed),
-        }
+        unpack_fx_returns(self.fx_returns.load(Ordering::Relaxed))
     }
 
     /// Sets this mix's effect return levels (each held to 100%) from the next block, where they
     /// glide; answers what is kept. Engineer-only: never from a phone.
     pub(crate) fn set_fx_returns(&self, levels: EffectLevels) -> EffectLevels {
         let levels = levels.clamped();
-        self.fx_returns[0].store(levels.reverb, Ordering::Relaxed);
-        self.fx_returns[1].store(levels.delay, Ordering::Relaxed);
+        self.fx_returns
+            .store(pack_fx_returns(levels), Ordering::Relaxed);
         levels
+    }
+
+    /// Sets the return of `effect` alone to `level` percent (held to 100), keeping the other's
+    /// as it is at that moment, as one atomic step: two changes at once, one to each effect, both
+    /// land. Answers both returns now kept.
+    pub(crate) fn set_fx_return(&self, effect: Effect, level: u8) -> EffectLevels {
+        let update = |bits| Some(pack_fx_returns(unpack_fx_returns(bits).with(effect, level)));
+        let before = self
+            .fx_returns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, update)
+            .unwrap_or_else(|bits| bits);
+        unpack_fx_returns(before).with(effect, level)
     }
 
     /// Builds a state that carries the given group membership. Each client's group levels start
@@ -2246,6 +2271,94 @@ mod tests {
         output.reset();
         assert_eq!(output.limiter_reduction_db(), 0.0);
         assert_eq!(mastered(&plan, &output, &limiter, &quiet, 2), plain);
+    }
+
+    /// The effects' returns are limited with the dry mix: a quiet mix whose reverb and delay
+    /// returns push it over the ceiling comes out under it, turned down by the limiter (its
+    /// reduction reported), not cut flat by the clamp.
+    #[test]
+    fn the_effect_returns_are_limited_with_the_dry_mix() {
+        let source: Vec<f32> = (0..2 * 480)
+            .map(|index| 0.2 * ((index / 2) as f32 * 0.05).sin())
+            .collect();
+        let plan = MixPlan::new(&MixValues::default(), 2);
+        let ceiling = 10f32.powf(-6.0 / 20.0);
+        let mut dry = vec![0.0; source.len()];
+        plan.mix_into(&source, &mut dry);
+        assert!(peak(&dry) < ceiling * 0.9, "the dry mix alone is under it");
+
+        let wet: Vec<f32> = (0..2 * 480)
+            .map(|index| 0.9 * ((index / 2) as f32 * 0.031).cos())
+            .collect();
+        let levels = EffectLevels {
+            reverb: 100,
+            delay: 100,
+        };
+        let (limited, plain) = (MixRamp::default(), MixRamp::default());
+        let mut returned = vec![0.0; source.len()];
+        plan.mix_master(
+            &limited,
+            &limiter_on(-6.0, 100.0),
+            levels,
+            &Wet::of(Some(&wet), Some(&wet)),
+            &source,
+            &mut returned,
+        );
+        assert!(peak(&returned) <= ceiling, "{}", peak(&returned));
+        assert!(peak(&returned) > ceiling * 0.99, "it limits, not mutes");
+        assert!(
+            limited.limiter_reduction_db() > 6.0,
+            "{}",
+            limited.limiter_reduction_db()
+        );
+        // The same returns with the limiter off reach far past the ceiling's -6 dB (the clamp at
+        // the mix's full scale holds them there), so it was the limiter that held them.
+        let mut unlimited = vec![0.0; source.len()];
+        plan.mix_master(
+            &plain,
+            &LimiterControl::default(),
+            levels,
+            &Wet::of(Some(&wet), Some(&wet)),
+            &source,
+            &mut unlimited,
+        );
+        assert!(peak(&unlimited) > ceiling * 1.5, "{}", peak(&unlimited));
+        assert_eq!(plain.limiter_reduction_db(), 0.0);
+    }
+
+    /// Two changes at once, one to each effect's return (the desk's reverb and delay sliders on
+    /// two threads): every change lands, none undoes the other.
+    #[test]
+    fn changes_to_both_returns_at_once_never_undo_each_other() {
+        let state = Arc::new(MixState::new(&GroupLayout::new(Vec::new())));
+        for round in 0..50u8 {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let threads: Vec<_> = Effect::ALL
+                .into_iter()
+                .map(|effect| {
+                    let (state, barrier) = (Arc::clone(&state), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for level in 0..=100 {
+                            state.set_fx_return(effect, level);
+                        }
+                        state.set_fx_return(effect, round + 1)
+                    })
+                })
+                .collect();
+            for (effect, thread) in Effect::ALL.into_iter().zip(threads) {
+                assert_eq!(thread.join().unwrap().get(effect), round + 1);
+            }
+            assert_eq!(
+                state.fx_returns(),
+                EffectLevels {
+                    reverb: round + 1,
+                    delay: round + 1
+                },
+                "round {round}"
+            );
+        }
+        assert_eq!(state.set_fx_return(Effect::Delay, 250).delay, 100);
     }
 
     /// Turned off while working, the limiter lets go over its switch-off time and then the mix is

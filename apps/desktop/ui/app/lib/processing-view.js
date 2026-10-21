@@ -454,6 +454,36 @@ export function abSettle(ab, channel, strip) {
   return rest;
 }
 
+/**
+ * The editor's failure line: the latest failure wins. `sent(channel, outcome)` notes the answer to
+ * an effect send of `channel` (a refusal, or `ok` to clear it); `text(view)` is the line for the
+ * editor's view (`{ channel, outcome, error }`): a refused send of the channel shown, unless a
+ * failure of the editor's own commands (or the strips' read error) came after it. A refused send is
+ * forgotten once another channel is shown, so it never stands over a channel it was not about.
+ */
+export function createFailureLine() {
+  let order = 0;
+  let send = null;
+  let other = { said: "", at: 0 };
+  return {
+    sent(channel, outcome) {
+      order += 1;
+      send = outcome?.ok ? null : { channel, message: outcome?.message ?? "", at: order };
+    },
+    text(view) {
+      const said = view.outcome && !view.outcome.ok ? view.outcome.message : (view.error ?? "");
+      if (said !== other.said) {
+        order += 1;
+        other = { said, at: order };
+      }
+      if (send && send.channel !== view.channel) {
+        send = null;
+      }
+      return send && (!other.said || send.at > other.at) ? send.message : other.said;
+    },
+  };
+}
+
 // A slider of the editor: `{ key, label, range, scale, format }`, `key` its name in the strip part.
 const field = (key, label, range, scale, format) => Object.freeze({ key, label, range, scale, format });
 

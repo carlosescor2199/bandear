@@ -1,4 +1,4 @@
-Versión 0.4 (agrega historial de salud del enlace, buffer del celular desde la consola, redundancia de paquetes, archivo de registro, fuente de demostración y respaldo automático de mezclas; la 0.3 agregó mezcla local, grabación multipista y soundcheck virtual), ajustada para una primera validación técnica realizada por una sola persona, con 1 a 3 horas de trabajo por noche.
+Versión 0.5 (agrega procesamiento por canal de entrada, presets de canal, limitador en el máster de cada mezcla, reverb y delay compartidos con envíos por canal y retornos por mezcla, y medidor de carga del motor; la 0.4 agregó historial de salud del enlace, buffer del celular desde la consola, redundancia de paquetes, archivo de registro, fuente de demostración y respaldo automático de mezclas; la 0.3 agregó mezcla local, grabación multipista y soundcheck virtual), ajustada para una primera validación técnica realizada por una sola persona, con 1 a 3 horas de trabajo por noche.
 
 # PRD: Sistema de monitoreo personal inalámbrico (nombre provisional: _MixLink_)
 
@@ -15,7 +15,7 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 
 ## 3. Fuera de alcance (v1)
 
-- Procesamiento avanzado (EQ, compresión, reverb por músico).
+- Procesamiento por músico (un EQ o un compresor distinto en la mezcla de cada uno) y procesamiento desde el celular: en v1 el procesamiento es por canal de entrada, compartido por todas las mezclas, y se edita solo desde la consola (RF21 a RF25).
 - Control de la mezcla principal de la consola.
 - Edición o recorte de tomas grabadas, y remuestreo de la salida local (la grabación multipista y el soundcheck virtual sí entran en v1: RF13 a RF16).
 - Transmisión por internet; v1 funciona solo en red local.
@@ -47,6 +47,11 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 - RF18. Archivo de registro: el motor y la app de escritorio escriben sus eventos en `mixlink.log`, en la carpeta de registros de la app, con hora UTC, nivel y área; rota a los 5 MB y conserva 5 archivos anteriores. Una versión sin consola sigue dejando diagnóstico.
 - RF19. Fuente de demostración: una señal generada (un loop de 8 canales a -18 dBFS, igual en cada ejecución) elegible como driver "Demo (no interface)", para correr el motor y transmitir a los celulares sin interfaz de audio. Nunca se elige sola; permite grabar, pero no el soundcheck virtual.
 - RF20. Respaldo automático de las mezclas de los músicos: unos segundos después de que dejan de cambiar (y al detener el motor o cerrar la app) se guardan en un respaldo rotativo de 10 copias, escrito de forma atómica. Restaurar es decisión del ingeniero desde el panel de sesión y solo alcanza a los músicos conectados; la mezcla propia de un celular que se reconecta no se reemplaza sola.
+- RF21. Procesamiento por canal de entrada, como en una consola: filtro pasa altos, ecualizador paramétrico de 4 bandas (shelf de graves, dos picos y shelf de agudos), puerta de ruido y compresor, en ese orden (pasa altos, puerta, ecualizador, compresor). Un par estéreo enlazado es un solo canal con un detector compartido. Todas las mezclas oyen el canal procesado (los celulares, la salida local y la mezcla local grabada); las pistas grabadas de cada entrada quedan como se capturaron. Se edita solo desde la consola, con la curva de respuesta del ecualizador, medidores de entrada y de salida procesada, medidores de reducción de ganancia de la puerta y del compresor, y comparación A/B. Un canal con todo apagado deja las muestras idénticas bit a bit. Se guarda en la sesión y en las sesiones con nombre.
+- RF22. Presets de canal: cinco de fábrica ("Vocal", "Kick", "Bass DI", "Acoustic guitar" y "Gentle compression"), que no se borran, y los del ingeniero con cualquier otro nombre. Aplicar un preset, copiar o reiniciar un canal no cambia sus envíos a los efectos.
+- RF23. Limitador de picos en el máster de cada mezcla (la de cada músico y la mezcla local), después de la suma y de los retornos de efectos y sin lookahead: techo de -24 a 0 dBFS (rige el menor entre el suyo y el de la mezcla) y release de 1 a 1000 ms, con medidor de reducción de ganancia. Solo lo maneja el ingeniero; apagado por defecto, la mezcla queda exactamente como sin él.
+- RF24. Efectos compartidos: una reverb (tamaño, amortiguación, pre-delay y amplitud estéreo) y un delay (tiempo de 1 a 2000 ms o una nota a un tempo, realimentación, corte de agudos en las repeticiones y ping-pong). Cada entrada tiene un envío a cada efecto, tomado después de su procesamiento y antes de los faders, y cada mezcla un retorno de cada efecto que solo maneja el ingeniero. Se guardan en la sesión.
+- RF25. Medidor de carga del motor: el tiempo que tarda el motor en procesar cada bloque, como porcentaje del período del bloque (promedio de alrededor de un segundo, pico de los últimos segundos y bloques tardíos), con aviso por encima del 70 %.
 
 **Apps móviles (Swift y Kotlin)**
 
@@ -57,7 +62,8 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 
 ## 6. Requerimientos no funcionales
 
-- **Latencia de extremo a extremo:** objetivo ≤ 25 ms, aceptable para MVP ≤ 40 ms.
+- **Latencia de extremo a extremo:** objetivo ≤ 25 ms, aceptable para MVP ≤ 40 ms. El procesamiento agrega 0 ms: los filtros son IIR y la puerta, el compresor y el limitador trabajan sin lookahead; la reverb y el delay son retornos (señal húmeda) que no retrasan la señal directa.
+- **Carga del motor:** en una compilación release, 32 canales procesados con 16 músicos usan en promedio el 17,6 % del período de cada bloque (25,9 % en el percentil 99), sin bloques tardíos.
 - **Estabilidad:** sin cortes audibles en sesiones de 3 horas.
 - **Ancho de banda aproximado** (48 kHz, estéreo, por músico): PCM 16 bits ≈ 1,5 Mbps; PCM 24 bits ≈ 2,3 Mbps; Opus ≈ 0,1 a 0,2 Mbps. Con 16 músicos, el PCM suma unos 25 a 37 Mbps. Con Opus, solo unos 2 a 3 Mbps.
 - **Plataformas:** servidor en Windows y macOS (Linux opcional); iOS 16+ y Android 10+.
@@ -70,6 +76,7 @@ Un sistema de software que toma los canales de una mezcladora digital o interfaz
 - **Tiempo de ida y vuelta:** se mide con el ping y pong del canal de control cada 2 s, suavizado como el SRTT de TCP, en cualquier celular.
 - **Códec:** PCM en v1; Opus con tramas de 2,5 a 5 ms como opción para redes saturadas.
 - **Audio interno:** flotante de 32 bits a 48 kHz desde la captura; la conversión a 16 bits ocurre solo al enviar a los celulares, así que la grabación conserva los 24 bits de la entrada. Las entradas a 96 o 192 kHz pasan por un filtro antialias antes de diezmar.
+- **Procesamiento:** una etapa en el hilo del motor, entre la captura y las mezclas. Los coeficientes se calculan fuera del hilo de audio y llegan por una cola sin bloqueos; el hilo de audio nunca reserva memoria ni bloquea. Los cambios de ajustes y de ganancia se deslizan para no producir chasquidos, y los efectos reservan sus líneas de retardo una sola vez.
 - **Grabación:** escritor WAV/RF64 propio; el audio va a disco en un hilo aparte por un búfer sin bloqueos, y si el búfer se llena se descartan y cuentan muestras sin bloquear nunca el audio.
 - **Audio móvil:** AVAudioEngine en iOS y Oboe/AAudio en Android.
 - **Control:** WebSocket para faders, nombres y estado.

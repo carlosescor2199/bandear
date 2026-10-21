@@ -35,15 +35,6 @@ pub(crate) struct BiquadCoefficients {
 }
 
 impl BiquadCoefficients {
-    /// The filter that changes nothing.
-    pub(crate) const IDENTITY: Self = Self {
-        b0: 1.0,
-        b1: 0.0,
-        b2: 0.0,
-        a1: 0.0,
-        a2: 0.0,
-    };
-
     /// The cookbook filter of `shape` at `frequency_hz` with quality `q` and, for the shelves and
     /// the peak, `gain_db`, at the engine's 48 kHz. The caller keeps the numbers in range (see
     /// [super::eq]); the frequency must be below the Nyquist frequency and `q` above zero.
@@ -166,11 +157,6 @@ impl Biquad {
         for (glide, target) in self.coefficients.iter_mut().zip(target) {
             glide.restart(target, GLIDE_FRAMES);
         }
-    }
-
-    /// Jumps to the identity with no state, untouched samples from the next block.
-    pub(crate) fn reset(&mut self) {
-        *self = Self::new(self.channels);
     }
 
     /// False when the samples go through untouched.

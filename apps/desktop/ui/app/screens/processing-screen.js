@@ -25,6 +25,7 @@ import {
   HIGH_PASS_FIELDS,
   SLIDER_STEPS,
   bandHandles,
+  createFailureLine,
   curveDescription,
   curvePath,
   dragHandle,
@@ -281,9 +282,9 @@ export function mountProcessingScreen(main, app) {
   }
 
   let view = commands.view();
-  // The send slider under the pointer, if any, and the last refused send.
+  // The send slider under the pointer, if any, and the failure line (the latest failure wins).
   let draggingSend = null;
-  let sendOutcome = null;
+  const failures = createFailureLine();
 
   function readPath(settings, path) {
     return path.split(".").reduce((part, key) => part?.[key], settings);
@@ -328,11 +329,7 @@ export function mountProcessingScreen(main, app) {
       return;
     }
     view = commands.view();
-    const failure = sendOutcome
-      ? sendOutcome.message
-      : view.outcome && !view.outcome.ok
-        ? view.outcome.message
-        : view.error ?? "";
+    const failure = failures.text(view);
     parts.outcome.textContent = view.outcome?.ok ? view.outcome.message : "";
     parts.failure.textContent = failure;
 
@@ -490,8 +487,9 @@ export function mountProcessingScreen(main, app) {
     input.addEventListener("pointerup", release);
     input.addEventListener("change", release);
     input.addEventListener("input", () => {
-      app.editChannelSend(view.channel, effect, Number(input.value)).then((outcome) => {
-        sendOutcome = outcome.ok ? null : outcome;
+      const channel = view.channel;
+      app.editChannelSend(channel, effect, Number(input.value)).then((outcome) => {
+        failures.sent(channel, outcome);
         scheduleRender();
       });
     });

@@ -591,7 +591,76 @@ test.
   - Counts: `cargo test -p personal-monitoring` 643 passed (617 before); `cargo test -p
     mixlink-desktop` 341 passed (333); `cargo check -p mixlink-desktop --all-targets` clean; UI
     `node --test apps/desktop/ui/tests` 615 passed (604). Commit: this commit.
-- [ ] T9 (close): PRD update, docs, latency check, live test with the S23. Route: inline or writer.
+- [x] T8-fix (review-24afb76ed941a1de's, review-5d6be859d233a714's and review-6f8659ef97e6cff0's
+  findings: six WARNINGs, five SUGGESTIONs). Route: delegated writer (with T9's docs; trigger: the
+  engine's stage, two effects, the mixer and targets, then the console's app, store, a pure module,
+  the master strip, a screen and the fake bridge). Commits 01df9c5 `fix(engine): keep a channel's
+  sends when its strip is replaced` (+61/-5), 3759ecc `fix(engine): retarget delay and pre-delay
+  without a click` (+178/-67), 714dbd5 `fix(engine): change one effect return without losing the
+  other's` (+128/-16), 590d746 `refactor(engine): drop the dsp module's dead-code allowance`
+  (+7/-26), 993342f `fix(desktop-ui): settle every limiter edit and test the slider's keys`
+  (+103/-22) and 702b47a `fix(desktop-ui): keep each effect's own answer and the latest failure`
+  (+137/-24).
+  - Sends: `Processing::set_channel` (so `set_channel_processing`) keeps the channel's own sends and
+    ignores `settings.sends`; only `set_send` changes them, and `replace` (a session load) replaces
+    them with the strips it loads. The desk already kept each target's sends; now no caller can
+    zero them by accident.
+  - Delay time and pre-delay: one `MovingTap` (`dsp/reverb.rs`) for both; a length that comes
+    during the 20 ms crossfade waits for it to end and then crossfades on from where the output is
+    (the last length wins), so the output only moves between two taps along one fade.
+  - Returns: both of a mix's returns in one `AtomicU16`; `MixState::set_fx_return` changes one with
+    a single compare-and-swap (musicians and the local mix), and `set_fx_return` in the targets
+    holds the book from the change through the keeping.
+  - Dead code: the blanket `#[allow(dead_code)]` on `mod dsp` and its stale note are gone; four
+    unused helpers removed (`Glide::jump`, `BiquadCoefficients::IDENTITY`, `Biquad::reset`,
+    `StripProcessor::channels`), test-only accessors under `#[cfg(test)]`. The intra-doc links in
+    `dsp/mod.rs` point at modules that exist; `cargo doc` not run.
+  - Console: `sendLimiter` settles in `finally` on every path (an answer that cannot be read is
+    said as not set); the limiter sliders' key tracking is the pure `createSliderKeys`
+    (`lib/limiter.js`); the store keeps only the answered effect's settings and the answered
+    return (`effectsKept`, `returnsKept`); the processing editor's failure line is
+    `createFailureLine` (`lib/processing-view.js`): the latest failure wins and a refused send is
+    forgotten on another channel; the fake bridge refuses an unknown effect in
+    `set_musician_fx_return` and `set_local_fx_return`. Suggestion 11 (the effects screen's DOM
+    handlers into pure helpers) not done: not cheap.
+  - RED: against mutations (`set_channel` writing the sends it was given; `MovingTap::set` with
+    the old jump-to-the-louder-tap rule) `a_strip_written_over_a_channel_keeps_its_sends` (sends 0,
+    not 40), `times_that_come_during_a_crossfade_never_click` (a step of 0.235 against 0.0144) and
+    `a_tap_moved_during_a_crossfade_never_jumps` (1,673 against 7 a frame) failed, then passed.
+    `changes_to_both_returns_at_once_never_undo_each_other` (two threads, 50 rounds) and
+    `the_effect_returns_are_limited_with_the_dry_mix` were written with the fix and passed against
+    the old code (a race that rarely shows, and behaviour that was already right). UI: against the
+    committed modules (stub `createSliderKeys` and `createFailureLine` with the old rules) all five
+    new or extended tests failed (the unreadable limiter answer, the slider keys, the out-of-order
+    effect and return answers, the failure line, the fake's unknown effect), then passed.
+  - Counts: `cargo test -p personal-monitoring` 648 passed (643 before); `cargo test -p
+    mixlink-desktop` 341 passed; `cargo check -p mixlink-desktop --all-targets` clean, and `cargo
+    check -p personal-monitoring --lib` now without warnings; UI `node --test apps/desktop/ui/tests`
+    619 passed (615). `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one at a time.
+- [x] T9 (close): PRD update, docs, latency check, live test with the S23. Route: delegated writer
+  for the docs (with T8-fix); the live test with the user.
+  - Docs: `PRD.md` version 0.5: processing in scope (RF21 per-input strip, RF22 strip presets,
+    RF23 master limiter per mix, RF24 reverb and delay with sends and returns, RF25 engine load),
+    "procesamiento avanzado" moved out of "fuera de alcance" (per-musician processing and
+    processing from the phone stay out), latency (processing adds 0 ms: IIR, no lookahead, effects
+    are wet returns), the release benchmark (32 strips, 16 musicians: 17.6% mean, 25.9% p99, 0
+    late blocks) and a processing decision. `apps/desktop/README.md`: the screens list, Channel
+    processing, Master limiter, Effects, Engine load and ASIO safety. Commit: this commit.
+  - Remaining: live test.
+    - [x] Neutral strips sound unchanged.
+    - [x] An HPF, EQ and compressor on a vocal channel work, and the meters move.
+    - [x] A factory preset keeps the channel's sends.
+    - [x] The limiter on a musician keeps peaks at the ceiling.
+    - [x] Reverb and delay sends and returns (and the tempo) sound right on the S23.
+    - [x] Engine load stays low with everything on.
+    - [x] ASIO open-by-name with the Volt (only with the user's explicit go-ahead).
+  - Live test (2026-10-20, desktop debug build at c357ff6, Galaxy S23 with the phase 4 APK, which
+    phase 5 does not change): the app log shows the S23's reverb and delay returns being moved,
+    then a switch to ASIO that opened "Universal Audio Volt" by name (4 channels at 48 kHz,
+    buffer 256) with the phone registered, and the local output on the Volt's outputs 1/2 under
+    ASIO; the app exited cleanly and the PC stayed up. The user's verdict: "funciona excelente".
+    The ASIO run was the user's own choice during the test. Individual items beyond what the log
+    shows rest on the user's word.
 
 ## Delivery
 
@@ -648,8 +717,16 @@ per reviewed slice, only with the user's approval.
   acknowledged; their findings fixed in T7-fix (b6bdff7, 36f2173, ff50994). Next review base:
   62f6926.
 - T7-fix and T8 done (b6bdff7, 36f2173, ff50994, 5584583, c99a50c, 9016db4 and the console commit).
+- Reviews review-24afb76ed941a1de, review-5d6be859d233a714 and review-6f8659ef97e6cff0 (62f6926..
+  b924113, T7-fix and T8): approved and acknowledged; their findings fixed in T8-fix (01df9c5,
+  3759ecc, 714dbd5, 590d746, 993342f, 702b47a). Next review base: b924113.
+- T8-fix and T9's docs done (the six fix commits and the docs commit).
 
 ## Next step
 
-T9 (close: PRD update, docs, latency check, live test with the S23). Review of 62f6926..T8
-pending.
+Push and the pull requests, with the user's approval. Review review-48067a52e39f2671
+(b924113..c357ff6, T8-fix and docs) approved and acknowledged; next review base c357ff6. T9's
+live test passed (see T9); phase 5 is complete. The user continues on a Mac
+afterwards: the ASIO items (the Volt under ASIO, the vendored cpal patch) and the build-safety
+constraints (`CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, no release builds without a yes) are
+specific to this Windows PC.

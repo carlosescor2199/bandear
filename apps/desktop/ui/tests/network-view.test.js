@@ -194,6 +194,11 @@ test("the engine's load shows its average and peak, and warns once either passes
   assert.deepEqual(load(70, 70), { text: "70% (peak 70%)", warning: false });
   assert.deepEqual(load(40, 82), { text: "40% (peak 82%)", warning: true });
   assert.deepEqual(load(71.2, 75), { text: "71% (peak 75%)", warning: true });
+  // The warning follows the numbers shown: 70.4% reads "70%", like 70%, and does not warn.
+  assert.deepEqual(load(70.4, 70.4), { text: "70% (peak 70%)", warning: false });
+  assert.deepEqual(load(40, 70.4), { text: "40% (peak 70%)", warning: false });
+  assert.deepEqual(load(70.5, 40), { text: "71% (peak 40%)", warning: true });
+  assert.deepEqual(load(40, 70.5), { text: "40% (peak 71%)", warning: true });
   assert.deepEqual(load(55, 130, 1), { text: "55% (peak 130%) · 1 late block", warning: true });
   assert.equal(load(55, 130, 1200).text, "55% (peak 130%) · 1,200 late blocks");
 });

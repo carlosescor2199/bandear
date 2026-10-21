@@ -72,7 +72,9 @@ of v1; this phase brings it in and updates the PRD.
 - ASIO is never chosen by default and never enumerated implicitly.
 - The engine thread and audio callbacks never allocate, lock or panic.
 - **Build safety**: `CARGO_BUILD_JOBS=2`, gradle `--max-workers=2`, one build at a time, never
-  `cargo clean`, stop and report on a compiler crash or a corrupt generated file.
+  `cargo clean`, stop and report on a compiler crash or a corrupt generated file. The F: drive is
+  nearly full: `CARGO_INCREMENTAL=0`, no release builds without the user's approval, stop on "no
+  space" (os error 112).
 
 ## Scope
 
@@ -121,8 +123,63 @@ test.
   clean; UI `node --test apps/desktop/ui/tests` 542 passed. Builds ran with `CARGO_BUILD_JOBS=2`;
   the F: drive filled up (25 MB free), so `target/debug/incremental` (a regenerable cache, not a
   `cargo clean`) was removed and later builds used `CARGO_INCREMENTAL=0`.
-- [ ] T3 (dsp module): biquad EQ and HPF, gate, compressor, limiter; allocation-free, exact bypass,
-  tests. Route: delegated writer.
+- [x] T1/T2-fix (review-9d72c382f294a073's two SUGGESTIONs). Route: delegated writer (with T3).
+  Commit 535aa1e `fix: settle the load warning on shown values and bound the bench` (+149/-28):
+  `loadView` decides the warning on the rounded numbers it shows (70.4% reads "70%" and does not
+  warn; 70.5% reads "71%" and does); RED: the new 70.4 case failed (`warning: true`), then passed.
+  `LoadBenchOptions::validate` bounds the bench (inputs 1-32, musicians 0-64, seconds above 0 and
+  at most 600, block 1-8,192 frames) and `run_engine_load` and the example's parser (whole numbers
+  now, no `as usize` cast) refuse anything past them with a usage error; tests
+  `the_bench_refuses_options_outside_its_bounds` and
+  `a_run_out_of_bounds_is_an_error_before_it_allocates` (written with the fix). No port fallback
+  on 127.0.0.1: the registry keeps one target per IP, so on a host that only answers on 127.0.0.1
+  (macOS by default) a second musician is an error that says to run with `--targets 1` or add
+  loopback aliases; documented in the example and `run_engine_load`.
+- [x] T3 (dsp module): biquad EQ and HPF, gate, compressor, limiter; allocation-free, exact bypass,
+  tests. Route: delegated writer (trigger: four new non-trivial files, `apps/server/src/dsp/`).
+  Commits 6bbb70e `feat(engine): biquad filters and the channel equaliser` (+1077),
+  7996fee `feat(engine): gate, compressor and limiter` (+1038/-2) and this commit (the strip).
+  Pure module, not on the audio path yet (`#[allow(dead_code)] mod dsp`; T4 wires it).
+  - API: settings are serde plain data (camelCase, missing fields defaulted): `StripSettings
+    { eq: EqSettings { highPass, bands[4] }, gate, compressor }`, `LimiterSettings`; each has
+    `clamped()`, `is_neutral()` and `design()` (off the engine thread: f64 RBJ coefficients,
+    linear thresholds, time constants). Processors `Biquad`, `Eq`, `Gate`, `Compressor`,
+    `Limiter`, `StripProcessor` are made in `new(channels)` (1, or 2 linked), take a design with
+    `apply` (copies numbers) and `process(block, stride, first)` in place on interleaved frames,
+    so a stage can process one input of a whole capture block. Gain reduction: positive dB f32s
+    (`gain_reduction_db`, `gate_reduction_db`, `compressor_reduction_db`) for atomics as bits.
+    `EqSettings::magnitude_db(freq)` gives the response curve.
+  - Ranges (clamped; NaN takes the default): HPF 20-2,000 Hz, Q 0.5-2 (80 Hz, 0.707, off); bands
+    20-20,000 Hz, ±18 dB, Q 0.3-10 (low shelf 100 Hz, peaks 400 and 2,500 Hz, high shelf 8 kHz);
+    gate threshold -80-0 dBFS, range 0-80 dB, attack 0.05-50 ms, hold 0-2,000 ms, release
+    5-4,000 ms; compressor threshold -60-0 dBFS, ratio 1-20, knee 0-24 dB, attack 0.1-200 ms,
+    release 10-2,000 ms, makeup 0-24 dB; limiter ceiling -24-0 dBFS, release 1-1,000 ms.
+  - Detectors: one per linked pair on `max(|L|,|R|)`. Compressor: feed-forward on the sample
+    peak, soft knee in dB (Giannoulis/Massberg/Reiss), reduction smoothed in dB (attack up,
+    release down). Gate: a peak envelope with a fixed 10 ms fall (no chatter on low notes), open
+    at or above the threshold plus hold, closing by `range`. Limiter: instant attack to the
+    ceiling, release on the attenuation (`1 - gain`, kept as the distance so f32 rounding cannot
+    stall it short of 1), and a final clip at the ceiling for rounding. Peak, not RMS: no window,
+    and transients are what a monitor mix must not let through.
+  - Exact bypass: a neutral or disabled processor does not touch the samples (tests compare bits
+    on a signal with ±0, 1e-30, `f32::MIN_POSITIVE`, -1.5, a tone and noise). Turned off while
+    working, each glides out (filters to the identity, reductions to 0 dB over 20 ms, makeup to
+    0 dB) and then stops touching them. Smoothing: coefficients and makeup glide linearly over
+    480 frames (10 ms); a linear mix of two stable biquads is stable (the stability triangle is
+    convex). Denormals: biquad state is zeroed when both values fall below 1e-20 together (zeroing
+    one alone kept a resonant filter ringing at the floor, caught by the tail test), envelopes are
+    flushed, reductions snap to their target within 0.001 dB.
+  - RED: against stubs (`magnitude_db` returning 0, `flush_denormal` passing values through) the
+    response, running-response, EQ curve and subnormal tests failed (5), then passed; against
+    stubbed dynamics (no smoothing, a flat static curve, no limiter gain, no flush, glides that
+    jump) 7 failed; with glides alone jumping, the biquad and makeup glide tests and the
+    switch-off test failed (both glide tests first passed by switching on a zero crossing, so they
+    now switch on a crest); with the strip's order reversed both order tests failed; then all 39
+    `dsp` tests pass. The limiter's switch-off test found the f32 stall above.
+  - No allocation: `applying_and_running_never_allocate` (Eq, dynamics) and
+    `applying_and_running_a_strip_never_allocates` count 0 allocations and frees.
+  - Micro benchmark of one strip on 32 channels: not added (optional); T4's `engine_load` run
+    with strips on measures it in the real stage.
 - [ ] T4 (per-input stage): the stage in `Pipeline`, engine API, command ring, raw block to the
   recorder, post-processing meters and gain reduction. Route: delegated writer.
 - [ ] T5 (desk): session, commands and strip presets for channel processing. Route: delegated
@@ -144,7 +201,15 @@ per reviewed slice, only with the user's approval.
 - Branch `feat/desktop-dsp` from main ea71cde (phase 4 merged as PRs #57-#68).
 - Exploration done (read-only map with file evidence); the user chose per-input processing,
   shared by all mixes.
+- Review review-9d72c382f294a073 (ea71cde..052c897, T1 + T2): approved and acknowledged; its two
+  SUGGESTIONs (the load warning on unrounded values, the bench's unbounded options) fixed in
+  535aa1e. Next review base: 052c897.
+- Verification after T1/T2-fix and T3: `cargo test -p personal-monitoring` 574 passed; UI
+  `node --test apps/desktop/ui/tests` 542 passed; `cargo check -p mixlink-desktop --all-targets`
+  clean. Builds with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, no release builds.
+- Disk: the F: drive is nearly full (2.4 GB free before T3, 1.4 GB after; each test build of the
+  server takes a few hundred MB). Keep builds to debug, one at a time, and stop on "no space".
 
 ## Next step
 
-T3 (dsp module). Before it: the user's approval for a release run of `engine_load`.
+T4 (per-input stage). The release run of `engine_load` still waits for the user's approval.

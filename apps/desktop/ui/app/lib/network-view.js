@@ -137,8 +137,8 @@ export const LOAD_WARNING_PERCENT = 70;
  * The engine's load line: `{ text, warning }`, the text "12% (peak 30%)", the average and the
  * peak of the last seconds as shares of the time a block lasts, then the late blocks when there
  * are any ("· 3 late blocks"); a dash with no engine or no load reported. `warning` is true once
- * the average or the peak passes LOAD_WARNING_PERCENT: the engine thread is close to running late,
- * and late blocks drop audio.
+ * the average or the peak, as shown (rounded), passes LOAD_WARNING_PERCENT: the engine thread is
+ * close to running late, and late blocks drop audio.
  */
 export function loadView(status) {
   const load = status?.load;
@@ -151,9 +151,8 @@ export function loadView(status) {
   const lateText = late > 0 ? ` · ${count(late)} late ${late === 1 ? "block" : "blocks"}` : "";
   return {
     text: `${average}% (peak ${peak}%)${lateText}`,
-    warning:
-      (load.averagePercent ?? 0) > LOAD_WARNING_PERCENT ||
-      (load.peakPercent ?? 0) > LOAD_WARNING_PERCENT,
+    // Decided on the rounded numbers, so the warning always agrees with the text shown.
+    warning: average > LOAD_WARNING_PERCENT || peak > LOAD_WARNING_PERCENT,
   };
 }
 

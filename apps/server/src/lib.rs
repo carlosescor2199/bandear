@@ -6,6 +6,9 @@ mod control;
 mod decimate;
 mod demo;
 mod discovery;
+// Channel processing; the engine's per-input stage puts it on the audio path.
+#[allow(dead_code)]
+mod dsp;
 mod engine;
 mod health;
 mod link_history;

@@ -1,6 +1,7 @@
 //! Channel processing: the filters and dynamics of a console's channel strip, for one input or a
 //! linked stereo pair, at the engine's 48 kHz. [strip] puts them in order (high-pass, gate,
-//! equaliser, compressor); [dynamics] also holds the limiter for a mix's master.
+//! equaliser, compressor); [dynamics] also holds the limiter for a mix's master; [reverb] and
+//! [delay] are the two shared effects every mix can return (see [crate::effects]).
 //!
 //! Every processor follows the engine thread's rules:
 //!
@@ -23,8 +24,10 @@ use std::ops::RangeInclusive;
 use crate::capture::TARGET_SAMPLE_RATE;
 
 pub(crate) mod biquad;
+pub(crate) mod delay;
 pub(crate) mod dynamics;
 pub(crate) mod eq;
+pub(crate) mod reverb;
 pub(crate) mod strip;
 
 /// The rate every processor runs at.

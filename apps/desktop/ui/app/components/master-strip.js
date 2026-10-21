@@ -17,7 +17,8 @@
 //   drag sends its last value only.
 //   `limiter-edit` { field, value } (bubbling, composed): "enabled" with true or false, or
 //   "ceilingDb" / "releaseMs" with the slider's position (0-1,000; limiterChange turns it into the
-//   setting) as it moves.
+//   setting) as it moves, with `key` true when a key moved the slider (an arrow, Page Up/Down, Home
+//   or End), false for the pointer.
 
 import "./fader.js";
 import "./reduction-meter.js";
@@ -114,12 +115,17 @@ const styles = sheet(`
   }
 `);
 
+// The keys a range input moves by.
+const SLIDER_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"]);
+
 class MlMasterStrip extends HTMLElement {
   #data = null;
   #parts;
   #limiter;
   // The limiter slider under the pointer, if any.
   #dragging = null;
+  // The limiter slider a key is moving, until its `input` event.
+  #keyed = null;
 
   constructor() {
     super();
@@ -260,12 +266,19 @@ class MlMasterStrip extends HTMLElement {
       this.#limiterEdit("enabled", event.detail.pressed);
     });
     for (const { input, key } of limiter.fields) {
+      input.addEventListener("keydown", (event) => {
+        this.#keyed = SLIDER_KEYS.has(event.key) ? input : null;
+      });
+      input.addEventListener("keyup", () => {
+        this.#keyed = null;
+      });
       input.addEventListener("input", (event) => {
         event.stopPropagation();
-        this.#limiterEdit(key, Number(input.value));
+        this.#limiterEdit(key, Number(input.value), this.#keyed === input);
       });
       input.addEventListener("pointerdown", () => {
         this.#dragging = input;
+        this.#keyed = null;
       });
       const release = () => {
         if (this.#dragging === input) {
@@ -281,9 +294,9 @@ class MlMasterStrip extends HTMLElement {
     }
   }
 
-  #limiterEdit(field, value) {
+  #limiterEdit(field, value, key = false) {
     if (this.#data?.limiter) {
-      emit(this, "limiter-edit", { field, value });
+      emit(this, "limiter-edit", { field, value, key });
     }
   }
 

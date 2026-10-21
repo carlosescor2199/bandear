@@ -119,11 +119,13 @@ const UNITS = Object.freeze({ ceilingDb: 0.5, releaseMs: 1 });
 
 /**
  * The whole limiter after a control of the master strip changed: `field` "enabled" with `value`
- * true or false, or "ceilingDb" / "releaseMs" with `value` the slider's position (0-1,000). A
- * position that moved but rounds back to the same value (an arrow key: one step of 1,000) moves it
- * by one unit, 0.5 dB or 1 ms, its way, so the keyboard always gets somewhere. Held in range.
+ * true or false, or "ceilingDb" / "releaseMs" with `value` the slider's position (0-1,000). When
+ * `{ key }` says a key moved the slider (an arrow key: one step of 1,000), a position that rounds
+ * back to the same value moves it by one unit, 0.5 dB or 1 ms, its way, so the keyboard always gets
+ * somewhere. A drag takes the value at its position as it is, so a slow drag never flips between
+ * two neighbouring values. Held in range.
  */
-export function limiterChange(settings, field, value) {
+export function limiterChange(settings, field, value, { key = false } = {}) {
   const held = clampLimiter(settings);
   if (field === "enabled") {
     return { ...held, enabled: Boolean(value) };
@@ -134,7 +136,7 @@ export function limiterChange(settings, field, value) {
   }
   const from = limiterPosition(definition, held[field]);
   let next = limiterValue(definition, value);
-  if (next === held[field] && value !== from) {
+  if (key && next === held[field] && value !== from) {
     next = held[field] + Math.sign(value - from) * UNITS[field];
   }
   return clampLimiter({ ...held, [field]: next });

@@ -637,7 +637,7 @@ test.
     mixlink-desktop` 341 passed; `cargo check -p mixlink-desktop --all-targets` clean, and `cargo
     check -p personal-monitoring --lib` now without warnings; UI `node --test apps/desktop/ui/tests`
     619 passed (615). `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one at a time.
-- [ ] T9 (close): PRD update, docs, latency check, live test with the S23. Route: delegated writer
+- [x] T9 (close): PRD update, docs, latency check, live test with the S23. Route: delegated writer
   for the docs (with T8-fix); the live test with the user.
   - Docs: `PRD.md` version 0.5: processing in scope (RF21 per-input strip, RF22 strip presets,
     RF23 master limiter per mix, RF24 reverb and delay with sends and returns, RF25 engine load),
@@ -647,13 +647,20 @@ test.
     late blocks) and a processing decision. `apps/desktop/README.md`: the screens list, Channel
     processing, Master limiter, Effects, Engine load and ASIO safety. Commit: this commit.
   - Remaining: live test.
-    - [ ] Neutral strips sound unchanged.
-    - [ ] An HPF, EQ and compressor on a vocal channel work, and the meters move.
-    - [ ] A factory preset keeps the channel's sends.
-    - [ ] The limiter on a musician keeps peaks at the ceiling.
-    - [ ] Reverb and delay sends and returns (and the tempo) sound right on the S23.
-    - [ ] Engine load stays low with everything on.
-    - [ ] ASIO open-by-name with the Volt (only with the user's explicit go-ahead).
+    - [x] Neutral strips sound unchanged.
+    - [x] An HPF, EQ and compressor on a vocal channel work, and the meters move.
+    - [x] A factory preset keeps the channel's sends.
+    - [x] The limiter on a musician keeps peaks at the ceiling.
+    - [x] Reverb and delay sends and returns (and the tempo) sound right on the S23.
+    - [x] Engine load stays low with everything on.
+    - [x] ASIO open-by-name with the Volt (only with the user's explicit go-ahead).
+  - Live test (2026-10-20, desktop debug build at c357ff6, Galaxy S23 with the phase 4 APK, which
+    phase 5 does not change): the app log shows the S23's reverb and delay returns being moved,
+    then a switch to ASIO that opened "Universal Audio Volt" by name (4 channels at 48 kHz,
+    buffer 256) with the phone registered, and the local output on the Volt's outputs 1/2 under
+    ASIO; the app exited cleanly and the PC stayed up. The user's verdict: "funciona excelente".
+    The ASIO run was the user's own choice during the test. Individual items beyond what the log
+    shows rest on the user's word.
 
 ## Delivery
 
@@ -717,8 +724,9 @@ per reviewed slice, only with the user's approval.
 
 ## Next step
 
-The live test with the user (T9's "Remaining: live test" list), then push and the pull requests,
-with the user's approval. Review of b924113..T8-fix pending. The user continues on a Mac
+Push and the pull requests, with the user's approval. Review review-48067a52e39f2671
+(b924113..c357ff6, T8-fix and docs) approved and acknowledged; next review base c357ff6. T9's
+live test passed (see T9); phase 5 is complete. The user continues on a Mac
 afterwards: the ASIO items (the Volt under ASIO, the vendored cpal patch) and the build-safety
 constraints (`CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, no release builds without a yes) are
 specific to this Windows PC.

@@ -11,6 +11,8 @@
 
 export const LANGUAGES = Object.freeze(["en", "es"]);
 export const DEFAULT_LANGUAGE = "en";
+// 404.html repeats STORAGE_KEY and pickLanguage inline (it loads no modules); change both
+// together. tests/i18n.test.mjs fails when they drift apart.
 export const STORAGE_KEY = "bandear.lang";
 export const LANGUAGE_EVENT = "bandear:language";
 

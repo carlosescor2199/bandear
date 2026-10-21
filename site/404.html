@@ -123,15 +123,27 @@
       var home = /\.github\.io$/.test(location.hostname) ? "/bandear/" : "/";
       document.querySelector("[data-home]").setAttribute("href", home);
 
-      // Same language choice as the main page (js/i18n.js): stored choice, else the browser.
-      var lang = "en";
-      try {
-        var stored = localStorage.getItem("bandear.lang");
-        if (stored === "es" || stored === "en") lang = stored;
-        else if (/^es/i.test((navigator.languages && navigator.languages[0]) || navigator.language || "")) lang = "es";
-      } catch (error) {
-        if (/^es/i.test(navigator.language || "")) lang = "es";
+      // The main page's language choice, copied from js/i18n.js because this page loads no
+      // modules: keep STORAGE_KEY and pickLanguage in step with it (tests/i18n.test.mjs checks).
+      var STORAGE_KEY = "bandear.lang";
+      // BEGIN pickLanguage
+      function pickLanguage(stored, browserLanguages) {
+        if (stored === "en" || stored === "es") return stored;
+        for (var i = 0; i < browserLanguages.length; i++) {
+          var tag = browserLanguages[i];
+          if (typeof tag === "string" && tag.length > 0) return /^es/i.test(tag) ? "es" : "en";
+        }
+        return "en";
       }
+      // END pickLanguage
+      var stored = null;
+      try {
+        stored = localStorage.getItem(STORAGE_KEY);
+      } catch (error) {
+        /* Blocked storage: follow the browser. */
+      }
+      var languages = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
+      var lang = pickLanguage(stored, languages);
       if (lang !== "es") return;
       var es = {
         title: "Esta página no está en la mezcla",

@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { DICTIONARY, LANGUAGES, keysInHtml, parseAttrSpec, pickLanguage, translate } from "../js/i18n.js";
+import { DICTIONARY, LANGUAGES, STORAGE_KEY, keysInHtml, parseAttrSpec, pickLanguage, translate } from "../js/i18n.js";
 
 const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const sceneFlow = readFileSync(new URL("../js/scene-flow.js", import.meta.url), "utf8");
@@ -57,6 +57,32 @@ test("pickLanguage prefers a stored choice, then a Spanish browser", () => {
   assert.equal(pickLanguage("fr", ["de-DE"]), "en");
   assert.equal(pickLanguage(null, []), "en");
   assert.equal(pickLanguage(null, [undefined]), "en");
+});
+
+test("404.html picks its language exactly like the main page", () => {
+  const page = readFileSync(new URL("../404.html", import.meta.url), "utf8");
+  const key = page.match(/var STORAGE_KEY = "([^"]+)";/);
+  assert.ok(key, "STORAGE_KEY not found in 404.html");
+  assert.equal(key[1], STORAGE_KEY);
+
+  const source = page.match(/\/\/ BEGIN pickLanguage([\s\S]*?)\/\/ END pickLanguage/);
+  assert.ok(source, "pickLanguage not found in 404.html");
+  const inline = new Function(`${source[1]}; return pickLanguage;`)();
+  const cases = [
+    ["es", ["en-US"]],
+    ["en", ["es-MX"]],
+    [null, ["es-419", "en"]],
+    [null, ["ES"]],
+    [null, ["en-GB", "es"]],
+    [null, ["", "es-AR"]],
+    [null, [undefined, "es"]],
+    ["fr", ["de-DE"]],
+    [null, []],
+    [null, [undefined]],
+  ];
+  for (const [stored, languages] of cases) {
+    assert.equal(inline(stored, languages), pickLanguage(stored, languages), `${stored} ${JSON.stringify(languages)}`);
+  }
 });
 
 test("translate fills placeholders and falls back to English, then the key", () => {

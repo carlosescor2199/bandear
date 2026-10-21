@@ -33,6 +33,12 @@ pub(crate) trait LimiterEngine {
     ) -> Result<(MusicianKey, String, LimiterSettings), String>;
     /// Sets the master limiter on the local mix; answers the settings kept, held in range.
     fn set_local_limiter(&self, settings: LimiterSettings) -> Result<LimiterSettings, String>;
+    /// Replaces every musician's master limiter the engine keeps
+    /// ([EngineHandle::replace_musician_limiters]).
+    fn replace_musician_limiters(
+        &self,
+        kept: &[(MusicianKey, LimiterSettings)],
+    ) -> Result<(), String>;
 }
 
 impl LimiterEngine for EngineHandle {
@@ -48,6 +54,15 @@ impl LimiterEngine for EngineHandle {
 
     fn set_local_limiter(&self, settings: LimiterSettings) -> Result<LimiterSettings, String> {
         EngineHandle::set_local_limiter(self, settings).map_err(|error| error.to_string())
+    }
+
+    fn replace_musician_limiters(
+        &self,
+        kept: &[(MusicianKey, LimiterSettings)],
+    ) -> Result<(), String> {
+        EngineHandle::replace_musician_limiters(self, kept)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -83,6 +98,25 @@ pub(crate) fn local_limiter_of(session: &Session) -> LimiterSettings {
         .as_ref()
         .and_then(|local| local.limiter)
         .unwrap_or_else(LimiterSettings::master)
+}
+
+/// Hands `engine` every limiter `session` keeps: each musician's replaces the engine's whole (a
+/// musician the session keeps none for has none), and the local mix takes the session's (off when
+/// it keeps none). A start does this for the new engine, and a load for the loaded session. Rule
+/// for a loaded session saved without a local section: the desk keeps its own local section, its
+/// limiter included, so `session` is the session as loaded and the engine and the session always
+/// agree on the local mix's limiter. Answers what the engine refused, in words.
+pub(crate) fn hand_kept_limiters<E: LimiterEngine>(engine: &E, session: &Session) -> Vec<String> {
+    let mut refused = Vec::new();
+    if let Err(error) = engine.replace_musician_limiters(&limiters_of(session)) {
+        refused.push(format!("the saved limiters were not applied: {error}"));
+    }
+    if let Err(error) = engine.set_local_limiter(local_limiter_of(session)) {
+        refused.push(format!(
+            "the saved local mix limiter was not applied: {error}"
+        ));
+    }
+    refused
 }
 
 /// What a set says in words.
@@ -220,6 +254,8 @@ mod tests {
     struct StandIn {
         took: Mutex<Vec<(MusicianKey, LimiterSettings)>>,
         local: Mutex<Vec<LimiterSettings>>,
+        /// Every list of musicians' limiters it took whole.
+        replaced: Mutex<Vec<Vec<(MusicianKey, LimiterSettings)>>>,
         stopping: bool,
     }
 
@@ -255,6 +291,20 @@ mod tests {
             let settings = settings.clamped();
             self.local.lock().expect("local lock").push(settings);
             Ok(settings)
+        }
+
+        fn replace_musician_limiters(
+            &self,
+            kept: &[(MusicianKey, LimiterSettings)],
+        ) -> Result<(), String> {
+            if self.stopping {
+                return Err("the engine is stopping".to_owned());
+            }
+            self.replaced
+                .lock()
+                .expect("replaced lock")
+                .push(kept.to_vec());
+            Ok(())
         }
     }
 
@@ -425,6 +475,52 @@ mod tests {
         assert_eq!(
             local_limiter_of(&Session::default()),
             LimiterSettings::master()
+        );
+    }
+
+    /// What a start hands the new engine: the saved musicians' limiters whole and the saved local
+    /// mix's; a session with none hands an empty list and the default.
+    #[test]
+    fn an_engine_is_handed_the_saved_musician_and_local_limiters() {
+        let session = SessionStore::open(&test_directory("hand-engine"));
+        session
+            .set_limiter(&client_key(PHONE), ADDRESS, Some(on(-6.0)))
+            .expect("kept");
+        session.set_local_limiter(Some(on(-2.0))).expect("kept");
+        let engine = StandIn::default();
+
+        assert_eq!(
+            hand_kept_limiters(&engine, &session.current()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            *engine.replaced.lock().expect("replaced lock"),
+            vec![vec![(MusicianKey::Client(PHONE.to_owned()), on(-6.0))]]
+        );
+        assert_eq!(*engine.local.lock().expect("local lock"), vec![on(-2.0)]);
+
+        let fresh = StandIn::default();
+        assert!(hand_kept_limiters(&fresh, &Session::default()).is_empty());
+        assert_eq!(
+            *fresh.replaced.lock().expect("replaced lock"),
+            vec![Vec::new()]
+        );
+        assert_eq!(
+            *fresh.local.lock().expect("local lock"),
+            vec![LimiterSettings::master()],
+            "no local section: the local mix's limiter goes back to off"
+        );
+
+        let stopping = StandIn {
+            stopping: true,
+            ..StandIn::default()
+        };
+        assert_eq!(
+            hand_kept_limiters(&stopping, &session.current()),
+            vec![
+                "the saved limiters were not applied: the engine is stopping".to_owned(),
+                "the saved local mix limiter was not applied: the engine is stopping".to_owned(),
+            ]
         );
     }
 }

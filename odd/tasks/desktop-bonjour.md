@@ -64,3 +64,4 @@ build the iOS app now.
   personal-monitoring`: lib 657 passed, 0 failed, 0 ignored; main.rs 0; doc-tests 0. Existing
   discovery tests unchanged.
 - Pending: manual `dns-sd -B _bandear._tcp` on the Mac mini.
+- Work-unit commit: `8b37cfd feat(server): announce the desk over Bonjour for iOS` (T1 + T2).

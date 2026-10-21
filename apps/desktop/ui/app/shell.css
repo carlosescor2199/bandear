@@ -51,8 +51,12 @@
   font-weight: var(--ml-weight-bold);
 }
 
-/* The BandEar mark: its drawing fills the middle ~45% of a square canvas, so the box is larger
-   than the glyph and the negative margins keep the glyph where the old square sat. */
+/* The BandEar mark: on its 1024 canvas the stroked drawing spans x 274-760 and y 202-830, about
+   47% of the width and 61% of the height, so in this 32px box the glyph is about 15 x 20px, from
+   8.5px in on the left and 6.3px down from the top. The negative margins take the empty canvas out
+   of the layout: -6px above and below leave a 20px line the glyph fills, -9px on the left starts
+   the glyph at the row's padding (where the old square sat), and -6px on the right leaves about
+   2px of canvas before the 10px gap to the name. */
 .brand-mark {
   flex: none;
   width: 32px;

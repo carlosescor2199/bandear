@@ -4,7 +4,9 @@
     The paths are docs/brand/bandear-mark.svg's, in its 1024 viewport (1024 units = 108 dp). The
     group scales the mark by 0.82 around its centre (517, 516) and moves that centre to the canvas
     centre, so its farthest point (the stem's top corner, stroke included) sits about 303 units from
-    the centre: inside the 66 dp safe circle (313 units), so no launcher mask cuts it.
+    the centre: inside the 66 dp safe circle (313 units), so no launcher mask cuts it. The stroke
+    is 46, as in docs/brand/bandear-icon.svg (the app-icon variant), not the 44
+    of docs/brand/bandear-mark.svg (the mark on its own).
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"

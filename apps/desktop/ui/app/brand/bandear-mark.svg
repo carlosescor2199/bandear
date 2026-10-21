@@ -1,5 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <title>BandEar</title>
+  <!-- A copy of docs/brand/bandear-mark.svg, the source of truth, shipped with the console (the
+       sidebar mark and the favicon). Change the source and copy it here; docs/brand/README.md lists
+       every copy. -->
   <g fill="none" stroke="#FFBF43" stroke-width="44" stroke-linecap="round" stroke-linejoin="round">
     <!-- Outer B: top bar, stem, bottom bar and the lower bowl -->
     <path d="M520 224 H344 A48 48 0 0 0 296 272 V738 A70 70 0 0 0 366 808 H556 A186 186 0 0 0 692 528"/>

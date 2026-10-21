@@ -9,8 +9,9 @@
 // Property: `data`, one entry of channelStrips (mix-view.js):
 //   { index, sides, stereo, label, kind, group, gain, pan, muted, solo, tone, readout, lockable,
 //   locked, lockText, following }. A strip that is not `lockable` (the engineer's local mix, which
-//   no phone plays) has no lock. `processing` (the screen adds it) is true while the input's
-//   processing is on; the strip links to its editor, "Processing on" in words when it is.
+//   no phone plays) has no lock. `processing` (the screen adds it, processingActive) is true while the
+//   input's processing is on, null while not read yet; the strip links to its editor (processingLink),
+//   "Processing on" in words when it is.
 // Method: `setLevel(level)`, the input peak from the `meters` event (a pair's louder side).
 // Event: `mix-edit` { field, index, sides, stereo, value } (bubbling, composed) for a move of the
 //   fader ("channelGains") or the pan ("pans", a balance for a pair) and a press of Mute
@@ -25,7 +26,7 @@ import "./pan.js";
 import "./toggle.js";
 import { kindIcon, stereoIcon } from "./kind-icons.js";
 import { followingState } from "../lib/mix-tools.js";
-import { processingHash } from "../lib/router.js";
+import { processingLink } from "../lib/processing-view.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
@@ -207,11 +208,11 @@ class MlChannelStrip extends HTMLElement {
       ? "Locked: the musician's phone cannot change this channel; you still can"
       : "Unlocked: the musician's phone can change this channel";
     // The input's processing is shared by every mix; a pair's opens on its first side.
-    const on = data.processing === true;
-    reflect(parts.processing, "href", processingHash(data.sides[0] + 1));
-    reflect(parts.processing, "data-on", on);
-    reflect(parts.processing, "aria-label", `Processing of ${label}, ${on ? "on" : "off"}`);
-    setText(parts.processing, on ? "Processing on" : "Processing");
+    const link = processingLink({ sides: data.sides, label, active: data.processing ?? null });
+    reflect(parts.processing, "href", link.href);
+    reflect(parts.processing, "data-on", link.state === "on");
+    reflect(parts.processing, "aria-label", link.ariaLabel);
+    setText(parts.processing, link.text);
     parts.processing.title = "Open this input's high-pass, equaliser, gate and compressor";
   }
 

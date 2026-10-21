@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::dsp::dynamics::{Limiter, LimiterDesign, LimiterSettings};
+
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
 pub(crate) const MAX_GROUPS: usize = 16;
 pub(crate) const OUTPUT_CHANNELS: u8 = 2;
@@ -397,6 +399,9 @@ pub(crate) struct MixState {
     /// The name of the musician whose mix this one follows (see [MixState::set_following]), or
     /// `None`. Changed and read by writers under the writer lock; never read by the audio path.
     following: Mutex<Option<Arc<str>>>,
+    /// The master limiter the engineer set for this mix (see [LimiterControl]): engineer-only, and
+    /// apart from the mix's values, so no copy, mirror or `mix` of the values touches it.
+    limiter: LimiterControl,
 }
 
 /// A partial change to one client's mix: every absent field keeps its current value.
@@ -521,6 +526,7 @@ impl Default for MixState {
             writer: Mutex::new(revision),
             published: AtomicU64::new(revision),
             following: Mutex::new(None),
+            limiter: LimiterControl::default(),
         }
     }
 }
@@ -557,6 +563,22 @@ fn store_all_flags(slots: &[AtomicBool; MAX_MIX_CHANNELS], values: &[bool; MAX_M
 }
 
 impl MixState {
+    /// The master limiter of this mix, for the engine thread's [MixPlan::mix_master].
+    pub(crate) fn limiter(&self) -> &LimiterControl {
+        &self.limiter
+    }
+
+    /// Sets this mix's master limiter (see [LimiterControl]) from the next block; answers the
+    /// settings kept, held in range. Engineer-only: never from a phone.
+    pub(crate) fn set_limiter(&self, settings: LimiterSettings) -> LimiterSettings {
+        self.limiter.set(settings)
+    }
+
+    /// The master limiter's settings in force.
+    pub(crate) fn limiter_settings(&self) -> LimiterSettings {
+        self.limiter.settings()
+    }
+
     /// Builds a state that carries the given group membership. Each client's group levels start
     /// neutral, so a client that never sends `group_levels` hears every channel ungrouped.
     pub(crate) fn new(layout: &GroupLayout) -> Self {
@@ -1120,14 +1142,29 @@ struct Moving {
 /// Before the first block, and when the source's channel count changes, there is nothing to glide
 /// from: that block is mixed as it is, unramped.
 ///
+/// It also keeps the running state of the mix's master limiter ([MixPlan::mix_master]): how far
+/// it turns the mix down after the previous block, and the gain reduction to report. The limiter's
+/// settings belong to the mix ([LimiterControl], on its [MixState]); its state belongs to whoever
+/// mixes it, so the local output and the recorder's local mix, which mix the same local mix, each
+/// limit with their own and never share it.
+///
 /// Only the engine thread uses it once it is made; its atomics are never contended. They let a
 /// target entry share it with that thread without a lock, as [crate::redundancy::HeldCopies] is
-/// shared. Made off the engine thread, sized for [MAX_MIX_CHANNELS]; mixing never allocates.
+/// shared, and let the meters read the gain reduction. Made off the engine thread, sized for
+/// [MAX_MIX_CHANNELS]; mixing never allocates.
 pub(crate) struct MixRamp {
     /// The channel count of the previous block's source; 0 before the first block.
     channels: AtomicUsize,
     /// Each channel's gain, left and right weights in the previous block, as `f32` bits.
     weights: [[AtomicU32; 3]; MAX_MIX_CHANNELS],
+    /// The master limiter's attenuation after the previous block (`f32` bits; see
+    /// [crate::dsp::dynamics::Limiter::attenuation]).
+    limiter_attenuation: AtomicU32,
+    /// Whether the master limiter still touches the samples (on, or releasing after being turned
+    /// off).
+    limiter_active: AtomicBool,
+    /// How far the master limiter turned the last block down, in dB as `f32` bits (0: not at all).
+    limiter_reduction_db: AtomicU32,
 }
 
 impl Default for MixRamp {
@@ -1135,14 +1172,33 @@ impl Default for MixRamp {
         Self {
             channels: AtomicUsize::new(0),
             weights: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
+            limiter_attenuation: AtomicU32::new(0),
+            limiter_active: AtomicBool::new(false),
+            limiter_reduction_db: AtomicU32::new(0),
         }
     }
 }
 
 impl MixRamp {
-    /// Forgets the previous block: the next one is mixed unramped, as a first block is.
+    /// Forgets the previous block: the next one is mixed unramped, as a first block is, and the
+    /// master limiter starts again from no reduction.
     pub(crate) fn reset(&self) {
         self.channels.store(0, Ordering::Relaxed);
+        self.keep_limiter(0.0, false, 0.0);
+    }
+
+    /// How far the master limiter turned the last block of this mix down, in dB (0: not at all,
+    /// or off). A read for the meters, from any thread.
+    pub(crate) fn limiter_reduction_db(&self) -> f32 {
+        f32::from_bits(self.limiter_reduction_db.load(Ordering::Relaxed))
+    }
+
+    fn keep_limiter(&self, attenuation: f32, active: bool, reduction_db: f32) {
+        self.limiter_attenuation
+            .store(attenuation.to_bits(), Ordering::Relaxed);
+        self.limiter_active.store(active, Ordering::Relaxed);
+        self.limiter_reduction_db
+            .store(reduction_db.to_bits(), Ordering::Relaxed);
     }
 
     fn load(&self, channel: usize) -> Weights {
@@ -1160,6 +1216,90 @@ impl MixRamp {
         gain.store(weights.gain.to_bits(), Ordering::Relaxed);
         left.store(weights.left.to_bits(), Ordering::Relaxed);
         right.store(weights.right.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// A mix's master limiter, as the engineer set it: engineer-only, like [EngineerControls], so no
+/// phone's `mix` can change it and it is not part of [MixValues] or any `mix` message.
+///
+/// **Where it sits.** After the mix's sum and before the clamp at the mix's ceiling (the lower of
+/// the phone's level cap and the engineer's limit, see [MixPlan]), which stays as the last safety
+/// net. Peak, with an instant attack and no lookahead: it adds no latency.
+///
+/// **Its ceiling.** The lower of its own ceiling (-24 to 0 dBFS) and the mix's ceiling. At its
+/// default of 0 dBFS ([LimiterSettings::master]) it limits right at the mix's ceiling, so the clamp
+/// never cuts a peak while it is on; a lower ceiling limits below it. Turning the engineer's limit
+/// or the phone's cap down lowers it too.
+///
+/// **Off.** Off is the default and leaves the mix bit for bit as without a limiter; turned off
+/// while it works, it releases what it still turns down (a 20 ms time constant) and then stops
+/// touching the mix.
+///
+/// The settings are written off the engine thread with the design worked out there (the linear
+/// ceiling and the release coefficient), and read by the engine thread with plain atomic loads:
+/// no lock, no allocation and no logarithm on the audio path. A change that lands while a block
+/// reads it may pair the new switch with the old numbers for that one block, which is harmless.
+pub(crate) struct LimiterControl {
+    enabled: AtomicBool,
+    ceiling_db: AtomicU32,
+    release_ms: AtomicU32,
+    /// The design the engine thread runs: limiting, linear ceiling, release coefficient.
+    design_enabled: AtomicBool,
+    design_ceiling: AtomicU32,
+    design_release: AtomicU32,
+}
+
+impl Default for LimiterControl {
+    fn default() -> Self {
+        let control = Self {
+            enabled: AtomicBool::new(false),
+            ceiling_db: AtomicU32::new(0),
+            release_ms: AtomicU32::new(0),
+            design_enabled: AtomicBool::new(false),
+            design_ceiling: AtomicU32::new(0),
+            design_release: AtomicU32::new(0),
+        };
+        control.set(LimiterSettings::master());
+        control
+    }
+}
+
+impl LimiterControl {
+    /// Puts `settings`, held in range, in force from the next block; answers what was kept. Works
+    /// out the design here, so call it off the engine thread.
+    pub(crate) fn set(&self, settings: LimiterSettings) -> LimiterSettings {
+        let kept = settings.clamped();
+        let (enabled, ceiling, release) = kept.design().parts();
+        self.ceiling_db
+            .store(kept.ceiling_db.to_bits(), Ordering::Relaxed);
+        self.release_ms
+            .store(kept.release_ms.to_bits(), Ordering::Relaxed);
+        self.enabled.store(kept.enabled, Ordering::Relaxed);
+        self.design_ceiling
+            .store(ceiling.to_bits(), Ordering::Relaxed);
+        self.design_release
+            .store(release.to_bits(), Ordering::Relaxed);
+        self.design_enabled.store(enabled, Ordering::Release);
+        kept
+    }
+
+    /// The settings in force.
+    pub(crate) fn settings(&self) -> LimiterSettings {
+        LimiterSettings {
+            enabled: self.enabled.load(Ordering::Relaxed),
+            ceiling_db: f32::from_bits(self.ceiling_db.load(Ordering::Relaxed)),
+            release_ms: f32::from_bits(self.release_ms.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// The design the engine thread runs this block.
+    fn design(&self) -> LimiterDesign {
+        let enabled = self.design_enabled.load(Ordering::Acquire);
+        LimiterDesign::from_parts(
+            enabled,
+            f32::from_bits(self.design_ceiling.load(Ordering::Relaxed)),
+            f32::from_bits(self.design_release.load(Ordering::Relaxed)),
+        )
     }
 }
 
@@ -1217,8 +1357,16 @@ impl MixPlan {
     }
 
     /// Mixes the whole frames of `source` into `stereo` (interleaved left and right, at most as
-    /// many frames as it holds) and returns the frames written. Allocation-free.
+    /// many frames as it holds) and returns the frames written. Allocation-free. The sinks mix
+    /// through [Self::mix_master], which is this for a steady block with the limiter off; the
+    /// tests compare against it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mix_into(&self, source: &[f32], stereo: &mut [f32]) -> usize {
+        self.mix_into_at(self.ceiling, source, stereo)
+    }
+
+    /// [Self::mix_into], clamped at `ceiling` (infinite: not clamped, for the master limiter).
+    fn mix_into_at(&self, ceiling: f32, source: &[f32], stereo: &mut [f32]) -> usize {
         let voices = &self.voices[..self.count];
         let mut frames = 0;
         for (frame, output) in source
@@ -1232,8 +1380,8 @@ impl MixPlan {
                 left += sample * voice.gain * voice.left;
                 right += sample * voice.gain * voice.right;
             }
-            output[0] = left.clamp(-self.ceiling, self.ceiling);
-            output[1] = right.clamp(-self.ceiling, self.ceiling);
+            output[0] = left.clamp(-ceiling, ceiling);
+            output[1] = right.clamp(-ceiling, ceiling);
             frames += 1;
         }
         frames
@@ -1243,6 +1391,17 @@ impl MixPlan {
     /// this plan's wherever they differ (see [MixRamp]), and keeps this plan's in `ramp` for the
     /// next block. Allocation-free.
     pub(crate) fn mix_ramped(&self, ramp: &MixRamp, source: &[f32], stereo: &mut [f32]) -> usize {
+        self.mix_ramped_at(self.ceiling, ramp, source, stereo)
+    }
+
+    /// [Self::mix_ramped], clamped at `ceiling` (infinite: not clamped, for the master limiter).
+    fn mix_ramped_at(
+        &self,
+        ceiling: f32,
+        ramp: &MixRamp,
+        source: &[f32],
+        stereo: &mut [f32],
+    ) -> usize {
         let continued = ramp.channels.swap(self.channels, Ordering::Relaxed) == self.channels;
         let mut moving = [Moving::default(); MAX_MIX_CHANNELS];
         let mut count = 0;
@@ -1276,7 +1435,7 @@ impl MixPlan {
         }
         if !changed {
             // The same voices with the same weights: the steady mix, bit for bit.
-            return self.mix_into(source, stereo);
+            return self.mix_into_at(ceiling, source, stereo);
         }
 
         let moving = &moving[..count];
@@ -1297,9 +1456,47 @@ impl MixPlan {
                 left += sample * gain * (voice.from.left + voice.step.left * way);
                 right += sample * gain * (voice.from.right + voice.step.right * way);
             }
-            output[0] = left.clamp(-self.ceiling, self.ceiling);
-            output[1] = right.clamp(-self.ceiling, self.ceiling);
+            output[0] = left.clamp(-ceiling, ceiling);
+            output[1] = right.clamp(-ceiling, ceiling);
         }
+        frames
+    }
+
+    /// Mixes like [Self::mix_ramped], through the mix's master limiter `limiter` when it is on or
+    /// still releasing (see [LimiterControl]): the sum, unclamped, goes through the limiter, its
+    /// ceiling held to this mix's, and then through the clamp as before. The limiter carries on
+    /// from the state `ramp` kept and keeps its state and its gain reduction there. While the
+    /// limiter is off and done, this is [Self::mix_ramped], bit for bit. Allocation-free.
+    pub(crate) fn mix_master(
+        &self,
+        ramp: &MixRamp,
+        limiter: &LimiterControl,
+        source: &[f32],
+        stereo: &mut [f32],
+    ) -> usize {
+        let design = limiter.design().capped(self.ceiling);
+        let mut running = Limiter::resumed(
+            usize::from(OUTPUT_CHANNELS),
+            &design,
+            f32::from_bits(ramp.limiter_attenuation.load(Ordering::Relaxed)),
+            ramp.limiter_active.load(Ordering::Relaxed),
+        );
+        if !running.is_active() {
+            ramp.keep_limiter(0.0, false, 0.0);
+            return self.mix_ramped(ramp, source, stereo);
+        }
+        let frames = self.mix_ramped_at(f32::INFINITY, ramp, source, stereo);
+        let mixed = &mut stereo[..frames * usize::from(OUTPUT_CHANNELS)];
+        running.process(mixed, usize::from(OUTPUT_CHANNELS), 0);
+        // The clamp stays the last word, though the limiter already held every sample under it.
+        for sample in mixed.iter_mut() {
+            *sample = sample.clamp(-self.ceiling, self.ceiling);
+        }
+        ramp.keep_limiter(
+            running.attenuation(),
+            running.is_active(),
+            running.gain_reduction_db(),
+        );
         frames
     }
 }
@@ -1689,6 +1886,217 @@ mod tests {
                 values.pans[(block + 7) % 32] = (block * 3 % 101) as u8;
                 values.channel_muted[(block + 3) % 32] = block % 2 == 0;
                 MixPlan::new(&values, 32).mix_ramped(&ramp, &source, &mut stereo);
+            }
+        });
+
+        assert_eq!((allocations, frees), (0, 0));
+    }
+
+    fn limiter_on(ceiling_db: f32, release_ms: f32) -> LimiterControl {
+        let control = LimiterControl::default();
+        control.set(LimiterSettings {
+            enabled: true,
+            ceiling_db,
+            release_ms,
+        });
+        control
+    }
+
+    fn mastered(
+        plan: &MixPlan,
+        ramp: &MixRamp,
+        limiter: &LimiterControl,
+        source: &[f32],
+        channels: usize,
+    ) -> Vec<f32> {
+        let mut stereo = vec![0.0; source.len() / channels * 2];
+        plan.mix_master(ramp, limiter, source, &mut stereo);
+        stereo
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    }
+
+    /// Off (the default), the master limiter is not on the path at all: every block, steady or
+    /// gliding, is the ramped mix bit for bit, over hundreds of drawn mixes.
+    #[test]
+    fn with_the_limiter_off_the_master_is_the_ramped_mix_bit_for_bit() {
+        use golden::Noise;
+
+        let limiter = LimiterControl::default();
+        assert_eq!(limiter.settings(), LimiterSettings::master());
+        let (plain, master) = (MixRamp::default(), MixRamp::default());
+        let mut noise = Noise(0x0bad_cafe_f00d_d00d);
+        for block in 0..600 {
+            let channels = [2, 4, 8, 32][noise.below(4) as usize];
+            let frames = 1 + noise.below(64) as usize;
+            // A mix moves every third block; the others hold it.
+            let values = if block % 3 == 0 {
+                noise.mix()
+            } else {
+                MixValues::default()
+            };
+            let source: Vec<f32> = (0..channels * frames)
+                .map(|_| f32::from(noise.sample()) / 16_384.0)
+                .collect();
+            let plan = MixPlan::new(&values, channels);
+            let mut expected = vec![0.0; frames * 2];
+            plan.mix_ramped(&plain, &source, &mut expected);
+            let got = mastered(&plan, &master, &limiter, &source, channels);
+            assert!(
+                got.iter()
+                    .zip(&expected)
+                    .all(|(got, want)| got.to_bits() == want.to_bits()),
+                "block {block} differs"
+            );
+            assert_eq!(master.limiter_reduction_db(), 0.0);
+        }
+    }
+
+    /// A mix far over full scale comes out under the limiter's ceiling, its reduction is reported,
+    /// and the clamp is not what held it: the limited block is the mix turned down, not cut flat.
+    #[test]
+    fn a_hot_mix_is_held_under_the_ceiling_and_its_reduction_reported() {
+        // Four inputs, two on each side, each a 0.9 peak sine: up to 1.8 on each side.
+        let source: Vec<f32> = (0..480)
+            .flat_map(|frame| {
+                let value = 0.9 * (frame as f32 * 0.05).sin();
+                [value; 4]
+            })
+            .collect();
+        let plan = MixPlan::new(&MixValues::default(), 4);
+        let ramp = MixRamp::default();
+        let limiter = limiter_on(-6.0, 100.0);
+        let ceiling = 10f32.powf(-6.0 / 20.0);
+
+        let limited = mastered(&plan, &ramp, &limiter, &source, 4);
+        assert!(peak(&limited) <= ceiling, "{}", peak(&limited));
+        assert!(peak(&limited) > ceiling * 0.99, "it limits, not mutes");
+        let reduction = ramp.limiter_reduction_db();
+        assert!(reduction > 9.0 && reduction < 12.0, "{reduction}");
+        // Past the first crest the whole mix is turned down, the quiet parts too: a clip at the
+        // ceiling would have left every sample under it as it was.
+        let mut unlimited = vec![0.0; limited.len()];
+        plan.mix_into(&source, &mut unlimited);
+        let quiet: Vec<(f32, f32)> = limited
+            .iter()
+            .zip(&unlimited)
+            .skip(2 * 40)
+            .filter(|(_, plain)| plain.abs() > 0.05 && plain.abs() < ceiling)
+            .map(|(limited, plain)| (*limited, *plain))
+            .collect();
+        assert!(quiet.len() > 60, "{}", quiet.len());
+        assert!(
+            quiet
+                .iter()
+                .all(|(limited, plain)| limited.abs() < plain.abs() * 0.5),
+            "{quiet:?}"
+        );
+
+        // The engineer's limit lowers the ceiling below the limiter's: 25% is about -12 dBFS.
+        let mut values = MixValues::default();
+        values.engineer.limit_percent = 25;
+        let capped = MixPlan::new(&values, 4);
+        let limited = mastered(&capped, &MixRamp::default(), &limiter, &source, 4);
+        assert!(peak(&limited) <= capped.ceiling, "{}", peak(&limited));
+        assert!(peak(&limited) > capped.ceiling * 0.99);
+    }
+
+    /// The limiter's settings belong to the mix, its state to whoever mixes it: two mixes of the
+    /// same settings (the local output and the recorder's local mix, or two musicians) never share
+    /// what one of them is turning down.
+    #[test]
+    fn each_mix_limits_with_its_own_state() {
+        let hot = vec![1.5f32; 2 * 64];
+        let quiet = vec![0.25f32; 2 * 64];
+        let plan = MixPlan::new(&MixValues::default(), 2);
+        let limiter = limiter_on(-3.0, 500.0);
+        let (output, recorder) = (MixRamp::default(), MixRamp::default());
+
+        mastered(&plan, &output, &limiter, &hot, 2);
+        assert!(output.limiter_reduction_db() > 6.0);
+        assert_eq!(recorder.limiter_reduction_db(), 0.0, "untouched");
+
+        let still_down = mastered(&plan, &output, &limiter, &quiet, 2);
+        let fresh = mastered(&plan, &recorder, &limiter, &quiet, 2);
+        let mut plain = vec![0.0; quiet.len()];
+        plan.mix_into(&quiet, &mut plain);
+        assert!(
+            still_down[0] < 0.25 * 0.6,
+            "still releasing: {}",
+            still_down[0]
+        );
+        assert_eq!(fresh, plain, "the other mix starts from no reduction");
+        assert_eq!(recorder.limiter_reduction_db(), 0.0);
+
+        // A reset (a new take) starts the state again.
+        output.reset();
+        assert_eq!(output.limiter_reduction_db(), 0.0);
+        assert_eq!(mastered(&plan, &output, &limiter, &quiet, 2), plain);
+    }
+
+    /// Turned off while working, the limiter lets go over its switch-off time and then the mix is
+    /// as without it again, bit for bit; the settings are held in range.
+    #[test]
+    fn a_limiter_turned_off_lets_go_and_then_leaves_the_mix_alone() {
+        let plan = MixPlan::new(&MixValues::default(), 2);
+        let ramp = MixRamp::default();
+        let limiter = limiter_on(-12.0, 1_000.0);
+        mastered(&plan, &ramp, &limiter, &[1.0f32; 2 * 64], 2);
+        assert!(ramp.limiter_reduction_db() > 11.0);
+
+        let kept = limiter.set(LimiterSettings {
+            enabled: false,
+            ceiling_db: -40.0,
+            release_ms: f32::NAN,
+        });
+        assert_eq!(
+            kept,
+            LimiterSettings {
+                enabled: false,
+                ceiling_db: -24.0,
+                release_ms: 50.0,
+            },
+            "held in range"
+        );
+        let quiet = vec![0.1f32; 2 * 480];
+        let letting_go = mastered(&plan, &ramp, &limiter, &quiet, 2);
+        assert!(letting_go[0] < 0.1 && letting_go[0] > 0.0);
+        // The switch-off release is a 20 ms time constant: give it 400 ms.
+        for _ in 0..40 {
+            mastered(&plan, &ramp, &limiter, &quiet, 2);
+        }
+        let plain = {
+            let mut stereo = vec![0.0; quiet.len()];
+            plan.mix_ramped(&MixRamp::default(), &quiet, &mut stereo);
+            stereo
+        };
+        assert_eq!(mastered(&plan, &ramp, &limiter, &quiet, 2), plain);
+        assert_eq!(ramp.limiter_reduction_db(), 0.0);
+    }
+
+    #[test]
+    fn mixing_through_a_working_limiter_never_allocates() {
+        let ramp = MixRamp::default();
+        let limiter = limiter_on(-6.0, 50.0);
+        let source = vec![0.75f32; 256 * 32];
+        let mut stereo = vec![0.0f32; 256 * 2];
+        let mut values = MixValues::default();
+
+        let (allocations, frees) = crate::pipeline::tests::allocations::count(|| {
+            for block in 0..300 {
+                values.channel_gains[block % 32] = (block % 101) as u8;
+                if block % 50 == 0 {
+                    limiter.set(LimiterSettings {
+                        enabled: block % 100 == 0,
+                        ceiling_db: -(block as f32 % 24.0),
+                        release_ms: 20.0,
+                    });
+                }
+                MixPlan::new(&values, 32).mix_master(&ramp, &limiter, &source, &mut stereo);
             }
         });
 

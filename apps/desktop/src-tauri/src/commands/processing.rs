@@ -890,12 +890,13 @@ mod tests {
 
     const PAIR: [usize; 2] = [2, 3];
 
-    /// Holds one read of the strips while another change runs: it says it is parked, then waits
-    /// until CH 1's strip changes (a change landed while the read was half done) or `wait`
-    /// passes, and notes which.
+    /// Holds one read of the strips while another change runs: it says it is parked, waits for the
+    /// competing change to say it is about to take the engine lock, and notes whether CH 1's strip
+    /// changed meanwhile (a change landed while the read was half done). No fixed wait: the read
+    /// goes on only once the competitor is at the lock.
     struct ReadPark {
         parked: std::sync::mpsc::Sender<()>,
-        wait: std::time::Duration,
+        competitor: std::sync::mpsc::Receiver<()>,
         changed_meanwhile: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -903,14 +904,12 @@ mod tests {
         fn hold(self, engine: &StandIn) {
             let before = engine.strips.lock().expect("strips")[0];
             self.parked.send(()).expect("the test waits for the park");
-            let deadline = std::time::Instant::now() + self.wait;
-            while std::time::Instant::now() < deadline {
-                if engine.strips.lock().expect("strips")[0] != before {
-                    self.changed_meanwhile
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            self.competitor
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the competing change reached the engine lock");
+            if engine.strips.lock().expect("strips")[0] != before {
+                self.changed_meanwhile
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -1523,6 +1522,7 @@ mod tests {
             let engine = running();
             set_with(&engine, &saver, 1, compressed(-20.0)).expect("set");
             let (parked, parked_signal) = std::sync::mpsc::channel();
+            let (at_lock, competitor) = std::sync::mpsc::channel();
             let changed_meanwhile = Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
                 let guard = engine.lock().expect("engine");
@@ -1530,7 +1530,7 @@ mod tests {
                 stand_in.writes.lock().expect("writes").clear();
                 *stand_in.park.lock().expect("park") = Some(ReadPark {
                     parked,
-                    wait: std::time::Duration::from_millis(50),
+                    competitor,
                     changed_meanwhile: Arc::clone(&changed_meanwhile),
                 });
             }
@@ -1546,6 +1546,7 @@ mod tests {
                     .expect("the copy reached its read");
                 // The change to the source runs while the copy is between its read and its write.
                 scope.spawn(move || {
+                    at_lock.send(()).expect("the park waits for the change");
                     set_with(engine, saver, 1, compressed(-40.0)).expect("set");
                 });
             });

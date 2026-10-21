@@ -37,6 +37,7 @@ fn store_path() -> PathBuf {
 /// announced client name. All other values are neutral; only the name path is under test.
 fn engine_status(client_name: Option<&str>) -> EngineStatus {
     EngineStatus {
+        local_limiter: Default::default(),
         device_name: "Probe device".to_owned(),
         capture_format: CaptureFormat {
             channels: 2,
@@ -55,6 +56,7 @@ fn engine_status(client_name: Option<&str>) -> EngineStatus {
         packets_sent: 0,
         packets_discarded: 0,
         musicians: vec![MusicianStatus {
+            limiter: Default::default(),
             address: ADDRESS.parse().expect("the probe address should parse"),
             name: client_name.map(str::to_owned),
             client_id: None,

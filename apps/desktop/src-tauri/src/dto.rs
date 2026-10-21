@@ -1564,6 +1564,7 @@ mod tests {
 
     fn status_with(groups: Vec<GroupStatus>, channel_levels: Vec<u8>) -> EngineStatus {
         EngineStatus {
+            local_limiter: Default::default(),
             device_name: "Test device".to_owned(),
             capture_format: CaptureFormat {
                 channels: 2,
@@ -1671,6 +1672,7 @@ mod tests {
     #[test]
     fn the_engine_name_becomes_the_client_name_and_the_label_is_left_to_the_command_layer() {
         let musician = MusicianStatus {
+            limiter: Default::default(),
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: Some("Ana".to_owned()),
             client_id: None,
@@ -1694,6 +1696,7 @@ mod tests {
     #[test]
     fn a_musician_that_never_announced_a_name_reports_no_client_name() {
         let musician = MusicianStatus {
+            limiter: Default::default(),
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: None,
             client_id: None,
@@ -1717,6 +1720,7 @@ mod tests {
     #[test]
     fn the_last_send_error_reaches_the_window_and_is_null_without_one() {
         let failing = MusicianStatus {
+            limiter: Default::default(),
             counters: personal_monitoring::MusicianCounters {
                 packets_discarded: 3,
                 last_send_error: Some("network unreachable"),
@@ -1738,6 +1742,7 @@ mod tests {
     #[test]
     fn the_phones_client_id_reaches_the_window_and_is_null_without_one() {
         let phone = MusicianStatus {
+            limiter: Default::default(),
             client_id: Some("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
             ..musician_with_link(LinkStatus::default())
         };
@@ -1759,6 +1764,7 @@ mod tests {
     #[test]
     fn a_row_says_whose_mix_the_musician_follows_and_whether_the_leader_is_here() {
         let follower = MusicianStatus {
+            limiter: Default::default(),
             capabilities: Vec::new(),
             mirror: Some(MirrorStatus {
                 leader: MusicianKey::Client("0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b".to_owned()),
@@ -1768,6 +1774,7 @@ mod tests {
             ..musician_with_link(LinkStatus::default())
         };
         let away = MusicianStatus {
+            limiter: Default::default(),
             capabilities: Vec::new(),
             mirror: Some(MirrorStatus {
                 leader: MusicianKey::Address("192.168.1.40:50000".parse().expect("test address")),
@@ -1806,6 +1813,7 @@ mod tests {
 
     fn musician_with_link(link: LinkStatus) -> MusicianStatus {
         MusicianStatus {
+            limiter: Default::default(),
             address: "192.168.1.30:50000".parse().expect("test address"),
             name: None,
             client_id: None,
@@ -2075,6 +2083,7 @@ mod tests {
         mix.channel_solo[3] = true;
         mix.group_levels[0] = 70;
         let musician = MusicianStatus {
+            limiter: Default::default(),
             mix,
             ..musician_with_link(LinkStatus::default())
         };
@@ -2106,6 +2115,7 @@ mod tests {
             ..MixValues::default()
         };
         let musician = MusicianStatus {
+            limiter: Default::default(),
             mix,
             ..musician_with_link(LinkStatus::default())
         };
@@ -2132,6 +2142,7 @@ mod tests {
             ..MixValues::default()
         };
         let musician = MusicianStatus {
+            limiter: Default::default(),
             mix,
             ..musician_with_link(LinkStatus::default())
         };
@@ -2227,16 +2238,19 @@ mod tests {
     #[test]
     fn meters_reach_the_window_with_output_peaks_keyed_by_address() {
         let meters = EngineMeters {
+            local_limiter_reduction_db: 0.0,
             channel_levels: vec![50, 0],
             processed_levels: vec![40, 0],
             gate_reduction_db: vec![0.0, 12.5],
             compressor_reduction_db: vec![3.25, 0.0],
             musicians: vec![
                 MusicianMeters {
+                    limiter_reduction_db: 0.0,
                     address: "192.168.1.4:50000".parse().expect("test address"),
                     output_levels: [0, 7],
                 },
                 MusicianMeters {
+                    limiter_reduction_db: 0.0,
                     address: "192.168.1.3:50000".parse().expect("test address"),
                     output_levels: [100, 50],
                 },
@@ -2431,6 +2445,7 @@ mod tests {
         let mut status = EngineStatusDto::from(&status_with(Vec::new(), vec![0, 0]));
         status.run = 3;
         let mut meters = MetersDto::from(&EngineMeters {
+            local_limiter_reduction_db: 0.0,
             channel_levels: vec![0],
             processed_levels: vec![0],
             gate_reduction_db: vec![0.0],
@@ -2486,6 +2501,7 @@ mod tests {
     fn a_translated_status_or_meters_belong_to_no_run_until_one_is_set() {
         let status = EngineStatusDto::from(&status_with(Vec::new(), vec![0, 0]));
         let meters = MetersDto::from(&EngineMeters {
+            local_limiter_reduction_db: 0.0,
             channel_levels: Vec::new(),
             processed_levels: Vec::new(),
             gate_reduction_db: Vec::new(),

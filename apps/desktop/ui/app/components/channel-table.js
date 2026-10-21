@@ -3,7 +3,8 @@
 // pair's opens on its first side), with whether the processing is on in words.
 //
 // Property: `data` = { rows, kinds }: rows from channelRows and kinds KIND_OPTIONS
-//   (channels-view.js), each with `processing`, true while its strip does something.
+//   (channels-view.js), each with `processing` (processingActive: true while its strip does
+//   something, null while the strips are not read yet).
 // Method: `setLevels(levels)`, the input peaks of a `meters` event, one per input.
 // Events (bubbling, composed): `channel-rename` { index, name } when a name is committed,
 //   `channel-kind` { index, kind }, `channel-link` { index, linked } and `channel-shown`
@@ -18,7 +19,7 @@
 import "./group-chip.js";
 import "./meter.js";
 import { kindIcon, stereoIcon } from "./kind-icons.js";
-import { processingHash } from "../lib/router.js";
+import { processingLink } from "../lib/processing-view.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
 
 const NAME_TITLE = "Shown on every phone and on the Mix. Enter saves, Escape reverts";
@@ -372,13 +373,13 @@ class MlChannelTable extends HTMLElement {
     reflect(view.row, "data-hidden", row.hidden);
 
     // A pair is one strip: its processing opens on its first side.
-    const first = stereo.linked ? stereo.first : row.index;
-    reflect(view.processing, "href", processingHash(first + 1));
-    const on = row.processing === true;
-    reflect(view.processing, "aria-label", `Processing of ${row.label}, ${on ? "on" : "off"}`);
+    const sides = stereo.linked ? [stereo.first, stereo.partner] : [row.index];
+    const link = processingLink({ sides, label: row.label, active: row.processing ?? null });
+    reflect(view.processing, "href", link.href);
+    reflect(view.processing, "aria-label", link.ariaLabel);
     view.processing.title = "Open this input's high-pass, equaliser, gate and compressor";
-    setText(view.processingWord, on ? "On" : "Off");
-    reflect(view.processingWord, "data-on", on);
+    setText(view.processingWord, link.word);
+    reflect(view.processingWord, "data-on", link.state === "on");
   }
 }
 

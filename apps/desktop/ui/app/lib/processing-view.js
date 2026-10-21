@@ -17,6 +17,7 @@ import {
   defaultStrip,
   eqResponseOf,
 } from "./processing.js";
+import { processingHash } from "./router.js";
 
 /** The gain the graph shows either side of 0 dB: the bands' own range. */
 export const EQ_SPAN_DB = RANGES.bandGainDb[1];
@@ -403,6 +404,26 @@ export function presetOptions(presets) {
     label: factory ? `${name} (built-in)` : name,
     factory: Boolean(factory),
   }));
+}
+
+/**
+ * The link to an input's processing editor that the Mix strips and the Channels table show.
+ * `sides` are the strip's inputs (0-based, both sides of a stereo pair), `label` what the input is
+ * called and `active` processingActive's answer (null: not read yet). A pair opens on its first
+ * side. Answers `{ href, state: "on" | "off" | "unknown", word, text, ariaLabel }`: `word` the
+ * table's ("On", "Off", "" while unknown) and `text` the strip's ("Processing on" or "Processing").
+ */
+export function processingLink({ sides, label, active }) {
+  const first = Math.min(...sides) + 1;
+  const state = active === null || active === undefined ? "unknown" : active ? "on" : "off";
+  const said = { on: "on", off: "off", unknown: "not read yet" }[state];
+  return {
+    href: processingHash(first),
+    state,
+    word: { on: "On", off: "Off", unknown: "" }[state],
+    text: state === "on" ? "Processing on" : "Processing",
+    ariaLabel: `Processing of ${label}, ${said}`,
+  };
 }
 
 /**

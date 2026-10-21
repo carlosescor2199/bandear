@@ -157,7 +157,12 @@ impl Sink for NetworkSink {
             .resize(frames * usize::from(OUTPUT_CHANNELS), 0.0);
         for destination in &self.destinations {
             let plan = MixPlan::new(&destination.mix.snapshot(), block.channels);
-            plan.mix_ramped(&destination.ramp, block.samples, &mut self.stereo);
+            plan.mix_master(
+                &destination.ramp,
+                destination.mix.limiter(),
+                block.samples,
+                &mut self.stereo,
+            );
             // Two atomic updates on the buffer just mixed: no allocation, lock or clock.
             destination.meter.observe(&self.stereo);
             encode_audio_packet(
@@ -684,6 +689,61 @@ mod tests {
         assert!(steady.iter().all(|left| *left == 8_192), "{steady:?}");
     }
 
+    fn left_samples(packet: &[u8]) -> Vec<i16> {
+        packet[HEADER_SIZE..]
+            .chunks_exact(4)
+            .map(|frame| i16::from_le_bytes([frame[0], frame[1]]))
+            .collect()
+    }
+
+    /// The master limiter is per musician: the one whose mix the desk limits is sent their hot
+    /// mix under the ceiling, with the reduction on their row, while another phone is sent the same
+    /// block at the clamp as before, untouched.
+    #[test]
+    fn a_musicians_limiter_holds_only_their_mix_under_its_ceiling() {
+        use crate::dsp::dynamics::LimiterSettings;
+        use crate::targets::MusicianKey;
+
+        let first = bind("127.0.0.1:0");
+        let Some(second) = musician_phone(2) else {
+            return;
+        };
+        let first_address = first.local_addr().expect("first address");
+        let targets = registry(&[first_address, second.local_addr().expect("second address")]);
+        targets
+            .set_limiter(
+                &MusicianKey::Address(first_address),
+                LimiterSettings {
+                    enabled: true,
+                    ceiling_db: -12.0,
+                    release_ms: 200.0,
+                },
+            )
+            .expect("the phone is here");
+        let mut sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+        // Four inputs at 0.75, two on each side: 1.5 on each side, far over full scale.
+        let block = vec![0.75f32; 4 * 64];
+        sink.process(&Block {
+            samples: &block,
+            raw: &block,
+            channels: 4,
+            sequence: 0,
+        });
+
+        let limited = left_samples(&datagram(&first));
+        let plain = left_samples(&datagram(&second));
+        let ceiling = (10f32.powf(-12.0 / 20.0) * 32_768.0).round() as i16;
+        assert!(limited.iter().all(|left| *left <= ceiling), "{limited:?}");
+        assert!(
+            limited.iter().all(|left| *left >= ceiling - 2),
+            "{limited:?}"
+        );
+        assert!(plain.iter().all(|left| *left == i16::MAX), "{plain:?}");
+        let entries = targets.read();
+        assert!(entries[0].ramp.limiter_reduction_db() > 13.0);
+        assert_eq!(entries[1].ramp.limiter_reduction_db(), 0.0);
+    }
+
     /// The send happens after the target table's guard is released, so the engine can add or remove
     /// a musician while a block is on its way: here a removal runs inside the send itself, which
     /// would deadlock if the send still held the table.
@@ -913,8 +973,8 @@ mod tests {
     /// The whole per-block path after warm-up, as it runs live: a 24-bit, 96 kHz stereo callback
     /// converted, filtered, decimated and metered into the ring, then each block mixed for three
     /// phones, metered, encoded and sent (the first phone's twice, its copies two blocks late, and
-    /// the last phone's twice, each copy right away), and mixed
-    /// and metered for the local mix, with no local output and then with one playing. Not one heap
+    /// the last phone's twice, each copy right away; the first phone's through a working master
+    /// limiter), and mixed, limited and metered for the local mix, with no local output and then with one playing. Not one heap
     /// allocation or free on the way.
     #[test]
     fn the_capture_to_phone_path_never_allocates() {
@@ -953,6 +1013,18 @@ mod tests {
                 )
                 .expect("the last phone is here");
         }
+        // The first phone's mix and the local mix go through a working master limiter.
+        let limiting = crate::dsp::dynamics::LimiterSettings {
+            enabled: true,
+            ceiling_db: -18.0,
+            release_ms: 30.0,
+        };
+        targets
+            .set_limiter(
+                &crate::targets::MusicianKey::Address(addresses[0]),
+                limiting,
+            )
+            .expect("the first phone is here");
         // The phones drain their sockets on their own threads, which are not watched.
         let draining = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let drains: Vec<_> = phones
@@ -987,8 +1059,12 @@ mod tests {
         .expect("capture should build");
         let sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
         let local_mix = Arc::new(crate::mix::MixState::default());
-        let (local, mut outputs) =
-            crate::output::local_output_sink(local_mix, crate::engine::OutputMeter::default());
+        local_mix.set_limiter(limiting);
+        let (local, mut outputs) = crate::output::local_output_sink(
+            local_mix,
+            crate::engine::OutputMeter::default(),
+            Arc::default(),
+        );
         let mut pipeline = Pipeline::new(vec![Box::new(sink), Box::new(local)], links.levels);
         pipeline.set_source(reader);
         let callback: Vec<i32> = (0..2 * 256).map(|index| (index * 4_096) << 8).collect();
@@ -1026,5 +1102,9 @@ mod tests {
         }
         assert_eq!(without_output, (0, 0), "no local output");
         assert_eq!(with_output, (0, 0), "a local output playing");
+        assert!(
+            targets.read()[0].ramp.limiter_reduction_db() > 0.0,
+            "the limiter worked"
+        );
     }
 }

@@ -7,7 +7,7 @@
 
 import "../components/channel-table.js";
 import "../components/group-cards.js";
-import { channelStrip } from "../lib/console-state.js";
+import { processingActive } from "../lib/console-state.js";
 import { KIND_OPTIONS, channelsScreenCommands } from "../lib/channels-view.js";
 
 const LAYOUT = `
@@ -62,7 +62,11 @@ export function mountChannelsScreen(main, app) {
     }
     const state = app.store.getState();
     parts.table.data = {
-      rows: view.rows.map((row) => ({ ...row, processing: channelStrip(state, row.number).active })),
+      // A pair's strip is kept on its first side.
+      rows: view.rows.map((row) => ({
+        ...row,
+        processing: processingActive(state, row.stereo.first + 1),
+      })),
       kinds: KIND_OPTIONS,
     };
     parts.groups.data = { cards: view.cards, canAdd: view.canAdd };

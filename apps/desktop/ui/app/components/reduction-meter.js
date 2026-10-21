@@ -5,10 +5,11 @@
 //   bar stands for, 20 by default).
 // Method: `setReduction(db)`, the positive dB taken off from the `meters` event. Call it as often as
 //   meters arrive: it draws once in the next animation frame; the spoken value follows at most twice
-//   a second.
+//   a second, and once more after the last change, so the value it settles on is announced.
 // No events.
 
 import { reductionView } from "../lib/processing-view.js";
+import { trailingThrottle } from "../lib/scheduling.js";
 import { attachShadowRoot, define, numberAttribute, setText, sheet, syncLabel } from "./support.js";
 
 const SPOKEN_INTERVAL_MS = 500;
@@ -49,7 +50,7 @@ class MlReductionMeter extends HTMLElement {
   #parts;
   #db = 0;
   #frame = 0;
-  #spokenAt = -Infinity;
+  #spoken = trailingThrottle(() => this.#speak(), { intervalMs: SPOKEN_INTERVAL_MS });
 
   constructor() {
     super();
@@ -71,6 +72,7 @@ class MlReductionMeter extends HTMLElement {
   disconnectedCallback() {
     cancelAnimationFrame(this.#frame);
     this.#frame = 0;
+    this.#spoken.cancel();
   }
 
   attributeChangedCallback(name) {
@@ -94,13 +96,16 @@ class MlReductionMeter extends HTMLElement {
     const view = reductionView(this.#db, scale);
     this.#parts.bar.style.transform = `scaleX(${view.fraction})`;
     setText(this.#parts.value, view.text);
-    const now = performance.now();
-    if (now - this.#spokenAt >= SPOKEN_INTERVAL_MS) {
-      this.#spokenAt = now;
-      this.setAttribute("aria-valuemax", String(scale));
-      this.setAttribute("aria-valuenow", String(Math.min(scale, Math.max(0, this.#db || 0)).toFixed(1)));
-      this.setAttribute("aria-valuetext", view.text);
-    }
+    this.#spoken.push();
+  }
+
+  // The value said to assistive technology: at most twice a second, and the last one always.
+  #speak() {
+    const scale = numberAttribute(this, "scale", 20);
+    const view = reductionView(this.#db, scale);
+    this.setAttribute("aria-valuemax", String(scale));
+    this.setAttribute("aria-valuenow", String(Math.min(scale, Math.max(0, this.#db || 0)).toFixed(1)));
+    this.setAttribute("aria-valuetext", view.text);
   }
 }
 

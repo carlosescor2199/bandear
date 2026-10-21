@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>BandEar</title>
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="#192223"/>
+  <g transform="translate(512 512) scale(1.16) translate(-517 -516)" fill="none" stroke="#FFBF43" stroke-width="46" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M520 224 H344 A48 48 0 0 0 296 272 V738 A70 70 0 0 0 366 808 H556 A186 186 0 0 0 692 528"/>
+    <path d="M736 446 Q720 486 678 514"/>
+    <path d="M314 522 C354 482 404 470 476 470 H606"/>
+    <path d="M402 708 H562 A71 71 0 0 0 562 566 H474 A72 72 0 0 0 402 638"/>
+    <path d="M586 302 A92 92 0 0 1 662 386"/>
+    <path d="M584 224 A162 162 0 0 1 738 386"/>
+  </g>
+</svg>

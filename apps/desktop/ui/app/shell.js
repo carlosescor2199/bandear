@@ -52,7 +52,8 @@ function renderSidebar(nav) {
     (route) =>
       `<li><a class="nav-link" href="${route.hash}" data-route="${route.id}" title="${route.label}">${icon(route.id)}<span class="nav-label">${route.label}</span></a></li>`,
   ).join("");
-  nav.innerHTML = `<div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">BandEar</span></div><ul class="nav-list">${links}</ul>`;
+  // The mark's file is relative to index.html, the page the shell runs in.
+  nav.innerHTML = `<div class="brand"><img class="brand-mark" src="app/brand/bandear-mark.svg" alt="" /><span class="brand-name">BandEar</span></div><ul class="nav-list">${links}</ul>`;
 }
 
 /** The stand-in for a section whose screen is not built yet. */

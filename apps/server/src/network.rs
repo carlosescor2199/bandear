@@ -270,6 +270,7 @@ pub(crate) fn spawn_network_thread(
                 .collect();
             sink.process(&Block {
                 samples: &samples,
+                raw: &samples,
                 channels: usize::from(packet.channels),
                 sequence: packet.sequence,
             });
@@ -539,6 +540,7 @@ mod tests {
                 .collect();
             sink.process(&Block {
                 samples: &gliding,
+                raw: &gliding,
                 channels,
                 sequence: sequence - 1,
             });
@@ -548,6 +550,7 @@ mod tests {
 
             sink.process(&Block {
                 samples: &block,
+                raw: &block,
                 channels,
                 sequence,
             });
@@ -582,6 +585,70 @@ mod tests {
         }
     }
 
+    /// Channel strips that do nothing (laid out with a stereo pair, one of them given neutral
+    /// settings) are not on the path at all: through the engine thread, from the capture callback
+    /// on, the phone is sent exactly what the 16-bit mixer would send, byte for byte. Once a strip
+    /// works, the packets change.
+    #[test]
+    fn neutral_channel_strips_leave_the_phones_packets_byte_for_byte() {
+        use crate::dsp::strip::StripSettings;
+        use crate::mix::golden::{legacy_mix_channels, Noise};
+        use crate::processing::tests::{high_pass, metas};
+        use crate::processing::{processing_stage, Processing};
+
+        let phone = bind("127.0.0.1:0");
+        let targets = registry(&[phone.local_addr().expect("phone address")]);
+        let mix = Arc::clone(&targets.read()[0].mix_state);
+        let links = CaptureLinks {
+            levels: inputs(),
+            stats: Arc::new(CaptureStats::default()),
+            wake: None,
+        };
+        let (mut capture, reader) = CaptureWriter::new(
+            48_000,
+            SourceFormat {
+                channels: 4,
+                block_frames: 32,
+            },
+            links.clone(),
+        )
+        .expect("capture should build");
+        let (stage, control) = processing_stage();
+        let sink = NetworkSink::new(Arc::clone(&targets), stats()).expect("sink should bind");
+        let mut pipeline = Pipeline::with_processing(vec![Box::new(sink)], links.levels, stage);
+        pipeline.set_source(reader);
+        let mut processing = Processing::new(control);
+        processing
+            .follow(&metas(4, &[2]))
+            .expect("the stage listens");
+        processing
+            .set_channel(3, StripSettings::default())
+            .expect("the stage listens");
+        let mut noise = Noise(0x2545_f491_4f6c_dd1d);
+        let mut send = |sequence: u64| {
+            let input: Vec<i16> = (0..4 * 32).map(|_| noise.sample()).collect();
+            capture.write(&input);
+            assert_eq!(pipeline.pump(), 1);
+            let expected = serialize_packet(&AudioPacket {
+                channels: OUTPUT_CHANNELS,
+                sample_rate: TARGET_SAMPLE_RATE,
+                sequence,
+                samples: legacy_mix_channels(&input, 4, mix.snapshot()),
+            });
+            (datagram(&phone), expected)
+        };
+
+        for sequence in 0..200 {
+            let (received, expected) = send(sequence);
+            assert_eq!(received, expected, "packet {sequence} differs");
+        }
+        processing
+            .set_channel(1, high_pass(1_000.0))
+            .expect("the stage listens");
+        let (received, expected) = send(200);
+        assert_ne!(received, expected, "a working strip is heard");
+    }
+
     /// A fader the musician pulls down between two blocks reaches their phone as a glide over the
     /// next block, never as a step, and then holds.
     #[test]
@@ -594,6 +661,7 @@ mod tests {
         let mut send = |sequence: u64| {
             sink.process(&Block {
                 samples: &block,
+                raw: &block,
                 channels: 2,
                 sequence,
             });
@@ -637,6 +705,7 @@ mod tests {
         std::thread::spawn(move || {
             sink.process(&Block {
                 samples: &[0.0, 0.0],
+                raw: &[0.0, 0.0],
                 channels: 2,
                 sequence: 0,
             });
@@ -666,6 +735,7 @@ mod tests {
         let samples = vec![0.0f32; 2 * 20_000];
         sink.process(&Block {
             samples: &samples,
+            raw: &samples,
             channels: 2,
             sequence: 0,
         });
@@ -685,6 +755,7 @@ mod tests {
             let level = sequence as f32 / 100.0;
             sink.process(&Block {
                 samples: &[level, -level, level, -level],
+                raw: &[level, -level, level, -level],
                 channels: 2,
                 sequence,
             });

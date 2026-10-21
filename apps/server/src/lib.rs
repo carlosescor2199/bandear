@@ -6,7 +6,7 @@ mod control;
 mod decimate;
 mod demo;
 mod discovery;
-// Channel processing; the engine's per-input stage puts it on the audio path.
+// Channel processing. The master limiter is not on the audio path yet.
 #[allow(dead_code)]
 mod dsp;
 mod engine;
@@ -19,6 +19,7 @@ mod network;
 mod output;
 mod pipeline;
 mod playback;
+mod processing;
 mod protocol;
 mod recorder;
 mod redundancy;
@@ -29,6 +30,9 @@ mod wav;
 pub use capture::{list_input_devices, list_input_devices_for, AudioHost, InputDevice};
 pub use cli::{check_groups, parse_arguments, EngineConfig, GroupDefinition};
 pub use demo::{DEMO_CHANNELS, DEMO_DEVICE_NAME, DEMO_VOICES};
+pub use dsp::dynamics::{CompressorSettings, GateSettings, LimiterSettings};
+pub use dsp::eq::{EqBandSettings, EqSettings, HighPassSettings};
+pub use dsp::strip::StripSettings;
 pub use engine::{
     check_channels, start, CaptureFormat, ChannelKind, ChannelMeta, EngineEvent, EngineHandle,
     EngineMeters, EngineStatus, GroupStatus, MirrorOutcome, MirrorSource, MixOrigin,

@@ -32,6 +32,11 @@
 //! thread then takes its blocks, in the capture's layout, from the take's ring as the take's clock
 //! makes them due, and the capture callback lets its audio go until the engine goes back to it.
 //!
+//! Between taking a block and the sinks, the channel processing stage ([crate::processing]) runs
+//! every working channel strip into a second buffer: the sinks get the processed block for the
+//! mixes and the raw one for the recorder's input tracks, and while no strip works, the raw block
+//! for both, untouched.
+//!
 //! The demo source ([crate::demo]) has no ring and no callback: the engine thread writes each of
 //! its blocks itself when its clock (the local output's callbacks, else the timer) makes it due.
 
@@ -48,6 +53,7 @@ use crate::decimate::Decimator;
 use crate::demo::DemoReader;
 use crate::engine::{LevelMeter, METER_IDLE_FRAMES, METER_IDLE_WAIT};
 use crate::load::{EngineLoad, LoadMeter};
+use crate::processing::{ProcessingMeters, ProcessingStage};
 use crate::soundcheck::PlaybackReader;
 
 /// The longest block the engine thread hands the sinks: 8192 frames, 171 ms. A stereo packet of it
@@ -267,7 +273,11 @@ impl CaptureWriter {
 
 /// One block of capture: `channels`-interleaved f32 frames at 48 kHz, numbered in order.
 pub(crate) struct Block<'a> {
+    /// The block every mix hears: after the channel processing ([crate::processing]), and the
+    /// raw block itself, bit for bit, while no strip works.
     pub(crate) samples: &'a [f32],
+    /// The block as captured, before any processing: what the recorder's input tracks keep.
+    pub(crate) raw: &'a [f32],
     pub(crate) channels: usize,
     /// The block's number: consecutive from the engine's start, across device switches.
     pub(crate) sequence: u64,
@@ -324,6 +334,8 @@ pub(crate) struct Pipeline {
     /// How long each block takes, from taking it to the return of the last sink (see
     /// [crate::load]).
     load: LoadMeter,
+    /// The channel processing between the block and the sinks (see [crate::processing]).
+    stage: ProcessingStage,
 }
 
 /// `duration` in frames at 48 kHz, rounded down.
@@ -332,7 +344,19 @@ pub(crate) fn frames_in(duration: Duration) -> usize {
 }
 
 impl Pipeline {
+    /// The engine thread for `sinks`, with a processing stage nobody sends settings to: every
+    /// block reaches the sinks as it was captured.
+    #[cfg(test)]
     pub(crate) fn new(sinks: Vec<Box<dyn Sink>>, levels: Arc<LevelMeter>) -> Self {
+        Self::with_processing(sinks, levels, crate::processing::processing_stage().0)
+    }
+
+    /// The engine thread for `sinks`, each block processed by `stage` before them.
+    pub(crate) fn with_processing(
+        sinks: Vec<Box<dyn Sink>>,
+        levels: Arc<LevelMeter>,
+        stage: ProcessingStage,
+    ) -> Self {
         Self {
             source: None,
             playback: None,
@@ -344,6 +368,7 @@ impl Pipeline {
             received: 0,
             credit: 0,
             load: LoadMeter::new(),
+            stage,
         }
     }
 
@@ -352,13 +377,19 @@ impl Pipeline {
         self.load.shared()
     }
 
-    /// Reads `source` from now on. The block buffer and every sink are sized for its layout here,
-    /// off the per-block path.
+    /// Where the processing stage publishes its meters, for the status.
+    pub(crate) fn processing_meters(&self) -> Arc<ProcessingMeters> {
+        self.stage.meters()
+    }
+
+    /// Reads `source` from now on. The block buffers and every sink are sized for its layout
+    /// here, off the per-block path.
     pub(crate) fn set_source(&mut self, source: SourceReader) {
         let format = source.format;
         self.block.clear();
         self.block
             .resize(format.block_frames * format.channels, 0.0);
+        self.stage.source_changed(format);
         for sink in &mut self.sinks {
             sink.source_changed(format);
         }
@@ -379,6 +410,7 @@ impl Pipeline {
     pub(crate) fn play(&mut self, playback: PlaybackReader) {
         playback.capture().suspended.store(true, Ordering::Release);
         self.levels.clear();
+        self.stage.clear_meters();
         // The engine never sends a second take before the first is let go of.
         self.playback = Some(playback);
     }
@@ -400,6 +432,7 @@ impl Pipeline {
             }
         }
         self.levels.clear();
+        self.stage.clear_meters();
         playback.capture().suspended.store(false, Ordering::Release);
         playback.release();
     }
@@ -434,6 +467,7 @@ impl Pipeline {
                     &self.levels,
                     &mut self.received,
                     &mut self.load,
+                    &mut self.stage,
                 );
             }
         };
@@ -443,14 +477,13 @@ impl Pipeline {
             if consumer.pop_entire_slice(&mut self.block).is_err() {
                 break;
             }
-            let block = Block {
-                samples: &self.block,
+            deliver(
+                &mut self.stage,
+                &mut self.sinks,
+                &self.block,
                 channels,
-                sequence: self.sequence,
-            };
-            for sink in &mut self.sinks {
-                sink.process(&block);
-            }
+                self.sequence,
+            );
             self.sequence = self.sequence.wrapping_add(1);
             self.received += length / channels;
             self.load.block(started.elapsed(), length / channels);
@@ -471,6 +504,7 @@ impl Pipeline {
             levels,
             received,
             load,
+            stage,
             ..
         } = self;
         let (Some(source), Some(playback)) = (source.as_ref(), playback.as_mut()) else {
@@ -488,14 +522,7 @@ impl Pipeline {
             let started = Instant::now();
             playback.fill(block.as_mut_slice());
             levels.observe(block.as_slice(), format.channels);
-            let handed = Block {
-                samples: block.as_slice(),
-                channels: format.channels,
-                sequence: *sequence,
-            };
-            for sink in sinks.iter_mut() {
-                sink.process(&handed);
-            }
+            deliver(stage, sinks, block, format.channels, *sequence);
             *sequence = sequence.wrapping_add(1);
             *received += format.block_frames;
             load.block(started.elapsed(), format.block_frames);
@@ -537,8 +564,11 @@ impl Pipeline {
             .saturating_sub(elapsed)
             .min(block_frames + METER_IDLE_FRAMES);
         let silence = elapsed.saturating_sub(covered);
+        // Settings sent while no audio comes take effect now, ready for the next block.
+        self.stage.take_commands();
         if silence > 0 {
             self.levels.fall(silence);
+            self.stage.silence(silence);
             for sink in &mut self.sinks {
                 sink.silence(silence);
             }
@@ -566,6 +596,27 @@ impl Pipeline {
     }
 }
 
+/// Processes the block `raw` (see [crate::processing]) and hands it to every sink, in order: the
+/// processed block for the mixes, and the raw one for what keeps the inputs as captured.
+fn deliver(
+    stage: &mut ProcessingStage,
+    sinks: &mut [Box<dyn Sink>],
+    raw: &[f32],
+    channels: usize,
+    sequence: u64,
+) {
+    let samples = stage.process(raw, channels).unwrap_or(raw);
+    let block = Block {
+        samples,
+        raw,
+        channels,
+        sequence,
+    };
+    for sink in sinks.iter_mut() {
+        sink.process(&block);
+    }
+}
+
 /// Hands the sinks every block of the demo its clock has made due by `now`, metered as a capture
 /// callback meters its own; returns how many.
 #[allow(clippy::too_many_arguments)]
@@ -579,6 +630,7 @@ fn pump_demo(
     levels: &LevelMeter,
     received: &mut usize,
     load: &mut LoadMeter,
+    stage: &mut ProcessingStage,
 ) -> usize {
     if format.channels == 0 || block.len() != format.block_frames * format.channels {
         return 0;
@@ -588,14 +640,7 @@ fn pump_demo(
         let started = Instant::now();
         demo.fill(block);
         levels.observe(block, format.channels);
-        let handed = Block {
-            samples: block,
-            channels: format.channels,
-            sequence: *sequence,
-        };
-        for sink in sinks.iter_mut() {
-            sink.process(&handed);
-        }
+        deliver(stage, sinks, block, format.channels, *sequence);
         *sequence = sequence.wrapping_add(1);
         *received += format.block_frames;
         load.block(started.elapsed(), format.block_frames);

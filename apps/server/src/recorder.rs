@@ -11,8 +11,9 @@
 //! armed input, a stereo file per armed linked pair (arming either side arms the pair), a stereo file
 //! of the local mix when asked, and `take.json`, which describes it (written when the take starts and
 //! again, atomically, when it ends). The track layout is fixed when the take starts. Tracks hold the
-//! inputs exactly as captured, before any processing; the local mix is mixed here with [MixPlan],
-//! as the local output mixes it, but from its own copy of the plan.
+//! inputs exactly as captured, before any processing (the block's raw samples, before the channel
+//! strips of [crate::processing]); the local mix is mixed here with [MixPlan] from the processed
+//! block, as the local output mixes it, but from its own copy of the plan.
 //!
 //! The sink never allocates, locks or panics on the engine thread. The take's ring (a few seconds)
 //! is allocated when the take starts, on the engine's side; the take reaches the sink through a
@@ -638,11 +639,12 @@ impl Drop for TakeFeed {
 }
 
 impl TakeFeed {
-    /// Puts the armed channels of `block` (and the local mix in `stereo`, when the take records
-    /// it) into the ring, or drops the block whole and counts it when the ring has no room.
+    /// Puts the armed channels of `block` as captured (its raw samples, before the channel
+    /// processing) and the local mix in `stereo` (mixed from the processed block), when the take
+    /// records it, into the ring, or drops the block whole and counts it when the ring has no room.
     fn record(&mut self, block: &Block<'_>, stereo: &[f32]) {
         let channels = block.channels.max(1);
-        let frames = block.samples.len() / channels;
+        let frames = block.raw.len() / channels;
         if frames == 0 || self.shared.failed.load(Ordering::Acquire) {
             return;
         }
@@ -663,7 +665,7 @@ impl TakeFeed {
         let picks = &self.picks;
         let mixed = if self.local { 2 } else { 0 };
         let samples = block
-            .samples
+            .raw
             .chunks_exact(channels)
             .zip(stereo.chunks_exact(2))
             .flat_map(|(frame, mix)| {
@@ -1604,6 +1606,7 @@ pub(crate) mod tests {
     fn block(samples: &[f32], channels: usize) -> Block<'_> {
         Block {
             samples,
+            raw: samples,
             channels,
             sequence: 0,
         }
@@ -1911,6 +1914,43 @@ pub(crate) mod tests {
         assert_eq!(json["ended"], serde_json::Value::Null);
         assert_eq!(bench.recorder.status().tracks, vec!["CH 2".to_owned()]);
         bench.stop();
+    }
+
+    /// The input tracks keep the inputs as captured, before the channel processing, while the
+    /// local mix track is the mix the engineer hears: mixed from the processed block.
+    #[test]
+    fn input_tracks_keep_the_raw_inputs_and_the_local_mix_the_processed_ones() {
+        let tracks = plan_tracks(&four_inputs(), 4, &[0, 2], true).expect("a valid plan");
+        let (feed, mut consumer, _shared) = take_feed(&tracks, 4, 4_800);
+        let mut bench = bench();
+        bench
+            .recorder
+            .lines
+            .send(Some(feed))
+            .expect("the sink listens");
+        let raw = numbered(0, 64, 4);
+        let processed: Vec<f32> = raw.iter().map(|sample| -0.5 * sample).collect();
+
+        bench.sink.process(&Block {
+            samples: &processed,
+            raw: &raw,
+            channels: 4,
+            sequence: 0,
+        });
+
+        let chunk = consumer
+            .read_chunk(64 * 5)
+            .expect("one block of frames: CH 1, CH 3-4 and the local mix");
+        let (first, second) = chunk.as_slices();
+        let recorded: Vec<f32> = first.iter().chain(second).copied().collect();
+        let mut mixed = vec![0.0; 64 * 2];
+        MixPlan::new(&bench.mix.snapshot(), 4).mix_into(&processed, &mut mixed);
+        let expected: Vec<f32> = raw
+            .chunks(4)
+            .zip(mixed.chunks(2))
+            .flat_map(|(frame, mix)| [frame[0], frame[2], frame[3], mix[0], mix[1]])
+            .collect();
+        assert_eq!(recorded, expected);
     }
 
     /// A ring with no room for a block drops the block whole and counts it; what fits is kept.

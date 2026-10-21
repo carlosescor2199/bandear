@@ -856,6 +856,7 @@ mod tests {
     fn block(samples: &[f32], sequence: u64) -> Block<'_> {
         Block {
             samples,
+            raw: samples,
             channels: 2,
             sequence,
         }

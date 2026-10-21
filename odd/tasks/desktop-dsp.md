@@ -180,8 +180,60 @@ test.
     `applying_and_running_a_strip_never_allocates` count 0 allocations and frees.
   - Micro benchmark of one strip on 32 channels: not added (optional); T4's `engine_load` run
     with strips on measures it in the real stage.
-- [ ] T4 (per-input stage): the stage in `Pipeline`, engine API, command ring, raw block to the
-  recorder, post-processing meters and gain reduction. Route: delegated writer.
+- [x] T3-fix (review-ca13706495195c9e's two SUGGESTIONs). Route: delegated writer (with T4).
+  Commit 94b0a1f `fix(engine): retarget every coefficient together and survive non-finite
+  samples` (+219/-4). `Biquad::set` restarts all five coefficients from where they are
+  (`Glide::restart`) on any new target, so a change mid-glide moves them along one straight line
+  and lands them on one frame. A working strip and the limiter take NaN and infinities as silence
+  and count them (`non_finite_samples`), and a biquad whose state stops being finite starts again
+  from silence and flushes that block's non-finite outputs. RED: the four new tests
+  (`a_setting_changed_mid_glide_moves_every_coefficient_on_together`: `a1` landed on frame 239, not
+  479; `a_filter_poisoned_by_a_non_finite_sample_recovers`; the limiter's and the strip's NaN/inf
+  tests) failed against stubs (old `set`, counters returning 0, no sanitising), then passed; 43
+  `dsp` tests, 578 server tests.
+- [x] T4 (per-input stage): the stage in `Pipeline`, engine API, command ring, raw block to the
+  recorder, post-processing meters and gain reduction. Route: delegated writer (trigger: a new
+  module plus the pipeline, engine, recorder, bench and desktop DTO). Commit: this commit.
+  - Stage (`apps/server/src/processing.rs`): `deliver` in `Pipeline` runs `ProcessingStage::process`
+    between the pop (or the demo's or take's fill) and the sinks. `Block` now carries `samples`
+    (processed; what the network, local output and the recorder's local mix read) and `raw` (as
+    captured; the recorder's input tracks). While every strip is idle the stage returns `None` and
+    does nothing, not even the copy: `samples` is `raw`. One strip per input for the first 32,
+    a linked pair (`linked_to_next`, from the fitted channel details) one stereo strip on its first
+    side's settings; a pair's sides keep equal settings.
+  - Real time: designs go as plain numbers (`ProcessingCommand::Design`) and a new layout as a
+    whole `StripSet` built off the engine thread (`ProcessingCommand::Strips`) through a 256-slot
+    rtrb ring; the replaced set comes back through the return ring and is freed by the engine side.
+    Strips on the same channels in both layouts carry their running state over. `EngineHandle`'s
+    `publish` re-lays the strips after a device switch, a channel-count change or a pair (un)linked;
+    the processed buffer is sized in `set_source`, like the block.
+  - Engine API: `set_channel_processing(channel, StripSettings) -> StripSettings` (clamped),
+    `channel_processing(channel) -> Option<StripSettings>`, `processing() -> Vec<StripSettings>`
+    (32, CH 1 first) and `replace_processing(&[StripSettings])` (session load; channels past the
+    list neutral). Settings are kept per channel index for the whole run. Exported:
+    `StripSettings`, `EqSettings`, `EqBandSettings`, `HighPassSettings`, `GateSettings`,
+    `CompressorSettings`, `LimiterSettings`.
+  - Meters: `EngineMeters { processed_levels, gate_reduction_db, compressor_reduction_db }` (a
+    channel whose strip is idle reads its input level); `EngineStatus.non_finite_samples`. Desktop
+    `MetersDto { processed, gateReductionDb, compressorReductionDb }`.
+  - RED: the 13 new tests (9 `processing::tests`, the recorder's raw/processed tracks, the
+    network's neutral golden, the engine's device-switch and meters tests) all failed against stubs
+    (`process` always `None`, the layout ignoring pairs, the recorder reading `samples`; the
+    device-switch test saw a 16,384 peak against its bound of 500), then passed. Existing goldens
+    unchanged: `phones_receive_the_same_packets_as_from_the_16_bit_mixer`,
+    `a_steady_mix_is_the_unramped_mix_bit_for_bit`; new
+    `neutral_channel_strips_leave_the_phones_packets_byte_for_byte` (200 packets through the stage
+    from the capture callback, a pair laid out). No allocation:
+    `the_engine_thread_never_allocates_with_every_strip_working_and_settings_changing` (32 working
+    strips, three pairs, a design or a new layout between each of 200 blocks) counts 0 and 0.
+  - Bench: `engine_load --strips` runs `bench::typical_strip()` (HPF 80 Hz, -3 dB at 400 Hz,
+    +2 dB at 8 kHz, compressor -30 dBFS 3:1) on every input. Debug run once (32 inputs, 16
+    musicians, 256-frame blocks, 10 s; pessimistic): mean 6,059 µs (113.6% of 5,333 µs), p99
+    8,886 µs (166.6%), max 10,275 µs (192.7%); the meter: average 113.2%, peak 177.8%, 1,870 late
+    blocks; 30,016 packets, 0 discarded. Against T1's 37.0% without strips, the 32 strips cost
+    about 4.1 ms per block in debug (about 128 µs each); a release run is needed for a real figure.
+  - Counts: 591 server tests, 307 desktop tests, `cargo check -p mixlink-desktop --all-targets`
+    clean.
 - [ ] T5 (desk): session, commands and strip presets for channel processing. Route: delegated
   writer.
 - [ ] T6 (editor): the channel processing editor (EQ curve, dynamics, meters), opened from the
@@ -207,9 +259,16 @@ per reviewed slice, only with the user's approval.
 - Verification after T1/T2-fix and T3: `cargo test -p personal-monitoring` 574 passed; UI
   `node --test apps/desktop/ui/tests` 542 passed; `cargo check -p mixlink-desktop --all-targets`
   clean. Builds with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, no release builds.
+- Review review-ca13706495195c9e (052c897..06bdde6, T1/T2-fix + T3): approved and acknowledged;
+  its two SUGGESTIONs (coefficients retargeted apart mid-glide, non-finite samples) fixed in
+  94b0a1f. Next review base: 06bdde6.
+- Verification after T3-fix and T4: `cargo test -p personal-monitoring` 591 passed;
+  `cargo test -p mixlink-desktop` 307 passed; `cargo check -p mixlink-desktop --all-targets`
+  clean; the debug `engine_load --strips` run above. UI tests not run (no UI change).
 - Disk: the F: drive is nearly full (2.4 GB free before T3, 1.4 GB after; each test build of the
   server takes a few hundred MB). Keep builds to debug, one at a time, and stop on "no space".
 
 ## Next step
 
-T4 (per-input stage). The release run of `engine_load` still waits for the user's approval.
+T5 (desk: session, commands and strip presets for channel processing, on the T4 engine API). The
+release runs of `engine_load` (with and without `--strips`) still wait for the user's approval.

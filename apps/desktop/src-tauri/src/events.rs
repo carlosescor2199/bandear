@@ -598,6 +598,9 @@ mod tests {
             Some(MetersDto {
                 run: 0,
                 channels: vec![50, 0],
+                processed: vec![50, 0],
+                gate_reduction_db: vec![0.0, 0.0],
+                compressor_reduction_db: vec![0.0, 0.0],
                 musicians: BTreeMap::new(),
                 local: OutputLevelsDto {
                     left: 20,
@@ -715,6 +718,9 @@ mod tests {
             Some(serde_json::json!({
                 "run": 7,
                 "channels": [50, 0],
+                "processed": [50, 0],
+                "gateReductionDb": [0.0, 0.0],
+                "compressorReductionDb": [0.0, 0.0],
                 "musicians": {},
                 "local": { "left": 20, "right": 30 }
             })),

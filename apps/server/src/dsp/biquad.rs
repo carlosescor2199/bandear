@@ -152,14 +152,19 @@ impl Biquad {
     }
 
     /// Glides to `coefficients`, or to the identity for `None`, over [GLIDE_FRAMES].
+    ///
+    /// Every coefficient starts again from where it is, the unchanged ones included, so a change
+    /// made halfway through a glide still moves all five along one straight line and lands them on
+    /// the same frame: each step stays a mix of two stable filters.
     pub(crate) fn set(&mut self, coefficients: Option<&BiquadCoefficients>) {
         let target = coefficients.map_or(IDENTITY, |coefficients| coefficients.to_f32());
-        if !self.active && target == IDENTITY {
+        if self.coefficients.map(|glide| glide.target()) == target {
+            // Nothing to move to (an idle filter's target is the identity).
             return;
         }
         self.active = true;
         for (glide, target) in self.coefficients.iter_mut().zip(target) {
-            glide.set(target, GLIDE_FRAMES);
+            glide.restart(target, GLIDE_FRAMES);
         }
     }
 
@@ -203,6 +208,12 @@ impl Biquad {
                 *sample = y;
             }
         }
+        if !self.state.iter().flatten().all(|value| value.is_finite()) {
+            // A NaN, or a sample that overflowed the filter, would ring on for ever: start again
+            // from silence, and send what this block made of it on as silence too.
+            self.state = [[0.0; 2]; MAX_CHANNELS];
+            super::sanitize(block, stride, first, channels);
+        }
         let settled = self.coefficients.iter().all(Glide::is_settled);
         let identity = self.coefficients.map(|glide| glide.target()) == IDENTITY;
         let silent = self.state.iter().flatten().all(|&value| value == 0.0);
@@ -214,6 +225,12 @@ impl Biquad {
     #[cfg(test)]
     pub(crate) fn state(&self) -> &[[f32; 2]] {
         &self.state[..self.channels]
+    }
+
+    /// The coefficients the last frame ran with, `[b0, b1, b2, a1, a2]`.
+    #[cfg(test)]
+    pub(crate) fn coefficients(&self) -> [f32; 5] {
+        self.coefficients.map(|glide| glide.value())
     }
 }
 
@@ -421,5 +438,91 @@ mod tests {
             moving <= settled * 1.05,
             "moving {moving}, settled {settled}"
         );
+    }
+
+    /// A setting changed halfway through a glide sends every coefficient on from where it is, all
+    /// together: they reach the new filter on the same frame, along a straight line, so each step
+    /// stays a mix of two stable filters. Here `a1` keeps its target while `a2` moves; a coefficient
+    /// left on its old glide would land 240 frames early and bend the path.
+    #[test]
+    fn a_setting_changed_mid_glide_moves_every_coefficient_on_together() {
+        let first = BiquadCoefficients {
+            b0: 0.9,
+            b1: -0.4,
+            b2: 0.1,
+            a1: -0.5,
+            a2: 0.2,
+        };
+        let second = BiquadCoefficients {
+            b1: 0.3,
+            a2: 0.6,
+            ..first
+        };
+        let mut filter = Biquad::new(1);
+        filter.set(Some(&first));
+        let mut frame = [0.25f32];
+        for _ in 0..GLIDE_FRAMES / 2 {
+            filter.process(&mut frame, 1, 0);
+        }
+        let start = filter.coefficients();
+        filter.set(Some(&second));
+        let target = second.to_f32();
+        let mut path = Vec::new();
+        for _ in 0..GLIDE_FRAMES + 10 {
+            filter.process(&mut frame, 1, 0);
+            path.push(filter.coefficients());
+        }
+        let arrival = |index: usize| {
+            path.iter()
+                .position(|coefficients| coefficients[index] == target[index])
+                .expect("every coefficient reaches its target")
+        };
+        for index in 0..5 {
+            assert_eq!(
+                arrival(index),
+                GLIDE_FRAMES as usize - 1,
+                "coefficient {index}"
+            );
+        }
+        for (frame, coefficients) in path.iter().enumerate().take(GLIDE_FRAMES as usize) {
+            let share = (frame + 1) as f32 / GLIDE_FRAMES as f32;
+            for index in 0..5 {
+                let line = start[index] + share * (target[index] - start[index]);
+                assert!(
+                    (coefficients[index] - line).abs() < 1e-5,
+                    "frame {frame}, coefficient {index}: {} off the line at {line}",
+                    coefficients[index]
+                );
+            }
+        }
+    }
+
+    /// A filter whose state stops being a number (fed NaN, or a sample that overflows it) starts
+    /// again from silence instead of ringing NaN for ever: the block it happened in goes out as
+    /// numbers, and the next one is filtered exactly as by a filter that never saw it.
+    #[test]
+    fn a_filter_poisoned_by_a_non_finite_sample_recovers() {
+        let coefficients = BiquadCoefficients::design(FilterShape::Peak, 1_000.0, 2.0, 18.0);
+        for poison in [f32::NAN, f32::INFINITY, f32::MAX] {
+            let warmed = || {
+                let mut filter = Biquad::new(1);
+                filter.set(Some(&coefficients));
+                filter.process(&mut [0.0; 2 * GLIDE_FRAMES as usize], 1, 0);
+                filter
+            };
+            let mut poisoned = warmed();
+            let mut block = sine(1_000.0, 0.5, 256);
+            block[100] = poison;
+            poisoned.process(&mut block, 1, 0);
+            assert!(block.iter().all(|s| s.is_finite()), "{poison}: {block:?}");
+            assert!(poisoned.state().iter().flatten().all(|s| s.is_finite()));
+
+            let mut clean = warmed();
+            let mut expected = sine(440.0, 0.5, 1_024);
+            let mut recovered = expected.clone();
+            clean.process(&mut expected, 1, 0);
+            poisoned.process(&mut recovered, 1, 0);
+            assert!(same_bits(&expected, &recovered), "{poison}");
+        }
     }
 }

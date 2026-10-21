@@ -1501,10 +1501,11 @@ impl TargetRegistry {
             .find(|entry| names(key, entry))
             .ok_or_else(|| format!("{} is not here", describe_key(key)))?;
         let kept_for = musician_key(entry);
-        let kept = entry
-            .mix_state
-            .set_fx_returns(entry.mix_state.fx_returns().with(effect, level));
+        // The book is held from the change through the keeping, so two changes at once (one to
+        // each effect) keep the returns they leave in the mix; the change itself is one atomic
+        // step on the mix.
         let mut book = self.fx_return_book();
+        let kept = entry.mix_state.set_fx_return(effect, level);
         if matches!(kept_for, MusicianKey::Client(_)) {
             book.remove(&BookKey::Ip(entry.address.ip()));
         }

@@ -3073,9 +3073,7 @@ impl EngineHandle {
         if self.is_stopped() {
             return Err("the engine is stopping".into());
         }
-        Ok(self
-            .local_mix
-            .set_fx_returns(self.local_mix.fx_returns().with(effect, level)))
+        Ok(self.local_mix.set_fx_return(effect, level))
     }
 
     /// Replaces the local mix's effect returns at once (a start or a session load).

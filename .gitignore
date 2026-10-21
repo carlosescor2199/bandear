@@ -9,6 +9,13 @@ apps/android/local.properties
 *.apk
 *.aab
 
+# Swift/SwiftPM build output
+apps/ios/**/.build/
+apps/ios/**/.swiftpm/
+apps/ios/**/*.xcodeproj/xcuserdata/
+apps/ios/**/*.xcworkspace/xcuserdata/
+apps/ios/**/DerivedData/
+
 # IDE and editor state
 .idea/
 .vscode/

@@ -12,6 +12,7 @@ import {
   abSettle,
   bandHandles,
   compressorOutputDb,
+  createFailureLine,
   curveDescription,
   curvePath,
   curveSource,
@@ -316,4 +317,31 @@ test("every slider of the editor covers its part's whole range and says its valu
     }
   }
   assert.equal(view.COMPRESSOR_FIELDS[1].format(4), "4:1");
+});
+
+test("the editor's failure line says the latest failure and forgets a send on another channel", () => {
+  const line = createFailureLine();
+  const refused = { ok: false, message: "CH 5's reverb send was not changed: the engine is stopping." };
+  const view = (channel, outcome = null, error = null) => ({ channel, outcome, error });
+  assert.equal(line.text(view(5)), "", "nothing failed");
+
+  line.sent(5, refused);
+  assert.equal(line.text(view(5)), refused.message);
+  // A preset refused after it is the latest failure, and stands over the send.
+  const preset = { ok: false, message: "\"Vocal\" was not applied: the engine is stopping." };
+  assert.equal(line.text(view(5, preset)), preset.message);
+  // Another send refused after that is the latest again.
+  line.sent(5, refused);
+  assert.equal(line.text(view(5, preset)), refused.message);
+  // A send that went through clears it; the older failure shows again.
+  line.sent(5, { ok: true, message: "CH 5 is sending 20% to the reverb." });
+  assert.equal(line.text(view(5, preset)), preset.message);
+
+  // A refused send is about its own channel: switching channels forgets it, and it does not come
+  // back on the way back.
+  line.sent(5, refused);
+  assert.equal(line.text(view(6)), "");
+  assert.equal(line.text(view(5)), "");
+  // The strips' read error shows when nothing newer failed.
+  assert.equal(line.text(view(5, null, "The channel processing could not be read.")), "The channel processing could not be read.");
 });

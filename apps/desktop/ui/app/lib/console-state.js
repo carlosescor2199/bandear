@@ -300,14 +300,16 @@ export const actions = Object.freeze({
   effectEdit: (effect, settings) => ({ type: "effect-edit", effect, settings }),
   /**
    * The answer (or failure) of the effect change `sent`: a later one stays; `effects`, when given,
-   * are both effects as the desk answered them, kept until the next status.
+   * are both effects as the desk answered them, of which `effect`'s alone is kept until the next
+   * status (the other one's may be older than its own latest change).
    */
   effectSettled: (effect, sent, effects = null) => ({ type: "effect-settled", effect, sent, effects }),
   /** A return of `effect` in the mix `address` on its way to the desk at `level`. */
   returnEdit: (address, effect, level) => ({ type: "return-edit", address, effect, level }),
   /**
    * The answer (or failure) of the return `level`: a later one stays; `returns`, when given, are the
-   * mix's returns as the desk answered them, kept until the next status.
+   * mix's returns as the desk answered them, of which `effect`'s alone is kept until the next
+   * status.
    */
   returnSettled: (address, effect, level, returns = null) => ({
     type: "return-settled",
@@ -708,27 +710,39 @@ function settleLevel(pending, key, effect, level) {
   return Object.keys(next).length === 0 ? NO_EDITS : next;
 }
 
-// Both effects as the desk answered them, kept in the status until the next one.
-function effectsKept(state, effects) {
-  return effects && state.engine.status
-    ? { ...state, engine: { ...state.engine, status: { ...state.engine.status, effects } } }
-    : state;
-}
-
-// The returns of the mix `address` as the desk answered them, kept until the next status.
-function returnsKept(state, address, returns) {
-  if (!returns) {
+// The settings of `effect` as the desk answered a change of it, kept in the status until the next
+// one. Only that effect's: the other effect has a coalescer of its own, and an answer about this
+// one may be older than the other's latest.
+function effectsKept(state, effect, effects) {
+  if (!effects?.[effect] || !state.engine.status) {
     return state;
   }
+  const kept = { ...(state.engine.status.effects ?? {}), [effect]: effects[effect] };
+  return { ...state, engine: { ...state.engine, status: { ...state.engine.status, effects: kept } } };
+}
+
+// The return of `effect` in the mix `address` as the desk answered a change of it, kept until the
+// next status. Only that effect's return, for the same reason as effectsKept.
+function returnsKept(state, address, effect, returns) {
+  if (!returns || returns[effect] === undefined) {
+    return state;
+  }
+  const merged = (before) => ({ ...(before ?? {}), [effect]: returns[effect] });
   if (address === LOCAL_MIX) {
     return state.engine.status
-      ? { ...state, engine: { ...state.engine, status: { ...state.engine.status, localFxReturns: returns } } }
+      ? {
+          ...state,
+          engine: {
+            ...state.engine,
+            status: { ...state.engine.status, localFxReturns: merged(state.engine.status.localFxReturns) },
+          },
+        }
       : state;
   }
   return {
     ...state,
     musicians: state.musicians.map((musician) =>
-      musician.address === address ? { ...musician, fxReturns: returns } : musician,
+      musician.address === address ? { ...musician, fxReturns: merged(musician.fxReturns) } : musician,
     ),
   };
 }
@@ -852,7 +866,7 @@ export function consoleReducer(state, action) {
       return { ...state, effectsPending: { ...state.effectsPending, [action.effect]: action.settings } };
     case "effect-settled":
       return {
-        ...effectsKept(state, action.effects),
+        ...effectsKept(state, action.effect, action.effects),
         effectsPending: settleStrip(state.effectsPending, action.effect, action.sent),
       };
     case "return-edit":
@@ -865,7 +879,7 @@ export function consoleReducer(state, action) {
       };
     case "return-settled":
       return {
-        ...returnsKept(state, action.address, action.returns),
+        ...returnsKept(state, action.address, action.effect, action.returns),
         returnsPending: settleLevel(state.returnsPending, action.address, action.effect, action.level),
       };
     case "limiter-settled":

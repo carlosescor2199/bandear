@@ -3353,6 +3353,10 @@ export function createFakeBridge({
       return { outcome: "set", effect, effects: clone(effects), saved: true, saveError: null, message };
     },
     set_musician_fx_return({ musicianKey, effect, level = 0 } = {}) {
+      // As the desktop answers: the effect is read with the arguments, before anything else.
+      if (effect !== "reverb" && effect !== "delay") {
+        throw `unknown variant "${effect}", expected "reverb" or "delay"`;
+      }
       const key = String(musicianKey ?? "");
       if (!key.startsWith("client:") && !key.startsWith("address:")) {
         throw `"${key}" names no phone or address`;
@@ -3379,6 +3383,9 @@ export function createFakeBridge({
       return returnAnswer(key, effect, returns, "This musician's");
     },
     set_local_fx_return({ effect, level = 0 } = {}) {
+      if (effect !== "reverb" && effect !== "delay") {
+        throw `unknown variant "${effect}", expected "reverb" or "delay"`;
+      }
       if (!isRunning) {
         throw "the engine is not running";
       }

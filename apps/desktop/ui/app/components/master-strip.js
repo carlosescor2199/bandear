@@ -1,20 +1,29 @@
 // <ml-master-strip>: a musician's master: the stereo output meters, the level, the phone's level
 // cap (the loudest the phone may play; the musician sets it too), the engineer's limit (the loudest
 // this desk lets the musician hear; their phone cannot change it), a line saying the lower of the
-// two wins, and Mute.
+// two wins, Mute, and the mix's master limiter: On, its ceiling and release as sliders with their
+// values in words, its gain reduction and a line saying what it does.
 //
 // Property: `data`, from masterStrip (mix-view.js):
 //   { volume, cap, limit, muted, readout, ceilingNote }. The engineer's local mix has no cap or
 //   limit (both null, and no note): the strip then shows the level and Mute alone.
+//   `limiter`, from masterLimiter (limiter.js), or absent to hide the limiter: { enabled, ceiling,
+//   release, state, note, ceilingPosition, releasePosition }.
 // Method: `setLevels(left, right)`, the output peaks from the `meters` event.
+//   `setLimiterReduction(db)`, the limiter's gain reduction from the `meters` event (0 while off).
 // Event: `mix-edit` { field, index: null, value } (bubbling, composed) for the level
 //   ("volumePercent") and the cap ("maxLevelPercent") as they move, Mute ("muted"), and the limit
 //   ("engineerLimitPercent") when a gesture on it ends: each limit change is kept by the desk, so a
 //   drag sends its last value only.
+//   `limiter-edit` { field, value } (bubbling, composed): "enabled" with true or false, or
+//   "ceilingDb" / "releaseMs" with the slider's position (0-1,000; limiterChange turns it into the
+//   setting) as it moves.
 
 import "./fader.js";
+import "./reduction-meter.js";
 import "./meter.js";
 import "./toggle.js";
+import { LIMITER_REDUCTION_SCALE_DB } from "../lib/limiter.js";
 import { showMasterValues, wireMasterControls } from "../lib/master-controls.js";
 import { stripStyles } from "./strip-styles.js";
 import { attachShadowRoot, define, emit, reflect, setText, sheet } from "./support.js";
@@ -59,11 +68,58 @@ const styles = sheet(`
     line-height: 1.35;
     text-align: center;
   }
+  /* The master limiter, under Mute: its own group with a rule above it. */
+  .limiter {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    padding-top: 8px;
+    border-top: 1px solid var(--ml-border);
+  }
+  .limiter[hidden] {
+    display: none;
+  }
+  .limiter-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .limiter-state {
+    font-size: var(--ml-text-2xs);
+    color: var(--ml-text-secondary);
+  }
+  .limiter-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 2px 6px;
+    font-size: var(--ml-text-2xs);
+    color: var(--ml-text-secondary);
+  }
+  .limiter-field output {
+    font-family: var(--ml-font-mono);
+    color: var(--ml-text);
+    text-align: right;
+  }
+  .limiter-field input {
+    grid-column: 1 / -1;
+    width: 100%;
+    min-height: 24px;
+    margin: 0;
+    accent-color: var(--ml-accent);
+  }
+  .limiter ml-reduction-meter {
+    grid-template-columns: minmax(0, 1fr) 56px;
+  }
 `);
 
 class MlMasterStrip extends HTMLElement {
   #data = null;
   #parts;
+  #limiter;
+  // The limiter slider under the pointer, if any.
+  #dragging = null;
 
   constructor() {
     super();
@@ -92,10 +148,41 @@ class MlMasterStrip extends HTMLElement {
         <!-- Describes both caps: it says which one wins. -->
         <p class="note" id="ceiling"></p>
         <ml-toggle kind="mute" wide label="Mute master">Mute</ml-toggle>
+        <div class="limiter" role="group" aria-label="Limiter" data-limiter hidden>
+          <div class="limiter-head">
+            <ml-toggle wide label="Limiter on" data-limiter-on>Limiter</ml-toggle>
+            <span class="limiter-state" data-limiter-state></span>
+          </div>
+          <label class="limiter-field">
+            <span>Ceiling</span>
+            <output data-limiter-value="ceilingDb"></output>
+            <input type="range" min="0" max="1000" step="1" aria-label="Limiter ceiling" aria-describedby="limiter-note" data-limiter-field="ceilingDb" />
+          </label>
+          <label class="limiter-field">
+            <span>Release</span>
+            <output data-limiter-value="releaseMs"></output>
+            <input type="range" min="0" max="1000" step="1" aria-label="Limiter release" data-limiter-field="releaseMs" />
+          </label>
+          <ml-reduction-meter label="Limiter gain reduction" scale="${LIMITER_REDUCTION_SCALE_DB}"></ml-reduction-meter>
+          <p class="note" id="limiter-note" data-limiter-note></p>
+        </div>
       </div>`,
     );
     const [left, right] = root.querySelectorAll("ml-meter");
     const [level, cap, limit] = root.querySelectorAll("ml-fader");
+    this.#limiter = {
+      group: root.querySelector("[data-limiter]"),
+      on: root.querySelector("[data-limiter-on]"),
+      state: root.querySelector("[data-limiter-state]"),
+      note: root.querySelector("[data-limiter-note]"),
+      reduction: root.querySelector("ml-reduction-meter"),
+      fields: [...root.querySelectorAll("[data-limiter-field]")].map((input) => ({
+        input,
+        key: input.dataset.limiterField,
+        output: root.querySelector(`[data-limiter-value="${input.dataset.limiterField}"]`),
+      })),
+    };
+    this.#wireLimiter();
     this.#parts = {
       left,
       right,
@@ -104,7 +191,7 @@ class MlMasterStrip extends HTMLElement {
       limit,
       readout: root.querySelector(".readout"),
       note: root.querySelector(".note"),
-      mute: root.querySelector("ml-toggle"),
+      mute: root.querySelector("ml-toggle[kind=mute]"),
       capColumn: root.querySelector("[data-cap]"),
       limitColumn: root.querySelector("[data-limit]"),
     };
@@ -126,11 +213,78 @@ class MlMasterStrip extends HTMLElement {
     setText(parts.readout, data.readout);
     parts.note.hidden = !data.ceilingNote;
     setText(parts.note, data.ceilingNote ?? "");
+    this.#showLimiter(data.limiter ?? null);
   }
 
   setLevels(left, right) {
     this.#parts.left.setLevel(left);
     this.#parts.right.setLevel(right);
+  }
+
+  setLimiterReduction(db) {
+    this.#limiter.reduction.setReduction(this.#data?.limiter?.enabled ? db : 0);
+  }
+
+  #showLimiter(view) {
+    const limiter = this.#limiter;
+    limiter.group.hidden = view === null;
+    if (view === null) {
+      return;
+    }
+    limiter.on.pressed = view.enabled;
+    setText(limiter.state, view.enabled ? "On" : "Off");
+    setText(limiter.note, view.note);
+    const shown = {
+      ceilingDb: { position: view.ceilingPosition, text: view.ceiling },
+      releaseMs: { position: view.releasePosition, text: view.release },
+    };
+    for (const { input, key, output } of limiter.fields) {
+      // A thumb under the pointer stays where it is held; it lands on the rounded value after.
+      if (this.#dragging !== input && input.value !== String(shown[key].position)) {
+        input.value = String(shown[key].position);
+      }
+      reflect(input, "aria-valuetext", shown[key].text);
+      setText(output, shown[key].text);
+    }
+    if (!view.enabled) {
+      limiter.reduction.setReduction(0);
+    }
+  }
+
+  // On and the two sliders send `limiter-edit`; the sliders' own `input` events stay inside, so
+  // nothing outside takes them for a fader's.
+  #wireLimiter() {
+    const limiter = this.#limiter;
+    limiter.on.addEventListener("change", (event) => {
+      event.stopPropagation();
+      this.#limiterEdit("enabled", event.detail.pressed);
+    });
+    for (const { input, key } of limiter.fields) {
+      input.addEventListener("input", (event) => {
+        event.stopPropagation();
+        this.#limiterEdit(key, Number(input.value));
+      });
+      input.addEventListener("pointerdown", () => {
+        this.#dragging = input;
+      });
+      const release = () => {
+        if (this.#dragging === input) {
+          this.#dragging = null;
+          if (this.#data) {
+            this.#showLimiter(this.#data.limiter ?? null);
+          }
+        }
+      };
+      input.addEventListener("pointerup", release);
+      input.addEventListener("pointercancel", release);
+      input.addEventListener("change", release);
+    }
+  }
+
+  #limiterEdit(field, value) {
+    if (this.#data?.limiter) {
+      emit(this, "limiter-edit", { field, value });
+    }
   }
 
   #edit(field, value) {

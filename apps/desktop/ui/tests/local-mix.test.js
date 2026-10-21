@@ -475,7 +475,7 @@ test("the fake's meters carry the local mix's peak", async () => {
   fake.emitMeters();
 
   assert.equal(typeof heard[0].local.left, "number");
-  assert.deepEqual(heard[1].local, { left: 0, right: 0 }, "a muted local mix is silent");
+  assert.deepEqual(heard[1].local, { left: 0, right: 0, limiterReductionDb: 0 }, "a muted local mix is silent");
 });
 
 test("a fake session keeps the local mix and a load takes it, an older one leaving the desk's own", async () => {

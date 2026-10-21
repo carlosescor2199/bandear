@@ -436,7 +436,56 @@ test.
   - Counts: UI `node --test apps/desktop/ui/tests` 584 passed (553 before T5-fix); `cargo test -p
     mixlink-desktop` 328 passed (325 before); `cargo check -p mixlink-desktop --all-targets` clean.
     Commit: this commit.
-- [ ] T7 (master limiter): per mix, engine, desk and master strip. Route: delegated writer.
+- [x] T6-fix: the findings of review-90dc4abdb8816f9f and review-93fc890ef1905355. Route: delegated
+  writer (with T7). Commits 3a044b2 `fix(desktop-ui): keep the bypassed strip until it is restored
+  and guard unknown processing` and c7b03e2 `test(desktop): make the copy race deterministic`.
+  - Bypass off keeps the kept strip, still bypassed, until the restore is answered; a refused
+    restore leaves it bypassed with its settings kept.
+  - The strip opened last is remembered per console app, not in module state.
+  - The processing screen draws through `frameScheduler` (`lib/scheduling.js`), stopped for good on
+    unmount, so a late answer neither draws on a removed screen nor rewrites the address.
+  - The Mix strips and the Channels table say neither On nor Off while the strips are not read
+    (`processingActive` null, `processingLink` "not read yet"); a pair opens on its first side
+    (tests in `processing-editor.test.js`).
+  - The copy race test waits for the competing change to reach the engine lock (no fixed sleep).
+  - `<ml-reduction-meter>` announces the value it settles on (`trailingThrottle`).
+- [x] T7 (master limiter): per mix, engine, desk and master strip. Route: delegated writer
+  (trigger: the engine, the desk's commands and session, then the console's store, app, fake bridge,
+  a pure module, an organism and the screen). Commits 992e418 `feat(engine): a limiter on every
+  mix's master` (+1,055/-37), aa58567 `feat(desktop): keep each mix's limiter` (+766/-26) and this
+  commit `feat(desktop-ui): limiter on the master strip`.
+  - Design: each musician's mix, the local output and the recorder's local mix go through a peak
+    limiter after the sum and before the clamp at the mix's ceiling, which stays as the last safety
+    net. Its ceiling is the lower of its own (−24 to 0 dBFS, 0 by default) and the mix's (the lower
+    of the phone's cap and the engineer's limit); release 1-1,000 ms (50 by default); no lookahead,
+    no added latency. Settings live on the mix as atomics, the design worked out off the engine
+    thread; the running state lives with each mixer's ramp, so two mixes never share it. Off by
+    default and bit for bit as before. Engineer-only (`set_musician_limiter`, `set_local_limiter`),
+    kept per musician by client id or address (the default kept as nothing) and in the session's
+    local section, so named sessions carry them; the status reports each row's `limiter` and
+    `localLimiter`, the meters each mix's `limiterReductionDb`.
+  - Master strip (each musician's tab and the Local mix tab): a "Limiter" switch with On/Off in
+    words, Ceiling and Release sliders with their values in words (`aria-valuetext`), a "Limiter
+    gain reduction" meter (`<ml-reduction-meter>`, 12 dB full scale, 0 while off) and a line saying
+    which ceiling wins (the mix's cap/limit, or full scale for the local mix). Changes show at once
+    and go through a per-mix coalescer (`editMixLimiter`); a refusal is said above the strips.
+  - Pure logic in `lib/limiter.js` (ranges, `masterLimiter`, `limiterChange`, where an arrow key
+    that rounds back to the same value moves one unit, 0.5 dB or 1 ms; `limiterReduction`, words).
+    The fake bridge keeps them as the desk does and limits a hot mix in its meters.
+  - RED: `limiter.test.js` (12) against the inherited uncommitted module with stub `limiterChange`
+    and `masterLimiter`: 6 failed (the view's positions, the control change, the fake's commands and
+    session, the console's command and refusal; the fake also threw on an undefined default), 6
+    passed (ranges, words, reduction, outcome, bridge, fake meters, written before by the previous
+    writer); then all 12 passed. The local mix meters test now expects `limiterReductionDb: 0`.
+  - Browser check (`desktop-ui`, `?fake`): Lead vocal's limiter on, ceiling to −18 then an arrow key
+    to −17.5 dBFS, release 251 ms, gain reduction −8.0 dB with the note naming the 90% cap; the Local
+    mix tab's own limiter on at −21.5 dBFS, 4 ms, reduction about −21 dB; back on Lead vocal its own
+    settings kept. Processing editor: "Vocal" applied to CH 5, Bypass on ("Bypassed", settings kept)
+    and off ("Processing on"); an edit and a bypass then leaving for the Mix screen at once left the
+    address on `#/mix`. No console errors.
+  - Counts: UI `node --test apps/desktop/ui/tests` 604 passed (592 before this commit);
+    `cargo test -p mixlink-desktop` 333 passed; `cargo test -p personal-monitoring` 617 passed
+    (`CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one at a time, once at the end). Commit: this commit.
 - [ ] T8 (effects): reverb and delay buses, per-channel sends, per-mix returns, editor. Route:
   delegated writer.
 - [ ] T9 (close): PRD update, docs, latency check, live test with the S23. Route: inline or writer.
@@ -487,7 +536,12 @@ per reviewed slice, only with the user's approval.
   HVCI on, several under compile load; builds kept minimal (one focused desktop test build, one full
   run and one check for T5-fix and T6, `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, no release builds).
 - T5-fix and T6 done (cf238a4, 7b25b2d, 21b9f98 and the editor commit).
+- Reviews review-90dc4abdb8816f9f (9bdd0e9..21b9f98, T5-fix and T6's logic) and
+  review-93fc890ef1905355 (21b9f98..0069f51, T6's editor): approved and acknowledged; their findings
+  fixed in T6-fix (3a044b2, c7b03e2). Next review base: 0069f51.
+- T6-fix and T7 done (3a044b2, c7b03e2, 992e418, aa58567 and the master strip commit).
 
 ## Next step
 
-T7 (master limiter: per mix, engine, desk and master strip). Review of 9bdd0e9..T6 pending.
+T8 (effects: reverb and delay buses, per-channel sends, per-mix returns, editor). Review of
+0069f51..T7 pending.

@@ -4,7 +4,9 @@
 // into engine calls and mix edits. The tools beside the musician tabs (Mirror, Copy mix to…,
 // Presets) act on the open musician's mix, and their last outcome is said in words above the
 // strips. The last tab is the engineer's Local mix (local-mix.js): the same strips without a lock,
-// a cap or a limit, and no tools, metered by the `meters` event's `local` peak.
+// a cap or a limit, and no tools, metered by the `meters` event's `local` peak. Every mix's master
+// strip carries its limiter (limiter.js): its changes go to the desk through the console app, the
+// gain reduction comes from the meters, and a change the desk refused is said above the strips.
 
 import "../components/index.js";
 import { editKey } from "../lib/mix.js";
@@ -12,6 +14,7 @@ import { mixToolsView } from "../lib/mixes.js";
 import { mixToolCommands } from "../lib/mix-tools.js";
 import { musicianLabel } from "../lib/format.js";
 import { LOCAL_MIX, processingActive, selectedMusician } from "../lib/console-state.js";
+import { limiterChange, limiterReduction, masterLimiter } from "../lib/limiter.js";
 import {
   channelEdits,
   channelStrips,
@@ -149,8 +152,11 @@ export function mountMixScreen(main, app) {
     parts.noticeAction.textContent = copy.action ?? "";
   }
 
-  // The last outcome of the tools, `{ ok, message }`, said until the next one.
+  // The last outcome of the tools (or a limiter change the desk refused), `{ ok, message }`, said
+  // until the next one.
   let toolsOutcome = null;
+  // Set once the screen is left: a late answer then draws nothing.
+  let disposed = false;
 
   function renderTools(state) {
     parts.tools.hidden = selectedMusician(state) === null;
@@ -207,7 +213,8 @@ export function mountMixScreen(main, app) {
     ).forEach((element, position) => {
       element.data = groups[position];
     });
-    parts.master.data = masterStrip(state, address);
+    const master = masterStrip(state, address);
+    parts.master.data = master && { ...master, limiter: masterLimiter(state, address) };
   }
 
   // Store changes can come many times a frame (a fader drag, a burst of events): draw once.
@@ -232,6 +239,7 @@ export function mountMixScreen(main, app) {
     }
     const { left, right } = masterLevels({ musicians, local }, app.store.getState().selected);
     parts.master.setLevels(left, right);
+    parts.master.setLimiterReduction(limiterReduction({ musicians, local }, app.store.getState().selected));
   }
 
   // A channel strip's move goes to every input it stands for (both sides of a pair, its balance
@@ -269,6 +277,21 @@ export function mountMixScreen(main, app) {
   screen.addEventListener("engine-stop", () => app.stop());
   screen.addEventListener("musician-select", (event) => app.select(event.detail.address));
   screen.addEventListener("mix-edit", onMixEdit);
+  // A limiter control's change, made on the limiter shown (the change on its way first) and sent
+  // for the open mix; only a refusal is said, so a drag does not announce every step.
+  screen.addEventListener("limiter-edit", async (event) => {
+    const state = app.store.getState();
+    const address = state.selected;
+    const shown = address ? masterLimiter(state, address) : null;
+    if (!shown) {
+      return;
+    }
+    const outcome = await app.editMixLimiter(address, limiterChange(shown, event.detail.field, event.detail.value));
+    if (!outcome.ok && !disposed) {
+      toolsOutcome = outcome;
+      renderTools(app.store.getState());
+    }
+  });
   // "Try again" after a lost connection connects again; every other notice's action starts.
   parts.noticeAction.addEventListener("click", () => {
     if (parts.noticeAction.dataset.kind === "disconnected") {
@@ -282,6 +305,7 @@ export function mountMixScreen(main, app) {
   render();
 
   return () => {
+    disposed = true;
     unsubscribe();
     stopMeters();
     cancelAnimationFrame(frame);

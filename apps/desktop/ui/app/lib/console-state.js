@@ -66,6 +66,9 @@
 //              could not be read after a load), cleared by the next answer or read.
 //   stripPresets every strip preset, the built-in ones first (`strip_presets`), or null until read.
 //   eqCurves  { channel: [{ freqHz, db }] }: the equaliser response last worked out for a channel.
+//   limiterPending { address: settings }: a master limiter change still on its way to the desk (a
+//              musician's address, or LOCAL_MIX), which the master strip shows over the status's
+//              (mixLimiter, limiter.js) until its answer settles it.
 //
 // Loading a saved session replaces the mixes, the groups and the channel details at once, so the
 // edits still waiting are dropped once it loaded (`sessionLoaded`): none of them was meant for the
@@ -154,6 +157,7 @@ export const initialState = Object.freeze({
   processingError: null,
   stripPresets: null,
   eqCurves: NO_EDITS,
+  limiterPending: NO_EDITS,
 });
 
 const READY = Object.freeze({ status: "ready", error: null });
@@ -274,6 +278,10 @@ export const actions = Object.freeze({
   processing: (list) => ({ type: "processing", list }),
   /** A strip edit of `channel` (1-based) on its way to the desk: the whole strip, `settings`. */
   processingEdit: (channel, settings) => ({ type: "processing-edit", channel, settings }),
+  /** A master limiter change sent for the mix `address`, shown until it is answered. */
+  limiterEdit: (address, settings) => ({ type: "limiter-edit", address, settings }),
+  /** The answer (or failure) of the limiter change `sent` for `address`: a later one stays. */
+  limiterSettled: (address, sent) => ({ type: "limiter-settled", address, sent }),
   /**
    * The desk answered a processing change (an edit of `channel` that carried `sent`, or a reset,
    * copy or preset with `sent` null) with `answer`, `{ outcome, channels, message }`: every channel
@@ -635,6 +643,7 @@ function sessionLoaded(state, outcome) {
     ...next,
     processingPending: NO_EDITS,
     processingError: null,
+    limiterPending: NO_EDITS,
     presets: outcome.presets ?? next.presets,
     audio: outcome.audioLoaded ? restoredAudio(outcome.audio) : next.audio,
   };
@@ -734,6 +743,16 @@ export function consoleReducer(state, action) {
       return { ...state, stripPresets: action.list ?? null };
     case "eq-curve":
       return { ...state, eqCurves: { ...state.eqCurves, [action.channel]: action.points } };
+    case "limiter-edit":
+      return {
+        ...state,
+        limiterPending: { ...state.limiterPending, [action.address]: action.settings },
+      };
+    case "limiter-settled":
+      return {
+        ...state,
+        limiterPending: settleStrip(state.limiterPending, action.address, action.sent),
+      };
     case "sessions":
       return { ...state, sessions: action.sessions };
     case "sessions-failed":

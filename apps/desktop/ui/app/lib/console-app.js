@@ -65,6 +65,11 @@
 //   `setMusicianRedundancy(musicianKey, on, delayBlocks)` turns it on or off, in turn with the desk
 //   edits and loads (a load replaces the settings), answers `{ ok, message }` (formatRedundancySet)
 //   and reads the status after it.
+// - The master limiter on every mix (the master strip; see limiter.js): `editMixLimiter(address,
+//   settings)` for a musician's address or LOCAL_MIX, shown at once over the status's (mixLimiter)
+//   and sent through a per-mix coalescer (one request in flight per mix, the latest change always
+//   sent); answers `{ ok, message }` (formatLimiterSet) once that mix's changes settled, and reads
+//   the status after each answer.
 // - Each input's channel processing (see processing.js): every channel's strip (read once
 //   connected and after a loaded session, `loadProcessing` again), `editProcessing(channel,
 //   settings)` through a per-channel coalescer (one request in flight per channel, the latest edit
@@ -140,6 +145,8 @@ import { buildEngineerRequest, buildMixRequest, splitEdits } from "./mix.js";
 import { formatCopied, formatMirrorSet, formatPresetApplied } from "./mixes.js";
 import { switchMethod, windowTitle } from "./network-view.js";
 import { formatMixRestored } from "./mix-backups-view.js";
+import { clampLimiter, formatLimiterSet } from "./limiter.js";
+import { musicianKey } from "./link-health-view.js";
 import { formatBufferSet, nameForKey } from "./playback-buffer.js";
 import { formatProcessingSet, formatStripPresetsSet, stripUnitChannels } from "./processing.js";
 import { blockMsOf, formatRedundancySet } from "./redundancy.js";
@@ -988,6 +995,48 @@ export function createConsoleApp({
     });
   }
 
+  // The last answer to a limiter change of each mix, in words.
+  const limiterSaid = new Map();
+
+  // Sends the limiter change `sent` of the mix `address` and reads the status after its answer;
+  // the change shown meanwhile is settled either way.
+  async function sendLimiter(address, sent) {
+    const local = address === LOCAL_MIX;
+    const musician = local ? null : musicianByAddress(store.getState(), address);
+    const name = local ? "The local mix" : musician ? musicianLabel(musician) : address;
+    try {
+      if (!local && !musician) {
+        throw new Error(`${name} is not here`);
+      }
+      const answer = local
+        ? await api.setLocalLimiter(sent)
+        : await api.setMusicianLimiter(musicianKey(musician), sent);
+      await readStatus();
+      limiterSaid.set(address, formatLimiterSet(answer, name));
+    } catch (error) {
+      const whose = local ? "The local mix's" : `${name}'s`;
+      limiterSaid.set(address, {
+        ok: false,
+        message: sentenceWithReason(`${whose} limiter was not set`, message(error)),
+      });
+    } finally {
+      store.dispatch(actions.limiterSettled(address, sent));
+    }
+  }
+
+  const limiterSender = createCoalescer(sendLimiter);
+
+  // Changes the master limiter of the mix `address` (a musician's address, or LOCAL_MIX) to
+  // `settings`: shown at once, sent through the mix's coalescer, answered once that mix's changes
+  // settled.
+  async function editMixLimiter(address, settings) {
+    const sent = clampLimiter(settings);
+    store.dispatch(actions.limiterEdit(address, sent));
+    limiterSender.push(address, sent);
+    await limiterSender.idle(address);
+    return limiterSaid.get(address) ?? { ok: false, message: "The limiter was not set." };
+  }
+
   // Sends every edit still waiting, as the coalescers would have: after a load that was refused.
   function sendWaiting() {
     for (const channel of Object.keys(store.getState().processingPending)) {
@@ -1568,6 +1617,12 @@ export function createConsoleApp({
      * }` (formatRedundancySet).
      */
     setMusicianRedundancy,
+    /**
+     * Changes the master limiter of the mix `address` (a musician's address, or LOCAL_MIX) to
+     * `settings` `{ enabled, ceilingDb, releaseMs }` (see limiter.js): shown at once (mixLimiter)
+     * and sent with the latest change winning; answers `{ ok, message }` (formatLimiterSet).
+     */
+    editMixLimiter,
     /** Reads every channel's strip again; resolves to null, or to the error of a failed read. */
     loadProcessing,
     /**

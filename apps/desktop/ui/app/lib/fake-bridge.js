@@ -21,6 +21,7 @@ import { DEMO_CHANNELS, DEMO_DEVICE, DEMO_HOST, demoDevices } from "./demo-sourc
 import { HOSTS } from "./engine-config.js";
 import { MAX_GROUPS, defaultMix, mergeEngineerUpdate, mergeMixUpdate, mixFromDto } from "./mix.js";
 import { checkPresetName, presetOf, sameShared, withPreset, withShared } from "./mixes.js";
+import { clampLimiter, defaultLimiter, sameLimiter } from "./limiter.js";
 import { IDLE_RECORDING, RECORD_FORMATS } from "./recording.js";
 import { IDLE_SOUNDCHECK } from "./soundcheck.js";
 import { BACKUP_MAX_WAIT_MS, BACKUP_QUIET_MS, KEPT_BACKUPS } from "./mix-backups-view.js";
@@ -335,6 +336,7 @@ function musicianRow(address, identity, link, mixChanges = {}) {
     buffer: { mode: "auto" },
     redundancy: { on: false },
     duplicatesSent: 0,
+    limiter: { enabled: false, ceilingDb: 0, releaseMs: 50 },
     recovered: 0,
     ...identity,
     bufferSupported: (identity.capabilities ?? []).includes("playback.buffer"),
@@ -510,6 +512,8 @@ export function sampleStatus() {
     demo: false,
     // The engine thread at a light load: well inside each block, never late.
     load: { percent: 9.4, averagePercent: 8.2, peakPercent: 14.6, lateBlocks: 0 },
+    // No limiter on the local mix, the default.
+    localLimiter: { enabled: false, ceilingDb: 0, releaseMs: 50 },
   };
 }
 
@@ -578,6 +582,44 @@ function heardLevels(musician, hidden, levels) {
   return { left: clampLevel(Math.min(left, cap)), right: clampLevel(Math.min(right, cap)) };
 }
 
+// `levels` through a master limiter `limiter` (`{ enabled, ceilingDb }`) on a mix whose own ceiling
+// is `ceilingPercent`: held under the lower of the two ceilings, with the dB it took off
+// (`limiterReductionDb`, 0 while off or under the ceiling).
+function limited(levels, limiter, ceilingPercent) {
+  if (!limiter?.enabled) {
+    return { ...levels, limiterReductionDb: 0 };
+  }
+  const ceiling = Math.min(100 * 10 ** ((limiter.ceilingDb ?? 0) / 20), ceilingPercent);
+  // The mix as summed, before its clamp: a hot input sums past the cap the levels were held to.
+  const peak = Math.max(levels.left, levels.right) * 1.6;
+  const reduction = peak > ceiling && ceiling > 0 ? 20 * Math.log10(peak / ceiling) : 0;
+  return {
+    left: clampLevel(Math.min(levels.left, ceiling)),
+    right: clampLevel(Math.min(levels.right, ceiling)),
+    limiterReductionDb: Math.round(reduction * 10) / 10,
+  };
+}
+
+// A number as the desktop writes a limiter setting: at most one decimal, no trailing zero.
+function trimmed(value) {
+  return String(Math.round(value * 10) / 10);
+}
+
+// The desktop's answer to a limiter change for `musicianKey` (null for the local mix), `held` the
+// settings in force, in the words of its message for `whose` mix.
+function limiterAnswer(musicianKey, held, whose) {
+  return {
+    musicianKey,
+    outcome: "set",
+    settings: clone(held),
+    saved: true,
+    saveError: null,
+    message: held.enabled
+      ? `${whose} limiter is on: peaks are held at ${trimmed(held.ceilingDb)} dBFS, released over ${trimmed(held.releaseMs)} ms.`
+      : `${whose} limiter is off.`,
+  };
+}
+
 /**
  * A `meters` payload for `status` at `time` milliseconds; the same time gives the same levels.
  * Each input goes through its strip in `strips` (CH 1 first; none, or a neutral one, leaves it as
@@ -594,11 +636,15 @@ export function syntheticMeters(status, time, strips = []) {
   const hidden = channels.map((_, index) => Boolean(status.channels?.[index]?.hidden));
   const musicians = {};
   for (const musician of status.musicians) {
-    musicians[musician.address] = heardLevels(musician, hidden, processed);
+    musicians[musician.address] = limited(
+      heardLevels(musician, hidden, processed),
+      musician.limiter,
+      Math.min(musician.maxLevelPercent ?? 100, musician.engineerLimitPercent ?? 100),
+    );
   }
   const local = status.localMix
-    ? heardLevels(status.localMix, hidden, processed)
-    : { left: 0, right: 0 };
+    ? limited(heardLevels(status.localMix, hidden, processed), status.localLimiter, 100)
+    : { left: 0, right: 0, limiterReductionDb: 0 };
   return {
     run: status.run,
     channels,
@@ -1035,6 +1081,9 @@ export function createFakeBridge({
   // The redundancy settings as the desk's session keeps them, `{ delayBlocks }` by labelKey (off is
   // kept as nothing), and the second each was turned on at.
   const redundancyBook = new Map();
+  // Each musician's master limiter as the desk's session keeps it, by labelKey (the default, off, is
+  // kept as nothing); the local mix's is in the local section (`keptLocal.limiter`).
+  const limiterBook = new Map();
   const redundancySince = new Map();
   // The audio input as the desk's session keeps it, `{ host, device, bufferFrames, asioDriver }`,
   // or null before any was kept.
@@ -1189,6 +1238,7 @@ export function createFakeBridge({
     showMirrors();
     showBuffers();
     showRedundancy();
+    showLimiters();
     showLinks();
     engine.recording = recordingNow();
     engine.lastTake = lastTake ? clone(lastTake) : null;
@@ -1247,6 +1297,16 @@ export function createFakeBridge({
   // The delay of the copies kept for `row`'s musician, in blocks (0 while off or immediate).
   function delayOf(row) {
     return keptRedundancy(row)?.redundancy.delayBlocks ?? 0;
+  }
+
+  // Each row's master limiter and the local mix's as the engine reports them: the one kept, for the
+  // phone first and then the address, else the default.
+  function showLimiters() {
+    for (const row of engine.musicians) {
+      const key = keysOf(row).find((candidate) => limiterBook.has(candidate));
+      row.limiter = clone(key ? limiterBook.get(key) : defaultLimiter());
+    }
+    engine.localLimiter = clone(keptLocal?.limiter ?? defaultLimiter());
   }
 
   // Each row's redundancy as the engine reports it: on with its delay, or off; the copies sent since
@@ -1747,7 +1807,11 @@ export function createFakeBridge({
   // mix it plays.
   function deskSession() {
     const local = isRunning
-      ? { mix: savedMixOf(engine.localMix), output: keptLocal?.output ?? null }
+      ? {
+          mix: savedMixOf(engine.localMix),
+          output: keptLocal?.output ?? null,
+          ...(keptLocal?.limiter ? { limiter: keptLocal.limiter } : {}),
+        }
       : keptLocal;
     return clone({
       labels: [...labels.entries()],
@@ -1756,6 +1820,7 @@ export function createFakeBridge({
       engineer: [...engineerBook.entries()],
       buffers: [...bufferBook.entries()],
       redundancies: [...redundancyBook.entries()],
+      limiters: [...limiterBook.entries()],
       mirrors: [...mirrorBook.entries()],
       presets: keptPresets,
       audio: keptAudio,
@@ -2867,6 +2932,11 @@ export function createFakeBridge({
         redundancyBook.set(key, redundancy);
         redundancySince.set(key, Math.floor(clock() / LINK_SAMPLE_PERIOD_MS));
       }
+      // And its limiters: a musician it keeps none for has none.
+      limiterBook.clear();
+      for (const [key, limiter] of session.limiters ?? []) {
+        limiterBook.set(key, limiter);
+      }
       keptPresets = session.presets ?? [];
       // As the desktop does: the loaded processing replaces every strip, a channel it keeps none
       // for going back to no processing; the desk's own strip presets stay.
@@ -3150,6 +3220,44 @@ export function createFakeBridge({
       }
       redundancyBook.delete(keptFor);
       return answer("set", { on: false }, "Each packet is sent once again: this musician's bandwidth is back to normal.");
+    },
+    set_musician_limiter({ musicianKey, settings } = {}) {
+      // As the desktop answers: a key of the desk's forms, then a running engine, then a musician
+      // here; the settings are held in range and kept for the phone when it has a client id
+      // (dropping one kept for its address), else for the address; the default is kept as nothing.
+      const key = String(musicianKey ?? "");
+      if (!key.startsWith("client:") && !key.startsWith("address:")) {
+        throw `\`${key}\` names no phone or address`;
+      }
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const row = rowForKey(key);
+      if (!row) {
+        const named = key.startsWith("client:") ? `the phone ${key.slice(7)}` : key.slice(8);
+        throw `${named} is not here`;
+      }
+      const held = clampLimiter(settings);
+      const keptFor = labelKey(row);
+      if (row.clientId) {
+        limiterBook.delete(`address:${row.address}`);
+      }
+      if (sameLimiter(held, defaultLimiter())) {
+        limiterBook.delete(keptFor);
+      } else {
+        limiterBook.set(keptFor, held);
+      }
+      row.limiter = clone(held);
+      return limiterAnswer(key, held, "This musician's");
+    },
+    set_local_limiter({ settings } = {}) {
+      if (!isRunning) {
+        throw "the engine is not running";
+      }
+      const held = clampLimiter(settings);
+      keepLocal({ limiter: sameLimiter(held, defaultLimiter()) ? null : held });
+      engine.localLimiter = clone(held);
+      return limiterAnswer(null, held, "The local mix's");
     },
     set_musician_buffer({ musicianKey, mode, ms = null } = {}) {
       // As the desktop answers: a key of the desk's forms, then the buffer asked for, then a

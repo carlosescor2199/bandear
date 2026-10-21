@@ -6,12 +6,12 @@ import { arcToCenter, samplePath } from "./svg-path.js";
 import { clamp, damp } from "./motion.js";
 import {
   AMBER,
-  createRenderer,
   createStage,
   disposeObject,
   glowTexture,
   isPhone,
   prefersReducedMotion,
+  withRenderer,
 } from "./three-setup.js";
 
 // The six strokes of assets/brand/bandear-mark.svg (1024 grid, stroke width 44, round caps).
@@ -152,11 +152,13 @@ function buildMark(phone) {
   return { mark, signalCore, signalHalo };
 }
 
-export function mount(host, { onLost } = {}) {
-  const canvas = host.querySelector("canvas");
+export function mount(host, callbacks = {}) {
+  return withRenderer(host, {}, (renderer) => build(host, renderer, callbacks));
+}
+
+function build(host, renderer, { onRendered, onFail }) {
   const phone = isPhone();
   const still = prefersReducedMotion();
-  const renderer = createRenderer(canvas);
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 50);
   camera.position.set(0, 0, 8);
@@ -251,7 +253,8 @@ export function mount(host, { onLost } = {}) {
   const stageHandle = createStage({
     host,
     renderer,
-    onLost,
+    onRendered,
+    onFail,
     onResize(width, height) {
       const aspect = width / height;
       const fit = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));

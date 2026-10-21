@@ -10,6 +10,7 @@ API call that finds the latest release.
 | `404.html` | Shown by GitHub Pages for any missing path. Self-contained on purpose (works at any depth). |
 | `js/i18n.js` | English and Spanish copy and the language toggle. |
 | `js/downloads.js` | Finds the latest release and points the download buttons at the visitor's installer. |
+| `js/links.js` | The repository's GitHub addresses (releases page, API, license) shared by the scripts. |
 | `js/main.js`, `js/scene-*.js`, `js/model-mixer.js`, `js/three-setup.js` | Decorative three.js scenes (only with WebGL 2; the static design stays otherwise). |
 | `assets/` | Brand marks, app screenshots, the social card (`og.png`) and the self-hosted fonts. |
 | `vendor/three/` | three.js, vendored (see below). |
@@ -70,6 +71,9 @@ One-time setup: **Settings → Pages → Build and deployment → Source: GitHub
 4. Update the absolute URLs that still name GitHub Pages: the `canonical`, `og:url`, `og:image`
    and `twitter:image` tags in `index.html`, and the root `README.md` link. `404.html` already
    links home to `/` on any host that is not `*.github.io`.
+5. The download links stay on github.com and need no change. Only if the repository itself is
+   renamed or moved, update `js/links.js` and the fallback `href`s that repeat the releases page
+   in `index.html` and `404.html` (the tests fail until they all match).
 
 ## Vendored three.js
 

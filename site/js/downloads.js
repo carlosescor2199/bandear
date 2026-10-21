@@ -7,9 +7,7 @@
 // globals and are tested with node.
 
 import { LANGUAGE_EVENT, t } from "./i18n.js";
-
-export const RELEASES_PAGE = "https://github.com/carlosescor2199/bandear/releases/latest";
-export const RELEASE_API = "https://api.github.com/repos/carlosescor2199/bandear/releases/latest";
+import { RELEASES_PAGE, RELEASE_API } from "./links.js";
 
 // One entry per installer, keyed by the suffix of its file name.
 export const ASSETS = Object.freeze({
@@ -24,6 +22,7 @@ export const ASSETS = Object.freeze({
 const CACHE_KEY = "bandear.release";
 const CACHE_MS = 30 * 60 * 1000; // The API allows 60 anonymous requests per hour per address.
 const TIMEOUT_MS = 6000;
+const HINTS_TIMEOUT_MS = 800; // client hints usually answer at once; never hold the button back
 
 // Which system the visitor is on, from navigator-like data:
 //   { userAgent, platform, maxTouchPoints, uaPlatform, architecture }
@@ -41,7 +40,11 @@ export function detectPlatform({ userAgent = "", platform = "", maxTouchPoints =
   if (/CrOS/.test(ua) || hint === "chrome os") return { os: "unknown", arch: null };
   if (/Windows/.test(ua) || hint === "windows" || /^Win/.test(platform)) return { os: "windows", arch };
   if (/Macintosh|Mac OS X/.test(ua) || hint === "macos" || /^Mac/.test(platform)) return { os: "mac", arch };
-  if (/Linux|X11/.test(ua) || hint === "linux" || /Linux/.test(platform)) return { os: "linux", arch };
+  if (/Linux|X11/.test(ua) || hint === "linux" || /Linux/.test(platform)) {
+    // Firefox and others name an ARM CPU in the user agent ("Linux aarch64", "armv7l").
+    const armInUa = /\b(aarch64|arm64|armv\d+\w*)\b/i.test(`${ua} ${platform}`);
+    return { os: "linux", arch: arch ?? (armInUa ? "arm" : null) };
+  }
   return { os: "unknown", arch: null };
 }
 
@@ -57,7 +60,10 @@ export function matchAssets(assets = []) {
   return found;
 }
 
-// What the hero offers a platform: { label: [key, vars], href, alt?: { text, link, href } }.
+// What the hero offers a platform:
+//   { label: [key, vars], href, card: key | null, alt?: { text, link?, href? } }
+// `label` is a dictionary key and its placeholders, `card` the download card to highlight and
+// `alt` an optional line under the button (a text key, plus a link key and its href).
 // Without a matching file the button still names the system and opens the releases page.
 export function heroChoice({ os, arch }, found = {}) {
   const url = (key) => found[key]?.url ?? RELEASES_PAGE;
@@ -76,6 +82,10 @@ export function heroChoice({ os, arch }, found = {}) {
         alt: { text: "dl.alt.intel", link: "dl.alt.intelLink", href: url("macIntel") },
       };
     case "linux":
+      // Only x86-64 Linux builds exist: never hand an ARM machine the amd64 AppImage.
+      if (arch === "arm") {
+        return { label: ["dl.hero.generic", {}], href: RELEASES_PAGE, card: null, alt: { text: "dl.alt.linuxArm" } };
+      }
       return {
         label: forOs("dl.os.linux"),
         href: url("appImage"),
@@ -98,18 +108,28 @@ export function versionOf(release) {
   return tag.startsWith("v") ? tag : `v${tag}`;
 }
 
+// The CPU architecture from client hints ("arm", "x86"…), or "" when the browser has none,
+// declines or takes longer than `timeoutMs` to answer. Takes navigator.userAgentData.
+export async function readArchitecture(userAgentData, timeoutMs = HINTS_TIMEOUT_MS) {
+  if (typeof userAgentData?.getHighEntropyValues !== "function") return "";
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    const hints = await Promise.race([userAgentData.getHighEntropyValues(["architecture"]), timeout]);
+    return typeof hints?.architecture === "string" ? hints.architecture : "";
+  } catch {
+    return ""; // The browser declined: the hero offers both Mac builds.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------- Browser side ----------
 
-async function readPlatform() {
+function readPlatform(architecture = "") {
   const data = navigator.userAgentData;
-  let architecture = "";
-  if (data?.getHighEntropyValues) {
-    try {
-      ({ architecture = "" } = await data.getHighEntropyValues(["architecture"]));
-    } catch {
-      // The browser declined: the hero offers both Mac builds.
-    }
-  }
   return detectPlatform({
     userAgent: navigator.userAgent,
     platform: navigator.platform,
@@ -199,13 +219,24 @@ function markCard(card) {
 }
 
 export async function initDownloads() {
-  const platform = await readPlatform();
+  // Name the visitor's system straight away from the user agent; the client hints (the Mac
+  // chip, an ARM Linux) and the release data refine the choice when they arrive.
+  let platform = readPlatform();
   let found = {};
   let choice = heroChoice(platform, found);
-  const render = () => renderHero(choice);
+  const render = () => {
+    renderHero(choice);
+    markCard(choice.card);
+  };
   render();
-  markCard(choice.card);
-  document.addEventListener(LANGUAGE_EVENT, render);
+  document.addEventListener(LANGUAGE_EVENT, () => renderHero(choice));
+
+  const refined = readArchitecture(navigator.userAgentData).then((architecture) => {
+    if (!architecture) return;
+    platform = readPlatform(architecture);
+    choice = heroChoice(platform, found);
+    render();
+  });
 
   try {
     const release = await fetchRelease();
@@ -217,4 +248,5 @@ export async function initDownloads() {
     // Every link already opens the releases page.
     console.info("BandEar: using the releases page for downloads.", error?.message ?? error);
   }
+  await refined;
 }

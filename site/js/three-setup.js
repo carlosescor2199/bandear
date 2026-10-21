@@ -26,6 +26,22 @@ export function createRenderer(canvas, { maxPixelRatio = Infinity } = {}) {
   return renderer;
 }
 
+// Creates the renderer for the canvas in `host` and returns `build(renderer)`. A host without a
+// canvas throws before any WebGL context exists; when `build` throws, the renderer and its
+// context are released before the error propagates, so a failed mount leaks no GPU context.
+export function withRenderer(host, options, build) {
+  const canvas = host.querySelector("canvas");
+  if (!canvas) throw new Error("the 3D host has no <canvas>");
+  const renderer = createRenderer(canvas, options);
+  try {
+    return build(renderer);
+  } catch (error) {
+    renderer.dispose();
+    renderer.forceContextLoss();
+    throw error;
+  }
+}
+
 // A white radial gradient on transparent, for additive "bloom" sprites and soft particles.
 export function glowTexture(size = 128) {
   const canvas = document.createElement("canvas");
@@ -66,33 +82,56 @@ export function disposeObject(root) {
 // screen and the tab is visible, and with reduced motion renders a single still frame (again
 // after each resize). `onFrame(elapsedSeconds, dtSeconds)` draws; `onResize(width, height)`
 // updates cameras. `alwaysOn` skips the visibility observer (for a fixed full-page canvas).
-export function createStage({ host, renderer, onResize, onFrame, onLost, fps = 60, alwaysOn = false }) {
+// `onRendered()` runs once, after the first frame drew without throwing. `onFail(error)` runs
+// once when a frame or a resize throws or the GPU context is lost; the stage stops drawing.
+export function createStage({ host, renderer, onResize, onFrame, onRendered, onFail, fps = 60, alwaysOn = false }) {
   const still = prefersReducedMotion();
   const minInterval = 1000 / fps - 2;
   const size = { width: 0, height: 0 };
   let visible = alwaysOn;
   let running = false;
   let disposed = false;
+  let failed = false;
   let frame = 0;
   let last = 0;
   let lastDraw = 0;
   let elapsed = 0;
 
+  function fail(error) {
+    if (failed || disposed) return;
+    failed = true;
+    update();
+    onFail?.(error);
+  }
+
   function resize() {
     const width = host.clientWidth;
     const height = host.clientHeight;
-    if (width === 0 || height === 0 || (width === size.width && height === size.height)) return false;
+    if (failed || width === 0 || height === 0 || (width === size.width && height === size.height)) return false;
     size.width = width;
     size.height = height;
-    renderer.setSize(width, height, false); // CSS owns the canvas box, so no layout shift.
-    onResize(width, height);
+    try {
+      renderer.setSize(width, height, false); // CSS owns the canvas box, so no layout shift.
+      onResize(width, height);
+    } catch (error) {
+      fail(error);
+      return false;
+    }
     return true;
   }
 
   function draw(dt) {
-    if (size.width === 0) return;
-    onFrame(elapsed, dt);
-    if (host.dataset.rendered !== "true") host.dataset.rendered = "true";
+    if (failed || size.width === 0) return;
+    try {
+      onFrame(elapsed, dt);
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    if (host.dataset.rendered !== "true") {
+      host.dataset.rendered = "true";
+      onRendered?.();
+    }
   }
 
   function tick(now) {
@@ -106,7 +145,7 @@ export function createStage({ host, renderer, onResize, onFrame, onLost, fps = 6
   }
 
   function update() {
-    const shouldRun = !disposed && !still && visible && !document.hidden;
+    const shouldRun = !disposed && !failed && !still && visible && !document.hidden;
     if (shouldRun && !running) {
       running = true;
       last = 0;
@@ -138,7 +177,7 @@ export function createStage({ host, renderer, onResize, onFrame, onLost, fps = 6
 
   const lost = (event) => {
     event.preventDefault();
-    onLost?.();
+    fail(new Error("WebGL context lost"));
   };
   renderer.domElement.addEventListener("webglcontextlost", lost);
 

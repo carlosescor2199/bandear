@@ -3,7 +3,7 @@
 
 import * as THREE from "../vendor/three/three.module.min.js";
 import { particleBudget } from "./motion.js";
-import { AMBER, createRenderer, createStage, disposeObject, isPhone, prefersReducedMotion } from "./three-setup.js";
+import { AMBER, createStage, disposeObject, isPhone, prefersReducedMotion, withRenderer } from "./three-setup.js";
 
 const LINES = [
   { base: -0.62, amp: 34, freq: 4.2, seed: 0.0, alpha: 0.07 },
@@ -75,9 +75,12 @@ const moteFragment = /* glsl */ `
     #include <colorspace_fragment>
   }`;
 
-export function mount(host, { onLost } = {}) {
-  const canvas = host.querySelector("canvas");
-  const renderer = createRenderer(canvas, { maxPixelRatio: 1 }); // soft content: 1x is plenty
+export function mount(host, callbacks = {}) {
+  // Soft content: 1x is plenty.
+  return withRenderer(host, { maxPixelRatio: 1 }, (renderer) => build(host, renderer, callbacks));
+}
+
+function build(host, renderer, { onRendered, onFail }) {
   const scene = new THREE.Scene();
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10, 10);
   const size = new THREE.Vector2(1, 1);
@@ -143,7 +146,8 @@ export function mount(host, { onLost } = {}) {
   const stageHandle = createStage({
     host,
     renderer,
-    onLost,
+    onRendered,
+    onFail,
     alwaysOn: true,
     fps: 30, // slow, soft motion: half rate is indistinguishable and halves the cost
     onResize(width, height) {

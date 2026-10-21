@@ -140,10 +140,13 @@ export function parsePathData(d) {
 }
 
 // Converts an SVG endpoint arc to centre form (SVG 1.1 implementation notes, F.6.5).
-// Angles are in radians in the path's own (y-down) coordinates.
+// Angles are in radians in the path's own (y-down) coordinates. Returns null for the
+// out-of-range cases of F.6.2, which have no centre: identical endpoints (the arc is omitted)
+// and a zero radius (the arc is drawn as a straight line).
 export function arcToCenter(from, rx, ry, rotationDeg, largeArc, sweep, to) {
   const [x1, y1] = from;
   const [x2, y2] = to;
+  if ((x1 === x2 && y1 === y2) || rx === 0 || ry === 0) return null;
   const phi = (rotationDeg * Math.PI) / 180;
   const cos = Math.cos(phi);
   const sin = Math.sin(phi);
@@ -184,9 +187,10 @@ export function arcToCenter(from, rx, ry, rotationDeg, largeArc, sweep, to) {
 function segmentFunction(segment) {
   const { from, to } = segment;
   const finish = (fn) => (t) => (t >= 1 ? [to[0], to[1]] : fn(t));
+  const line = () => finish((t) => [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t]);
   switch (segment.type) {
     case "line":
-      return finish((t) => [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t]);
+      return line();
     case "quad": {
       const c = segment.control;
       return finish((t) => {
@@ -214,6 +218,9 @@ function segmentFunction(segment) {
     }
     case "arc": {
       const arc = arcToCenter(from, segment.rx, segment.ry, segment.rotation, segment.largeArc, segment.sweep, to);
+      // A zero radius draws a straight line; identical endpoints give a zero-length line,
+      // which sampling skips.
+      if (arc === null) return line();
       const cos = Math.cos(arc.rotation);
       const sin = Math.sin(arc.rotation);
       return finish((t) => {

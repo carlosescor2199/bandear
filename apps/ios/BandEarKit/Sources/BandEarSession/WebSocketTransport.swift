@@ -15,15 +15,50 @@ import Network
 /// ``networkEndpoint(_:)``). The desk pings every 2 s and drops a client silent for 10
 /// (`control.rs:42,48`), so pings are answered by Network itself (`autoReplyPing`).
 ///
-/// Everything happens on the transport's own serial queue, `connection` included, which is what
-/// makes this class safe to share; events are reported from that queue.
+/// Two clocks of its own end a connection that would otherwise hang, as OkHttp's do on Android:
+/// - A connection not open within ``defaultConnectTimeout`` is given up and reported failed. Network
+///   would otherwise keep preparing for good: a Bonjour desk that is no longer announced stays
+///   unresolved until it is announced again, and a host dropping SYNs waits for the system's TCP
+///   timeout or longer.
+/// - The phone pings an open connection every ``defaultPingInterval``, and a ping whose pong has not
+///   come back by the next one fails it (`ControlTransport.kt:12-19`), so a link that went silent
+///   with no close (Wi-Fi gone) is noticed within two intervals rather than never.
+///
+/// Everything happens on the transport's own serial queue, `connection` and both clocks included,
+/// which is what makes this class safe to share; events are reported from that queue. Nothing a
+/// connection or a clock holds keeps the transport alive.
 public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
-    private let queue = DispatchQueue(label: "com.bandear.control")
-    private var connection: NWConnection?
+    /// How long a connection may take to open, TCP and the WebSocket handshake together, before it
+    /// is given up: OkHttp's default connect timeout, which the Android client keeps
+    /// (`ControlTransport.kt:77-79` sets none).
+    public static let defaultConnectTimeout: Duration = .seconds(10)
+    /// How often the phone pings an open connection, inside the desk's ten-second silence limit
+    /// (`CONTROL_PING_INTERVAL_SECONDS`, `ControlTransport.kt:19`).
+    public static let defaultPingInterval: Duration = .seconds(5)
 
-    public init() {}
+    private let queue = DispatchQueue(label: "com.bandear.control")
+    private let connectTimeout: Duration
+    private let pingInterval: Duration
+    private var connection: NWConnection?
+    /// Gives up on `connection` if it is not open in time; nil once it opened or ended.
+    private var openingDeadline: DispatchWorkItem?
+    /// Pings `connection` while it is open.
+    private var pinger: DispatchSourceTimer?
+    /// True from a ping until its pong.
+    private var awaitingPong = false
+
+    /// A transport that gives a connection `connectTimeout` to open and pings an open one every
+    /// `pingInterval`. Only tests need other values than the defaults.
+    public init(
+        connectTimeout: Duration = WebSocketTransport.defaultConnectTimeout,
+        pingInterval: Duration = WebSocketTransport.defaultPingInterval
+    ) {
+        self.connectTimeout = connectTimeout
+        self.pingInterval = pingInterval
+    }
 
     deinit {
+        stopClocks()
         connection?.stateUpdateHandler = nil
         connection?.cancel()
     }
@@ -37,6 +72,7 @@ public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
                 self.connection(connection, changedTo: state, events: events)
             }
             self.connection = connection
+            giveUp(on: connection, unlessOpenWithin: connectTimeout, events: events)
             connection.start(queue: queue)
         }
     }
@@ -56,6 +92,7 @@ public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
     /// out; a connection that never opened is just cancelled.
     public func close() {
         queue.async { [self] in
+            stopClocks()
             guard let connection else { return }
             connection.stateUpdateHandler = nil
             self.connection = nil
@@ -111,12 +148,15 @@ public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
         guard connection === self.connection else { return }
         switch state {
         case .ready:
+            openingDeadline?.cancel()
+            openingDeadline = nil
             events(.opened)
+            startPinging(connection, events: events)
             receive(on: connection, events: events)
         case .waiting(let error), .failed(let error):
             // A connection waits, rather than fails, when the desk refuses it or cannot be reached,
             // and would only try again once the network changes. Whether and when to try again is
-            // the session's decision (T6c), so waiting ends the connection too.
+            // the session's decision (``ReconnectPolicy``), so waiting ends the connection too.
             end(reporting: .failed(error.debugDescription), to: events)
         case .setup, .preparing, .cancelled:
             // Only this transport cancels, and it silences a connection first.
@@ -154,6 +194,66 @@ public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
         }
     }
 
+    /// Reports `connection` as failed and lets it go if it has not opened within `timeout`.
+    private func giveUp(
+        on connection: NWConnection, unlessOpenWithin timeout: Duration,
+        events: @escaping @Sendable (TransportEvent) -> Void
+    ) {
+        let deadline = DispatchWorkItem { [weak self, weak connection] in
+            guard let self, let connection, connection === self.connection else { return }
+            end(reporting: .failed("not open after \(timeout)"), to: events)
+        }
+        openingDeadline = deadline
+        queue.asyncAfter(deadline: .now() + timeout.seconds, execute: deadline)
+    }
+
+    /// Pings `connection` every `pingInterval` while it is open. A ping still unanswered when the
+    /// next one is due fails the connection, as OkHttp's `pingInterval` does.
+    private func startPinging(
+        _ connection: NWConnection, events: @escaping @Sendable (TransportEvent) -> Void
+    ) {
+        awaitingPong = false
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + pingInterval.seconds, repeating: pingInterval.seconds)
+        timer.setEventHandler { [weak self, weak connection] in
+            guard let self, let connection, connection === self.connection else { return }
+            ping(connection, events: events)
+        }
+        pinger = timer
+        timer.resume()
+    }
+
+    private func ping(
+        _ connection: NWConnection, events: @escaping @Sendable (TransportEvent) -> Void
+    ) {
+        guard !awaitingPong else {
+            end(reporting: .failed("no pong within \(pingInterval)"), to: events)
+            return
+        }
+        awaitingPong = true
+        let ping = NWProtocolWebSocket.Metadata(opcode: .ping)
+        ping.setPongHandler(queue) { [weak self, weak connection] error in
+            // A pong handler hears an error when its connection ends, which the state reports.
+            guard let self, let connection, connection === self.connection, error == nil else {
+                return
+            }
+            awaitingPong = false
+        }
+        connection.send(
+            content: Data(),
+            contentContext: NWConnection.ContentContext(identifier: "ping", metadata: [ping]),
+            isComplete: true, completion: .contentProcessed { _ in })
+    }
+
+    /// Stops both clocks, so neither touches a connection that is gone.
+    private func stopClocks() {
+        openingDeadline?.cancel()
+        openingDeadline = nil
+        pinger?.cancel()
+        pinger = nil
+        awaitingPong = false
+    }
+
     /// Reports how the connection ended, once, and lets it go.
     private func end(
         reporting event: TransportEvent, to events: @escaping @Sendable (TransportEvent) -> Void
@@ -165,6 +265,7 @@ public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
     /// Clears the handler before cancelling, so nothing the old connection reports afterwards (its
     /// `cancelled`, a receive failing) reaches anyone.
     private func silenceAndCancel() {
+        stopClocks()
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil

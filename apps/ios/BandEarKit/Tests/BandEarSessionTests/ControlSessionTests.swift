@@ -13,11 +13,12 @@ import Testing
 @MainActor
 struct ControlSessionTests {
     private let transport = FakeTransport()
+    private let scheduler = ManualScheduler()
     private let session: ControlSession
     private let desk: FakeDesk
 
     init() {
-        session = ControlSession(transport: transport)
+        session = ControlSession(transport: transport, scheduler: scheduler)
         desk = FakeDesk(transport)
     }
 
@@ -90,7 +91,7 @@ struct ControlSessionTests {
                 intervalMilliseconds: 1_000, packetsReceived: 1, packetsLost: 0, underruns: 0,
                 receiveTimeouts: 0))
 
-        #expect(session.connection == .disconnected)
+        #expect(session.connection == .reconnecting)
         #expect(transport.sent.count == sent)
         #expect(transport.closes == 0)
         #expect(session.mixSession.isSessionRunning)
@@ -117,7 +118,8 @@ struct ControlSessionTests {
         desk.post(.failed("connection refused"))
         await settle()
 
-        #expect(session.connection == .failed(reason: "connection refused"))
+        #expect(session.connection == .reconnecting)
+        #expect(session.connectionError == "connection refused")
         #expect(session.mixSession.isSessionRunning)
     }
 
@@ -125,14 +127,17 @@ struct ControlSessionTests {
     func ignoresAConnectionAfterItEnded() async throws {
         try await connected()
         await desk.closes()
-        try #require(session.connection == .disconnected)
+        try #require(session.connection == .reconnecting)
+        try #require(scheduler.pending.count == 1)
 
         await desk.receive(#"{"type":"redundancy","delay_blocks":2}"#)
         desk.post(.failed("late failure"))
         await settle()
 
         #expect(session.redundancyHoldBlocks == 0)
-        #expect(session.connection == .disconnected)
+        #expect(session.connection == .reconnecting)
+        #expect(session.connectionError == nil)
+        #expect(scheduler.pending.count == 1)
     }
 
     // MARK: Stopping

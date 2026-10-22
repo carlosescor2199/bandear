@@ -6,17 +6,20 @@ import Foundation
 /// The musician's session with one desk: the control connection, and the mix it carries both ways.
 ///
 /// Ported from the Android client's `ControlChannel.kt` and the session half of
-/// `MonitorViewModel.kt`, without reconnecting yet (T6c):
+/// `MonitorViewModel.kt`:
 /// - On every open it registers first, then sends the opening mix (`ControlChannel.kt:134-146`):
 ///   the desk adds this musician as a target from the registration, so the mix that follows finds
-///   one to join.
+///   one to join. A reopened connection does exactly the same, so the desk gets the musician's name
+///   and mix back under the newest number.
 /// - Every event, the desk's and the musician's, goes through
 ///   ``MixSession/reducedNumberingSends(by:)``, and the phone sends ``MixSession/outgoingMix()``
 ///   whenever that numbered a new mix (`MonitorViewModel.kt:346-348,390-394`).
 /// - A `mix` or `stats` sent while the connection is not open is dropped, never queued, as Android
 ///   drops it (`ControlChannel.kt:405-411,436-440`): the next open sends the newest mix anyway, and
 ///   a report describes one interval and is worthless later.
-/// - A socket that closes or fails does not end the session; only ``stop()`` does.
+/// - A connection that closes or fails while the session runs is opened again after
+///   ``ReconnectPolicy``'s wait, to the same desk, for as long as the session runs
+///   (`ControlChannel.kt:290-325`). Only ``stop()`` ends the session.
 ///
 /// Everything happens on the main actor. The transport reports from its own thread, and every
 /// event is handed to the main queue in the order it came, so the session's state is only touched
@@ -31,10 +34,9 @@ public final class ControlSession {
         case connecting
         /// Open: what the musician changes reaches the desk.
         case connected
-        /// The desk closed the connection. The session still runs.
-        case disconnected
-        /// The connection could not be opened or broke. The session still runs.
-        case failed(reason: String)
+        /// The connection was lost, and the session opens it again after ``ReconnectPolicy``'s wait.
+        /// It stays here until a new connection opens; ``connectionError`` says why, when it failed.
+        case reconnecting
     }
 
     /// The mix, and how the desk's answers are matched to it. Kept across sessions, as Android keeps
@@ -53,26 +55,46 @@ public final class ControlSession {
     public private(set) var redundancyHoldBlocks: UInt8 = 0
     /// The desk's latest `error`, for a screen to show.
     public private(set) var lastError: DeskError?
+    /// Why the connection was lost, said once per outage, as Android reports one error per outage
+    /// (`ControlChannel.kt:296-318`): the reason of the outage's first failure, kept while its retries
+    /// keep failing. An outage ends when a connection hears from the desk, which forgets the reason;
+    /// so does ``stop()`` and a new start. A desk closing the connection is no failure, so an outage
+    /// that began with a close reports its first failure instead.
+    public private(set) var connectionError: String?
     /// Called on the main actor after anything above may have changed.
     public var stateDidChange: (() -> Void)?
 
     private let transport: any ControlTransport
+    private let scheduler: any ControlScheduler
     /// Who this session registers as; sent on every open.
     private var registration: Registration?
+    /// The desk the session reopens its connection to.
+    private var endpoint: DeskEndpoint?
     /// How many connections the session has opened, so each one's events can be told apart.
     private var opened = 0
     /// The connection whose events count, or nil when none does: before a start, after a stop, and
     /// once the current one ended. Events of any other are late and ignored, as Android ignores the
     /// callbacks of a socket that is no longer current (`ControlChannel.kt:134-149,278-289`).
     private var current: Int?
+    /// Set by ``stop()``: nothing reconnects until the next start (Android's `stopped`).
+    private var stopped = true
+    private var reconnectPolicy = ReconnectPolicy()
+    private var pendingRetry: (any ScheduledTask)?
+    /// Whether the current connection has heard from the desk yet.
+    private var connectionProved = false
 
-    public init(transport: any ControlTransport = WebSocketTransport()) {
+    public init(
+        transport: any ControlTransport = WebSocketTransport(),
+        scheduler: any ControlScheduler = MainQueueScheduler()
+    ) {
         self.transport = transport
+        self.scheduler = scheduler
     }
 
     /// Starts a session with the desk `request` names, registering as `musicianName` with this
     /// phone's audio port and, when given, its `clientID`, and opens the connection. A session already
-    /// running is replaced: its connection is no longer heard.
+    /// running is replaced: its connection is no longer heard, and a retry it was waiting for is
+    /// called off.
     ///
     /// Throws, and starts nothing, for a name the desk would store as no name
     /// (``ClientMessageError/nameIsBlank``).
@@ -81,31 +103,34 @@ public final class ControlSession {
     ) throws {
         registration = try Registration(
             name: musicianName, udpPort: request.audioPort, clientID: clientID)
+        endpoint = request.endpoint
+        // The previous connection is set aside before anything below could send: what this session
+        // sends goes out once its own connection opens.
+        current = nil
+        connection = .connecting
+        cancelPendingRetry()
+        stopped = false
+        reconnectPolicy.reset()
+        connectionError = nil
         mixHeldByDesk = false
         playbackBuffer = .auto
         redundancyHoldBlocks = 0
         lastError = nil
         reduce(.sessionStarted)
-        connection = .connecting
-
-        opened += 1
-        let attempt = opened
-        current = attempt
-        transport.open(request.endpoint) { [weak self] event in
-            // The main queue runs blocks in the order they were queued, so the events keep theirs.
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.handle(event, from: attempt) }
-            }
-        }
+        openConnection()
         stateDidChange?()
     }
 
-    /// Ends the session: the connection closes, and nothing it reports afterwards is heard.
+    /// Ends the session: the connection closes, a retry it was waiting for is called off, and nothing
+    /// the connection reports afterwards is heard.
     public func stop() {
         current = nil
+        connection = .idle
+        stopped = true
+        cancelPendingRetry()
+        connectionError = nil
         transport.close()
         reduce(.sessionEnded)
-        connection = .idle
         stateDidChange?()
     }
 
@@ -118,6 +143,21 @@ public final class ControlSession {
     /// Sends one link-stats report while the connection is open, and drops it otherwise.
     public func send(stats: LinkStats) {
         send(.stats(stats))
+    }
+
+    /// Opens a connection to the session's desk and makes it the one whose events count.
+    private func openConnection() {
+        guard let endpoint else { return }
+        opened += 1
+        let attempt = opened
+        current = attempt
+        connectionProved = false
+        transport.open(endpoint) { [weak self] event in
+            // The main queue runs blocks in the order they were queued, so the events keep theirs.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handle(event, from: attempt) }
+            }
+        }
     }
 
     /// Runs `event` through the mix, and sends the mix when that numbered a new one.
@@ -140,21 +180,75 @@ public final class ControlSession {
         guard attempt == current else { return }
         switch event {
         case .opened:
+            // Opening alone proves nothing: a desk that accepts and drops at once must still back
+            // off (`ControlChannel.kt:258-261`).
             connection = .connected
             if let registration {
                 send(.register(registration))
             }
             send(.mix(mixSession.outgoingMix()))
         case .received(let text):
+            if !connectionProved {
+                // The desk sends `config` right after the open: the connection works, so the backoff
+                // starts again from its shortest wait and the outage is over
+                // (`ControlChannel.kt:272-288`).
+                connectionProved = true
+                reconnectPolicy.reset()
+                connectionError = nil
+            }
             receive(text)
         case .closed:
-            current = nil
-            connection = .disconnected
+            connectionEnded(failure: nil)
         case .failed(let reason):
-            current = nil
-            connection = .failed(reason: reason)
+            connectionEnded(failure: reason)
         }
         stateDidChange?()
+    }
+
+    /// The current connection ended, whichever way: while the session runs, the next one is opened
+    /// after the policy's wait (`ControlChannel.kt:290-325`). The mix, its numbers and whether the
+    /// desk holds it are left exactly as they were.
+    private func connectionEnded(failure: String?) {
+        current = nil
+        guard
+            ReconnectPolicy.shouldReconnect(
+                sessionRunning: mixSession.isSessionRunning, stopped: stopped)
+        else {
+            connection = .idle
+            return
+        }
+        connection = .reconnecting
+        if let failure, connectionError == nil {
+            connectionError = failure
+        }
+        let ended = opened
+        pendingRetry = scheduler.schedule(after: reconnectPolicy.nextDelay()) { [weak self] in
+            self?.retry(after: ended)
+        }
+    }
+
+    /// Opens the connection again, unless the session has moved on since the connection numbered
+    /// `ended` was lost: a new one was opened (a new start), the session was stopped, or it ended on
+    /// its own. A retry already due when that happened then opens nothing (`ControlChannel.kt:228-244`).
+    private func retry(after ended: Int) {
+        guard ended == opened, current == nil else { return }
+        pendingRetry = nil
+        guard
+            ReconnectPolicy.shouldReconnect(
+                sessionRunning: mixSession.isSessionRunning, stopped: stopped)
+        else {
+            if !stopped {
+                connection = .idle
+                stateDidChange?()
+            }
+            return
+        }
+        openConnection()
+    }
+
+    private func cancelPendingRetry() {
+        pendingRetry?.cancel()
+        pendingRetry = nil
     }
 
     /// One message from the desk. A message this build cannot read is ignored like one it does not

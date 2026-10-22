@@ -18,30 +18,71 @@ let toStage = ConnectionRequest(endpoint: stage, audioPort: 50_000)
 ///
 /// Used from the main actor only; ``sink`` is a `@Sendable` closure a test may hand to a thread.
 final class FakeTransport: ControlTransport, @unchecked Sendable {
-    /// Every endpoint ``open(_:events:)`` was asked for, in order.
-    private(set) var opened: [DeskEndpoint] = []
-    /// Every text sent, in order.
-    private(set) var sent: [String] = []
-    private(set) var closes = 0
-    /// What the latest ``open(_:events:)`` was told to report to.
-    private(set) var sink: (@Sendable (TransportEvent) -> Void)?
-
-    func open(_ endpoint: DeskEndpoint, events: @escaping @Sendable (TransportEvent) -> Void) {
-        opened.append(endpoint)
-        sink = events
+    /// What the session asked of the transport, in the order it asked.
+    enum Call: Equatable {
+        case open(DeskEndpoint)
+        case send(String)
+        case close
     }
 
-    func send(_ text: String) { sent.append(text) }
+    /// One connection the session opened, as Android's `FakeSocket` is one socket: where it goes,
+    /// what was sent while it was the newest, and the callback its events go to.
+    final class Attempt: @unchecked Sendable {
+        let endpoint: DeskEndpoint
+        let sink: @Sendable (TransportEvent) -> Void
+        fileprivate(set) var sent: [String] = []
 
-    func close() { closes += 1 }
+        init(_ endpoint: DeskEndpoint, _ sink: @escaping @Sendable (TransportEvent) -> Void) {
+            self.endpoint = endpoint
+            self.sink = sink
+        }
+
+        /// The `type` of every message sent on this connection, in order: Android's `sentTypes()`.
+        func sentTypes() throws -> [String] {
+            try parsed(sent).map { $0["type"] as? String ?? "" }
+        }
+
+        /// Every message of `type` sent on this connection: Android's `sentOfType(type)`.
+        func sent(ofType type: String) throws -> [[String: Any]] {
+            try parsed(sent).filter { $0["type"] as? String == type }
+        }
+    }
+
+    /// Every connection ``open(_:events:)`` started, in order.
+    private(set) var attempts: [Attempt] = []
+    /// Every call, in order.
+    private(set) var calls: [Call] = []
+    /// Every text sent, on any connection, in order.
+    private(set) var sent: [String] = []
+    private(set) var closes = 0
+
+    /// Every endpoint ``open(_:events:)`` was asked for, in order.
+    var opened: [DeskEndpoint] { attempts.map(\.endpoint) }
+
+    /// What the latest ``open(_:events:)`` was told to report to.
+    var sink: (@Sendable (TransportEvent) -> Void)? { attempts.last?.sink }
+
+    func open(_ endpoint: DeskEndpoint, events: @escaping @Sendable (TransportEvent) -> Void) {
+        attempts.append(Attempt(endpoint, events))
+        calls.append(.open(endpoint))
+    }
+
+    /// Recorded against the newest connection, the only one the transport keeps.
+    func send(_ text: String) {
+        sent.append(text)
+        attempts.last?.sent.append(text)
+        calls.append(.send(text))
+    }
+
+    func close() {
+        closes += 1
+        calls.append(.close)
+    }
 
     /// Every sent message as the desk reads it, parsed, so a test checks keys and values and never
     /// their order, as Android's tests read the sent `JSONObject`.
     func sentObjects() throws -> [[String: Any]] {
-        try sent.map { text in
-            try #require(
-                try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
-        }
+        try parsed(sent)
     }
 
     /// The `type` of every sent message, in order: Android's `sentTypes()`.
@@ -55,6 +96,58 @@ final class FakeTransport: ControlTransport, @unchecked Sendable {
     }
 }
 
+/// `texts` as the desk reads them, each parsed to an object.
+private func parsed(_ texts: [String]) throws -> [[String: Any]] {
+    try texts.map { text in
+        try #require(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    }
+}
+
+/// A scheduler that runs nothing until the test says so, as Android's `FakeScheduler` does: the
+/// session's retries wait here, with their delays, and a test fires them by hand.
+@MainActor
+final class ManualScheduler: ControlScheduler {
+    /// One piece of work the session scheduled.
+    final class Work: ScheduledTask {
+        let delay: Duration
+        let run: @MainActor () -> Void
+        private(set) var cancelled = false
+        fileprivate(set) var ran = false
+
+        init(_ delay: Duration, _ run: @escaping @MainActor () -> Void) {
+            self.delay = delay
+            self.run = run
+        }
+
+        func cancel() { cancelled = true }
+    }
+
+    /// Everything ever scheduled, in order.
+    private(set) var scheduled: [Work] = []
+
+    func schedule(after delay: Duration, _ work: @escaping @MainActor () -> Void)
+        -> any ScheduledTask
+    {
+        let work = Work(delay, work)
+        scheduled.append(work)
+        return work
+    }
+
+    /// The work neither cancelled nor run yet: Android's `pending()`.
+    var pending: [Work] { scheduled.filter { !$0.cancelled && !$0.ran } }
+
+    /// The delays of ``pending``: Android's `pendingDelays()`.
+    var pendingDelays: [Duration] { pending.map(\.delay) }
+
+    /// Runs the pending work with the shortest delay: Android's `runNextDue()`.
+    func runNextDue(sourceLocation: SourceLocation = #_sourceLocation) throws {
+        let next = try #require(
+            pending.min { $0.delay < $1.delay }, "nothing is scheduled", sourceLocation: sourceLocation)
+        next.ran = true
+        next.run()
+    }
+}
+
 /// The desk at the other end of a ``FakeTransport``, as Android's `FakeSocket` plays it.
 ///
 /// Each event goes through the callback the session handed the transport, so it takes the same hop
@@ -63,8 +156,8 @@ final class FakeTransport: ControlTransport, @unchecked Sendable {
 @MainActor
 final class FakeDesk {
     let transport: FakeTransport
-    /// How many of the phone's mixes the desk has answered.
-    private var answered = 0
+    /// How many of the phone's mixes on each connection the desk has answered.
+    private var answered: [ObjectIdentifier: Int] = [:]
 
     init(_ transport: FakeTransport) {
         self.transport = transport
@@ -94,16 +187,23 @@ final class FakeDesk {
         await settle()
     }
 
-    /// Android's `answerMixes`: the desk answers every mix it has not answered yet, in order, each
-    /// with the mix as sent under its own number. With `settling` false the answers are only on
-    /// their way, as answers already in flight when the musician moves on.
+    /// The connection breaks: Android's `fail(message)`.
+    func fails(_ reason: String) async {
+        post(.failed(reason))
+        await settle()
+    }
+
+    /// Android's `answerMixes`: the desk answers every mix of the newest connection it has not
+    /// answered yet, in order, each with the mix as sent under its own number. With `settling` false
+    /// the answers are only on their way, as answers already in flight when the musician moves on.
     func answerMixes(settling: Bool = true) async throws {
-        let mixes = try transport.sent(ofType: "mix")
-        for var mix in mixes.dropFirst(answered) {
+        let attempt = try #require(transport.attempts.last)
+        let mixes = try attempt.sent(ofType: "mix")
+        for var mix in mixes.dropFirst(answered[ObjectIdentifier(attempt), default: 0]) {
             mix["type"] = "mix_ack"
             post(.received(try text(mix)))
         }
-        answered = mixes.count
+        answered[ObjectIdentifier(attempt)] = mixes.count
         if settling { await settle() }
     }
 
@@ -140,6 +240,28 @@ func settle(seconds: Double = 5, sourceLocation: SourceLocation = #_sourceLocati
         }.start()
     }
     #expect(ran, "the main queue did not run within \(seconds) s", sourceLocation: sourceLocation)
+}
+
+/// Waits until the work `start` hands out calls `done` on the main queue, for at most `seconds`,
+/// and says whether it did. The main queue keeps running meanwhile, which is where that work runs;
+/// a watchdog thread gives up as ``settle(seconds:sourceLocation:)``'s does.
+@MainActor
+func waitUntilDone(
+    seconds: Double = 5, _ start: (_ done: @escaping @MainActor () -> Void) -> Void
+) async -> Bool {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        let once = ResumeOnce(continuation)
+        let semaphore = DispatchSemaphore(value: 0)
+        start {
+            semaphore.signal()
+            once.resume(returning: true)
+        }
+        Thread {
+            if semaphore.wait(timeout: .now() + seconds) == .timedOut {
+                once.resume(returning: false)
+            }
+        }.start()
+    }
 }
 
 /// Resumes a continuation once, whichever of the main queue and the watchdog gets there first.

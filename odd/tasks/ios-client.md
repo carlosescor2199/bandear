@@ -116,7 +116,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
   (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
   storage, which the pure mix module does not have.
-- [ ] T6 — App shell, project file and control session. Grown since first written: the follow-ups
+- [x] T6 — App shell, project file and control session. Grown since first written: the follow-ups
   of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
   - [x] T6a — The project and a shell that builds (route: delegated writer; trigger: the
     long-session backstop). `apps/ios/BandEar/BandEar.xcodeproj` from Xcode's app prototype with a
@@ -144,7 +144,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     so a dead link is noticed (Android pings every 5 s, `ControlTransport.kt:19,77`); `connection`
     set before `.sessionStarted` and `.sessionEnded` are reduced; tests for the transport's failure
     paths and for its release. See Follow-ups, "T6c inputs from T6b".
-  - [ ] T6d — Identity, persistence and the app (route: delegated writer; trigger: the long-session
+  - [x] T6d — Identity, persistence and the app (route: delegated writer; trigger: the long-session
     backstop). A stable client id
     (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
     T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
@@ -233,6 +233,21 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `connectionError`. Clear it when the session ends. Done in T6d.
   - For T8: `connectionError` stays set while `connected` until the desk's first message (the "one
     outage" rule); do not show it as a current error.
+- **Desk-side findings from the first end-to-end run (server; out of this feature's scope, the
+  user's call).** The desk's control channel listens on IPv4 only (`0.0.0.0`,
+  `apps/server/src/control.rs:357`) while its Bonjour announcement carries IPv6 link-local
+  addresses too, including the loopback's `fe80::1`, published on `en1` as well as `lo0`. A client
+  that resolves the service where only IPv6 addresses exist reaches nothing; the iOS client now
+  forces IPv4 (`4694c2e`), and listening dual-stack or announcing IPv4 only would fix it on the desk.
+  Separately, with the desk running on macOS the Android discovery beacon fails on every send with
+  `No route to host` (os error 65): a broadcast to `255.255.255.255` needs an interface on macOS,
+  so an Android phone cannot find a macOS desk by beacon.
+- **T8 inputs from T6d's verifier.** A refused `start` still saves a client id (the id is resolved
+  as an argument before `Registration` throws; build the registration first). An empty name field
+  stores the device's name, so the next launch shows it, where Android keeps what was typed. A
+  session that ends on its own leaves `SessionView` on screen with the desk set (T7 or T8). A stored
+  `Bool` or a whole `Double` reads as a channel through `NSNumber` bridging; the app never writes
+  either.
 - **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
   decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
   delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
@@ -838,4 +853,34 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     "Revisar este cambio" (`granted`); approved in 49 s with two non-blocking findings (above);
     acknowledged, `authority: burned`, lineage `review-4e409e696a4429d2`. The reviewed boundary is
     now `3540b25`.
-- Pending: T6d (delegated), T7, T8, T9.
+- T6d done (route: delegated writer). `MusicianStore` and `UserDefaultsMusicianStore`
+  (`bandear.client_id`, `bandear.musician_name`, `bandear.musician_channel`), `ClientIdentity`
+  (Android's `resolveClientId`, reusing `Registration`'s id rule), `ControlSession` taking the store
+  (name and remembered channel restored at construction, the channel stored only when the desk
+  announced it and forgotten when a `config` drops it, `R3-002` fixed), and the app's
+  `SessionModel`, name field, desk-to-session navigation and provisional `SessionView`. 115 session
+  tests; 14 of 14 mutations caught. The writer's early test runs left 64 empty
+  `com.bandear.tests.<UUID>.plist` files in `~/Library/Preferences` (`removePersistentDomain` leaves
+  the file); it switched to suites named by a path in a temp directory, and the parent removed the
+  64 after checking each was 42 bytes and matched the pattern. Work-unit commit `8597da5`.
+  - Independent verifier (item 6 named by the writer): all six claims held, no blocker; it drove the
+    real `inSession` binding of `DeskListView` and the model against fakes, and ran ten mutants, all
+    caught. It noticed the parent's uncommitted IPv4 change mid-run and verified `8597da5` without it.
+- End-to-end against the real desk (the user's choice of their own desk machine; asked to start it,
+  the parent built it on this Mac, which is that Mac mini: `cargo build -p personal-monitoring`, 24 s,
+  run with no arguments). The desk captured "Microsoft Teams Audio" (one channel, 48 kHz) and
+  announced "BandEar on Carloss-Mac-mini". On an iPhone 17 Pro simulator the app listed it with its
+  rate; the first connect showed "Reconnecting… not open after 10.0 seconds". Diagnosis: a manual
+  handshake to `192.168.1.54:50001` returned `101 Switching Protocols` and the desk's real `config`,
+  while both IPv6 link-local addresses were refused; the service had resolved over `lo0`, where the
+  announcement holds IPv6 only. Correction to what the parent first concluded: the old build was not
+  stuck for good, since the desk's log shows its retry registered over IPv4 at 18:23:07; the first
+  attempt simply lost 10 s. Fix (`4694c2e`, inline): `WebSocketTransport` requires IPv4; RED/GREEN on
+  a structural test of its parameters (`ip.version` `.any`, then `.v4`); the 18 opt-in round trips
+  still pass. Rebuilt and relaunched: the desk logged `control registration from
+  192.168.1.54:49934: 192.168.1.54:50000 as "iPhone 17 Pro"` about a second after the tap, the app
+  showed Connected with 1 strip (the desk's one channel), and the name stored by the previous run
+  was restored on relaunch. Disconnect ended the connection with no error on the desk, where the
+  connections killed by relaunching logged a reset without a closing handshake.
+- T6 complete. Pending: the native review of T6d and the IPv4 fix, then T7, T8, T9, and the small
+  unit for `R3-001` (an injected clock on the transport).

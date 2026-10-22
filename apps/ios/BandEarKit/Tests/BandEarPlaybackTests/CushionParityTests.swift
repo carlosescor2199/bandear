@@ -122,16 +122,16 @@ struct CushionParityTests {
         // 40 ms at 48 kHz in 256-frame packets is 8 packets; swapping the packet frames with the
         // player's capacity, or the rate with either, would give 1 packet or the whole player.
         let step = cushion.onPacket(
-            setting: .fixed(milliseconds: 40), packetFrames: 256, playbackRate: 48_000,
-            packetRate: 44_100, capacityFrames: 4_800)
+            setting: .fixed(milliseconds: 40), packetFrames: 256, playedFrames: 256,
+            playbackRate: 48_000, packetRate: 44_100, capacityFrames: 4_800)
         #expect(step.contains(.apply))
         #expect(cushion.cushionPackets == 8)
         #expect(cushion.setting == .fixed(milliseconds: 40))
         // A player that holds 4 800 frames clamps a long buffer to its 18 whole packets.
         #expect(
             cushion.onPacket(
-                setting: .fixed(milliseconds: 500), packetFrames: 256, playbackRate: 48_000,
-                packetRate: 44_100, capacityFrames: 4_800
+                setting: .fixed(milliseconds: 500), packetFrames: 256, playedFrames: 256,
+                playbackRate: 48_000, packetRate: 44_100, capacityFrames: 4_800
             ).contains(.apply))
         #expect(cushion.cushionPackets == 18)
     }
@@ -140,7 +140,8 @@ struct CushionParityTests {
         let cushion = CushionController()
         func step(_ controller: CushionController, _ setting: PlaybackBufferSetting) -> CushionStep {
             controller.onPacket(
-                setting: setting, packetFrames: 256, playbackRate: 48_000, packetRate: 48_000,
+                setting: setting, packetFrames: 256, playedFrames: 256,
+                playbackRate: 48_000, packetRate: 48_000,
                 capacityFrames: capacity)
         }
         #expect(step(cushion, .fixed(milliseconds: 40)).contains(.apply))
@@ -156,7 +157,8 @@ struct CushionParityTests {
         let cushion = CushionController()
         func step() -> CushionStep {
             cushion.onPacket(
-                setting: .auto, packetFrames: 24_000, playbackRate: 48_000, packetRate: 48_000,
+                setting: .auto, packetFrames: 24_000, playedFrames: 24_000,
+                playbackRate: 48_000, packetRate: 48_000,
                 capacityFrames: capacity)
         }
         #expect(!step().contains(.adjust))
@@ -170,7 +172,8 @@ struct CushionParityTests {
         let noTrack = CushionController()
         func noTrackStep() -> CushionStep {
             noTrack.onPacket(
-                setting: .auto, packetFrames: 22_050, playbackRate: nil, packetRate: 44_100,
+                setting: .auto, packetFrames: 22_050, playedFrames: 22_050,
+                playbackRate: nil, packetRate: 44_100,
                 capacityFrames: capacity)
         }
         #expect(!noTrackStep().contains(.adjust))
@@ -179,7 +182,8 @@ struct CushionParityTests {
         let slowTrack = CushionController()
         #expect(
             slowTrack.onPacket(
-                setting: .auto, packetFrames: 22_050, playbackRate: 22_050, packetRate: 44_100,
+                setting: .auto, packetFrames: 22_050, playedFrames: 22_050,
+                playbackRate: 22_050, packetRate: 44_100,
                 capacityFrames: capacity
             ).contains(.adjust))
     }

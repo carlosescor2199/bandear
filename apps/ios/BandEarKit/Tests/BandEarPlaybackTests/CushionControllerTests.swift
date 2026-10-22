@@ -28,14 +28,33 @@ struct CushionControllerTests {
         #expect(frames == Int(PlaybackBufferSetting.maximumFixedMilliseconds) * 48)
     }
 
+    /// Android passes the track's packet frames to `follow` and the played packet's samples to
+    /// `onPlayed` (`PmonPlayer.kt:320-323`); a desk that changes its block size mid-stream makes
+    /// them differ. 40 ms in 256-frame packets is 8 packets, whatever the packet played; 24 000
+    /// played frames at 48 kHz is half a second, so the second packet completes one.
+    @Test("counts the cushion in the player's packets and the time in the packet played")
+    func cushionAndTimeTakeTheirOwnFrames() {
+        let cushion = CushionController()
+        func step() -> CushionStep {
+            cushion.onPacket(
+                setting: .fixed(milliseconds: 40), packetFrames: 256, playedFrames: 24_000,
+                playbackRate: 48_000, packetRate: 48_000, capacityFrames: 96_000)
+        }
+
+        #expect(step() == [.apply])
+        #expect(cushion.cushionPackets == 8)
+        #expect(step() == [.adjust])
+        #expect(cushion.cushionPackets == 8)
+    }
+
     /// Android returns these as bit flags in an `Int`; the option set has to keep both when both
     /// happen on the same packet, or the caller would apply the new cushion and miss the adjustment.
     @Test("reports both steps when one packet changes the cushion and completes a second")
     func stepsCompose() {
         let cushion = CushionController()
         let step = cushion.onPacket(
-            setting: .fixed(milliseconds: 40), packetFrames: 48_000, playbackRate: 48_000,
-            packetRate: 48_000, capacityFrames: 96_000)
+            setting: .fixed(milliseconds: 40), packetFrames: 48_000, playedFrames: 48_000,
+            playbackRate: 48_000, packetRate: 48_000, capacityFrames: 96_000)
 
         #expect(step == [.apply, .adjust])
     }

@@ -217,6 +217,20 @@ struct ReceiveLoopTests {
         #expect(rig.sink.targets == [3 * packetFrames])
     }
 
+    /// Android follows the desk's buffer in packets of the size the track opened with, and counts
+    /// time in the frames of the packet played (`PmonPlayer.kt:320-323`). 30 ms at 48 kHz is three
+    /// of the opening 480-frame packets, 1 440 frames, even when a later packet carries 240; sizing
+    /// it in the later packet would ask for six of the opening ones.
+    @Test func aBufferTheDeskSetsLaterIsSizedInThePacketsTheSinkOpenedWith() throws {
+        let rig = Rig()
+
+        try rig.arrive(sequence: 1, at: 0)
+        rig.controls.update { $0.playbackBuffer = .fixed(milliseconds: 30) }
+        try rig.arrive(datagram(sequence: 2, samples: stereo(frames: 240)), at: 10)
+
+        #expect(rig.sink.targets == [CushionPolicy.startPackets * packetFrames, 3 * packetFrames])
+    }
+
     @Test func laterPacketsPlayThroughTheSinkTheFirstOpened() throws {
         let rig = Rig()
 

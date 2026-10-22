@@ -330,8 +330,8 @@ public final class ReceiveLoop {
         // The desk's buffer applies at once; once per second of audio the output's underruns move
         // an Auto cushion; a fixed one never moves.
         let step = cushion.onPacket(
-            setting: settings.playbackBuffer, packetFrames: frames, playbackRate: playbackRate,
-            packetRate: rate, capacityFrames: capacityFrames)
+            setting: settings.playbackBuffer, packetFrames: packetFrames, playedFrames: frames,
+            playbackRate: playbackRate, packetRate: rate, capacityFrames: capacityFrames)
         var resize = step.contains(.apply)
         if step.contains(.adjust) && cushion.adjust(underrunsTotal: sink.underrunCount) {
             resize = true

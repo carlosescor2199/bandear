@@ -159,12 +159,12 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     Commit `7556156`.
   - [x] T7b — A `BandEarPlayback` module that depends on `BandEarProtocol`. `ReorderHold` and
     `CushionController` move there with their tests (route: inline, mechanical). Commit `c2e9bc5`.
-  - [ ] T7c — Ports of `HoldPlayout` and `LinkStatsAccumulator`, with Android's tests (route:
+  - [x] T7c — Ports of `HoldPlayout` and `LinkStatsAccumulator`, with Android's tests (route:
     delegated writer A, launched together with T7d: two independent units with disjoint surfaces,
-    each over 100 lines).
-  - [ ] T7d — Ports of `Pcm16Processor` (local protection), the pure `PlaybackLatency` measures,
+    each over 100 lines). Commit `06eb2b0`.
+  - [x] T7d — Ports of `Pcm16Processor` (local protection), the pure `PlaybackLatency` measures,
     and the arrival spacing and jitter estimate from `PmonPlayer.kt:222-233` (route: delegated
-    writer B, launched together with T7c).
+    writer B, launched together with T7c). Commit `0aa3674`.
   - [ ] T7e — The receive engine and output:
     - a UDP socket on its own thread with a 250 ms wake-up (Android's only clock for link reports
       and hold releases);
@@ -952,4 +952,52 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - T7b (inline): `git mv` of the two sources and four test files; `CushionController` imports
   `BandEarProtocol` for `PlaybackBufferSetting`. 461 tests, the same as before the move (protocol
   152 → 88, playback 64). 0 warnings on a clean copy. Commit `c2e9bc5`.
+- T7c and T7d ran as two delegated writers, launched together, each in its own worktree. The
+  worktrees kept the shared module building for each writer, since a half-written file from one
+  would break the other's build. Both worktrees were created from `main`, so each writer first
+  moved its own throwaway branch to `bf10548`. A writer with worktree isolation must check its base
+  before it writes.
+- T7c, writer A: `HoldPlayout`, `LinkStatsAccumulator` and `LinkStatsReport`.
+  - RED: 29 of 32 tests failed against stubs. The other 3 hold on an empty stub: the two "no report
+    yet" cases and the constants.
+  - GREEN: 32 tests, 493 in the full suite. 0 warnings on a clean copy.
+  - Mutants: 13 of 14 caught. The 1 ms lower clamp on the interval can never be reached, because a
+    report is due only after 1000 ms. It is kept to match Android line for line.
+  - Two mutants are caught only by Swift tests Android lacks: the floor at 0 on underruns, and the
+    playout passing on its underruns and extras.
+  - Divergences:
+    - `nil` instead of NaN.
+    - The playout owns its accumulator and adds `onArrivalDeviation`.
+    - The interval limit is read from `LinkStats.maximumIntervalMilliseconds`.
+    - Android's first `HoldPlayoutTest` case also checks the JSON its report becomes. That needs
+      the conversion to `LinkStats`, so it waits for T7f (`HoldPlayoutTest.kt:113-114`).
+  - Parent's correction: it was first a struct holding the `ReorderHold` class, so a copy would
+    have shared the hold but split the counts. It is now a `final class`, like `ReorderHold` and
+    `CushionController`.
+- T7d, writer B: `Pcm16Processor`, `PlaybackLatency` and `ArrivalTiming`.
+  - RED: 27 of 32 tests failed against stubs.
+  - GREEN: 34 tests after the correction below, 495 in the full suite. 0 warnings.
+  - 8 of 8 mutants caught, plus 4 on the clock change.
+  - Local protection works in place on an `UnsafeMutableBufferPointer<Int16>` (or an `inout [Int16]`
+    overload), so no packet allocates. Android returns a new array.
+  - Halves round up, as with Kotlin's `roundToInt`, using `(x + 0.5).rounded(.down)`. A probe
+    matched the JDK's `Math.round` on all 6,619,136 combinations of sample and whole-percent
+    volume.
+  - Reused from `CushionController.swift`: `capacityFrames` (Android's `trackCapacityFrames`) and
+    `next` (`nextCushion`).
+  - Not ported: `keepsLowLatency`, which only means something for an `AudioTrack`.
+  - `reportExtras` takes `presentedFrame: Int64?`, where Android takes a flag and a frame.
+  - Parent's correction: `ArrivalTiming` takes `nowNanoseconds: UInt64`, because Android times
+    arrivals with `System.nanoTime()` (`PmonPlayer.kt:222`). A millisecond clock added about
+    0.44 ms of false jitter at 5.33 ms spacing.
+  - The interval is `Int64(bitPattern: now &- previous)`. A clock that goes backwards yields a
+    negative interval, as Android's `Long` does, instead of trapping on the receive thread.
+- Parent's integration:
+  - Every path was inside its writer's surfaces, and the copies were byte-identical.
+  - Combined suite: 527 tests (playback 130), 0 known issues, 0 warnings on a clean copy. No name
+    collided across the two units.
+  - The worktrees, their branches and both scratch folders were removed.
+  - The slice was assessed against `2e151e7` with `.atl/` excluded: `medium`, `under_budget` (33
+    paths). The boundary stays `2e151e7`.
+- The desk always sends stereo: `OUTPUT_CHANNELS = 2` (`apps/server/src/mix.rs:11`).
 

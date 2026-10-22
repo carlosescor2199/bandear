@@ -132,12 +132,19 @@ public final class WebSocketTransport: ControlTransport, @unchecked Sendable {
         }
     }
 
-    /// TCP with a WebSocket on top, answering the desk's pings.
-    private static func parameters() -> NWParameters {
+    /// TCP over IPv4 with a WebSocket on top, answering the desk's pings.
+    ///
+    /// IPv4 only, because that is the one family the desk listens on (`0.0.0.0`,
+    /// `apps/server/src/control.rs:357`) while its Bonjour announcement also carries IPv6
+    /// link-local addresses. Resolved over an interface where only those exist (the desk on the same
+    /// Mac, over `lo0`), an unrestricted connection is refused at every address until its deadline.
+    /// Android reaches the IPv4 source address of the desk's beacon, so it is IPv4 in practice too.
+    static func parameters() -> NWParameters {
         let webSocket = NWProtocolWebSocket.Options()
         webSocket.autoReplyPing = true
         let parameters = NWParameters.tcp
         parameters.defaultProtocolStack.applicationProtocols.insert(webSocket, at: 0)
+        (parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options)?.version = .v4
         return parameters
     }
 

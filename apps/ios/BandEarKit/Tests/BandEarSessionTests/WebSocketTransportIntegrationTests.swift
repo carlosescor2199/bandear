@@ -51,6 +51,19 @@ struct WebSocketTransportTests {
     func theConnectTimeoutIsOkHttpsDefault() {
         #expect(WebSocketTransport.defaultConnectTimeout == .seconds(10))
     }
+
+    /// The desk's control channel listens on IPv4 only (`0.0.0.0`, `apps/server/src/control.rs:357`),
+    /// yet its Bonjour announcement also carries IPv6 link-local addresses. Against a real desk on
+    /// the same Mac the service resolved over `lo0`, where the announcement holds IPv6 addresses
+    /// only, and every attempt was refused until the connect deadline. Android connects to the IPv4
+    /// source address of the desk's beacon, so it is IPv4 in practice too.
+    @Test("connects over IPv4 only, the one family the desk listens on")
+    func connectsOverIPv4Only() throws {
+        let ip = try #require(
+            WebSocketTransport.parameters().defaultProtocolStack.internetProtocol
+                as? NWProtocolIP.Options)
+        #expect(ip.version == .v4)
+    }
 }
 
 /// A real round trip through ``WebSocketTransport``: a WebSocket desk in this process

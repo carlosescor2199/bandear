@@ -149,7 +149,37 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
     T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
     observe. Ends with the end-to-end check against the user's own desk machine.
-- [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
+- [ ] T7 — UDP receive path and AVAudioEngine output. Sliced from a read-only map of Android's audio
+  path (`PmonPlayer.kt`, about 470 lines with no test of its own, plus small pure helpers that are
+  tested):
+  - [x] T7a — Decoders and `stats` agree with Android (route: inline). A `playback` or
+    `redundancy` message the phone cannot use is refused (`ServerMessageError.unusableField`, or
+    `missingField("ms")` for a fixed buffer with no length), so the session keeps its setting.
+    `LinkStats` rounds each extra to 0.01 after its range check. All 7 known issues are gone.
+    Commit `7556156`.
+  - [x] T7b — A `BandEarPlayback` module that depends on `BandEarProtocol`. `ReorderHold` and
+    `CushionController` move there with their tests (route: inline, mechanical). Commit `c2e9bc5`.
+  - [ ] T7c — Ports of `HoldPlayout` and `LinkStatsAccumulator`, with Android's tests (route:
+    delegated writer A, launched together with T7d: two independent units with disjoint surfaces,
+    each over 100 lines).
+  - [ ] T7d — Ports of `Pcm16Processor` (local protection), the pure `PlaybackLatency` measures,
+    and the arrival spacing and jitter estimate from `PmonPlayer.kt:222-233` (route: delegated
+    writer B, launched together with T7c).
+  - [ ] T7e — The receive engine and output:
+    - a UDP socket on its own thread with a 250 ms wake-up (Android's only clock for link reports
+      and hold releases);
+    - a single-producer, single-consumer ring between that thread and an `AVAudioSourceNode`
+      render block that takes no locks and allocates nothing;
+    - underruns counted on the render side.
+    Route decided when reached.
+  - [ ] T7f — Wiring:
+    - announce the four capabilities;
+    - hand `playback` and `redundancy` to the player;
+    - send `stats` through the session, with `recovered` always present as on Android;
+    - apply local protection only while the desk has not acknowledged a mix;
+    - set the cap to the lower of the musician's cap and the engineer's limit;
+    - set up the app's audio session, and start and stop with the control session;
+    - check it end to end by listening to the desk.
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
 ## Follow-ups
@@ -248,7 +278,8 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   session that ends on its own leaves `SessionView` on screen with the desk set (T7 or T8). A stored
   `Bool` or a whole `Double` reads as a channel through `NSNumber` bridging; the app never writes
   either.
-- **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
+- **(Done in T7a, except `recovered`, which is for T7f.) T7 inputs from T6b: align the `playback` and
+  `redundancy` decoders with Android.** The T2b
   decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
   delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
   has. That reading was a guess made in T2b, the same kind T2c corrected for `config`. Parent's
@@ -260,7 +291,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   where Android always sends it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
-- **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
+- **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
 - **T6 inputs from T4.** `Info.plist` needs `NSBonjourServices` = `_bandear._tcp` and an
@@ -302,8 +333,10 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - T1: inline, one unit of behaviour (package manifest plus one decoder with its tests).
 - T2, T3, T5: inline, one unit each.
 - T4: inline, with the browser isolated behind a protocol so the policy stays testable.
-- T6, T7, T8: route decided when reached; T7 and T8 are candidates for parallel writers once the
-  shell exists and their edit surfaces are disjoint.
+- T6, T8: route decided when reached.
+- T7: T7a and T7b inline. T7c and T7d are delegated writers launched together: two independent
+  units with disjoint surfaces in `BandEarPlayback`, each over 100 lines. T7e and T7f are decided
+  when reached.
 
 ## Delivery forecast
 
@@ -890,3 +923,33 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   Acknowledged; the reviewed boundary is now `2e151e7`.
 - T6 complete. Pending: T7, T8, T9, and the small unit for `R3-001` (an injected clock on the
   transport, so its deadline and pings run in the default suite).
+- T7 started. The user chose "T7: el audio". A read-only explorer mapped Android's audio path. What
+  the T7 units must keep in mind:
+  - Android takes datagrams from any sender (no `connect`, no source filter).
+  - The 250 ms socket timeout is the only clock for link reports and hold releases.
+  - `WRITE_BLOCKING` paces the loop.
+  - A sample-rate change drops every later packet with an error and never reopens the track.
+  - The `stats` jitter is the mean absolute deviation, per interval, from an EWMA-0.1 arrival
+    spacing (not RFC 3550's 1/16).
+  - Local gain is linear with no ramp, and applies only while `mixAcknowledged` is false.
+  - The cap is `min(levelCap, engineer limit)`.
+  - `ClientMixState`'s per-channel fields are never read by the player.
+
+  Parent's technical choices for T7e, to confirm when it is reached:
+  - A BSD socket with `SO_RCVTIMEO`, to keep Android's loop and clock.
+  - The ring's indices in a small C target with C11 atomics, because iOS 16 has no
+    `Synchronization.Atomic` and a package dependency would be a delivery risk.
+  - The source node declares the desk's format and lets the engine convert it to the hardware
+    rate.
+- T7a (inline, test-first):
+  - RED: the 7 former known issues, plus the new refusal and rounding cases (25 issues across 3
+    suites).
+  - GREEN: 461 tests with 0 known issues. A clean copy builds with 0 warnings.
+  - `-0.004` and `60_000.004` were already dropped and stay dropped. They pin the order: the range
+    check runs on the measured value, before rounding.
+  - Commit `7556156`. Assessed against `2e151e7` with `.atl/` excluded: `medium`, `under_budget`.
+    It stays pending in the slice, and the boundary stays `2e151e7`.
+- T7b (inline): `git mv` of the two sources and four test files; `CushionController` imports
+  `BandEarProtocol` for `PlaybackBufferSetting`. 461 tests, the same as before the move (protocol
+  152 → 88, playback 64). 0 warnings on a clean copy. Commit `c2e9bc5`.
+

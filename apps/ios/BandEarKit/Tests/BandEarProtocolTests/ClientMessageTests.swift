@@ -205,6 +205,23 @@ struct ClientMessageTests {
         #expect(object["recovered"] as? UInt64 == 2)
     }
 
+    /// Android rounds each extra to a hundredth, after checking its range on the measured value
+    /// (`putMilliseconds`, `ControlChannel.kt:586`).
+    @Test(
+        "rounds a measurement to a hundredth of a millisecond",
+        arguments: [(1.2345, 1.23), (0.006, 0.01), (37.5, 37.5), (59_999.996, 60_000.0)])
+    func roundsMeasurement(measured: Double, sent: Double) throws {
+        let stats = try LinkStats(
+            intervalMilliseconds: 1_000, packetsReceived: 0, packetsLost: 0, underruns: 0,
+            receiveTimeouts: 0, jitterMilliseconds: measured, cushionMilliseconds: measured,
+            backlogMilliseconds: measured)
+        let object = try wireObject(.stats(stats))
+
+        for key in ["jitter_ms", "cushion_ms", "backlog_ms"] {
+            #expect(object[key] as? Double == sent, "\(key)")
+        }
+    }
+
     @Test("refuses an interval the desk rejects", arguments: [0, 60_001, 100_000] as [UInt32])
     func refusesIntervalOutOfRange(interval: UInt32) {
         #expect(throws: ClientMessageError.statsIntervalOutOfRange(interval)) {
@@ -239,7 +256,9 @@ struct ClientMessageTests {
         #expect(try wireObject(.stats(stats))["jitter_ms"] == nil)
     }
 
-    @Test("drops a measurement outside the range the desk keeps", arguments: [-0.5, 60_000.5])
+    @Test(
+        "drops a measurement outside the range the desk keeps, before rounding it",
+        arguments: [-0.5, -0.004, 60_000.004, 60_000.5])
     func dropsMeasurementOutOfRange(value: Double) throws {
         let stats = try LinkStats(
             intervalMilliseconds: 1_000, packetsReceived: 0, packetsLost: 0, underruns: 0,

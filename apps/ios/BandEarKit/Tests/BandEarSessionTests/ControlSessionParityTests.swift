@@ -115,11 +115,6 @@ struct ControlSessionParityTests {
 
     /// Android hands nothing on for any of these. The session starts on Auto, so a fixed buffer is
     /// set first, or a message read as Auto would pass unnoticed.
-    ///
-    /// Four of them diverge, in the decoder (`ServerMessage.swift`, T2b), which reads a mode it does
-    /// not know and a fixed buffer with no length as Auto, and holds a length outside 5-500 ms to
-    /// that range, where Android ignores the message and keeps the buffer it had. Marked as known
-    /// issues so the suite fails, asking for them to be unmarked, the day the decoder agrees.
     @Test func aPlaybackMessageThePhoneCannotUseIsIgnored() async throws {
         let (session, desk) = try await connected()
         await desk.receive(#"{"type":"playback","buffer":{"mode":"fixed","ms":40}}"#)
@@ -134,17 +129,15 @@ struct ControlSessionParityTests {
             await desk.receive(unusable)
             #expect(session.playbackBuffer == .fixed(milliseconds: 40), "\(unusable)")
         }
-        await withKnownIssue("the decoder reads these instead of ignoring them (T2b)") {
-            for unusable in [
-                #"{"type":"playback","buffer":{"mode":"elastic","ms":40}}"#,
-                #"{"type":"playback","buffer":{"mode":"fixed"}}"#,
-                #"{"type":"playback","buffer":{"mode":"fixed","ms":4}}"#,
-                #"{"type":"playback","buffer":{"mode":"fixed","ms":501}}"#,
-            ] {
-                await desk.receive(#"{"type":"playback","buffer":{"mode":"fixed","ms":40}}"#)
-                await desk.receive(unusable)
-                #expect(session.playbackBuffer == .fixed(milliseconds: 40), "\(unusable)")
-            }
+        for unusable in [
+            #"{"type":"playback","buffer":{"mode":"elastic","ms":40}}"#,
+            #"{"type":"playback","buffer":{"mode":"fixed"}}"#,
+            #"{"type":"playback","buffer":{"mode":"fixed","ms":4}}"#,
+            #"{"type":"playback","buffer":{"mode":"fixed","ms":501}}"#,
+        ] {
+            await desk.receive(#"{"type":"playback","buffer":{"mode":"fixed","ms":40}}"#)
+            await desk.receive(unusable)
+            #expect(session.playbackBuffer == .fixed(milliseconds: 40), "\(unusable)")
         }
         #expect(session.lastError == nil)
     }
@@ -172,9 +165,6 @@ struct ControlSessionParityTests {
 
     /// Android hands nothing on for any of these. The session starts with no hold, so a hold is set
     /// first, or a message read as no hold would pass unnoticed.
-    ///
-    /// Two of them diverge, in the decoder (`ServerMessage.swift`, T2b), which holds a delay outside
-    /// 0-4 blocks to that range, where Android ignores the message and keeps the hold it had.
     @Test func aRedundancyMessageThePhoneCannotUseIsIgnored() async throws {
         let (session, desk) = try await connected()
         await desk.receive(#"{"type":"redundancy","delay_blocks":2}"#)
@@ -188,15 +178,13 @@ struct ControlSessionParityTests {
             await desk.receive(unusable)
             #expect(session.redundancyHoldBlocks == 2, "\(unusable)")
         }
-        await withKnownIssue("the decoder holds these to 0-4 instead of ignoring them (T2b)") {
-            for unusable in [
-                #"{"type":"redundancy","delay_blocks":-1}"#,
-                #"{"type":"redundancy","delay_blocks":5}"#,
-            ] {
-                await desk.receive(#"{"type":"redundancy","delay_blocks":2}"#)
-                await desk.receive(unusable)
-                #expect(session.redundancyHoldBlocks == 2, "\(unusable)")
-            }
+        for unusable in [
+            #"{"type":"redundancy","delay_blocks":-1}"#,
+            #"{"type":"redundancy","delay_blocks":5}"#,
+        ] {
+            await desk.receive(#"{"type":"redundancy","delay_blocks":2}"#)
+            await desk.receive(unusable)
+            #expect(session.redundancyHoldBlocks == 2, "\(unusable)")
         }
         #expect(session.lastError == nil)
     }
@@ -311,9 +299,7 @@ struct ControlSessionParityTests {
         }
     }
 
-    /// Android rounds each extra to a hundredth before sending it; ``LinkStats`` (T2a) sends the
-    /// value as measured, which the desk reads just as well. Marked as a known issue so the suite
-    /// says so the day it rounds.
+    /// Android rounds each extra to a hundredth before sending it.
     @Test func statsMessageCarriesTheMeasuredExtrasInMilliseconds() async throws {
         let message = try await sentStats(
             LinkStats(
@@ -322,9 +308,7 @@ struct ControlSessionParityTests {
                 backlogMilliseconds: 37.5, recovered: 0))
 
         #expect(Set(message.keys) == Self.wireKeys.union(["jitter_ms", "cushion_ms", "backlog_ms"]))
-        withKnownIssue("LinkStats does not round to a hundredth (T2a)") {
-            #expect(message["jitter_ms"] as? Double == 1.23, "rounded to a hundredth")
-        }
+        #expect(message["jitter_ms"] as? Double == 1.23, "rounded to a hundredth")
         #expect(message["cushion_ms"] as? Double == 10.0)
         #expect(message["backlog_ms"] as? Double == 37.5)
         #expect(message["recovered"] as? Int == 0)

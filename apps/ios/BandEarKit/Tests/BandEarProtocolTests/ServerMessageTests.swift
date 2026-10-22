@@ -369,25 +369,36 @@ struct ServerMessageTests {
                 == .playbackBuffer(.fixed(milliseconds: 40)))
     }
 
-    @Test("holds a pinned cushion to the range the desk allows", arguments: [(1, 5), (999, 500)])
-    func clampsFixedPlayback(sent: Int, kept: UInt16) throws {
+    @Test("reads the ends of the cushion the desk allows", arguments: [5, 500] as [UInt16])
+    func decodesFixedPlaybackBounds(milliseconds: UInt16) throws {
         #expect(
-            try decode(#"{"type":"playback","buffer":{"mode":"fixed","ms":\#(sent)}}"#)
-                == .playbackBuffer(.fixed(milliseconds: kept)))
+            try decode(#"{"type":"playback","buffer":{"mode":"fixed","ms":\#(milliseconds)}}"#)
+                == .playbackBuffer(.fixed(milliseconds: milliseconds)))
         #expect(PlaybackBufferSetting.minimumFixedMilliseconds == 5)
         #expect(PlaybackBufferSetting.maximumFixedMilliseconds == 500)
     }
 
-    /// A pinned cushion with no length, or a mode this build does not know, cannot be honoured.
-    /// Adapting on our own is the safe reading; dropping the message would leave us guessing too.
-    @Test(
-        "falls back to adapting when it cannot honour the buffer the desk named",
-        arguments: [
-            #"{"type":"playback","buffer":{"mode":"fixed"}}"#,
-            #"{"type":"playback","buffer":{"mode":"elastic","ms":40}}"#,
-        ])
-    func fallsBackToAuto(json: String) throws {
-        #expect(try decode(json) == .playbackBuffer(.auto))
+    /// Android ignores a buffer it cannot honour and keeps the one it had (`parsePlaybackBuffer`,
+    /// `ControlChannel.kt:689`); refusing the message is how this decoder asks for the same.
+    @Test("refuses a pinned cushion outside the range the desk allows", arguments: [4, 501, -1, 0])
+    func refusesFixedPlaybackOutOfRange(milliseconds: Int) {
+        #expect(throws: ServerMessageError.unusableField("ms", inMessageType: "playback")) {
+            try decode(#"{"type":"playback","buffer":{"mode":"fixed","ms":\#(milliseconds)}}"#)
+        }
+    }
+
+    @Test("refuses a pinned cushion with no length")
+    func refusesFixedPlaybackWithoutLength() {
+        #expect(throws: ServerMessageError.missingField("ms", inMessageType: "playback")) {
+            try decode(#"{"type":"playback","buffer":{"mode":"fixed"}}"#)
+        }
+    }
+
+    @Test("refuses a buffer mode this build does not know")
+    func refusesUnknownPlaybackMode() {
+        #expect(throws: ServerMessageError.unusableField("mode", inMessageType: "playback")) {
+            try decode(#"{"type":"playback","buffer":{"mode":"elastic","ms":40}}"#)
+        }
     }
 
     @Test("refuses a playback message with no buffer at all")
@@ -405,10 +416,19 @@ struct ServerMessageTests {
         #expect(try decode(#"{"type":"redundancy","delay_blocks":0}"#) == .redundancyHold(blocks: 0))
     }
 
-    @Test("holds the delay to the blocks the desk can ask for")
-    func clampsRedundancy() throws {
+    @Test("reads the longest delay the desk can ask for")
+    func decodesLongestRedundancy() throws {
         #expect(ServerMessage.maximumRedundancyHoldBlocks == 4)
-        #expect(try decode(#"{"type":"redundancy","delay_blocks":9}"#) == .redundancyHold(blocks: 4))
+        #expect(try decode(#"{"type":"redundancy","delay_blocks":4}"#) == .redundancyHold(blocks: 4))
+    }
+
+    /// Android ignores a delay it cannot hold and keeps the hold it had (`parseRedundancyHold`,
+    /// `ControlChannel.kt:708`).
+    @Test("refuses a delay outside the blocks the desk can ask for", arguments: [-1, 5, 9])
+    func refusesRedundancyOutOfRange(blocks: Int) {
+        #expect(throws: ServerMessageError.unusableField("delay_blocks", inMessageType: "redundancy")) {
+            try decode(#"{"type":"redundancy","delay_blocks":\#(blocks)}"#)
+        }
     }
 
     @Test("refuses a redundancy message with no delay")

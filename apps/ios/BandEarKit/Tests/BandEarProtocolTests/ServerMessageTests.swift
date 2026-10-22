@@ -7,6 +7,17 @@ private func decode(_ json: String) throws -> ServerMessage {
     try ServerMessage(decodingJSON: Data(json.utf8))
 }
 
+/// The groups a `config` carrying `groups` (as raw JSON) is read with.
+private func configGroups(_ groups: String) throws -> [ChannelGroup] {
+    guard case .configuration(let config) = try decode(
+        #"{"type":"config","source_channels":4,"groups":"# + groups + "}")
+    else {
+        Issue.record("expected a configuration")
+        return []
+    }
+    return config.groups
+}
+
 /// A whole `mix_ack` with two channels and one group, as the desk writes it
 /// (`apps/server/src/protocol.rs:382-396`).
 private let mixAckJSON = """
@@ -56,7 +67,7 @@ struct ServerMessageTests {
             return
         }
 
-        #expect(config.channels.first?.kind == kind)
+        #expect(config.channels?.first?.kind == kind)
     }
 
     /// The desk's own contract: "one that meets a kind it does not know shows it as `other`"
@@ -73,7 +84,7 @@ struct ServerMessageTests {
             return
         }
 
-        #expect(config.channels.first?.kind == .other)
+        #expect(config.channels?.first?.kind == .other)
     }
 
     @Test("ignores a field it has never heard of")
@@ -91,7 +102,9 @@ struct ServerMessageTests {
         #expect(config.sourceChannels == 1)
     }
 
-    @Test("reads a config with no groups or channels listed as empty")
+    /// An absent `channels` is an older desk's, and it is not the same as an empty list: with no
+    /// details a strip shows no kind icon, with details every strip shows one, `other` at worst.
+    @Test("reads a config with no groups as none, and with no channel details as none at all")
     func toleratesAbsentLists() throws {
         guard case .configuration(let config) = try decode(
             #"{"type":"config","source_channels":0,"sample_rate":48000}"#)
@@ -101,14 +114,68 @@ struct ServerMessageTests {
         }
 
         #expect(config.groups.isEmpty)
-        #expect(config.channels.isEmpty)
+        #expect(config.channels == nil)
     }
 
-    @Test("refuses a config with no sample rate")
-    func refusesConfigWithoutSampleRate() {
-        #expect(throws: ServerMessageError.missingField("sample_rate", inMessageType: "config")) {
-            try decode(#"{"type":"config","source_channels":2}"#)
+    /// The Android client never reads `sample_rate` from a `config`, and its own tests send configs
+    /// without one. The rate that matters is in every audio datagram's header.
+    @Test("reads a config with no sample rate")
+    func readsConfigWithoutSampleRate() throws {
+        guard case .configuration(let config) = try decode(#"{"type":"config","source_channels":2}"#)
+        else {
+            Issue.record("expected a configuration")
+            return
         }
+
+        #expect(config.sampleRate == nil)
+        #expect(config.sourceChannels == 2)
+    }
+
+    @Test("refuses a config that does not say how many channels it describes")
+    func refusesConfigWithoutSourceChannels() {
+        #expect(throws: ServerMessageError.missingField("source_channels", inMessageType: "config")) {
+            try decode(#"{"type":"config","groups":[]}"#)
+        }
+    }
+
+    // MARK: config groups, read as leniently as the Android client's parseGroups
+
+    /// Rules from `parseGroups` (`ControlChannel.kt:642-658`), which has no test of its own on
+    /// Android: a group's `id` came after its name and channels on the desk, so an older desk sends
+    /// none; an entry that is not an object, or has no name, is skipped; a channel that is not a
+    /// whole number, or is negative, is dropped. One bad group never costs the musician the others.
+    @Test("keeps a group from a desk that predates group ids")
+    func groupWithoutID() throws {
+        let groups = try configGroups(#"[{"name":"Band","channels":[0,1]}]"#)
+
+        #expect(groups == [ChannelGroup(id: nil, name: "Band", channels: [0, 1])])
+    }
+
+    @Test(
+        "skips a group that is not an object or has no name",
+        arguments: [#"["not a group"]"#, #"[{"channels":[0]}]"#, #"[{"name":"","channels":[0]}]"#, #"[{"name":7}]"#])
+    func skipsUnusableGroup(groups: String) throws {
+        #expect(try configGroups(groups).isEmpty)
+    }
+
+    @Test("keeps the groups around one it has to skip")
+    func keepsGoodGroupsAroundABadOne() throws {
+        let groups = try configGroups(#"[{"name":"A","channels":[0]},"junk",{"name":"B","channels":[1]}]"#)
+
+        #expect(groups.map(\.name) == ["A", "B"])
+    }
+
+    @Test("drops a group channel that is not a whole number or is negative")
+    func groupChannelsLenient() throws {
+        let groups = try configGroups(#"[{"name":"A","channels":[0,"one",-1,2.5,3,null]}]"#)
+
+        #expect(groups.map(\.channels) == [[0, 3]])
+    }
+
+    @Test("reads a group with no channels as an empty one, and groups that are not a list as none")
+    func groupListsLenient() throws {
+        #expect(try configGroups(#"[{"name":"A"}]"#).map(\.channels) == [[]])
+        #expect(try configGroups(#""not a list""#).isEmpty)
     }
 
     @Test("knows the mix sizes the desk works in")

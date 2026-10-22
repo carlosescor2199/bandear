@@ -30,11 +30,13 @@ public struct SourceChannel: Equatable, Sendable {
 
 /// One group in the desk's `config`: a stable id, a name, and 0-based source channel indices.
 public struct ChannelGroup: Equatable, Sendable {
-    public let id: String
+    /// The desk's stable id for the group, or nil from a desk that predates group ids. Groups are
+    /// matched by position everywhere, as on Android.
+    public let id: String?
     public let name: String
     public let channels: [Int]
 
-    public init(id: String, name: String, channels: [Int]) {
+    public init(id: String?, name: String, channels: [Int]) {
         self.id = id
         self.name = name
         self.channels = channels
@@ -50,13 +52,17 @@ public struct DeskConfiguration: Equatable, Sendable {
     public static let maximumGroups = 16
 
     public let sourceChannels: UInt8
-    public let sampleRate: UInt32
+    /// The rate the desk named, or nil when the `config` carried none; every audio datagram
+    /// carries the rate that matters.
+    public let sampleRate: UInt32?
     public let groups: [ChannelGroup]
-    public let channels: [SourceChannel]
+    /// Exactly one per source channel, or nil when the desk sent no details (an older desk), which
+    /// a screen shows differently from details that name nothing.
+    public let channels: [SourceChannel]?
 
     public init(
-        sourceChannels: UInt8, sampleRate: UInt32, groups: [ChannelGroup],
-        channels: [SourceChannel]
+        sourceChannels: UInt8, sampleRate: UInt32?, groups: [ChannelGroup],
+        channels: [SourceChannel]?
     ) {
         self.sourceChannels = sourceChannels
         self.sampleRate = sampleRate
@@ -226,6 +232,32 @@ extension ServerMessage {
     }
 }
 
+/// Decodes an element when it can and yields nil when it cannot, so one unreadable entry never
+/// costs the whole list it sits in.
+private struct Lenient<Value: Decodable>: Decodable {
+    let value: Value?
+
+    init(from decoder: any Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
+
+/// A `config`, read as leniently as the Android client reads it (`ControlChannel.kt:158-167`,
+/// `parseGroups` at `:642-658`, `parseChannelDetails` at `:669-680`). The desk added fields over
+/// time (the channel details after the groups, a group's `id` after its name and channels), so a
+/// phone that insisted on every field would lose the whole configuration to an older desk.
+///
+/// - `source_channels` is the one field it cannot do without.
+/// - `sample_rate` is read when present; Android never reads it, and every audio datagram carries
+///   the rate that matters.
+/// - `groups`: anything but a list is none; an entry that is not an object or has no name is
+///   skipped; `id` is optional; a member channel that does not decode as a whole number, or is
+///   negative, is dropped. Android's `optString` and `optInt` coerce where this drops (a name of
+///   `7` becomes "7", a channel of `2.5` or "3" becomes 2 or 3); the desk only ever sends names
+///   and whole numbers, so this is the one place the two read garbage differently.
+/// - `channels`: anything but a list is no details at all (an older desk), which is not the same as
+///   empty details; a list becomes exactly `source_channels` entries, an entry that is not an
+///   object or a field of the wrong type reading as the default, an unknown kind as `other`.
 private struct WireConfiguration: Decodable {
     let value: DeskConfiguration
 
@@ -236,35 +268,71 @@ private struct WireConfiguration: Decodable {
         case channels
     }
 
+    /// A channel the engineer never touched: no name, kind `other`, shown, not linked.
+    private static let untouched = SourceChannel(
+        name: "", kind: .other, isHidden: false, isLinkedToNext: false)
+
     private struct WireGroup: Decodable {
-        let id: String
-        let name: String
-        let channels: [Int]
+        let group: ChannelGroup
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case channels
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            guard let name = try? container.decodeIfPresent(String.self, forKey: .name), !name.isEmpty
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "a group with no name"))
+            }
+            let members = try? container.decodeIfPresent([Lenient<Int>].self, forKey: .channels)
+            group = ChannelGroup(
+                id: try? container.decodeIfPresent(String.self, forKey: .id),
+                name: name,
+                channels: (members ?? []).compactMap(\.value).filter { $0 >= 0 })
+        }
     }
 
     private struct WireChannel: Decodable {
-        let name: String
-        let kind: String
-        let hidden: Bool
-        let link: Bool
+        let channel: SourceChannel
+
+        private enum CodingKeys: String, CodingKey {
+            case name
+            case kind
+            case hidden
+            case link
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let kind = try? container.decodeIfPresent(String.self, forKey: .kind)
+            channel = SourceChannel(
+                name: (try? container.decodeIfPresent(String.self, forKey: .name)) ?? "",
+                // An unknown kind is shown as `other`, which is the desk's own contract.
+                kind: kind.flatMap(ChannelKind.init(rawValue:)) ?? .other,
+                isHidden: (try? container.decodeIfPresent(Bool.self, forKey: .hidden)) == true,
+                isLinkedToNext: (try? container.decodeIfPresent(Bool.self, forKey: .link)) == true)
+        }
     }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let count = Int(try container.decode(UInt8.self, forKey: .sourceChannels))
+        let groups = try? container.decodeIfPresent([Lenient<WireGroup>].self, forKey: .groups)
+        let details = try? container.decodeIfPresent([Lenient<WireChannel>].self, forKey: .channels)
         value = DeskConfiguration(
-            sourceChannels: try container.decode(UInt8.self, forKey: .sourceChannels),
-            sampleRate: try container.decode(UInt32.self, forKey: .sampleRate),
-            groups: try container.decodeIfPresent([WireGroup].self, forKey: .groups)?
-                .map { ChannelGroup(id: $0.id, name: $0.name, channels: $0.channels) } ?? [],
-            channels: try container.decodeIfPresent([WireChannel].self, forKey: .channels)?
-                .map {
-                    SourceChannel(
-                        name: $0.name,
-                        // An unknown kind is shown as `other`, which is the desk's own contract.
-                        kind: ChannelKind(rawValue: $0.kind) ?? .other,
-                        isHidden: $0.hidden,
-                        isLinkedToNext: $0.link)
-                } ?? [])
+            sourceChannels: UInt8(count),
+            sampleRate: try? container.decodeIfPresent(UInt32.self, forKey: .sampleRate),
+            groups: (groups ?? []).compactMap { $0.value?.group },
+            channels: details.map { entries in
+                (0..<count).map { index in
+                    entries.indices.contains(index)
+                        ? entries[index].value?.channel ?? Self.untouched : Self.untouched
+                }
+            })
     }
 }
 

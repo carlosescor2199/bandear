@@ -20,9 +20,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   codecs, the jitter policy and the mix domain as plain Swift with no SwiftUI, UIKit or AVFoundation
   import. It runs under `swift test` from the command line: no `.xcodeproj`, no simulator, no
   Homebrew tooling. The app shell composes it later (T6) and stays thin.
-- **No generated project file yet.** XcodeGen and Tuist are both absent from this machine and a
-  hand-written `.xcodeproj` is an unmergeable blob. The decision is deferred to T6, where the shell
-  is the first thing that actually needs one.
+- **A committed `.xcodeproj` with synchronized folders (T6, user's decision on 2026-10-21).** T1
+  deferred the choice because a hand-written project file used to list every source file and was
+  an unmergeable blob. Xcode 16 and later reference a folder instead
+  (`PBXFileSystemSynchronizedRootGroup`), and this Xcode's own prototype for a new app project
+  (`IDEFoundation.framework/…/UntitledAppProjectPrototype/Project.xcodeproj/project.pbxproj`) is
+  334 lines with no source file listed, so adding Swift files never touches the project. Chosen
+  over XcodeGen (an extra tool for every contributor and CI) and Tuist (more than one app target
+  and one local package need). The project is based on that prototype rather than invented.
 - **Bonjour only for discovery (T4).** The `MLNK` broadcast beacon the Android client uses
   (`apps/server/src/discovery.rs:9-26`) is unreachable from iOS without
   `com.apple.developer.networking.multicast`. `NWBrowser` over `_bandear._tcp` needs only the
@@ -111,8 +116,26 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
   (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
   storage, which the pure mix module does not have.
-- [ ] T6 — App shell and project file (route: to be decided). SwiftUI app, `Info.plist` with
-  `NSLocalNetworkUsageDescription` and `NSBonjourServices`, composition root over `BandEarKit`.
+- [ ] T6 — App shell, project file and control session. Grown since first written: the follow-ups
+  of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
+  - [ ] T6a — The project and a shell that builds (route: delegated writer; trigger: the
+    long-session backstop). `apps/ios/BandEar/BandEar.xcodeproj` from Xcode's app prototype with a
+    synchronized `BandEar/` folder; target and product `BandEar`, bundle id `com.bandear.ios`, iOS
+    16 deployment target; the local package `../BandEarKit` linked (`BandEarProtocol`,
+    `BandEarDiscovery`, `BandEarMix`); `NSBonjourServices` = `_bandear._tcp` and an
+    `NSLocalNetworkUsageDescription` in the built app's `Info.plist`; a SwiftUI shell (iOS 16, so
+    `ObservableObject`, not `@Observable`) that lists the desks `BonjourDeskBrowser` finds and
+    says when local network access is denied. Proof of life: built for the simulator, launched on
+    one, a desk announced with `dns-sd -R` appears.
+  - [ ] T6b — The control session (route: to be decided). The WebSocket to a found desk (a Bonjour
+    endpoint, so `NWConnection` with `NWProtocolWebSocket`, which resolves the service itself) or
+    a typed one; `register`; `ServerMessage` to `MixEvent` (`config` sent to the reducer
+    directly); every event through `reducedNumberingSends`, and `outgoingMix()` sent whenever
+    `sync.latest` grew; session state the screens observe.
+  - [ ] T6c — Reconnect, identity and persistence (route: to be decided). `ReconnectPolicy.kt`
+    (0.5, 1, 2, 4 s, then 5 s; reset on the first message, not on open), a stable client id
+    (`ClientIdentity.kt`), the musician's name and channel kept across launches; the Android tests
+    T5c-T5e left to T6.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
@@ -579,4 +602,9 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   (43 paths, 8 550 lines).
 - T5 complete: the mix module holds the channel layout, edits and `config`, reconciliation with
   the desk, More of me, and the outgoing mix. 341 tests: 148 protocol, 164 mix, 29 discovery.
-- Pending: T6 (app shell and project file, with the `.xcodeproj` decision still open), T7, T8, T9.
+- 2026-10-21, user's decision on how the Xcode project is defined: "`.xcodeproj` versionado
+  (Recommended)", the committed project with synchronized folders, over XcodeGen and Tuist.
+  Verified before it was offered: this Xcode's `Xcode3Core` knows
+  `PBXFileSystemSynchronizedRootGroup`, and its own new-app prototype (334 lines) lists only the
+  `.app` product, no source file. T6 sliced into T6a-T6c (see Tasks).
+- Pending: T6a (delegated), T6b, T6c, T7, T8, T9.

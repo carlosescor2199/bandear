@@ -105,7 +105,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     group levels, master, mute and cap, clamping.
   - [x] T5c — Reconciliation with the desk: `MixSyncState` numbering, `mix_state` and `mix_ack`
     rules, the engineer's controls, the echo check, session start.
-  - [ ] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
+  - [x] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
     the musician's own levels put back after a link.
   - [ ] T5e — The outgoing mix and when one is sent.
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
@@ -139,6 +139,12 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `seq` is negative or not a number fails as a whole message, where Android shows the error and
   answers nothing (make its `seq` as lenient as the ack's). The "acknowledged" counting and
   "nothing sent back" assertions of `ControlChannelTest.kt` belong to T6's transport.
+- **T6, T8 and T9 inputs from T5d.** Storing the musician's channel across launches is T6's
+  (Android's `startingRestoresTheName…`, `aChannelTheServerDidNotAnnounceIsNotStored`,
+  `aConfigWithoutTheRememberedChannelForgetsIt` in `MonitorViewModelTest.kt`). The amber strip
+  while More of me lifts it is T8's (`MixScreenTextTest.theMusiciansOwnStripIsAmberOnlyWhileMoreOfMeLiftsIt`);
+  so are the seven notices' words. The musician's channel surviving a recall is T9's (the More of me
+  assertion of `recallingAMixAppliesItsValuesAndKeepsWhatTheServerAnnounced`).
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -488,4 +494,43 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - Work-unit commit: `9982f3b feat(ios): reconcile the desk's mix reports with the edits in flight`.
 - Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
   (37 paths, 6 706 lines).
-- Pending: T5d, T5e. The `.xcodeproj` decision is still open and belongs to T6.
+- T5d done (route: delegated writer; trigger: the long-session backstop). The parent fixed the
+  shape in the handoff (`MoreOfMeNotice` with Android's seven cases, `MoreOfMeState`,
+  `MoreOfMe.liftedLevels`, `moreOfMe` and `ownLevelsToRestore` on the session, two events,
+  `mixAsPlayed` lifting, `reducedSending` clearing the restore) within eight named surfaces.
+  - `MoreOfMe.swift`: the lift ports `MixSnapshot.moreOfMe` and `moreOfMeFor`: the musician's
+    sides to 100, every other channel halved, locked sides as stored. Kotlin's `roundToInt` rounds
+    a half toward positive infinity, so a halved level is `(Double(level) / 2).rounded(.up)`, exact
+    for every `Int`; Swift's default `rounded()` agrees on 0...100 but not on negative halves, and a
+    test pins Kotlin's rule there. The rules that turn More of me off are internal methods on
+    `MoreOfMeState`.
+  - `MixSession.swift`: `applyConfig` fits the musician's channel to the new strips and keeps the
+    musician's own levels when a link turns More of me off; the engineer's lock or following turns
+    it off, and following stopping clears its notice; a report that is not an echo of the mix as
+    played turns it off with `mixChangedElsewhere`; after a link the musician's own levels go back
+    (Android's `dropLinkedLift`) and the result is numbered when it differs from what the desk
+    plays. The stored levels never carry the lift.
+  - Ports: 19 from `MonitorReducerTest.kt`, the five `moreOfMe` tests of `MixSnapshotTest.kt` and
+    `GroupSnapshotTest.moreOfMeKeepsTheGroupLevelsUntouched`; the deferred halves of four earlier
+    ports completed in place. 14 Swift-only tests. Skipped: the `MonitorViewModelTest.kt` tests
+    about what is sent (T5e or T6), storing the channel (T6), the amber strip (T8), recall (T9).
+  - Divergences: `liftedLevels` returns the levels unchanged where Android returns null, and every
+    Android caller then falls back to the stored mix, so behaviour is the same; the lift takes and
+    returns levels only, so the Android checks that pans, masters and groups come through untouched
+    are made on the session instead; Android's `sourceChannels <= 0` guard in `fittedTo` is left
+    out because `applyConfig` already rejects such a `config`.
+  - RED against the writer's stub: 130 mix tests, 38 failed with 64 expectations, no crash; five
+    passed on the stub because they assert that nothing changes, and four `#require` checks were
+    added so that tests built on a helper cannot pass against a reducer that does nothing. GREEN:
+    130. Ten mutations in a scratch copy (Swift's own rounding, restoring without numbering,
+    keeping the restore after a send, the engineer's locks in place of `lockedSides`, and more):
+    all caught.
+  - About 290 source and 620 test lines, over the ~400 heuristic, most of it the parity ports.
+- Parent checks of the delegated unit: all seven changed files inside the surfaces; `swift test`
+  rerun by the parent: 148, 130 and 29 passed; the writer's clean-copy build reported 0 warnings;
+  its scratch inspected (the mutation copy's sources matched the repository's) and removed.
+- Risk: none. Two public `MixEvent` cases added; the only consumers are this package's targets.
+- Work-unit commit: `28d2b3f feat(ios): lift the musician's own channel with More of me`.
+- Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
+  (40 paths, 7 601 lines).
+- Pending: T5e. The `.xcodeproj` decision is still open and belongs to T6.

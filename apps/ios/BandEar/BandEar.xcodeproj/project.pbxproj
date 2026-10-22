@@ -10,6 +10,7 @@
 		0D03C4DA382AEADDCE081433 /* BandEarProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = DAC849289CC49F9FF9974934 /* BandEarProtocol */; };
 		301B4F9451A51E56833E1A5D /* BandEarDiscovery in Frameworks */ = {isa = PBXBuildFile; productRef = DF97B5C9C35DBEDA9E36FAC1 /* BandEarDiscovery */; };
 		370FCA34E53F74BC23AFFC50 /* BandEarMix in Frameworks */ = {isa = PBXBuildFile; productRef = FA6EF0205D6D5625C75C12D6 /* BandEarMix */; };
+		A50D03190C8FE97D1B543221 /* BandEarSession in Frameworks */ = {isa = PBXBuildFile; productRef = 341D6E3B1293578447C722D5 /* BandEarSession */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +45,7 @@
 				0D03C4DA382AEADDCE081433 /* BandEarProtocol in Frameworks */,
 				301B4F9451A51E56833E1A5D /* BandEarDiscovery in Frameworks */,
 				370FCA34E53F74BC23AFFC50 /* BandEarMix in Frameworks */,
+				A50D03190C8FE97D1B543221 /* BandEarSession in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -86,6 +88,7 @@
 				DAC849289CC49F9FF9974934 /* BandEarProtocol */,
 				DF97B5C9C35DBEDA9E36FAC1 /* BandEarDiscovery */,
 				FA6EF0205D6D5625C75C12D6 /* BandEarMix */,
+				341D6E3B1293578447C722D5 /* BandEarSession */,
 			);
 			productName = BandEar;
 			productReference = 3A245A3118C442E86D7A5BF6 /* BandEar.app */;
@@ -377,6 +380,10 @@
 		FA6EF0205D6D5625C75C12D6 /* BandEarMix */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = BandEarMix;
+		};
+		341D6E3B1293578447C722D5 /* BandEarSession */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = BandEarSession;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

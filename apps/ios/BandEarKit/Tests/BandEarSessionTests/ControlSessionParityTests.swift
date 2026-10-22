@@ -12,7 +12,8 @@ import Testing
 @MainActor
 private func connected(channels: Int = 2) async throws -> (ControlSession, FakeDesk) {
     let transport = FakeTransport()
-    let session = ControlSession(transport: transport, scheduler: ManualScheduler())
+    let session = ControlSession(
+        transport: transport, scheduler: ManualScheduler(), store: FakeMusicianStore())
     let desk = FakeDesk(transport)
     try session.start(toStage, musicianName: "Ana")
     await desk.open()
@@ -348,7 +349,8 @@ struct ControlSessionParityTests {
 
     @Test func aSessionOpensOneConnectionToTheGivenServer() throws {
         let transport = FakeTransport()
-        let session = ControlSession(transport: transport, scheduler: ManualScheduler())
+        let session = ControlSession(
+            transport: transport, scheduler: ManualScheduler(), store: FakeMusicianStore())
 
         try session.start(toStage, musicianName: "Ana")
 
@@ -358,7 +360,8 @@ struct ControlSessionParityTests {
     @Test func stopClosesASocketThatIsStillOpening() async throws {
         let transport = FakeTransport()
         let scheduler = ManualScheduler()
-        let session = ControlSession(transport: transport, scheduler: scheduler)
+        let session = ControlSession(
+            transport: transport, scheduler: scheduler, store: FakeMusicianStore())
         let desk = FakeDesk(transport)
         try session.start(toStage, musicianName: "Ana")
         try #require(transport.opened.count == 1)
@@ -409,7 +412,8 @@ struct ControlSessionViewModelParityTests {
         async throws
     {
         let transport = FakeTransport()
-        let session = ControlSession(transport: transport, scheduler: ManualScheduler())
+        let session = ControlSession(
+            transport: transport, scheduler: ManualScheduler(), store: FakeMusicianStore())
         let desk = FakeDesk(transport)
         try session.start(toStage, musicianName: "Ana")
 

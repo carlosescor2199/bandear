@@ -20,6 +20,10 @@ import Foundation
 /// - A connection that closes or fails while the session runs is opened again after
 ///   ``ReconnectPolicy``'s wait, to the same desk, for as long as the session runs
 ///   (`ControlChannel.kt:290-325`). Only ``stop()`` ends the session.
+/// - What the phone remembers lives in a ``MusicianStore``, as Android's ViewModel keeps it in its
+///   `MonitorStore` (`MonitorViewModel.kt:322-324,424,490,519-525`): the name and the channel are
+///   read back when the session is made, the client id when a session starts, the name is written
+///   when a session starts with it, and the musician's channel whenever it changes.
 ///
 /// Everything happens on the main actor. The transport reports from its own thread, and every
 /// event is handed to the main queue in the order it came, so the session's state is only touched
@@ -58,14 +62,19 @@ public final class ControlSession {
     /// Why the connection was lost, said once per outage, as Android reports one error per outage
     /// (`ControlChannel.kt:296-318`): the reason of the outage's first failure, kept while its retries
     /// keep failing. An outage ends when a connection hears from the desk, which forgets the reason;
-    /// so does ``stop()`` and a new start. A desk closing the connection is no failure, so an outage
-    /// that began with a close reports its first failure instead.
+    /// so do ``stop()``, a new start, and the session ending on its own (``MixEvent/sessionEnded``).
+    /// A desk closing the connection is no failure, so an outage that began with a close reports its
+    /// first failure instead.
     public private(set) var connectionError: String?
+    /// The name the musician last started a session with, as the desk stores it; remembered across
+    /// launches, and empty before the first.
+    public private(set) var musicianName: String
     /// Called on the main actor after anything above may have changed.
     public var stateDidChange: (() -> Void)?
 
     private let transport: any ControlTransport
     private let scheduler: any ControlScheduler
+    private let store: any MusicianStore
     /// Who this session registers as; sent on every open.
     private var registration: Registration?
     /// The desk the session reopens its connection to.
@@ -85,24 +94,33 @@ public final class ControlSession {
 
     public init(
         transport: any ControlTransport = WebSocketTransport(),
-        scheduler: any ControlScheduler = MainQueueScheduler()
+        scheduler: any ControlScheduler = MainQueueScheduler(),
+        store: any MusicianStore
     ) {
         self.transport = transport
         self.scheduler = scheduler
+        self.store = store
+        // What an earlier launch left, as Android restores it when the app starts
+        // (`MonitorViewModel.kt:519-525`). The channel is on the mix before any `config`, which then
+        // keeps it, moves it to its pair's first side, or forgets it, as it would a chosen one.
+        musicianName = store.musicianName
+        mixSession.moreOfMe.musicianChannel = store.musicianChannel
     }
 
     /// Starts a session with the desk `request` names, registering as `musicianName` with this
-    /// phone's audio port and, when given, its `clientID`, and opens the connection. A session already
-    /// running is replaced: its connection is no longer heard, and a retry it was waiting for is
-    /// called off.
+    /// phone's audio port and this installation's ``ClientIdentity``, and opens the connection. The
+    /// name is remembered as the desk stores it. A session already running is replaced: its
+    /// connection is no longer heard, and a retry it was waiting for is called off.
     ///
     /// Throws, and starts nothing, for a name the desk would store as no name
     /// (``ClientMessageError/nameIsBlank``).
-    public func start(
-        _ request: ConnectionRequest, musicianName: String, clientID: String? = nil
-    ) throws {
-        registration = try Registration(
-            name: musicianName, udpPort: request.audioPort, clientID: clientID)
+    public func start(_ request: ConnectionRequest, musicianName: String) throws {
+        let registration = try Registration(
+            name: musicianName, udpPort: request.audioPort,
+            clientID: ClientIdentity.clientID(in: store))
+        self.registration = registration
+        self.musicianName = registration.name
+        store.musicianName = registration.name
         endpoint = request.endpoint
         // The previous connection is set aside before anything below could send: what this session
         // sends goes out once its own connection opens.
@@ -162,10 +180,21 @@ public final class ControlSession {
 
     /// Runs `event` through the mix, and sends the mix when that numbered a new one.
     private func reduce(_ event: MixEvent) {
-        let numbered = mixSession.sync.latest
+        let before = mixSession
         mixSession = mixSession.reducedNumberingSends(by: event)
-        if mixSession.sync.latest != numbered {
+        if mixSession.sync.latest != before.sync.latest {
             send(.mix(mixSession.outgoingMix()))
+        }
+        // The musician's channel is remembered whenever it changes: chosen (the mix takes only a
+        // channel the desk announced), moved to its pair's first side by a `config`, or forgotten by
+        // one that no longer has it (`MonitorViewModel.kt:322-324,424`).
+        if mixSession.moreOfMe.musicianChannel != before.moreOfMe.musicianChannel {
+            store.musicianChannel = mixSession.moreOfMe.musicianChannel
+        }
+        // An outage belongs to a running session: one that ended on its own, as the player (T7) will
+        // end it, has none left to report, exactly as after ``stop()`` (T6c's review, `R3-002`).
+        if before.isSessionRunning, !mixSession.isSessionRunning {
+            connectionError = nil
         }
     }
 

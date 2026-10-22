@@ -28,7 +28,8 @@ struct ControlSessionReconnectParityTests {
     private let desk: FakeDesk
 
     init() {
-        session = ControlSession(transport: transport, scheduler: scheduler)
+        session = ControlSession(
+            transport: transport, scheduler: scheduler, store: FakeMusicianStore())
         desk = FakeDesk(transport)
     }
 
@@ -214,7 +215,8 @@ struct ControlSessionViewModelReconnectParityTests {
     private let desk: FakeDesk
 
     init() {
-        session = ControlSession(transport: transport, scheduler: scheduler)
+        session = ControlSession(
+            transport: transport, scheduler: scheduler, store: FakeMusicianStore())
         desk = FakeDesk(transport)
     }
 

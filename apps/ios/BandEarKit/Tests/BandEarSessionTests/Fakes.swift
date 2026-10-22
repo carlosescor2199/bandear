@@ -103,6 +103,21 @@ private func parsed(_ texts: [String]) throws -> [[String: Any]] {
     }
 }
 
+/// What the phone remembers, kept in memory, as Android's `FakeStore` keeps it
+/// (`MonitorFakes.kt:25-55`): a test sets what an earlier launch left and reads what the session
+/// wrote.
+final class FakeMusicianStore: MusicianStore {
+    var clientID: String?
+    var musicianName: String
+    var musicianChannel: Int?
+
+    init(clientID: String? = nil, musicianName: String = "", musicianChannel: Int? = nil) {
+        self.clientID = clientID
+        self.musicianName = musicianName
+        self.musicianChannel = musicianChannel
+    }
+}
+
 /// A scheduler that runs nothing until the test says so, as Android's `FakeScheduler` does: the
 /// session's retries wait here, with their delays, and a test fires them by hand.
 @MainActor

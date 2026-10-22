@@ -14,11 +14,12 @@ import Testing
 struct ControlSessionTests {
     private let transport = FakeTransport()
     private let scheduler = ManualScheduler()
+    private let store = FakeMusicianStore()
     private let session: ControlSession
     private let desk: FakeDesk
 
     init() {
-        session = ControlSession(transport: transport, scheduler: scheduler)
+        session = ControlSession(transport: transport, scheduler: scheduler, store: store)
         desk = FakeDesk(transport)
     }
 
@@ -33,7 +34,8 @@ struct ControlSessionTests {
 
     @Test("registers first, with no capabilities, and then sends the opening mix")
     func registersThenSendsTheOpeningMix() async throws {
-        try session.start(toStage, musicianName: " Ana ", clientID: "phone-1")
+        store.clientID = "phone-1"
+        try session.start(toStage, musicianName: " Ana ")
         #expect(session.connection == .connecting)
 
         await desk.open()

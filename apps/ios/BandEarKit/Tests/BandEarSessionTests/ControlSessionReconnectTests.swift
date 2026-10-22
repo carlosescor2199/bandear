@@ -8,7 +8,7 @@ import Testing
 
 /// What the reconnect parity suite reaches only indirectly: changes made while the connection is
 /// down, a connection ending once, which reason an outage keeps and when it is forgotten, a retry
-/// outlived by its session, and the order ``ControlSession/start(_:musicianName:clientID:)`` and
+/// outlived by its session, and the order ``ControlSession/start(_:musicianName:)`` and
 /// ``ControlSession/stop()`` change things in.
 @Suite("Control session: reconnecting")
 @MainActor
@@ -19,7 +19,8 @@ struct ControlSessionReconnectTests {
     private let desk: FakeDesk
 
     init() {
-        session = ControlSession(transport: transport, scheduler: scheduler)
+        session = ControlSession(
+            transport: transport, scheduler: scheduler, store: FakeMusicianStore())
         desk = FakeDesk(transport)
     }
 
@@ -124,6 +125,41 @@ struct ControlSessionReconnectTests {
         try #require(session.connectionError == "refused")
         try session.start(toStage, musicianName: "Ana")
 
+        #expect(session.connectionError == nil)
+    }
+
+    /// T6c's review, `R3-002`: the session ends on its own through ``MixEvent/sessionEnded``, as
+    /// the player (T7) will end it, while it waits to reconnect.
+    @Test("forgets the reason when the session ends on its own while reconnecting")
+    func endingOnItsOwnWhileReconnectingForgetsTheReason() async throws {
+        try await connected()
+        await desk.fails("wifi gone")
+        try #require(session.connectionError == "wifi gone")
+
+        session.apply(.sessionEnded)
+
+        #expect(session.connectionError == nil)
+
+        try scheduler.runNextDue()
+
+        #expect(session.connection == .idle)
+        #expect(session.connectionError == nil)
+    }
+
+    /// `R3-002` again, on a connection open but not yet proved, which still carries the outage's
+    /// reason (``theReasonLastsUntilTheDeskSpeaks()``).
+    @Test("forgets the reason when the session ends on its own on an open the desk never spoke on")
+    func endingOnItsOwnWhileConnectedForgetsTheReason() async throws {
+        try await connected()
+        await desk.fails("wifi gone")
+        try scheduler.runNextDue()
+        await desk.open()
+        try #require(session.connection == .connected && session.connectionError == "wifi gone")
+
+        session.apply(.sessionEnded)
+        await desk.closes()
+
+        #expect(session.connection == .idle)
         #expect(session.connectionError == nil)
     }
 

@@ -19,9 +19,13 @@ let package = Package(
     targets: [
         .target(name: "BandEarProtocol"),
         .testTarget(name: "BandEarProtocolTests", dependencies: ["BandEarProtocol"]),
+        // The lock-free ring between the receive loop and the render callback. In C because iOS 16
+        // has no `Synchronization.Atomic`, and C11 atomics need no package to fetch.
+        .target(name: "BandEarRing"),
         // When a packet is played, and how the phone measures and plays it. It follows the desk's
         // playback settings and packets, so it depends on the protocol; nothing there depends on it.
-        .target(name: "BandEarPlayback", dependencies: ["BandEarProtocol"]),
+        // It plays through the ring.
+        .target(name: "BandEarPlayback", dependencies: ["BandEarProtocol", "BandEarRing"]),
         .testTarget(
             name: "BandEarPlaybackTests", dependencies: ["BandEarPlayback", "BandEarProtocol"]),
         .target(name: "BandEarDiscovery"),

@@ -88,8 +88,25 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - [x] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
   `sr` (`apps/server/src/mdns.rs:63-66`), and the manual host/port fallback. Staleness is the
   browser's, not a timer of ours: see the design decision below.
-- [ ] T5 — Mix domain and reducer (route: inline). 32 channels, 16 groups, gains, pans, mutes,
-  solos, group levels, engineer limit, locked channels, following.
+- [ ] T5 — Mix domain and reducer, in a `BandEarMix` module (route: inline per unit). 32 channels,
+  16 groups, gains, pans, mutes, solos, group levels, engineer limit, locked channels, following.
+  Mapped by one read-only explorer first (the Android reducer holds the whole app's state, about
+  2 500 lines with its tests, beyond an inline read); its reconciliation claim spot-checked against
+  `MonitorReducer.kt:123-125,428-437` and `MonitorUiState.kt:262-278`. Sliced into units of
+  behaviour, each with its Android parity suite:
+  - [ ] T5a — Channel layout: strips, stereo pairs, balance and pans, labels, the musician's
+    channel choices (`ChannelLayout.kt`, `ChannelLayoutTest.kt`, the layout tests of
+    `MonitorReducerTest.kt`).
+  - [ ] T5b — Edits and config: applying `config`, strip edits through pairs, locks and following,
+    group levels, master, mute and cap, clamping.
+  - [ ] T5c — Reconciliation with the desk: `MixSyncState` numbering, `mix_state` and `mix_ack`
+    rules, the engineer's controls, the echo check, session start.
+  - [ ] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
+    the musician's own levels put back after a link.
+  - [ ] T5e — The outgoing mix and when one is sent.
+- [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
+  (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
+  storage, which the pure mix module does not have.
 - [ ] T6 — App shell and project file (route: to be decided). SwiftUI app, `Info.plist` with
   `NSLocalNetworkUsageDescription` and `NSBonjourServices`, composition root over `BandEarKit`.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
@@ -97,6 +114,11 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 
 ## Follow-ups
 
+- **A comment of T2a overstates.** `MixCommand`'s doc says sending a whole mix to move one fader
+  "would fight every other socket of the same musician". That was never checked, and the Android
+  client sends all five lists on every `mix` (`ControlChannel.kt:470-504`). The wire rule it rests
+  on is right (an absent list is unchanged); the rationale is not. Correct it in T5e, which builds
+  the outgoing mix.
 - **A crashed desk lingers in the list.** The desk announces with mdns-sd's defaults:
   `DNS_OTHER_TTL` 4500 s for PTR and TXT, `DNS_HOST_TTL` 120 s for SRV and addresses
   (`mdns-sd` 0.21.5, `src/service_info.rs`). A desk that stops cleanly sends a goodbye and leaves

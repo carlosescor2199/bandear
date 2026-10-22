@@ -12,11 +12,16 @@ let package = Package(
     products: [
         .library(name: "BandEarProtocol", targets: ["BandEarProtocol"]),
         .library(name: "BandEarDiscovery", targets: ["BandEarDiscovery"]),
+        .library(name: "BandEarMix", targets: ["BandEarMix"]),
     ],
     targets: [
         .target(name: "BandEarProtocol"),
         .testTarget(name: "BandEarProtocolTests", dependencies: ["BandEarProtocol"]),
         .target(name: "BandEarDiscovery"),
         .testTarget(name: "BandEarDiscoveryTests", dependencies: ["BandEarDiscovery"]),
+        // The mix speaks the desk's published vocabulary (its `config` and `mix_*` values), so it
+        // depends on the protocol module; nothing in the protocol depends on the mix.
+        .target(name: "BandEarMix", dependencies: ["BandEarProtocol"]),
+        .testTarget(name: "BandEarMixTests", dependencies: ["BandEarMix", "BandEarProtocol"]),
     ]
 )

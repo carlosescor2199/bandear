@@ -27,6 +27,15 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   (`apps/server/src/discovery.rs:9-26`) is unreachable from iOS without
   `com.apple.developer.networking.multicast`. `NWBrowser` over `_bandear._tcp` needs only the
   local-network permission. A typed host/port form is the fallback, as on Android.
+- **No staleness timer for Bonjour (T4).** Android drops a desk it has not heard for 5 s
+  (`ServerBeacon.STALE_TIMEOUT_MS`) because a UDP beacon has no way to say it stopped. Bonjour
+  has one: the desk sends a goodbye when it unregisters, and the OS expires records it stops
+  hearing. A present desk raises no new events, it stays in the browser's set, so porting the
+  timer would remove live desks. `NWBrowser` hands over its whole current set on every change, so
+  the directory is one pure function from that set to the list. The original T4 line said
+  "staleness handling"; this is what it turned into.
+- **Discovery is its own module (T4).** `BandEarDiscovery` sits beside `BandEarProtocol` and
+  depends on nothing in it, so the package names its features rather than its layers.
 - **The Android jitter strategy is ported, not reinvented (T3).** Cushion counted in packets, 1 to 4,
   starting at 2, shrinking only after 3 clean intervals (`PlaybackLatency.kt:15-21`,
   `CushionController.kt:34-101`), and a reorder hold of up to 4 packets that reads a sequence 256
@@ -76,14 +85,38 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `client_id` character rule.
 - [x] T3 — Reorder hold and cushion policy (route: inline). Ported from `ReorderHold.kt` and
   `CushionController.kt`, including server-restart detection.
-- [ ] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
-  `sr` (`apps/server/src/mdns.rs:63-66`), staleness handling, and the manual host/port fallback.
+- [x] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
+  `sr` (`apps/server/src/mdns.rs:63-66`), and the manual host/port fallback. Staleness is the
+  browser's, not a timer of ours: see the design decision below.
 - [ ] T5 — Mix domain and reducer (route: inline). 32 channels, 16 groups, gains, pans, mutes,
   solos, group levels, engineer limit, locked channels, following.
 - [ ] T6 — App shell and project file (route: to be decided). SwiftUI app, `Info.plist` with
   `NSLocalNetworkUsageDescription` and `NSBonjourServices`, composition root over `BandEarKit`.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
+
+## Follow-ups
+
+- **A crashed desk lingers in the list.** The desk announces with mdns-sd's defaults:
+  `DNS_OTHER_TTL` 4500 s for PTR and TXT, `DNS_HOST_TTL` 120 s for SRV and addresses
+  (`mdns-sd` 0.21.5, `src/service_info.rs`). A desk that stops cleanly sends a goodbye and leaves
+  the list at once (proved by the round-trip test). One that crashes sends none: the phone can keep
+  listing it for up to 75 minutes, while connecting to it fails after about 2 minutes, once its
+  SRV and address records expire. Android drops it in 5 s. Two ways out, neither in this feature's
+  scope: the desk could announce PTR and TXT with a short TTL (`ServiceInfo::set_other_ttl`, a
+  server change), and T6 must make a failed connect to a listed desk say so plainly.
+- **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
+  playback timing. When T7 adds the player that depends on them, move them to a
+  `BandEarPlayback` module so every module names its feature.
+- **T6 inputs from T4.** `Info.plist` needs `NSBonjourServices` = `_bandear._tcp` and an
+  `NSLocalNetworkUsageDescription`, or the browser waits on `kDNSServiceErr_PolicyDenied`
+  forever. The browser spells a found desk's endpoint `type="_bandear._tcp"` (no trailing dot)
+  and `domain="local."` (with one), observed in the round-trip test.
+- **T8 inputs from T4.** The connect screen owns the form's words and must use Android's:
+  `missingHost` "Enter the server IP address or host name", `invalidAudioPort` "Enter a valid UDP
+  port between 1 and 65535", `invalidControlPort` "Enter a valid WebSocket control port between 1
+  and 65535". `DiscoveryStatus.localNetworkDenied` needs its own message: without it the screen
+  says "searching" for a desk that can never appear.
 
 ## Acceptance criteria
 
@@ -102,6 +135,9 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - `swift build --build-tests --package-path apps/ios/BandEarKit` with no warnings. A plain
   `swift build` does not compile the test targets, so it reports their warnings as clean.
 - `grep -rE 'import (SwiftUI|UIKit|AVFoundation)' apps/ios/BandEarKit/Sources` returns nothing.
+- `BANDEAR_BONJOUR_IT=1 swift test --package-path apps/ios/BandEarKit --filter roundTrip`: the
+  Bonjour round trip. Opt-in, because it announces a service on the local network; the
+  adapter has no other coverage, so run it whenever `BonjourDeskBrowser` changes.
 - Manual, later: `dns-sd -B _bandear._tcp` lists the desk, then the app connects and audio plays.
 
 ## Route
@@ -267,4 +303,48 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - Risk: none. Additive files in a package nothing depends on yet.
 - Native review assessment of the T3 slice against base f09c8bc: `medium`, `review_due: false`,
   reason `under_budget` (6 paths, 1446 lines). The slice stays open.
-- Pending: T4 onward. The `.xcodeproj` decision is still open and belongs to T6.
+- T4 done in two work units (route: inline), in a new `BandEarDiscovery` module.
+  - Reference first, this time from the start: `ServerDiscovery.kt` and `ServerDiscoveryTest.kt`
+    (the beacon parse and the 5 s expiry), the desk's `mdns.rs`, and the Android connection form
+    in `MonitorViewModel.startSession` with its test `aManualAddressIsCheckedBeforeAnythingStarts`.
+    The Network APIs were checked against the iOS 27 SDK's `Network.swiftinterface` and
+    `dns_sd.h` before use, not recalled.
+  - T4a `Sources/BandEarDiscovery/DeskDirectory.swift`: `DeskDirectory.desks(from:)`, a pure
+    function from the browser's current set to the list. A desk is listed once its TXT record
+    has arrived and only at discovery version 1, as Android ignores a beacon of another version.
+    `sr` is informational: anything but a positive whole number is no rate. A service reported
+    twice is listed once, and when its copies disagree on the rate the rate is dropped, so the
+    answer never depends on the set's iteration order. The order is by name, ignoring case and
+    reading digits as numbers, then domain and type, so it is total and stable between snapshots.
+    The service type is not filtered on: the browser was asked for that type only, and its
+    spelling in a result was not yet known. `Sources/BandEarDiscovery/ConnectionForm.swift`: the
+    Android checks in Android's order (host, then this phone's UDP port, then the desk's control
+    port), ports 1 through 65535 trimmed of blanks, defaults 50001 and 50000; a desk found over
+    Bonjour only needs this phone's port. The checks return cases; the words belong to T8 (see
+    Follow-ups). `ConnectionFormParityTests` ports Android's inputs. Commit `b27458c`.
+  - T4b `Sources/BandEarDiscovery/DiscoveryStatus.swift`: the browser state read as what the
+    screen says, with `localNetworkDenied` for `kDNSServiceErr_PolicyDenied` (-65570, verified
+    in the SDK's `dns_sd.h:801`) whether the browser waits or fails on it.
+    `Sources/BandEarDiscovery/BonjourDeskBrowser.swift`: the thin `NWBrowser` adapter. It clears
+    a browser's handlers before cancelling it, so an old browser's `cancelled` cannot land after a
+    new one reported browsing and make a live screen read idle. Its state is only touched on its
+    own serial queue. Commit `9ece87a`.
+  - The adapter cannot be unit tested; its input is a network. `BonjourDeskBrowserIntegrationTests`
+    announces a desk from the test process with `NWListener` (TXT `v=1`, `sr=48000`), finds it,
+    cancels the listener and waits for it to leave the list. RED against a stub that never
+    reported: failed after 10 s with the listener `ready`, so a later pass is the browser's doing.
+    GREEN: passed in 1.0 s; the desk was found with its rate and left the list on its own once the
+    listener stopped, which is the evidence behind having no staleness timer. It announced
+    `BandEar IT <8 hex>` on the local network for about a second.
+- Test-first: RED before each implementation. T4a: 24 new tests, 37 failed expectations. T4b: 5
+  new tests, 8 failed expectations, plus the round trip's RED above.
+- Checks: `swift test --package-path apps/ios/BandEarKit`: 156 passed, 0 failed (127 in
+  `BandEarProtocolTests`, 29 in `BandEarDiscoveryTests`; the round trip is skipped unless opted
+  in). `BANDEAR_BONJOUR_IT=1 … --filter roundTrip`: passed. `swift build --build-tests`: no
+  warnings. No SwiftUI, UIKit or AVFoundation import in `Sources`. The only earlier file touched
+  is `Package.swift`, which gained the new target; the earlier 127 tests pass unchanged.
+- Risk: none. Additive module nothing depends on yet. The adapter's only coverage is the opt-in
+  round trip, recorded under Checks so it is run whenever the adapter changes.
+- Native review assessment of the T4 slice against base fcff93e: `medium`, `review_due: false`,
+  reason `under_budget` (10 paths, 717 lines). The slice stays open.
+- Pending: T5 onward. The `.xcodeproj` decision is still open and belongs to T6.

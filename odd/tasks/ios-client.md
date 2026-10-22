@@ -137,7 +137,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `reducedNumberingSends` and sends `outgoingMix()` whenever `sync.latest` grew, keeps the desk's
     playback and redundancy settings for T7, and sends `stats` only while open. No app changes, no
     reconnect.
-  - [ ] T6c — Session robustness, in `BandEarSession` (route: delegated writer; trigger: the
+  - [x] T6c — Session robustness, in `BandEarSession` (route: delegated writer; trigger: the
     long-session backstop). `ReconnectPolicy.kt` (0.5, 1, 2, 4 s, then 5 s; reset on the first
     message, not on open) and its tests; a connect timeout (a listed Bonjour desk that is gone, or
     a host dropping SYNs, otherwise leaves the session `connecting` for good); the phone's own pings
@@ -793,4 +793,21 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - T6 resliced: the robustness work the verifier and the review handed over is T6c, inside the
   package and checked by `swift test`; identity, persistence, the app and the real-desk check are
   T6d.
-- Pending: T6c, T6d, T7, T8, T9.
+- T6c done (route: delegated writer). `ReconnectPolicy` (0.5, 1, 2, 4 s, then 5 s; reset on the
+  desk's first message), an injected `ControlScheduler` (`MainQueueScheduler`; `ManualScheduler`
+  in tests), `ConnectionState` now idle, connecting, connected, reconnecting (`.disconnected` and
+  `.failed` removed: a running session always reconnects), `connectionError` once per outage,
+  `WebSocketTransport(connectTimeout: 10 s, pingInterval: 5 s)` failing a connection not open by
+  the deadline or whose ping's pong has not come back by the next one, and `connection` set before
+  `.sessionStarted`/`.sessionEnded` are reduced. Ports: all 12 of `ControlChannelReconnectTest.kt`,
+  5 of `ReconnectPolicyTest`, both `MonitorViewModelTest` reconnect tests; `ConnectionGenerationsTest`
+  covered through the session. RED 32 of 86 failing; GREEN 86 (7 known issues), 148, 164, 29;
+  opt-in round trip 17/17, six repeated runs. 21 mutations, 20 caught including the verifier's M7
+  retain cycle; the ordering fix's mutant is not catchable while neither session event can send.
+  Parent checks: all eleven paths inside the surfaces, `swift test` rerun, scratch removed.
+  Work-unit commit recorded in git log after `777d23e`.
+  - Risk: items 4 and 6, named by the writer (retry scheduling, stale-connection guards, the
+    transport's queue clocks; the clocks covered only by the opt-in round trip). PENDING: the
+    independent verifier and the native review (assess with `--escalate-item 4` against `a0b94d8`)
+    were not run, because the session hit its usage limit.
+- Pending: T6c's verifier and review, then T6d, T7, T8, T9.

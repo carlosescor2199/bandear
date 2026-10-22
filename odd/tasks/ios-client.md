@@ -83,6 +83,10 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `config`, `mix_ack`, `mix_state`, `playback`, `redundancy`, `error` in. Field-for-field against
   `apps/server/src/protocol.rs`, with the `register` name truncation at 64 characters and the
   `client_id` character rule.
+- [x] T2c — Read `config` as leniently as Android (route: inline). Found while porting T5b: the
+  T2b decoder required `sample_rate`, a group `id` and all four channel fields, so a desk older
+  than any of them (the desk added the channel details after the groups, and a group's `id` after
+  its name and channels) would cost the musician the whole configuration. Commit `68cb553`.
 - [x] T3 — Reorder hold and cushion policy (route: inline). Ported from `ReorderHold.kt` and
   `CushionController.kt`, including server-restart detection.
 - [x] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
@@ -94,10 +98,10 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   2 500 lines with its tests, beyond an inline read); its reconciliation claim spot-checked against
   `MonitorReducer.kt:123-125,428-437` and `MonitorUiState.kt:262-278`. Sliced into units of
   behaviour, each with its Android parity suite:
-  - [ ] T5a — Channel layout: strips, stereo pairs, balance and pans, labels, the musician's
+  - [x] T5a — Channel layout: strips, stereo pairs, balance and pans, labels, the musician's
     channel choices (`ChannelLayout.kt`, `ChannelLayoutTest.kt`, the layout tests of
     `MonitorReducerTest.kt`).
-  - [ ] T5b — Edits and config: applying `config`, strip edits through pairs, locks and following,
+  - [x] T5b — Edits and config: applying `config`, strip edits through pairs, locks and following,
     group levels, master, mute and cap, clamping.
   - [ ] T5c — Reconciliation with the desk: `MixSyncState` numbering, `mix_state` and `mix_ack`
     rules, the engineer's controls, the echo check, session start.
@@ -127,6 +131,12 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   SRV and address records expire. Android drops it in 5 s. Two ways out, neither in this feature's
   scope: the desk could announce PTR and TXT with a short TTL (`ServiceInfo::set_other_ttl`, a
   server change), and T6 must make a failed connect to a listed desk say so plainly.
+- **T5c must read `mix_ack` and `mix_state` as Android does.** The `config` decoder was stricter
+  than Android in ways that broke interop (T2c). `parseMixReport` and `parseEngineerControls`
+  (`ControlChannel.kt:601-640`) clamp the limit to 0-100, read `locked[]` entries only `== true`
+  and `following` only as a string; the T2b report decoder fails the whole message on a wrong-typed
+  entry. Port those rules and their tests (`theEngineersControlsAreReadLeniently`,
+  `followingIsReadLeniently`, `aPushMissingPartOfTheMixIsReportedAndNotHandedOn`) with T5c.
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -369,4 +379,65 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   round trip, recorded under Checks so it is run whenever the adapter changes.
 - Native review assessment of the T4 slice against base fcff93e: `medium`, `review_due: false`,
   reason `under_budget` (10 paths, 717 lines). The slice stays open.
-- Pending: T5 onward. The `.xcodeproj` decision is still open and belongs to T6.
+- T5 started. One read-only explorer mapped the mix domain inside Android's whole-app reducer
+  (about 2 500 lines with its tests, beyond an inline read) and returned the state shape, events,
+  rules, the tests by area and two corrections to the brief: there is no "mix ownership" in the
+  reducer (in-flight edits are reconciled by `MixSyncState(latest, answered)`), and Android sends
+  all five lists on every `mix`. Its reconciliation claim was spot-checked against
+  `MonitorReducer.kt:123-125,428-437` and `MonitorUiState.kt:262-278` and held exactly.
+  - Module decision: `BandEarMix` depends on `BandEarProtocol` and takes the desk's values at its
+    edge (`DeskConfiguration`, `MixReport`, `MixCommand`); the protocol types are the vocabulary
+    the desk publishes, and a parallel set would be mapping for its own sake. The dependency only
+    runs one way.
+  - T5a `Sources/BandEarMix/ChannelLayout.swift` and `MixState.swift`: strips, stereo pairs, the
+    balance rule, labels, group faders and their members, the musician's channel choices, locked
+    sides and following, all derived from plain index-aligned lists. `ChannelLayoutParityTests`
+    ports `ChannelLayoutTest.kt` (9); `MixReducerParityTests` ports the four layout tests of
+    `MonitorReducerTest.kt`. Commit `878b35b`.
+    - Kotlin's `roundToInt` and Swift's `rounded()` disagree on negative halves; both are then held
+      to 0-100, which makes them agree everywhere, and the round trip over 0...100 pins it.
+    - The first RED crashed the test process (`Index out of range` on an empty stub result) rather
+      than failing. Indexing is now behind `try #require(count == …)`, so a short result fails one
+      test instead of hiding every other result.
+    - Two implicit dependencies made explicit: the test target imported `BandEarProtocol` only
+      through `BandEarMix`, and `ChannelLayout.swift` used `trimmingCharacters` without importing
+      Foundation. Both compiled; both would break the day a transitive import changed.
+  - T2c (above): the `config` decoder now reads as `ControlChannel.kt` does. `sample_rate` is
+    optional (Android never reads it, and its own tests send configs without one); groups skip an
+    entry that is not an object or has no name, take `id` as optional and drop member channels that
+    are not whole numbers or are negative; `channels` absent or not a list is nil, otherwise exactly
+    `source_channels` entries with defaults for anything unreadable. Where Android's `optString`
+    and `optInt` coerce garbage (a name of `7`, a channel of `2.5`) this drops it instead, documented
+    at the decoder; the desk never sends either. `ConfigParityTests` ports
+    `aConfigHandsOnTheChannelDetailsInChannelOrder`, `aConfigFromAnOlderServerHandsOnNoDetails`,
+    `channelDetailsAreReadLeniently` and `everyKindIsReadByItsWireName` with Android's own JSON.
+    RED in two steps: first a compile error from the API change, then, with only the types made
+    optional, exactly the ten new leniency tests failing and every earlier test passing. Scope
+    checked on the diff: no line of the routing or of the other four decoders changed.
+  - T5b `Sources/BandEarMix/MixSession.swift`: the reducer for `config` and the musician's edits.
+    A `config` outside 1...32 channels is ignored (Android drops it in its parser); lists resize
+    keeping existing channels, new ones neutral with the default pans, group levels kept by
+    position. Strip edits go through pairs, refuse locked strips and anything while following;
+    master, mute and cap never are. Android writes by index unguarded and would throw on a list
+    shorter than the levels; this writes only what a list has room for. The T5a ports now reach
+    their states through the reducer, and `firstConfigBridge` proves the reducer builds exactly
+    the hand-built states the layout tests started from. 13 more ports from `MonitorReducerTest.kt`;
+    `aGroupLevelFillsTheOtherGroupsAsTheyRead` sets the short group list directly where Android
+    reaches it through a recall (T9). Commit `ce9ef1f`.
+  - Test-first: RED before each unit. T5a: 24 tests, 156 issues (after the crash fix). T5b: 44
+    tests, 54 issues, the T5a ports included because they now go through the stub reducer.
+- A correction to every assessment recorded so far. The rule takes `--base-ref <last reviewed
+  boundary>`, and `under_budget` does not advance the boundary, so with nothing reviewed it is
+  still the branch point. T1 was assessed against it, but T2, T3 and T4 were each assessed against
+  the previous docs commit, which reset the slice every time. Re-assessed correctly after T5b:
+  base 07a8711, 33 paths, 5 427 lines, `medium`, `review_due: false`, `under_budget`. The
+  outcome did not change, but the bases were wrong. Assessments from here on use 07a8711 until
+  something is reviewed.
+- Checks: `swift test --package-path apps/ios/BandEarKit`: 210 passed, 0 failed (137 protocol,
+  29 discovery, 44 mix). `swift build --build-tests`: no warnings. No SwiftUI, UIKit or
+  AVFoundation import in `Sources`.
+- Risk: none for T5a and T5b (additive module, nothing depends on it yet). T2c changes public
+  types of `BandEarProtocol` (`DeskConfiguration.sampleRate` and `.channels`, `ChannelGroup.id`
+  became optional); their only consumers are this package's tests and `BandEarMix`, so no
+  contract anyone already consumes changed.
+- Pending: T5c, T5d, T5e. The `.xcodeproj` decision is still open and belongs to T6.

@@ -103,7 +103,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `MonitorReducerTest.kt`).
   - [x] T5b — Edits and config: applying `config`, strip edits through pairs, locks and following,
     group levels, master, mute and cap, clamping.
-  - [ ] T5c — Reconciliation with the desk: `MixSyncState` numbering, `mix_state` and `mix_ack`
+  - [x] T5c — Reconciliation with the desk: `MixSyncState` numbering, `mix_state` and `mix_ack`
     rules, the engineer's controls, the echo check, session start.
   - [ ] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
     the musician's own levels put back after a link.
@@ -131,12 +131,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   SRV and address records expire. Android drops it in 5 s. Two ways out, neither in this feature's
   scope: the desk could announce PTR and TXT with a short TTL (`ServiceInfo::set_other_ttl`, a
   server change), and T6 must make a failed connect to a listed desk say so plainly.
-- **T5c must read `mix_ack` and `mix_state` as Android does.** The `config` decoder was stricter
-  than Android in ways that broke interop (T2c). `parseMixReport` and `parseEngineerControls`
-  (`ControlChannel.kt:601-640`) clamp the limit to 0-100, read `locked[]` entries only `== true`
-  and `following` only as a string; the T2b report decoder fails the whole message on a wrong-typed
-  entry. Port those rules and their tests (`theEngineersControlsAreReadLeniently`,
-  `followingIsReadLeniently`, `aPushMissingPartOfTheMixIsReportedAndNotHandedOn`) with T5c.
+- **T6 inputs from T5c.** `MixEvent(reportedBy:)` maps `config` to nil, so the session layer
+  sends `.configReceived` to the reducer itself. Two decoding divergences left on purpose, both
+  about what T6 shows: a `mix_ack` with no number whose mix cannot be read still throws, where
+  Android only counts it as acknowledged (unreachable while every `mix` is numbered, which T5e
+  keeps; if the pill needs it, give `unreadableMixAck` an optional sequence); and an `error` whose
+  `seq` is negative or not a number fails as a whole message, where Android shows the error and
+  answers nothing (make its `seq` as lenient as the ack's). The "acknowledged" counting and
+  "nothing sent back" assertions of `ControlChannelTest.kt` belong to T6's transport.
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -164,8 +166,10 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 ## Checks
 
 - `swift test --package-path apps/ios/BandEarKit`.
-- `swift build --build-tests --package-path apps/ios/BandEarKit` with no warnings. A plain
-  `swift build` does not compile the test targets, so it reports their warnings as clean.
+- `swift build --build-tests` on a **clean copy** of the package (`rsync` without `.build`) with no
+  warnings. A plain `swift build` does not compile the test targets, and an incremental build
+  after `swift test` recompiles nothing and so prints no warnings at all: both report clean
+  whatever the code says.
 - `grep -rE 'import (SwiftUI|UIKit|AVFoundation)' apps/ios/BandEarKit/Sources` returns nothing.
 - `BANDEAR_BONJOUR_IT=1 swift test --package-path apps/ios/BandEarKit --filter roundTrip`: the
   Bonjour round trip. Opt-in, because it announces a service on the local network; the
@@ -440,4 +444,48 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   types of `BandEarProtocol` (`DeskConfiguration.sampleRate` and `.channels`, `ChannelGroup.id`
   became optional); their only consumers are this package's tests and `BandEarMix`, so no
   contract anyone already consumes changed.
-- Pending: T5c, T5d, T5e. The `.xcodeproj` decision is still open and belongs to T6.
+- T5c done (route: delegated writer; trigger: the long-session backstop, the parent context at
+  about 130k tokens). The parent fixed the API shape in the handoff (the `unreadableMixAck` case,
+  `MixSync`, the four new events, `reducedSending`, the `ServerMessage` to `MixEvent` mapping) and
+  the writer implemented it within eleven named edit surfaces. What landed:
+  - `ServerMessage.swift`: `mix_ack` and `mix_state` read as `parseMixReport` and
+    `parseEngineerControls` read them. The masters, the mute and all five lists are required now,
+    so a report missing a list is unreadable (T2b had read it as empty); the limit is any number cut
+    to its whole part and held to 0-100, else 100; `locked` counts only `true` entries; `following`
+    is only a string; `seq` is only a non-negative whole number. A numbered ack whose mix cannot be
+    read becomes `unreadableMixAck(sequence:)` and still answers its number. No other message type
+    changed, and no existing test did.
+  - `MixSync.swift`, `MixSession.swift`: `MixSync(latest, answered)` with `isSettled`, `changed()`,
+    `answeredUpTo(_:)`; `sync` and `isSessionRunning` on the session; `.sessionStarted`,
+    `.sessionEnded`, `.mixPushed`, `.mixAnswered`. A push applies its mix only when settled, an ack
+    only when it answers the newest change; engineer controls in a readable report apply at once; a
+    refusal only answers; reports outside a session change nothing (the answered number still moves,
+    as Android's does); session start resets the engineer controls, never the numbers. The echo
+    check compares against `mixAsPlayed`, the stored mix until T5d lifts it.
+  - `DeskReports.swift`: `MixReport.engineerControls` and `MixEvent(reportedBy:)`.
+    `EngineerControls.isLimited` added because two parity tests assert Android's `limited`.
+  - Ports: 26 from `MonitorReducerTest.kt` (795, 807 and 1166 partly, their More of me parts left
+    to T5d; 914's snapshot check to T5e; 776 sets directly the levels Android reaches by a recall)
+    and 12 from `ControlChannelTest.kt`. Skipped for later units: four recall tests (T9), four More
+    of me tests (T5d), two outgoing-mix tests (T5e). 20 Swift-only tests.
+  - RED against the writer's stub: 46 of 239 tests failed with 89 issues, no crash. GREEN: 268.
+    The writer also ran four mutations in a scratch copy (a push ignoring settled, any answer shown,
+    engineer controls changing outside a session, a mix applied outside one); each was caught.
+  - About 1 250 authored lines, over the ~400 heuristic: some 320 are source, the rest the parity
+    suites, every port reaching its state through events.
+- Parent checks of the delegated unit: every changed file inside the eleven surfaces; `swift test`
+  rerun by the parent: 148, 91 and 29 passed; scratch paths the writer reported removed after
+  inspection.
+- The warning check had been vacuous. The writer noticed that an incremental `swift build
+  --build-tests` after `swift test` recompiles nothing and so prints nothing, which is the order
+  every check since T1 ran in (with `swift test`'s own output filtered down to its result lines).
+  That explains why T3's `unused result` warning only surfaced in a fresh scratch copy. A full
+  build of a clean copy after T5c: 0 warnings in sources and tests, so the tree is clean as of
+  `9982f3b`. The documented check now builds a clean copy.
+- Risk: none. The writer named item 3 because `ServerMessage` gains a public case; as with T2c,
+  its only consumers are this package's own targets, which compile and pass, so no contract anyone
+  already consumes changed, and no independent verifier ran.
+- Work-unit commit: `9982f3b feat(ios): reconcile the desk's mix reports with the edits in flight`.
+- Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
+  (37 paths, 6 706 lines).
+- Pending: T5d, T5e. The `.xcodeproj` decision is still open and belongs to T6.

@@ -137,10 +137,16 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `reducedNumberingSends` and sends `outgoingMix()` whenever `sync.latest` grew, keeps the desk's
     playback and redundancy settings for T7, and sends `stats` only while open. No app changes, no
     reconnect.
-  - [ ] T6c — Reconnect, identity, persistence and the app wiring (route: to be decided).
-    `ReconnectPolicy.kt` (0.5, 1, 2, 4 s, then 5 s; reset on the first message, not on open), a
-    stable client id (`ClientIdentity.kt`), the musician's name and channel kept across launches,
-    the Android tests T5c-T5e left to T6; connecting from the desk list to a session the screens
+  - [ ] T6c — Session robustness, in `BandEarSession` (route: delegated writer; trigger: the
+    long-session backstop). `ReconnectPolicy.kt` (0.5, 1, 2, 4 s, then 5 s; reset on the first
+    message, not on open) and its tests; a connect timeout (a listed Bonjour desk that is gone, or
+    a host dropping SYNs, otherwise leaves the session `connecting` for good); the phone's own pings
+    so a dead link is noticed (Android pings every 5 s, `ControlTransport.kt:19,77`); `connection`
+    set before `.sessionStarted` and `.sessionEnded` are reduced; tests for the transport's failure
+    paths and for its release. See Follow-ups, "T6c inputs from T6b".
+  - [ ] T6d — Identity, persistence and the app (route: to be decided). A stable client id
+    (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
+    T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
     observe. Ends with the end-to-end check against the user's own desk machine.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
@@ -186,6 +192,34 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   device). A sample rate shows as "48.000 Hz" under a Spanish locale, correct grouping but easy to
   misread as 48: say "48 kHz". The status lines are provisional. "Designed for iPad/iPhone" on Mac
   and visionOS is still on by default; whether to offer it there is a distribution choice for M4.
+- **T6c inputs from T6b** (its verifier and its review, lineage `review-2d1cf4a399f54d0d`,
+  approved, every finding non-blocking):
+  - `R3-restart-sends-on-old-connection` and `R3-stop-reduces-after-close-while-connected`
+    (`ControlSession.swift:88-89,105-108`): `start` reduces `.sessionStarted` while `connection` is
+    still `.connected` to the previous desk, and `stop` reduces `.sessionEnded` after closing but
+    while still `.connected`. Nothing is sent today, because neither event numbers a send, but the
+    guard rests on that and on the transport's own ordering. Set `connection` to `.connecting` or
+    `.idle` before reducing, and pin with tests that nothing reaches the old connection on a replace
+    and nothing is sent on a stop from connected.
+  - `R4-no-connect-timeout` (`WebSocketTransport.swift:99-105`), also the verifier's: an
+    `NWConnection` to an unannounced Bonjour service stays preparing with no timeout (it completes
+    on its own once the desk is announced again), and a typed host dropping SYNs waits for the
+    system's TCP timeout or longer.
+  - No dead-link detection: the phone only answers the desk's pings, so a Wi-Fi drop with no FIN
+    leaves the session `connected`. Android pings every 5 s.
+  - `R3-transport-failure-paths-unproved` (`WebSocketTransport.swift:115-125`): `.waiting` to
+    `.failed`, a receive error, a stream ending with no opcode and the `hostPort` fallback have no
+    test in any run. The verifier saw a refused port and an unknown host report `.failed` at once.
+  - The verifier's mutant M7 (the connection handler holding the transport strongly) was caught
+    only by its own probe; no test in this repository catches that retain cycle.
+  - A Close frame right behind another message is reported as `.failed` ("Socket is not
+    connected") rather than `.closed`. The desk never sends a Close frame (`control.rs:952` reads
+    one, then drops the stream); mapping that receive error to `.closed` is the smallest fix if it
+    matters for reconnecting.
+  - `close()` cancels without waiting for the desk's close reply, so the desk saw a reset in 4 of
+    10 rounds. Harmless; noted.
+- **T8 input from T6b's verifier.** A typed `[::1]` becomes `[[::1]]` and fails; Android accepts the
+  brackets. Strip them in the connection form.
 - **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
   decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
   delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
@@ -742,4 +776,21 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - Risk: items 4 and 6, named by the writer and agreed (the hop to the main queue and the guard
   against old connections; `WebSocketTransport` covered only by the opt-in round trip). An
   independent verifier was launched.
-- Pending: T6b's verifier and native review, then T6c, T7, T8, T9.
+  - Independent verifier: no blocker. Claims 1-5 and 7 held; 6 held for everything the desk sends
+    (the Close-frame case above is the one exception). It reproduced the `ECONNABORTED` finding on
+    its own (with `.hostPort` and an IP literal the desk accepts TCP and receives zero handshake
+    bytes), confirmed 491 events kept their order through the hop, the mix numbers 1, 2, 4, 5 with
+    3-4 dropped while down and the next open sending the newest, pongs echoing the desk's payload
+    and the phone surviving 12.5 s of a desk that drops silent clients after 10, and the session
+    and transport released after `stop()`. Ten mutants, all caught; M7 only by its probe. Workspace
+    untouched (`find -newer`).
+  - Native review: assessed with `--escalate-item 4` against the reviewed boundary `b577761`:
+    `high`, due (9 paths, 1 855 lines). START checked before it ran (base tree `46ba67f` =
+    `b577761`, candidate `8418926` = `HEAD`). Consent relayed; the user chose "Revisar este
+    cambio" (`granted`). Both reviewers completed in 55 s; `approved` with four non-blocking
+    findings (under Follow-ups, T6c). Acknowledged: `authority: burned`, lineage
+    `review-2d1cf4a399f54d0d`. The reviewed boundary is now `a0b94d8`.
+- T6 resliced: the robustness work the verifier and the review handed over is T6c, inside the
+  package and checked by `swift test`; identity, persistence, the app and the real-desk check are
+  T6d.
+- Pending: T6c, T6d, T7, T8, T9.

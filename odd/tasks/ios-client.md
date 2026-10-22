@@ -127,7 +127,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `ObservableObject`, not `@Observable`) that lists the desks `BonjourDeskBrowser` finds and
     says when local network access is denied. Proof of life: built for the simulator, launched on
     one, a desk announced with `dns-sd -R` appears.
-  - [ ] T6b — The control session, in a `BandEarSession` module of `BandEarKit` (route: delegated
+  - [x] T6b — The control session, in a `BandEarSession` module of `BandEarKit` (route: delegated
     writer; trigger: the long-session backstop). A `ControlTransport` port with a fake for tests and
     a `WebSocketTransport` adapter (`NWConnection` with `NWProtocolWebSocket`, which connects to a
     Bonjour service endpoint itself and answers the desk's pings); a `ControlSession` core that
@@ -186,6 +186,18 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   device). A sample rate shows as "48.000 Hz" under a Spanish locale, correct grouping but easy to
   misread as 48: say "48 kHz". The status lines are provisional. "Designed for iPad/iPhone" on Mac
   and visionOS is still on by default; whether to offer it there is a distribution choice for M4.
+- **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
+  decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
+  delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
+  has. That reading was a guess made in T2b, the same kind T2c corrected for `config`. Parent's
+  decision: ignore them as Android does, done in T7 before it announces `playback.buffer` and
+  `redundancy.hold`, since only then can the desk send them. Six parity cases in
+  `ControlSessionParityTests` are marked `withKnownIssue`, which fails the suite the day the
+  decoder agrees, so the markers come off with the fix. Also for T7: `LinkStats` does not round the
+  extras to a hundredth (Android does; one more known issue), and leaves `recovered` out when nil,
+  where Android always sends it.
+- **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
+  response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -688,4 +700,46 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   the desk here (no crates cached, so a full dependency download, and the macOS microphone prompt,
   since the desk has no demo mode and captures a real device) or the fake server alone. The check
   needs the app wiring, so it moved to the end of T6c, and T6b stays inside `BandEarKit`.
-- Pending: T6b (delegated), T6c, T7, T8, T9.
+- T6b done (route: delegated writer; trigger: the long-session backstop), within the three named
+  surfaces. What landed in a new `BandEarSession` module (388 source lines):
+  - `ControlTransport` and `TransportEvent`, as specified; a fake in the tests.
+  - `ControlSession` (`@MainActor`): `mixSession`, `connection` (idle, connecting, connected,
+    disconnected, failed), `mixHeldByDesk` (Android's "acknowledged"), the desk's `playbackBuffer`
+    and `redundancyHoldBlocks` kept for T7, `lastError`, `stateDidChange`; `start` (throws on a
+    blank name; resets the buffer, the hold, the held flag and the last error, as Android's session
+    start does; a second `start` replaces the session), `stop`, `apply`, `send(stats:)`. Transport
+    events reach the main actor through `DispatchQueue.main.async`, which keeps them in order;
+    every connection is numbered and events from one stopped, replaced, closed or failed are
+    ignored, as Android ignores old sockets. `register` (no capabilities) then the opening mix on
+    open; `mix` and `stats` dropped while not connected; a socket closing does not end the session.
+  - `WebSocketTransport`: `NWConnection` with `autoReplyPing`, its state on its own queue, a
+    normal-closure frame on `close()`. One decision of the parent's did not hold: a typed desk was
+    to become `NWEndpoint.hostPort`, but Network's WebSocket client aborts with `ECONNABORTED`
+    before any handshake when given an IP address that way (IPv4 or IPv6; a `Host` header does not
+    help). A typed desk becomes `.url(ws://host:port)` instead, as Android connects
+    (`ControlChannel.kt:246`); IPv6 in brackets; a host no URL can hold falls back to `.hostPort`.
+    A Bonjour desk is `.service`, which Network resolves itself.
+  - Ports: 21 Android tests (9 new from `ControlChannelTest.kt`; the transport halves T5c left
+    for T6; two of `ControlChannelReconnectTest.kt` that need no reconnect; three of
+    `MonitorViewModelTest.kt`), 19 Swift-only tests, 2 endpoint-mapping tests. Skipped for T6c:
+    every reconnect and storage test, listed by the writer.
+  - The opt-in round trip (`BANDEAR_WS_IT=1`, `WebSocketTransportIntegrationTests`): by address in
+    0.7 s and over Bonjour in 1.6 s, the phone received the desk's `config`, the desk heard the
+    phone, three pings brought three pongs with the connection open, and closes from either side
+    were reported once. It announced `BandEar WS IT <8 hex>` for about 1.6 s.
+  - RED against the writer's stub: 39 of 40 failed with 66 issues, no crash; the one that passed
+    gained a `#require` and then failed on the stub. GREEN: all, with 7 known issues (the
+    divergences under Follow-ups). 14 mutations in a scratch copy, all caught; one only after
+    `aDeskReportThatNumbersAChangeSendsIt` was added for it.
+  - About 390 source and 1 300 test lines, over the ~400 heuristic, mostly the parity ports and a
+    WebSocket desk built inside the test process.
+- Parent checks: all eight changed paths inside the surfaces, `Package.swift` adding only the
+  product and two targets; `swift test` rerun by the parent: 43 session (7 known issues), 148,
+  164, 29; the writer's clean-copy build reported 0 warnings and the app still built; scratch
+  inspected and removed.
+- Work-unit commit: `fab5daf feat(ios): add the control session that speaks to the desk over a
+  WebSocket`.
+- Risk: items 4 and 6, named by the writer and agreed (the hop to the main queue and the guard
+  against old connections; `WebSocketTransport` covered only by the opt-in round trip). An
+  independent verifier was launched.
+- Pending: T6b's verifier and native review, then T6c, T7, T8, T9.

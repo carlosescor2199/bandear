@@ -127,15 +127,21 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `ObservableObject`, not `@Observable`) that lists the desks `BonjourDeskBrowser` finds and
     says when local network access is denied. Proof of life: built for the simulator, launched on
     one, a desk announced with `dns-sd -R` appears.
-  - [ ] T6b — The control session (route: to be decided). The WebSocket to a found desk (a Bonjour
-    endpoint, so `NWConnection` with `NWProtocolWebSocket`, which resolves the service itself) or
-    a typed one; `register`; `ServerMessage` to `MixEvent` (`config` sent to the reducer
-    directly); every event through `reducedNumberingSends`, and `outgoingMix()` sent whenever
-    `sync.latest` grew; session state the screens observe.
-  - [ ] T6c — Reconnect, identity and persistence (route: to be decided). `ReconnectPolicy.kt`
-    (0.5, 1, 2, 4 s, then 5 s; reset on the first message, not on open), a stable client id
-    (`ClientIdentity.kt`), the musician's name and channel kept across launches; the Android tests
-    T5c-T5e left to T6.
+  - [ ] T6b — The control session, in a `BandEarSession` module of `BandEarKit` (route: delegated
+    writer; trigger: the long-session backstop). A `ControlTransport` port with a fake for tests and
+    a `WebSocketTransport` adapter (`NWConnection` with `NWProtocolWebSocket`, which connects to a
+    Bonjour service endpoint itself and answers the desk's pings); a `ControlSession` core that
+    registers on open (no capabilities until T7 implements them, so the desk sends nothing this
+    build cannot use), then sends the opening mix, routes every desk message (`config` to the
+    reducer directly, reports through `MixEvent(reportedBy:)`), runs every event through
+    `reducedNumberingSends` and sends `outgoingMix()` whenever `sync.latest` grew, keeps the desk's
+    playback and redundancy settings for T7, and sends `stats` only while open. No app changes, no
+    reconnect.
+  - [ ] T6c — Reconnect, identity, persistence and the app wiring (route: to be decided).
+    `ReconnectPolicy.kt` (0.5, 1, 2, 4 s, then 5 s; reset on the first message, not on open), a
+    stable client id (`ClientIdentity.kt`), the musician's name and channel kept across launches,
+    the Android tests T5c-T5e left to T6; connecting from the desk list to a session the screens
+    observe. Ends with the end-to-end check against the user's own desk machine.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
@@ -676,4 +682,10 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     `action: acknowledged`, `authority: burned`. The reviewed boundary is now `b577761`;
     assessments from here on use it as `--base-ref`. The slice before T6a (07a8711..098577a, T1 to
     T5) was assessed `medium` and `under_budget` throughout and was never reviewed.
-- Pending: T6b, T6c, T7, T8, T9.
+- 2026-10-21, user's decision on how T6 is checked against a real desk: "Tu máquina del desk
+  (Recommended)": the user starts the desk on their own machine on this network and the simulator
+  connects over the LAN; nothing is downloaded or built on this Mac. The alternatives were building
+  the desk here (no crates cached, so a full dependency download, and the macOS microphone prompt,
+  since the desk has no demo mode and captures a real device) or the fake server alone. The check
+  needs the app wiring, so it moved to the end of T6c, and T6b stays inside `BandEarKit`.
+- Pending: T6b (delegated), T6c, T7, T8, T9.

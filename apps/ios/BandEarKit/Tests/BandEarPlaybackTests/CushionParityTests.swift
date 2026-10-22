@@ -1,6 +1,7 @@
 import Testing
 
-@testable import BandEarProtocol
+import BandEarProtocol
+@testable import BandEarPlayback
 
 /// The Android client's own tests for the playback cushion, ported case for case: every test in
 /// `CushionControllerTest.kt` and the `nextCushion` tests in `PlaybackLatencyTest.kt`

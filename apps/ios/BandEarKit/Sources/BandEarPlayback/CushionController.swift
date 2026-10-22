@@ -1,3 +1,5 @@
+import BandEarProtocol
+
 /// The pure rules behind the playback cushion: how many packets of audio the player keeps queued
 /// ahead of what it is playing.
 ///

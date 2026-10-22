@@ -1,6 +1,7 @@
 import Testing
 
-@testable import BandEarProtocol
+import BandEarProtocol
+@testable import BandEarPlayback
 
 /// What the cushion does beyond the Android parity suite: the bounds it keeps, and the step flags
 /// composing when one packet both changes the cushion and completes a second.

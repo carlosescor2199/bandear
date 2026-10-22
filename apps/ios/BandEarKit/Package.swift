@@ -11,6 +11,7 @@ let package = Package(
     platforms: [.iOS(.v16), .macOS(.v13)],
     products: [
         .library(name: "BandEarProtocol", targets: ["BandEarProtocol"]),
+        .library(name: "BandEarPlayback", targets: ["BandEarPlayback"]),
         .library(name: "BandEarDiscovery", targets: ["BandEarDiscovery"]),
         .library(name: "BandEarMix", targets: ["BandEarMix"]),
         .library(name: "BandEarSession", targets: ["BandEarSession"]),
@@ -18,6 +19,11 @@ let package = Package(
     targets: [
         .target(name: "BandEarProtocol"),
         .testTarget(name: "BandEarProtocolTests", dependencies: ["BandEarProtocol"]),
+        // When a packet is played, and how the phone measures and plays it. It follows the desk's
+        // playback settings and packets, so it depends on the protocol; nothing there depends on it.
+        .target(name: "BandEarPlayback", dependencies: ["BandEarProtocol"]),
+        .testTarget(
+            name: "BandEarPlaybackTests", dependencies: ["BandEarPlayback", "BandEarProtocol"]),
         .target(name: "BandEarDiscovery"),
         .testTarget(name: "BandEarDiscoveryTests", dependencies: ["BandEarDiscovery"]),
         // The mix speaks the desk's published vocabulary (its `config` and `mix_*` values), so it

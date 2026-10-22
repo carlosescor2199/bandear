@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@testable import BandEarProtocol
+@testable import BandEarPlayback
 
 /// Each packet carries its own sequence, so what is played reads as plainly as the sequence order.
 private typealias Hold = ReorderHold<UInt64>

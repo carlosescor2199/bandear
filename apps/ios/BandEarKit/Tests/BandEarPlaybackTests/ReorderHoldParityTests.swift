@@ -1,6 +1,6 @@
 import Testing
 
-@testable import BandEarProtocol
+@testable import BandEarPlayback
 
 /// The Android client's own tests for `ReorderHold`, ported case for case from
 /// `apps/android/app/src/test/java/com/bandear/android/ReorderHoldTest.kt`: same arrivals, same

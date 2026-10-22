@@ -166,6 +166,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `aReconnectSendsTheMixAgainUnderItsNewestNumberAndItsAnswerSettlesIt`,
   `ControlChannelReconnectTest.everyOpenRegistersFirstAndThenSendsTheMix`,
   `anAckWithoutANumberOnlySaysTheServerHoldsTheMix`, and the storage tests listed under T5d.
+- **T8 inputs from T6a's review** (lineage `review-94c7ed93bf2370fa`, approved; all four
+  findings non-blocking and, in the review's own words, separate later work):
+  `R4-no-recovery-after-terminal-status` (after `localNetworkDenied` or `unavailable`, coming back
+  from Settings fires no `onAppear`, so the list stays stuck: restart on `scenePhase` and offer a
+  retry); `R4-unbounded-searching-state` ("Searching for desks…" can last forever with no hint);
+  `R3-repeated-start` and `R3-untested-run-guard` (`DeskDiscoveryModel.swift`: the run guard has
+  no test in the repository; moving it into `BandEarKit`, where `swift test` reaches it, would close
+  that).
 - **T8 inputs from T6a.** Discovery is never restarted when the app comes back from the
   background or after the browser fails for good, because the root view's appear and disappear
   rarely fire: restart it on `scenePhase` (the verifier's smallest fix; not reproducible without a
@@ -661,5 +669,11 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     `retry_safe: true`): the reviewer runs through the `claude` CLI, whose OAuth session had
     expired and could not be refreshed. The bound STATUS still offers both slots; they are
     relaunched once the user signs in again (`claude auth login`).
-- Pending: the T6a review (waiting on the user's sign-in), then T6b, T6c, T7, T8, T9. T6b waits
-  for the review, since a correction could touch the shell T6b wires the session into.
+  - The user signed in again (`claude auth login`). The bound STATUS still offered both slots;
+    relaunched concurrently in provider order, both captures completed in 33 s and the review
+    closed `approved` with four non-blocking findings (under Follow-ups, T8). Acknowledged with
+    the provider's exact `review.acknowledge-approved` invocation: `gentle-ai.review-acknowledged/v1`,
+    `action: acknowledged`, `authority: burned`. The reviewed boundary is now `b577761`;
+    assessments from here on use it as `--base-ref`. The slice before T6a (07a8711..098577a, T1 to
+    T5) was assessed `medium` and `under_budget` throughout and was never reviewed.
+- Pending: T6b, T6c, T7, T8, T9.

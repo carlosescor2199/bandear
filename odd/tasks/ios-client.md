@@ -165,13 +165,23 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - [x] T7d — Ports of `Pcm16Processor` (local protection), the pure `PlaybackLatency` measures,
     and the arrival spacing and jitter estimate from `PmonPlayer.kt:222-233` (route: delegated
     writer B, launched together with T7c). Commit `0aa3674`.
-  - [ ] T7e — The receive engine and output:
-    - a UDP socket on its own thread with a 250 ms wake-up (Android's only clock for link reports
-      and hold releases);
-    - a single-producer, single-consumer ring between that thread and an `AVAudioSourceNode`
-      render block that takes no locks and allocates nothing;
-    - underruns counted on the render side.
-    Route decided when reached.
+  - [ ] T7e — The receive engine and output, split at a seam the parent wrote first:
+    `PlaybackSink` and `PlaybackSinkFactory` (`Sources/BandEarPlayback/PlaybackSink.swift`), this
+    client's stand-in for Android's `AudioTrack`. Two delegated writers are launched together,
+    each in its own worktree; each unit is over 100 lines with disjoint surfaces. Both touch
+    concurrency (high-risk item 4), so each gets an independent verifier and a native review.
+    - [ ] T7e1 — Output: a single-producer, single-consumer ring of PCM16 frames in a small C
+      target with C11 atomics, and a `RingPlaybackSink` conforming to `PlaybackSink`.
+      - Its render side is a pure function: it fills two `Float` channels, needs no lock and
+        allocates nothing.
+      - It plays silence until the target is queued, and starts over after it runs dry, counting
+        an underrun.
+      - The app's `AVAudioSourceNode` will call it in T7f.
+    - [ ] T7e2 — Receive: a UDP socket with `SO_RCVTIMEO` 250 ms on its own thread, and the
+      receive loop ported from `PmonPlayer.kt:113-357`.
+      - It is written against the protocol, with a fake sink, a fake datagram source and an
+        injected clock.
+      - It also ports `ReceiverLaunches`.
   - [ ] T7f — Wiring:
     - announce the four capabilities;
     - hand `playback` and `redundancy` to the player;

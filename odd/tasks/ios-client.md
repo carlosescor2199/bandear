@@ -118,7 +118,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   storage, which the pure mix module does not have.
 - [ ] T6 — App shell, project file and control session. Grown since first written: the follow-ups
   of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
-  - [ ] T6a — The project and a shell that builds (route: delegated writer; trigger: the
+  - [x] T6a — The project and a shell that builds (route: delegated writer; trigger: the
     long-session backstop). `apps/ios/BandEar/BandEar.xcodeproj` from Xcode's app prototype with a
     synchronized `BandEar/` folder; target and product `BandEar`, bundle id `com.bandear.ios`, iOS
     16 deployment target; the local package `../BandEarKit` linked (`BandEarProtocol`,
@@ -166,6 +166,12 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `aReconnectSendsTheMixAgainUnderItsNewestNumberAndItsAnswerSettlesIt`,
   `ControlChannelReconnectTest.everyOpenRegistersFirstAndThenSendsTheMix`,
   `anAckWithoutANumberOnlySaysTheServerHoldsTheMix`, and the storage tests listed under T5d.
+- **T8 inputs from T6a.** Discovery is never restarted when the app comes back from the
+  background or after the browser fails for good, because the root view's appear and disappear
+  rarely fire: restart it on `scenePhase` (the verifier's smallest fix; not reproducible without a
+  device). A sample rate shows as "48.000 Hz" under a Spanish locale, correct grouping but easy to
+  misread as 48: say "48 kHz". The status lines are provisional. "Designed for iPad/iPhone" on Mac
+  and visionOS is still on by default; whether to offer it there is a distribution choice for M4.
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -607,4 +613,53 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   Verified before it was offered: this Xcode's `Xcode3Core` knows
   `PBXFileSystemSynchronizedRootGroup`, and its own new-app prototype (334 lines) lists only the
   `.app` product, no source file. T6 sliced into T6a-T6c (see Tasks).
-- Pending: T6a (delegated), T6b, T6c, T7, T8, T9.
+- T6a done (route: delegated writer; trigger: the long-session backstop), within seven named
+  surfaces. What landed: `apps/ios/BandEar/BandEar.xcodeproj` built on Xcode's own app prototype
+  (new object IDs, `MyApp` renamed, its placeholder `PROJECT_UNIQUE_VALUE` dropped, `SWIFT_VERSION`
+  6.0), the synchronized `BandEar/` folder, `com.bandear.ios`, iOS 16, the local package
+  `../BandEarKit` with its three products, and a shared `BandEar` scheme in Xcode's own template
+  format. `NSBonjourServices` cannot be set from a build setting (`NSLocalNetworkUsageDescription`
+  can), so `BandEar/Info.plist` holds both and is merged through `INFOPLIST_FILE`, kept out of the
+  copied resources by a synchronized-group membership exception. The shell:
+  `DeskDiscoveryModel` (`@MainActor ObservableObject`, callbacks hopped to the main queue, a run
+  counter dropping reports from a stopped or replaced run, `stop()` clearing to idle, `deinit`
+  stopping the browser) and `DeskListView`.
+  - Parent change before commit: the prototype is multi-platform; the target is now iOS only
+    (`SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"`, `TARGETED_DEVICE_FAMILY = "1,2"`,
+    `SDKROOT = iphoneos`, the macOS-only sandbox settings removed), as the PRD asks. Rebuilt by the
+    parent: BUILD SUCCEEDED, no warning under `apps/ios/`, the built `Info.plist` showing
+    `com.bandear.ios`, `MinimumOSVersion` 16.0, `iPhoneSimulator` only, both network keys.
+  - Test-first exception: the shell holds no logic of its own (discovery is tested in
+    `BandEarKit`), so there is no meaningful unit RED; its proof is the build, the built
+    `Info.plist`, a fresh-copy build, the independent verifier and the simulator run below.
+  - Risk: items 4 and 6, named by the writer and agreed by the parent (async ordering in
+    `DeskDiscoveryModel`; no automated test covers the shell). An independent verifier ran: all
+    seven claims held, no blocker. It drove the unchanged model against a live `NWListener`
+    announcement from a scratch package, blocking the main thread so the browser's real reports
+    queued up before `stop()` or a second `start()`, and ran three mutants (no run check, no stop
+    in `deinit`, callbacks holding the model strongly), each caught. It left the workspace
+    untouched (`find -newer`). Its advisories are under Follow-ups.
+  - Proof of life on an iPhone 17 Pro simulator (iOS 27): the app showed "Searching for desks…";
+    a desk announced from the Mac with `dns-sd -R "BandEar on SIM-TEST" _bandear._tcp local 50001
+    v=1 sr=48000` appeared with its rate; stopping the announcement removed it on its own and the
+    app went back to searching. T4's no-timer decision holds on iOS too. The announcement was
+    visible on the local network for a few seconds.
+  - Work-unit commit: `b577761 feat(ios): add the Xcode project and a shell that lists Bonjour
+    desks`.
+  - Native review. Assessed with `--escalate-item 4`: against 07a8711 the whole branch came back
+    `high` and due (50 paths, 9 224 lines); the high-risk unit is reviewed alone, so it was
+    assessed against its parent 098577a: `high`, `review_due: true` (7 paths, 600 lines). The
+    preflight first asked for the untracked `.atl/` files to be declared (excluded, schema
+    `gentle-ai.review-intended-untracked-selection/v1` with `untracked_scope`,
+    `intended_untracked`, `expected_untracked_inventory`). The STATUS answering that submission,
+    run with only its own tokens, offered a START against 07a8711 (tree 95e8de7, the whole
+    branch); it was not run. Rerun with the original binding (`--base-ref=098577a
+    --committed-only=true`), the START targeted 825320c..46ba67f, T6a alone, lenses
+    `review-resilience` and `review-reliability`. Consent relayed: the user chose "Revisar este
+    cambio" (`granted`). Lineage `review-94c7ed93bf2370fa` created. Both in-process reviewer
+    captures then failed before starting (`invalid_request`, `mutation_outcome: not_started`,
+    `retry_safe: true`): the reviewer runs through the `claude` CLI, whose OAuth session had
+    expired and could not be refreshed. The bound STATUS still offers both slots; they are
+    relaunched once the user signs in again (`claude auth login`).
+- Pending: the T6a review (waiting on the user's sign-in), then T6b, T6c, T7, T8, T9. T6b waits
+  for the review, since a correction could touch the shell T6b wires the session into.

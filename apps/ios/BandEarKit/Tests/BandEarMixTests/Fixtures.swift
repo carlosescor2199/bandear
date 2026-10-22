@@ -82,12 +82,22 @@ func report(
         locked: [], following: nil)
 }
 
-/// The mix as the phone holds it, reported back whole: Android's `MixUiState.toSnapshot()`.
-func report(of mix: MixState) -> MixReport {
+/// The mix as the phone holds it, reported back whole: Android's `MixUiState.toSnapshot()`. With
+/// `gains`, the report carries them in place of the stored levels, as the desk reports the lift it
+/// plays while More of me is on.
+func report(of mix: MixState, gains: [Int]? = nil) -> MixReport {
     report(
-        gains: mix.levels, pans: mix.pans, mutes: mix.mutes, solos: mix.solos,
+        gains: gains ?? mix.levels, pans: mix.pans, mutes: mix.mutes, solos: mix.solos,
         groupLevels: mix.groupLevels, volume: mix.masterVolume, maxLevel: mix.levelCap,
         muted: mix.masterMuted)
+}
+
+extension MixSession {
+    /// The levels the desk plays while More of me is on, `locked` channels as stored: Android's
+    /// `mix.toSnapshot().moreOfMeFor(moreOfMeChannels, locked).channelGains`.
+    func played(locked: Set<Int> = []) -> [Int] {
+        MoreOfMe.liftedLevels(mix.levels, musicianChannels: moreOfMeChannels, lockedChannels: locked)
+    }
 }
 
 extension MixReport {

@@ -12,8 +12,8 @@ public enum MixEvent: Equatable, Sendable {
     case masterVolumeChanged(level: Int)
     case masterMuteChanged(muted: Bool)
     case levelCapChanged(level: Int)
-    /// A session with a desk started. What the engineer set belongs to the last one, so it goes;
-    /// the mix's numbers stay (see ``MixSync``).
+    /// A session with a desk started. What the engineer set belongs to the last one, so it goes, and
+    /// so do levels a link left to put back; the mix's numbers stay (see ``MixSync``).
     case sessionStarted
     /// The session ended: a report that arrives after it changes nothing.
     case sessionEnded
@@ -22,6 +22,10 @@ public enum MixEvent: Equatable, Sendable {
     /// The desk answered the phone's mix number `sequence`: with the whole mix it now plays, or with
     /// nil when it refused that mix or its answer could not be read.
     case mixAnswered(sequence: UInt64, report: MixReport?)
+    /// The musician turned More of me on or off.
+    case moreOfMeToggled(on: Bool)
+    /// The musician called a channel theirs, by the channel its strip is known by, or none.
+    case musicianChannelChosen(Int?)
 }
 
 /// The phone's side of the mix for one session, and the pure reducer over it.
@@ -37,15 +41,32 @@ public struct MixSession: Equatable, Sendable {
     /// a session, so one that arrives outside a session changes neither the mix nor what the
     /// engineer set.
     public var isSessionRunning = false
+    /// More of me and the musician's channel. The lift is never stored: ``mix`` always holds the
+    /// musician's own levels, and the lifted ones are derived when the mix is played or sent.
+    public var moreOfMe = MoreOfMeState()
+    /// The musician's own levels, kept when a link turned More of me off, to put back over the lift
+    /// the desk still plays once its next report arrives; nil when nothing waits. Not shown.
+    public var ownLevelsToRestore: [Int]?
 
     public init() {}
+
+    /// The channels More of me lifts: the musician's channel and, when its strip is a stereo pair,
+    /// the other side too; empty when no channel is chosen (`MonitorUiState.kt:60-65`).
+    public var moreOfMeChannels: [Int] {
+        moreOfMe.musicianChannel.map(mix.stripSides) ?? []
+    }
 
     /// ``reduced(by:)`` for a change the musician made. When `sends` says the change goes to the
     /// desk, the same step numbers it as the phone's newest mix (``MixSync/changed()``): the change
     /// and its number land in one value, so a send still queued already counts, and no answer from
     /// the desk can be matched to a mix older than the one on screen.
     ///
-    /// Ported from Android's `reduceChange` (`MonitorReducer.kt:196-208`). Which changes are sent is
+    /// A change that is sent also cancels levels still waiting to be put back after a link
+    /// (``ownLevelsToRestore``): the mix holds the musician's own unlifted levels, this change
+    /// included, so the send already puts them on the desk, and restoring the older ones when its
+    /// answer arrives would undo the change.
+    ///
+    /// Ported from Android's `reduceChange` (`MonitorReducer.kt:190-208`). Which changes are sent is
     /// the outgoing mix's rule (T5e); until then the caller says.
     public func reducedSending(
         _ event: MixEvent, sends: (_ before: MixSession, _ after: MixSession) -> Bool
@@ -53,6 +74,7 @@ public struct MixSession: Equatable, Sendable {
         var next = reduced(by: event)
         if sends(self, next) {
             next.sync = next.sync.changed()
+            next.ownLevelsToRestore = nil
         }
         return next
     }
@@ -86,9 +108,11 @@ public struct MixSession: Equatable, Sendable {
         case .levelCapChanged(let level):
             next.mix.levelCap = Self.percent(level)
         case .sessionStarted:
-            // This desk reports its own controls (an older one never does, and leaves all open).
+            // This desk reports its own controls (an older one never does, and leaves all open). A
+            // new session sends the phone's own mix when it opens, so no lift waits to be dropped.
             next.isSessionRunning = true
             next.mix.engineer = EngineerControls()
+            next.ownLevelsToRestore = nil
         case .sessionEnded:
             next.isSessionRunning = false
         case .mixPushed(let report):
@@ -100,6 +124,10 @@ public struct MixSession: Equatable, Sendable {
             }
         case .mixAnswered(let sequence, let report):
             next.answer(sequence, with: report)
+        case .moreOfMeToggled(let on):
+            next.moreOfMe = moreOfMe.toggled(on: on, in: mix)
+        case .musicianChannelChosen(let channel):
+            next.moreOfMe = moreOfMe.choosing(channel, in: mix)
         }
         return next
     }
@@ -128,46 +156,108 @@ public struct MixSession: Equatable, Sendable {
     /// The engineer's `controls` as the desk reported them with a mix. They hold at once, even when
     /// the mix they came with is overtaken by a change of the phone's still on its way: the phone
     /// never sends them, so nothing of its own can overtake them, and the desk reports them in
-    /// order. Outside a session they change nothing (`MonitorReducer.kt:283-288`; what they do to
-    /// More of me is T5d's).
+    /// order. Outside a session they change nothing (`MonitorReducer.kt:275-288`).
+    ///
+    /// More of me goes off when the musician's channel is now locked or the mix now follows
+    /// another's. When following stops, its notice goes; More of me stays off until the musician
+    /// turns it on.
     private mutating func takeEngineerControls(_ controls: EngineerControls) {
         guard isSessionRunning, mix.engineer != controls else { return }
+        let wasFollowing = mix.following != nil
         mix.engineer = controls
+        if wasFollowing, mix.following == nil, moreOfMe.notice == .following {
+            moreOfMe.notice = nil
+        }
+        moreOfMe = moreOfMe.offIfHeld(by: mix)
     }
 
     /// The desk's whole mix, pushed because it changed elsewhere or answering the phone's newest
-    /// change: it becomes the phone's mix, exactly as the desk plays it (`MonitorReducer.kt:450-462`).
+    /// change: it becomes the phone's mix, exactly as the desk plays it (`MonitorReducer.kt:439-462`).
     ///
-    /// Outside a session it changes nothing. A report of the mix the phone already plays (an answer
-    /// to its own mix, or the whole mix the desk re-sends after it missed events) changes nothing
-    /// either: that is the echo check, which More of me (T5d) needs, since it turns itself off on any
-    /// other report.
+    /// Outside a session it changes nothing. The first report after a link turned More of me off
+    /// puts the musician's own levels back (``restoreOwnLevels(_:over:)``). A report of the mix the
+    /// phone already plays (an answer to its own mix, or the whole mix the desk re-sends after it
+    /// missed events) changes nothing: that is the echo check. Any other report turns More of me off
+    /// and says why: its levels are what the desk plays, so lifting them again on the next send would
+    /// lift them twice.
     private mutating func applyDeskMix(_ report: MixReport) {
         guard isSessionRunning else { return }
         let reported = mix.takingDeskMix(report)
+        if let own = ownLevelsToRestore {
+            restoreOwnLevels(own, over: reported)
+            return
+        }
         guard reported != mixAsPlayed else { return }
         mix = reported
+        if moreOfMe.isEnabled {
+            moreOfMe.isEnabled = false
+            moreOfMe.notice = .mixChangedElsewhere
+        }
     }
 
-    /// The mix as the phone plays it, which is what the desk reports back when nothing changed
-    /// elsewhere. For now that is the stored mix; More of me (T5d) lifts the musician's channel at
-    /// send time without storing it, and makes this the lifted mix (`MonitorReducer.kt:516-521`).
+    /// The first report after a link turned More of me off (``MoreOfMeNotice/channelPaired``)
+    /// (`MonitorReducer.kt:464-484`).
+    ///
+    /// The `config` turned it off, kept the musician's `own` levels and sent nothing; the link's
+    /// `mix_state` (or the answer to a change made meanwhile) arrives with the pans the link moved
+    /// and the levels the desk plays, still lifted by the mix More of me sent. The phone takes that
+    /// report with its own levels put back on every channel but a locked one, which the desk keeps
+    /// (a pair whole when either side is), and with a pair's second side at its first side's level,
+    /// as the link sets it. When that differs from what the desk plays, it is numbered as the
+    /// phone's newest mix, so it is sent once through the usual numbering. While the mix follows
+    /// another's the desk keeps every channel, so the report is taken as it is. Either way nothing
+    /// waits any more.
+    private mutating func restoreOwnLevels(_ own: [Int], over reported: MixState) {
+        ownLevelsToRestore = nil
+        guard reported.following == nil else {
+            mix = reported
+            return
+        }
+        let locked = reported.lockedSides
+        var levels = reported.levels.indices.map { channel in
+            locked.contains(channel) || !own.indices.contains(channel)
+                ? reported.levels[channel] : own[channel]
+        }
+        for strip in reported.layout {
+            if let second = strip.second, !locked.contains(second) {
+                levels[second] = levels[strip.first]
+            }
+        }
+        mix = reported
+        mix.levels = levels
+        if levels != reported.levels {
+            sync = sync.changed()
+        }
+    }
+
+    /// The mix as the phone plays and sends it, which is what the desk reports back when nothing
+    /// changed elsewhere: with More of me on, the musician's strip lifted and every other channel
+    /// halved, except the channels the engineer locked (a pair whole when either side is), which
+    /// stay as stored (`MonitorReducer.kt:511-521`).
     private var mixAsPlayed: MixState {
-        mix
+        guard moreOfMe.isEnabled else { return mix }
+        var played = mix
+        played.levels = MoreOfMe.liftedLevels(
+            mix.levels, musicianChannels: moreOfMeChannels, lockedChannels: mix.lockedSides)
+        return played
     }
 
     /// A `config`: resizes the per-channel lists when the channel count changed, takes the announced
-    /// groups and details (which rebuild the strips), and keeps group levels by position.
+    /// groups and details (which rebuild the strips), keeps group levels by position, and fits the
+    /// musician's channel to the new strips (`MonitorReducer.kt:217-255`).
     ///
     /// A channel that still exists keeps what the musician set, a new one starts neutral with the
     /// default pan layout, and a repeated count changes nothing. Nothing is sent: a pair the engineer
-    /// just linked was panned apart on the desk, and the `mix_state` that follows says so.
+    /// just linked was panned apart on the desk, and the `mix_state` that follows says so. When that
+    /// link turns More of me off, the stored levels are the musician's own (the lift is never
+    /// stored), so they are kept to be put back once that `mix_state` arrives (``applyDeskMix(_:)``).
     ///
     /// A `config` for no channels, or for more than the mix holds, is ignored, as Android's parser
     /// ignores it before its reducer ever sees it (`ControlChannel.kt:160`).
     private mutating func applyConfig(_ config: DeskConfiguration) {
         let count = Int(config.sourceChannels)
         guard (1...DeskConfiguration.maximumMixChannels).contains(count) else { return }
+        let before = mix
 
         if !(mix.sourceChannels == count && mix.levels.count == count) {
             mix.sourceChannels = count
@@ -179,6 +269,13 @@ public struct MixSession: Equatable, Sendable {
         mix.groupLevels = mix.groupLevels.resized(to: config.groups.count) { _ in MixState.neutralLevel }
         mix.groups = config.groups
         mix.channelDetails = config.channels
+
+        let fitted = moreOfMe.fitted(to: mix).offIfNewlyPaired(
+            before: before, previousChannel: moreOfMe.musicianChannel, after: mix)
+        if moreOfMe.isEnabled, !fitted.isEnabled, fitted.notice == .channelPaired {
+            ownLevelsToRestore = mix.levels
+        }
+        moreOfMe = fitted.offIfHeld(by: mix)
     }
 
     /// Applies `change` with the channels an edit of `channel` writes: both sides of a pair's strip,

@@ -164,4 +164,129 @@ struct MixSessionTests {
         #expect(answered.mix.levels == [60, 70])
         #expect(answered.sync == MixSync(latest: 2, answered: 2))
     }
+
+    // MARK: More of me
+
+    @Test("takes an answer carrying the lift as the mix the phone plays, and never stores the lift")
+    func liftIsNeverStored() throws {
+        let on = connectedWith(3).after(.musicianChannelChosen(1), .moreOfMeToggled(on: true))
+            .sent(.channelLevelChanged(channel: 0, level: 80))
+        try #require(on.moreOfMe.isEnabled)
+
+        let answered = on.after(
+            .mixAnswered(sequence: 1, report: report(of: on.mix, gains: on.played())))
+
+        #expect(answered.mix == on.mix)
+        #expect(answered.mix.levels == [80, 100, 100])
+        #expect(answered.moreOfMe == on.moreOfMe)
+        #expect(answered.sync.isSettled)
+        #expect(answered.after(.moreOfMeToggled(on: false)).mix.levels == [80, 100, 100])
+    }
+
+    @Test("lifts a pair's two sides from its first channel, one channel otherwise, none without one")
+    func moreOfMeChannels() {
+        var state = withBand()
+        #expect(state.moreOfMeChannels == [])
+
+        state.moreOfMe.musicianChannel = 1
+        #expect(state.moreOfMeChannels == [1, 2])
+        state.moreOfMe.musicianChannel = 0
+        #expect(state.moreOfMeChannels == [0])
+        // Only a channel set directly (the app's remembered one) can sit on a pair's second side: the
+        // picker offers a pair by its first channel, and a `config` moves it there. A strip is matched
+        // by its first channel only, as Android matches it.
+        state.moreOfMe.musicianChannel = 2
+        #expect(state.moreOfMeChannels == [2])
+    }
+
+    @Test("keeps the musician's own levels only when a link turns More of me off")
+    func ownLevelsKeptOnlyByALink() throws {
+        let chosenOnly = running().after(
+            .configReceived(config(5)), .musicianChannelChosen(2), .configReceived(config(5, [], band)))
+        let pairElsewhere = running().after(
+            .configReceived(config(5)), .musicianChannelChosen(0), .moreOfMeToggled(on: true),
+            .configReceived(config(5, [], band)))
+
+        #expect(try linkedWhileLifted().ownLevelsToRestore == [80, 60, 40, 70, 90])
+        #expect(chosenOnly.ownLevelsToRestore == nil)
+        #expect(pairElsewhere.ownLevelsToRestore == nil)
+    }
+
+    /// A new session sends the phone's own mix when it opens, so no lift waits to be dropped
+    /// (`MonitorReducer.kt:75-76`).
+    @Test("forgets the levels a link left to restore when a new session starts")
+    func sessionStartForgetsOwnLevels() throws {
+        let reconnected = try linkedWhileLifted().after(.sessionEnded, .sessionStarted)
+
+        #expect(reconnected.ownLevelsToRestore == nil)
+        #expect(
+            reconnected.after(.mixPushed(linkReport([40, 30, 30, 35, 45]))).mix.levels
+                == [40, 30, 30, 35, 45])
+    }
+
+    /// While the mix follows another's the desk keeps every channel from the leader's, so nothing of
+    /// the phone's can go back (`MonitorReducer.kt:476`).
+    @Test("takes the link's report as it is while the mix follows another's, and stops waiting")
+    func linkReportWhileFollowing() throws {
+        let paired = try linkedWhileLifted()
+
+        let followed = paired.after(
+            .mixPushed(linkReport([40, 30, 30, 35, 45]).with(EngineerControls(following: "Ana"))))
+
+        #expect(followed.mix.levels == [40, 30, 30, 35, 45])
+        #expect(followed.ownLevelsToRestore == nil)
+        #expect(followed.sync == paired.sync)
+    }
+
+    @Test("leaves the desk's level on a locked channel, a pair whole, when the own levels go back")
+    func lockedChannelsKeepTheDesksLevel() throws {
+        let locked = try linkedWhileLifted().after(
+            .mixPushed(linkReport([40, 30, 30, 35, 45]).with(EngineerControls(lockedChannels: [2, 4]))))
+
+        #expect(locked.mix.levels == [80, 30, 30, 70, 45])
+        #expect(locked.ownLevelsToRestore == nil)
+    }
+
+    @Test("numbers no change when the own levels put back are what the desk already plays")
+    func restoreMatchingTheDeskIsNotNumbered() throws {
+        let paired = try linkedWhileLifted()
+
+        let restored = paired.after(.mixPushed(linkReport([80, 60, 60, 70, 90])))
+
+        #expect(restored.mix.levels == [80, 60, 60, 70, 90])
+        #expect(restored.sync == paired.sync)
+        #expect(restored.ownLevelsToRestore == nil)
+    }
+
+    @Test("keeps the levels to restore through a change that is not sent")
+    func unsentChangeKeepsOwnLevels() throws {
+        let paired = try linkedWhileLifted()
+
+        let unsent = paired.reducedSending(.masterVolumeChanged(level: 70)) { _, _ in false }
+
+        #expect(unsent.ownLevelsToRestore == paired.ownLevelsToRestore)
+        #expect(paired.sent(.masterVolumeChanged(level: 70)).ownLevelsToRestore == nil)
+    }
+}
+
+/// A running five-channel session whose musician set their own levels and lifted channel 2 with
+/// More of me, before the engineer linked channels 1 and 2 into the band's keys pair. Required to
+/// hold the levels to put back, so a test built on it cannot pass for want of any.
+private func linkedWhileLifted() throws -> MixSession {
+    let paired = running().after(
+        .configReceived(config(5)),
+        .channelLevelChanged(channel: 0, level: 80), .channelLevelChanged(channel: 1, level: 60),
+        .channelLevelChanged(channel: 2, level: 40), .channelLevelChanged(channel: 3, level: 70),
+        .channelLevelChanged(channel: 4, level: 90),
+        .musicianChannelChosen(2), .moreOfMeToggled(on: true),
+        .configReceived(config(5, [], band)))
+    try #require(paired.ownLevelsToRestore == [80, 60, 40, 70, 90])
+    return paired
+}
+
+/// The `mix_state` the link sends: the pair's pans moved apart, the levels `gains`.
+private func linkReport(_ gains: [Int]) -> MixReport {
+    report(
+        gains: gains, pans: [0, 0, 100, 100, 0], mutes: Array(repeating: false, count: 5),
+        solos: Array(repeating: false, count: 5))
 }

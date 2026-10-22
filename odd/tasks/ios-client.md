@@ -92,7 +92,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - [x] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
   `sr` (`apps/server/src/mdns.rs:63-66`), and the manual host/port fallback. Staleness is the
   browser's, not a timer of ours: see the design decision below.
-- [ ] T5 — Mix domain and reducer, in a `BandEarMix` module (route: inline per unit). 32 channels,
+- [x] T5 — Mix domain and reducer, in a `BandEarMix` module (route: inline per unit). 32 channels,
   16 groups, gains, pans, mutes, solos, group levels, engineer limit, locked channels, following.
   Mapped by one read-only explorer first (the Android reducer holds the whole app's state, about
   2 500 lines with its tests, beyond an inline read); its reconciliation claim spot-checked against
@@ -107,7 +107,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     rules, the engineer's controls, the echo check, session start.
   - [x] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
     the musician's own levels put back after a link.
-  - [ ] T5e — The outgoing mix and when one is sent.
+  - [x] T5e — The outgoing mix and when one is sent.
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
   (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
   storage, which the pure mix module does not have.
@@ -118,19 +118,6 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 
 ## Follow-ups
 
-- **A comment of T2a overstates.** `MixCommand`'s doc says sending a whole mix to move one fader
-  "would fight every other socket of the same musician". That was never checked, and the Android
-  client sends all five lists on every `mix` (`ControlChannel.kt:470-504`). The wire rule it rests
-  on is right (an absent list is unchanged); the rationale is not. Correct it in T5e, which builds
-  the outgoing mix.
-- **A crashed desk lingers in the list.** The desk announces with mdns-sd's defaults:
-  `DNS_OTHER_TTL` 4500 s for PTR and TXT, `DNS_HOST_TTL` 120 s for SRV and addresses
-  (`mdns-sd` 0.21.5, `src/service_info.rs`). A desk that stops cleanly sends a goodbye and leaves
-  the list at once (proved by the round-trip test). One that crashes sends none: the phone can keep
-  listing it for up to 75 minutes, while connecting to it fails after about 2 minutes, once its
-  SRV and address records expire. Android drops it in 5 s. Two ways out, neither in this feature's
-  scope: the desk could announce PTR and TXT with a short TTL (`ServiceInfo::set_other_ttl`, a
-  server change), and T6 must make a failed connect to a listed desk say so plainly.
 - **T6 inputs from T5c.** `MixEvent(reportedBy:)` maps `config` to nil, so the session layer
   sends `.configReceived` to the reducer itself. Two decoding divergences left on purpose, both
   about what T6 shows: a `mix_ack` with no number whose mix cannot be read still throws, where
@@ -145,6 +132,17 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   while More of me lifts it is T8's (`MixScreenTextTest.theMusiciansOwnStripIsAmberOnlyWhileMoreOfMeLiftsIt`);
   so are the seven notices' words. The musician's channel surviving a recall is T9's (the More of me
   assertion of `recallingAMixAppliesItsValuesAndKeepsWhatTheServerAnnounced`).
+- **T6 inputs from T5e.** The session layer routes every event through
+  `MixSession.reducedNumberingSends(by:)` and sends `outgoingMix()` whenever `sync.latest` grew,
+  which also covers the restore after a link, numbering itself. Every mix is numbered, the opening
+  one too (seq 0, all five lists as empty arrays before the first `config`, which the desk's
+  `merge_levels` reads as changing nothing, `mix.rs:1003-1027`). Left for T6 by T5e, needing a
+  socket, a queue or storage: Android's `aConfigArrivingBeforeTheOpeningMixIsSent…`,
+  `anAnswerArrivingBeforeAQueuedChangeIsSentNeitherUndoesNorLosesIt`,
+  `aReconnectStillSendsThePhonesOwnMix`,
+  `aReconnectSendsTheMixAgainUnderItsNewestNumberAndItsAnswerSettlesIt`,
+  `ControlChannelReconnectTest.everyOpenRegistersFirstAndThenSendsTheMix`,
+  `anAckWithoutANumberOnlySaysTheServerHoldsTheMix`, and the storage tests listed under T5d.
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -254,8 +252,9 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     the desk stores: the name trimmed and capped, a client id the desk would discard dropped here
     rather than sent, capabilities deduplicated in order, and a zero UDP port refused outright.
     `MixCommand` leaves an unset list out of the JSON instead of sending null, because the desk
-    reads an absent list as unchanged and sending a whole mix to move one fader would fight every
-    other socket of the same musician. `LinkStats` validates the interval and sanitises the
+    reads an absent list as unchanged (Corrected in T5e: this note first claimed that sending a whole mix to move one fader "would
+    fight every other socket of the same musician"; that was never checked, and the Android client
+    sends all five lists on every `mix`, as this client now does.) `LinkStats` validates the interval and sanitises the
     optional measurements on the way in.
   - T2b `Sources/BandEarProtocol/ServerMessage.swift` (+ tests): `ServerMessage` decoding
     `config`, `mix_ack`, `mix_state`, `playback`, `redundancy` and `error`. An unknown `type`
@@ -533,4 +532,51 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - Work-unit commit: `28d2b3f feat(ios): lift the musician's own channel with More of me`.
 - Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
   (40 paths, 7 601 lines).
-- Pending: T5e. The `.xcodeproj` decision is still open and belongs to T6.
+- T5e done (route: delegated writer; trigger: the long-session backstop), closing T5. Within
+  seven named surfaces, `ClientMessage.swift` limited to `MixCommand`'s doc comment.
+  - `OutgoingMix.swift`: `outgoingMix()` numbers the mix `sync.latest` (never nil, the opening
+    mix too), takes the master volume, the phone's own `levelCap` (not `effectiveCap`) and the mute,
+    and the five lists from the mix as played, so More of me is lifted here and only here with the
+    locked sides as stored. Every list goes out on every mix, as empty arrays before the first
+    `config`. `sends(_:before:after:)` ports Android's four rules: an edit sends when the mix
+    changed; a `config` when More of me went off for any reason but a link; a toggle when it
+    changed; a channel choice when More of me was on and the choice was taken. Desk reports and
+    session events never send through it. `reducedNumberingSends(by:)` is `reducedSending` with
+    that rule.
+  - `MixCommand`'s doc comment now keeps only the true part (an absent list leaves the desk's list
+    unchanged) and says this client sends every list, as Android does; the matching claim in this
+    document's T2 note is corrected in place, marked as corrected. The follow-up that tracked it is
+    closed.
+  - Ports: `aMixNeverCarriesTheEngineersControls` and `aMixCarriesTheNumberOfTheNewestChange…` from
+    `ControlChannelTest.kt`; 23 send-rule tests from `MonitorViewModelTest.kt`, run through a
+    socket-less harness (`Phone` in `Fixtures.swift`) that routes every event through
+    `reducedNumberingSends` and records `outgoingMix()` whenever the number grew;
+    `theMixBecomesTheSnapshotTheControlChannelSends` (649), never ported before; 914's snapshot
+    check completed in place. 8 Swift-only tests. Skipped: the recall and saved-mix tests (T9), and
+    those needing a socket, a queue, a reconnect, storage or the pill (T6, listed in Follow-ups).
+  - Divergences: the session's number is never nil, so the "none without one" half of
+    `aMixCarriesTheNumber…` is checked on a `MixCommand` built with no sequence;
+    `aLimitOnlyReport…` checks `effectiveCap` where Android checks the receive thread's ceiling,
+    which is copied from it.
+  - RED: a first stub with no lists and no number made 13 tests fail by a thrown decode error
+    rather than an expectation, so the stub became a constant mix with empty lists and seq 0; then
+    164 mix tests, 31 failed with 64 expectations, no crash. Five passed on the stub because a stub
+    that never sends satisfies them; `#require` checks were added to the ones that could pass
+    vacuously, and one test's extra checks were added after RED without RED being rerun. GREEN: 164.
+    Eleven mutations in a scratch copy, all caught. One of them ("a `config` never sends") was
+    caught only by a Swift-only test: Android's suite never reaches a `config` that turns More of
+    me off for a reason other than a link, which is the case for writing tests beyond the port.
+  - About 100 source and 830 test lines, over the ~400 heuristic because of the 25 parity ports.
+- Parent checks of the delegated unit: all seven changed files inside the surfaces, and only
+  doc-comment lines changed in `ClientMessage.swift`; `swift test` rerun by the parent: 148, 164
+  and 29 passed; the writer's clean-copy build reported 0 warnings; its scratch inspected (the
+  mutation copy's sources matched the repository's) and removed.
+- Risk: none. Public functions added to a module only this package uses, one property made
+  internal, one doc comment edited.
+- Work-unit commit: `b80bc49 feat(ios): build the outgoing mix and decide when the musician's
+  action sends one`.
+- Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
+  (43 paths, 8 550 lines).
+- T5 complete: the mix module holds the channel layout, edits and `config`, reconciliation with
+  the desk, More of me, and the outgoing mix. 341 tests: 148 protocol, 164 mix, 29 discovery.
+- Pending: T6 (app shell and project file, with the `.xcodeproj` decision still open), T7, T8, T9.

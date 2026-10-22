@@ -144,7 +144,8 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     so a dead link is noticed (Android pings every 5 s, `ControlTransport.kt:19,77`); `connection`
     set before `.sessionStarted` and `.sessionEnded` are reduced; tests for the transport's failure
     paths and for its release. See Follow-ups, "T6c inputs from T6b".
-  - [ ] T6d — Identity, persistence and the app (route: to be decided). A stable client id
+  - [ ] T6d — Identity, persistence and the app (route: delegated writer; trigger: the long-session
+    backstop). A stable client id
     (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
     T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
     observe. Ends with the end-to-end check against the user's own desk machine.
@@ -220,6 +221,18 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     10 rounds. Harmless; noted.
 - **T8 input from T6b's verifier.** A typed `[::1]` becomes `[[::1]]` and fails; Android accepts the
   brackets. Strip them in the connection form.
+- **From T6c's verifier and review** (lineage `review-4e409e696a4429d2`, approved, both findings
+  non-blocking):
+  - `R3-001`: the transport's connect deadline and ping clock (`WebSocketTransport.swift:197-256`)
+    are exercised only by the opt-in round trip, so a default `swift test` would pass a regression
+    in cancelling the deadline on ready or in the pong bookkeeping. Three independent looks (writer,
+    verifier, review) named it. The fix is an injected clock on the transport, so the clocks run
+    under a manual clock in the default suite; worth a small unit of its own after T6d.
+  - `R3-002` (`ControlSession.swift:211-219`): a session that ends on its own through
+    `.sessionEnded` (the path T7's audio receiver will take) goes idle but keeps the outage's
+    `connectionError`. Clear it when the session ends. Done in T6d.
+  - For T8: `connectionError` stays set while `connected` until the desk's first message (the "one
+    outage" rule); do not show it as a current error.
 - **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
   decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
   delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
@@ -810,4 +823,19 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     transport's queue clocks; the clocks covered only by the opt-in round trip). PENDING: the
     independent verifier and the native review (assess with `--escalate-item 4` against `a0b94d8`)
     were not run, because the session hit its usage limit.
-- Pending: T6c's verifier and review, then T6d, T7, T8, T9.
+- T6c checks, completed in a later session after the usage limit:
+  - Independent verifier: all nine claims held, no blocker. A real in-process desk restarted on the
+    same port (`allowLocalEndpointReuse`) was noticed in 0.006 s and the phone was back 0.30 s after
+    the restart, re-registered with the newest mix number; the backoff timeline matched Android's
+    across failures, an open with no message and a first message; a fuzz of 40 seeds by 400 steps
+    found no ordering violation; nine mutants caught. It confirmed the writer's claim from the code:
+    the mix number only grows on a sent change (`MixSession.swift:76`) and on restoring the
+    musician's own levels (`:229`, reached only from a desk report), so `.sessionStarted` and
+    `.sessionEnded` can never send, and the decision-4 reordering is defence in depth no test can
+    observe today.
+  - Native review: `--escalate-item 4` against `a0b94d8`, `high`, due (12 paths, 1 595 lines);
+    START checked (base `8418926` = `a0b94d8`, candidate `b10869b` = `HEAD`); the user chose
+    "Revisar este cambio" (`granted`); approved in 49 s with two non-blocking findings (above);
+    acknowledged, `authority: burned`, lineage `review-4e409e696a4429d2`. The reviewed boundary is
+    now `3540b25`.
+- Pending: T6d (delegated), T7, T8, T9.

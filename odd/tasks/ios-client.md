@@ -74,7 +74,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `config`, `mix_ack`, `mix_state`, `playback`, `redundancy`, `error` in. Field-for-field against
   `apps/server/src/protocol.rs`, with the `register` name truncation at 64 characters and the
   `client_id` character rule.
-- [ ] T3 — Reorder hold and cushion policy (route: inline). Ported from `ReorderHold.kt` and
+- [x] T3 — Reorder hold and cushion policy (route: inline). Ported from `ReorderHold.kt` and
   `CushionController.kt`, including server-restart detection.
 - [ ] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
   `sr` (`apps/server/src/mdns.rs:63-66`), staleness handling, and the manual host/port fallback.
@@ -99,7 +99,8 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 ## Checks
 
 - `swift test --package-path apps/ios/BandEarKit`.
-- `swift build --package-path apps/ios/BandEarKit` with no warnings.
+- `swift build --build-tests --package-path apps/ios/BandEarKit` with no warnings. A plain
+  `swift build` does not compile the test targets, so it reports their warnings as clean.
 - `grep -rE 'import (SwiftUI|UIKit|AVFoundation)' apps/ios/BandEarKit/Sources` returns nothing.
 - Manual, later: `dns-sd -B _bandear._tcp` lists the desk, then the app connects and audio plays.
 
@@ -212,4 +213,58 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   (T2b).
 - Native review assessment of the T2 slice against base 9b0fd19: `medium`, `review_due: false`,
   reason `under_budget` (4 paths, 1282 lines). No review for this slice yet; it stays open.
-- Pending: T3 onward. The `.xcodeproj` decision is still open and belongs to T6.
+- T3 done in two work units plus a parity suite (route: inline).
+  - T3a `Sources/BandEarProtocol/ReorderHold.swift`: a line-for-line port of `ReorderHold.kt`.
+    A `final class` rather than a struct, so an accidental copy can never duplicate its arrays on
+    the receive path. One deliberate difference: Android reads the u64 sequence as a signed `Long`
+    and Kotlin's arithmetic wraps, while Swift's traps, so a corrupt packet with the top bit set
+    would crash the receive loop. `offer` refuses a sequence above `Int64.max` before it reaches
+    any arithmetic; no stream reaches 2^63 blocks, so every real sequence behaves as on Android.
+    Commit `89d7fd4`.
+  - The suite first written for T3a was traced by hand through the Kotlin, case by case. Then
+    `ReorderHoldTest.kt` turned up: 19 tests, including scenarios the hand-traced suite did not
+    cover (the full redundancy stream with `dropped == 8`, the hold-4 burst that loses originals 6
+    and 7, a hold shortened mid-stream). They are ported verbatim as
+    `ReorderHoldParityTests.swift` and all 19 passed on the first run. Separate commit `dead274`,
+    so the history shows parity arrived after the port. Lesson applied to T3b: look for the
+    reference implementation's tests before writing any.
+  - T3b `Sources/BandEarProtocol/CushionController.swift`: `CushionPolicy` (`next`,
+    `fixedCushionPackets`, `adjustIntervalFrames`, `capacityFrames`) and `CushionController`,
+    ported from `PlaybackLatency.kt` and `CushionController.kt`, with `CushionParityTests.swift`
+    porting all 11 tests of `CushionControllerTest.kt` and the 5 `nextCushion` tests of
+    `PlaybackLatencyTest.kt` from the start. Two translations, both documented in the suite:
+    Android's `fixedMs` (an `Int`, 0 for Auto) becomes the `PlaybackBufferSetting` the
+    `playback` message already decodes to; and `onPacket` takes frames only, where Android takes
+    frames and samples and divides samples by a fixed `CHANNELS = 2`. The header's `frameCount`
+    already carries the real channel count, so counting samples as frames cannot be written, and
+    the two Android tests that exist to catch that mistake are ported by what they assert about
+    time. `capacityFrames` is ported now because the iOS player must be sized by it too.
+    Commit `2e52cf5`.
+  - Deferred to T7: what Android measures off `AudioTrack` (`pendingFrames`, `backlogMs`,
+    `targetBufferFrames`, `cushionMs`, `reportExtras`, `keepsLowLatency`). Its output path
+    measures differently from AVAudioEngine's, so porting it now would be guessing.
+- The property test, and what it took to give it teeth. `ReorderHoldTests` adds a seeded
+  SplitMix64 run over 50 seeds of 500 operations each (reordering, duplicates, loss, far jumps,
+  hold changes, releases). Order and uniqueness are largely structural, since `head` never moves
+  back, so its real job is catching a hang on the receive thread. Verified by mutation in a
+  `mktemp -d` copy outside the worktree, changing `newest - holdPackets` to
+  `newest - holdPackets - 1` so `head` can stop advancing:
+  - With Swift Testing's `.timeLimit(.minutes(1))`: the run never ended and had to be killed by
+    an outer alarm at 201 s (exit 142), leaving an orphaned `swiftpm-testing-helper` spinning.
+    Swift Testing cancels cooperatively, and a synchronous loop never yields. The comment that
+    said the time limit would catch this was wrong, and was removed.
+  - With a watchdog (the run on its own `Thread`, waited on with a `DispatchSemaphore` timeout):
+    exit 1 after 23 s, `next() never returned, first in the run for seed 0`, no orphans.
+  - The mutation was confirmed absent from the real source and the scratch copy removed.
+- The mutation run also surfaced an `unused result` warning in `ReorderHoldTests.swift` that the
+  documented check had missed, because a plain `swift build` does not compile test targets. The
+  check now uses `--build-tests`; it reports no other warning in any test file from T1 onward.
+- Test-first: RED before each implementation. T3a: 87 tests, 45 failed expectations. T3b: 127
+  tests, 57 failed expectations. GREEN after each.
+- Checks: `swift test --package-path apps/ios/BandEarKit`: 127 passed, 0 failed, across 7
+  suites. `swift build --build-tests`: no warnings. No SwiftUI, UIKit or AVFoundation import in
+  `Sources`. No file from an earlier task touched.
+- Risk: none. Additive files in a package nothing depends on yet.
+- Native review assessment of the T3 slice against base f09c8bc: `medium`, `review_due: false`,
+  reason `under_budget` (6 paths, 1446 lines). The slice stays open.
+- Pending: T4 onward. The `.xcodeproj` decision is still open and belongs to T6.

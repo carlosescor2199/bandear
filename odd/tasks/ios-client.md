@@ -170,18 +170,20 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     client's stand-in for Android's `AudioTrack`. Two delegated writers are launched together,
     each in its own worktree; each unit is over 100 lines with disjoint surfaces. Both touch
     concurrency (high-risk item 4), so each gets an independent verifier and a native review.
-    - [ ] T7e1 — Output: a single-producer, single-consumer ring of PCM16 frames in a small C
+    - [x] T7e1 — Output: a single-producer, single-consumer ring of PCM16 frames in a small C
       target with C11 atomics, and a `RingPlaybackSink` conforming to `PlaybackSink`.
       - Its render side is a pure function: it fills two `Float` channels, needs no lock and
         allocates nothing.
       - It plays silence until the target is queued, and starts over after it runs dry, counting
         an underrun.
       - The app's `AVAudioSourceNode` will call it in T7f.
-    - [ ] T7e2 — Receive: a UDP socket with `SO_RCVTIMEO` 250 ms on its own thread, and the
+      - Commit `67d35df`.
+    - [x] T7e2 — Receive: a UDP socket with `SO_RCVTIMEO` 250 ms on its own thread, and the
       receive loop ported from `PmonPlayer.kt:113-357`.
       - It is written against the protocol, with a fake sink, a fake datagram source and an
         injected clock.
       - It also ports `ReceiverLaunches`.
+      - Commit `88408f6`.
   - [ ] T7f — Wiring:
     - announce the four capabilities;
     - hand `playback` and `redundancy` to the player;
@@ -1010,4 +1012,61 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - The slice was assessed against `2e151e7` with `.atl/` excluded: `medium`, `under_budget` (33
     paths). The boundary stays `2e151e7`.
 - The desk always sends stereo: `OUTPUT_CHANNELS = 2` (`apps/server/src/mix.rs:11`).
+- T7e: two delegated writers launched together, each in its own worktree, against the seam
+  `9c208e9`. Both checked their base first (`git merge --ff-only feat/ios-client`, then
+  `9c208e9`).
+- T7e2 (receive), writer:
+  - RED: 55 of 57 tests failed against stubs.
+  - GREEN: 61 tests after the correction below.
+  - Thread Sanitizer clean; 0 warnings; 17 of 17 mutants caught.
+  - Finding: on Darwin, `shutdown(SHUT_RDWR)` on an unconnected UDP socket fails with `ENOTCONN`
+    and does not wake a blocked `recv`. Closing the socket from another thread does not wake it
+    reliably either. So a stop took up to one 250 ms timeout.
+  - Parent's correction: T7f restarts the receiver on the same port when it reconnects, and a
+    socket still bound would make the new `bind` fail with `EADDRINUSE`. Now:
+    - `stop` lowers `running`, then `wake()` sends one empty datagram to `127.0.0.1` on the bound
+      port. It holds the source's lock and does nothing once the source is closed, so a late
+      wake-up cannot reach a newer socket bound to the same port.
+    - The loop leaves before parsing once `running` is down.
+    - The descriptor is still closed on the loop thread.
+    - Tests: a stop takes under 100 ms; `onStopped` is reported once, with no error; a restart on
+      the same port within 100 ms binds and plays.
+  - Divergences from Android:
+    - The controls are one locked snapshot read per wake-up. Android reads each value as it uses
+      it.
+    - `serverOwnsMix` is one of the controls.
+    - The sink opens at the packet's rate, with no 48 kHz fallback.
+    - A stat not yet measured is `nil`. The backlog is seeded once.
+    - `onError` takes `any Error`.
+    - `EINTR` is retried.
+    - The loop closes the sink, then the socket, then reports.
+    - A change of sample rate errors for every later packet and never reopens the sink, as on
+      Android.
+  - `AudioDatagram` allocates its samples per packet. That is acceptable on the receive thread,
+    which is not real time.
+- T7e1 (output), writer:
+  - RED: 20 of 20 tests failed against stubs. GREEN: 20.
+  - 13 of 13 mutants caught, the three memory-ordering mutants by Thread Sanitizer.
+  - Finding: in a debug build, `memcpy` becomes the fortified `__memcpy_chk`, which Thread
+    Sanitizer does not see. A relaxed publish would pass unnoticed, so the ring copies sample by
+    sample. `Thread.sleep` creates a happens-before edge under TSan, so race probes must spin.
+  - Design: C provides only write, queued, peek and consume; the state machine and the Float
+    conversion are in Swift. The render reads straight from the ring.
+    - Frames consumed is the read position.
+    - `outputLatencyFrames` is atomic.
+    - `close()` keeps the storage until `deinit`.
+    - The first callback that finds the target queued plays it at once.
+    - A capacity of 0 or less becomes 1.
+- Inputs for T7f:
+  - `AudioDatagram.sampleRate` is a `UInt32` with no upper bound, and the ring's capacity grows
+    with it. The factory must check the rate before sizing the ring.
+  - A target smaller than the render callback counts an underrun on each start from priming, and
+    the cushion controller then grows the target.
+  - `HoldPlayoutTest.kt:113-114`: a report's JSON, once the conversion to `LinkStats` exists.
+- Parent's integration:
+  - Every path was inside its writer's surfaces, and the copies were byte-identical.
+  - `Package.swift` had not changed on the branch since the base.
+  - Combined suite: 608 tests (playback 211), 0 known issues, 0 warnings on a clean copy.
+  - `--sanitize=thread` over all 211 playback tests: exit 0, no reports.
+  - The worktrees, their branches and the scratch folders were removed.
 

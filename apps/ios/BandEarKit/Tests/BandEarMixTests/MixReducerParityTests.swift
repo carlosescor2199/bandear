@@ -235,4 +235,345 @@ struct MixReducerParityTests {
         #expect(state.mix.masterMuted)
         #expect(state.mix.levelCap == 90)
     }
+
+    // MARK: T5c, reconciliation with the desk
+
+    // Server reports.
+
+    @Test func aPushedMixTakesTheServersValuesForTheAnnouncedChannelsAndGroups() {
+        let groups = [group("Band", [0, 1])]
+        let state = connectedWith(2, groups)
+
+        let pushed = state.after(.mixPushed(serverMix))
+
+        #expect(pushed.mix.sourceChannels == 2)
+        #expect(pushed.mix.levels == [80, 70])
+        #expect(pushed.mix.pans == [25, 100])
+        #expect(pushed.mix.mutes == [true, false])
+        #expect(pushed.mix.solos == [false, true])
+        #expect(pushed.mix.groups == groups)
+        #expect(pushed.mix.groupLevels == [60])
+        #expect(pushed.mix.masterVolume == 50)
+        #expect(pushed.mix.levelCap == 90)
+        #expect(pushed.mix.masterMuted)
+    }
+
+    @Test func aPushedMixIsClampedAndKeepsWhatTheServerDidNotSend() {
+        let state = connectedWith(2, [group("Band", [0, 1])]).after(
+            .channelLevelChanged(channel: 1, level: 40))
+
+        let pushed = state.after(
+            .mixPushed(report(gains: [140], pans: [-5], volume: 120, maxLevel: -1)))
+
+        #expect(pushed.mix.levels == [100, 40])
+        #expect(pushed.mix.pans == [0, 100])
+        #expect(pushed.mix.groupLevels == [100])
+        #expect(pushed.mix.masterVolume == 100)
+        #expect(pushed.mix.levelCap == 0)
+    }
+
+    /// Android reaches the strips before the first `config` through a recalled mix (T9, mix banks);
+    /// the recalled levels are set directly here, which is the state that recall leaves.
+    @Test func aPushedMixBeforeTheFirstConfigKeepsTheStripsThePhoneShows() {
+        var recalled = running()
+        recalled.mix.levels = [30, 30, 30]
+        recalled.mix.groupLevels = [20]
+
+        let pushed = recalled.after(.mixPushed(serverMix))
+
+        #expect(pushed.mix.levels == [80, 70, 100])
+        #expect(pushed.mix.groupLevels == [60])
+    }
+
+    @Test func aPushedMixChangesNothingOutsideASession() {
+        let idleWithChannels = withChannels(2)
+        let ended = connectedWith(2).after(.sessionEnded)
+
+        #expect(idleWithChannels.after(.mixPushed(serverMix)) == idleWithChannels)
+        #expect(ended.after(.mixPushed(serverMix)) == ended)
+    }
+
+    /// Android turns More of me on first, then asserts it goes off with `MIX_CHANGED_ELSEWHERE` and
+    /// keeps the musician's channel; that half is More of me, ported with it in T5d.
+    @Test func aPushedMixTurnsMoreOfMeOffAndKeepsTheMixAsTheServerPlaysIt() {
+        let pushed = connectedWith(2).after(.mixPushed(serverMix))
+
+        #expect(pushed.mix.levels == [80, 70])
+    }
+
+    /// Android goes on to push the lifted mix back with More of me on and asserts it stays on; that
+    /// half is More of me, ported with it in T5d.
+    @Test func aPushOfTheMixThePhoneAlreadyPlaysChangesNothing() {
+        let plain = connectedWith(2).after(.channelLevelChanged(channel: 0, level: 80))
+
+        #expect(plain.after(.mixPushed(report(of: plain.mix))) == plain)
+    }
+
+    // Seq: the phone's mixes, numbered, and the desk's answers to them.
+
+    @Test func aChangeThatIsSentIsNumberedAsTheNewestMixAndOneThatIsNotKeepsTheNumber() {
+        let state = connectedWith(2)
+
+        let sent = state.sent(.channelLevelChanged(channel: 0, level: 40))
+        let kept = sent.reducedSending(.channelLevelChanged(channel: 0, level: 40)) { before, after in
+            before.mix != after.mix
+        }
+
+        #expect(sent.sync == MixSync(latest: 1, answered: 0))
+        #expect(sent.mix.levels == [40, 100])
+        #expect(kept == sent)
+        #expect(!sent.sync.isSettled)
+    }
+
+    @Test func aPushWhileAMixOfThePhoneIsUnansweredIsDropped() {
+        let outstanding = connectedWith(2).sent(.channelLevelChanged(channel: 0, level: 40))
+
+        #expect(outstanding.after(.mixPushed(serverMix)) == outstanding)
+    }
+
+    @Test func onlyTheAnswerToTheNewestMixIsShown() {
+        let twoInFlight = connectedWith(2).sent(.channelLevelChanged(channel: 0, level: 40))
+            .sent(.channelLevelChanged(channel: 0, level: 50))
+
+        let olderAnswered = twoInFlight.after(.mixAnswered(sequence: 1, report: serverMix))
+
+        #expect(olderAnswered.mix.levels == [50, 100])
+        #expect(olderAnswered.sync == MixSync(latest: 2, answered: 1))
+        #expect(olderAnswered.after(.mixPushed(serverMix)) == olderAnswered)
+
+        let newestAnswered = olderAnswered.after(.mixAnswered(sequence: 2, report: serverMix))
+
+        #expect(newestAnswered.mix.levels == [80, 70])
+        #expect(newestAnswered.sync.isSettled)
+    }
+
+    @Test func aRefusedNewestMixSettlesItSoTheNextPushIsShown() {
+        let refused = connectedWith(2).sent(.channelLevelChanged(channel: 0, level: 40))
+            .after(.mixAnswered(sequence: 1, report: nil))
+
+        #expect(refused.mix.levels == [40, 100])
+        #expect(refused.sync.isSettled)
+        #expect(refused.after(.mixPushed(serverMix)).mix.levels == [80, 70])
+    }
+
+    // Engineer: the engineer's limit and locks.
+
+    @Test func theReportedLimitAndLocksAreKeptAndShowOnTheStrips() {
+        let state = lockedBy(engineer(limit: 60, locked: [1]))
+
+        #expect(state.mix.engineer == engineer(limit: 60, locked: [1]))
+        #expect(state.mix.strips.map(\.isLocked) == [false, true, false])
+        #expect(state.mix.isStripLocked(1))
+        #expect(!state.mix.isStripLocked(0))
+    }
+
+    @Test func anOlderServerLeavesEverythingOpenAndUnlimited() {
+        let state = connectedWith(3).after(.mixPushed(serverMix))
+
+        #expect(state.mix.engineer == EngineerControls())
+        #expect(state.mix.strips.map(\.isLocked) == [false, false, false])
+        #expect(state.mix.effectiveCap == state.mix.levelCap)
+    }
+
+    /// Android also reads the phone's cap back off the mix it sends (`toSnapshot().maxLevelPercent`);
+    /// the outgoing mix is T5e, which ports that assertion.
+    @Test func theMusicianHearsTheLowerOfTheirCapAndTheEngineersLimit() {
+        let limited = lockedBy(engineer(limit: 60))
+
+        #expect(limited.mix.levelCap == 100)
+        #expect(limited.mix.effectiveCap == 60)
+        // The phone's own cap still moves, and wins when it is lower.
+        let lowerCap = limited.after(.levelCapChanged(level: 50))
+        #expect(lowerCap.mix.levelCap == 50)
+        #expect(lowerCap.mix.effectiveCap == 50)
+    }
+
+    @Test func aLockedChannelCannotBeChangedFromThePhone() {
+        let state = lockedBy(engineer(locked: [1]))
+
+        let tried = state.after(
+            .channelLevelChanged(channel: 1, level: 40), .channelPanChanged(channel: 1, pan: 50),
+            .channelMuteChanged(channel: 1, muted: true), .channelSoloChanged(channel: 1, soloed: true))
+
+        #expect(tried == state)
+        // The other channels still move.
+        #expect(tried.after(.channelLevelChanged(channel: 0, level: 30)).mix.levels == [30, 100, 100])
+    }
+
+    @Test func aPairIsLockedAsOneStripWhenEitherSideIs() {
+        let pair = [info("Keys", .keys, link: true), info(), info("Vox")]
+        let state = lockedBy(engineer(locked: [1]), pair)
+
+        #expect(state.mix.strips.map(\.isLocked) == [true, false])
+        #expect(state.mix.isStripLocked(0))
+        #expect(
+            state.after(
+                .channelLevelChanged(channel: 0, level: 40), .channelPanChanged(channel: 0, pan: 25),
+                .channelMuteChanged(channel: 0, muted: true)) == state)
+    }
+
+    @Test func aLockArrivingWhileAMixIsOutstandingHoldsAtOnceAndSettlesWithTheAnswer() {
+        let outstanding = connectedWith(3).sent(.channelLevelChanged(channel: 0, level: 40))
+        let kept = neutralMix(gains: (0..<32).map { $0 == 0 ? 70 : 100 })
+
+        // The push is overtaken by the phone's mix still on its way, but the lock holds at once.
+        let pushed = outstanding.after(.mixPushed(kept.with(engineer(locked: [0]))))
+        #expect(pushed.mix.levels == [40, 100, 100])
+        #expect(pushed.mix.isStripLocked(0))
+        #expect(pushed.after(.channelLevelChanged(channel: 0, level: 20)) == pushed)
+
+        // The answer to that mix carries the value the desk kept, and settles it.
+        let answered = pushed.after(.mixAnswered(sequence: 1, report: kept.with(engineer(locked: [0]))))
+        #expect(answered.mix.levels == [70, 100, 100])
+        #expect(answered.sync.isSettled)
+        #expect(answered.mix.isStripLocked(0))
+    }
+
+    @Test func aRefusedMixLeavesTheEngineersControlsAsTheyWere() {
+        let state = lockedBy(engineer(limit: 60, locked: [1])).sent(
+            .channelLevelChanged(channel: 0, level: 40))
+
+        #expect(
+            state.after(.mixAnswered(sequence: 1, report: nil)).mix.engineer
+                == engineer(limit: 60, locked: [1]))
+    }
+
+    @Test func aNewSessionStartsUnlockedAndReportsOutsideOneChangeNothing() {
+        let ended = lockedBy(engineer(limit: 60, locked: [1])).after(.sessionEnded)
+
+        #expect(ended.after(.mixPushed(serverMix.with(engineer(limit: 40, locked: [0])))) == ended)
+        #expect(ended.after(.sessionStarted).mix.engineer == EngineerControls())
+    }
+
+    // Following another musician's mix (a mirror the engineer set).
+
+    @Test func aReportedFollowingHoldsAndAnOlderServerFollowsNobody() {
+        let state = lockedBy(following("Ana"))
+
+        #expect(state.mix.following == "Ana")
+        #expect(connectedWith(3).after(.mixPushed(serverMix)).mix.following == nil)
+        #expect(state.after(.mixPushed(neutralMix().with(following(nil)))).mix.following == nil)
+    }
+
+    @Test func followingThatStartsWhileAMixIsOutstandingHoldsAtOnceAndTheAnswerBringsTheLeadersMix() {
+        let outstanding = connectedWith(3).sent(.channelLevelChanged(channel: 0, level: 40))
+
+        let pushed = outstanding.after(.mixPushed(leadersMix(60).with(following("Ana"))))
+
+        // The push is overtaken by the phone's mix still on its way; whom it follows holds at once.
+        #expect(pushed.mix.following == "Ana")
+        #expect(pushed.mix.levels == [40, 100, 100])
+
+        let answered = pushed.after(
+            .mixAnswered(sequence: 1, report: leadersMix(60).with(following("Ana"))))
+
+        #expect(answered.mix.levels == [60, 60, 60])
+        #expect(answered.sync.isSettled)
+    }
+
+    @Test func whileFollowingChannelAndGroupEditsChangeNothing() {
+        let state = running().after(
+            .configReceived(config(3, [group("Band", [0, 1])])),
+            .mixPushed(neutralMix().with(following("Ana"))))
+
+        let tried = state.after(
+            .channelLevelChanged(channel: 0, level: 40), .channelPanChanged(channel: 1, pan: 20),
+            .channelMuteChanged(channel: 2, muted: true), .channelSoloChanged(channel: 0, soloed: true),
+            .groupLevelChanged(group: 0, level: 50))
+
+        #expect(tried == state)
+        #expect(state.mix.strips.map(\.following) == ["Ana", "Ana", "Ana"])
+        #expect(state.mix.groupFaders.map(\.following) == ["Ana"])
+    }
+
+    @Test func whileFollowingTheMasterTheCapAndTheMuteAreStillTheMusicians() {
+        let state = lockedBy(following("Ana")).after(
+            .masterVolumeChanged(level: 70), .levelCapChanged(level: 80), .masterMuteChanged(muted: true))
+
+        #expect(state.mix.masterVolume == 70)
+        #expect(state.mix.levelCap == 80)
+        #expect(state.mix.masterMuted)
+    }
+
+    @Test func anEditAfterFollowingStartsWithAMixOutstandingChangesNothing() {
+        let pushed = connectedWith(3).sent(.channelLevelChanged(channel: 0, level: 40))
+            .after(.mixPushed(leadersMix(60).with(following("Ana"))))
+
+        #expect(
+            pushed.after(
+                .channelLevelChanged(channel: 1, level: 20), .channelMuteChanged(channel: 0, muted: true))
+                == pushed)
+    }
+
+    /// Android also chooses channel 1 and turns More of me on before following starts, then asserts
+    /// that its notice goes when following stops, that it stays off, and that it can be turned on
+    /// again; that half is More of me, ported with it in T5d.
+    @Test func whenFollowingStopsTheControlsAreTheMusiciansAgainAndTheMixStaysAsItWas() {
+        let followed = connectedWith(3, [group("Band", [0])]).after(
+            .mixPushed(leadersMix(60).with(following("Ana"))))
+
+        let free = followed.after(.mixPushed(leadersMix(60).with(following(nil))))
+
+        #expect(free.mix.following == nil)
+        #expect(free.mix.levels == [60, 60, 60])
+        #expect(free.after(.channelLevelChanged(channel: 0, level: 30)).mix.levels == [30, 60, 60])
+        #expect(free.after(.groupLevelChanged(group: 0, level: 50)).mix.groupLevels == [50])
+        #expect(free.mix.strips.map(\.following) == [nil, nil, nil])
+    }
+
+    @Test func aLockedChannelOfAFollowerIsBothLockedAndFollowing() throws {
+        let strips = lockedBy(following("Ana", locked: [1])).mix.strips
+        try #require(strips.count == 3)
+
+        #expect(strips[1].isLocked)
+        #expect(strips[1].following == "Ana")
+    }
+
+    @Test func aNewSessionFollowsNobodyUntilItsServerSays() {
+        let ended = lockedBy(following("Ana")).after(.sessionEnded)
+
+        #expect(ended.mix.following == "Ana")
+        #expect(ended.after(.sessionStarted).mix.following == nil)
+    }
+}
+
+// MARK: - T5c fixtures, as `MonitorReducerTest.kt` names them
+
+/// The desk's whole mix, as `mix_state` carries it: full 32-channel and 16-group tables.
+private let serverMix = report(
+    gains: (0..<32).map { $0 < 2 ? 80 - 10 * $0 : 100 },
+    pans: (0..<32).map { $0 == 0 ? 25 : 100 },
+    mutes: (0..<32).map { $0 == 0 },
+    solos: (0..<32).map { $0 == 1 },
+    groupLevels: (0..<16).map { $0 == 0 ? 60 : 100 },
+    volume: 50, maxLevel: 90, muted: true)
+
+/// The desk's whole mix at the neutral values a fresh three-channel session already shows, with
+/// `gains` in place of the neutral levels.
+private func neutralMix(gains: [Int] = Array(repeating: 100, count: 32)) -> MixReport {
+    report(
+        gains: gains, pans: (0..<32).map { $0 % 2 == 0 ? 0 : 100 },
+        mutes: Array(repeating: false, count: 32), solos: Array(repeating: false, count: 32),
+        groupLevels: Array(repeating: 100, count: 16))
+}
+
+/// The leader's whole mix, every channel at `level`.
+private func leadersMix(_ level: Int) -> MixReport {
+    neutralMix(gains: Array(repeating: level, count: 32))
+}
+
+/// The engineer's controls: a limit of `limit` and `locked` channels.
+private func engineer(limit: Int = 100, locked: Set<Int> = []) -> EngineerControls {
+    EngineerControls(limitPercent: limit, lockedChannels: locked)
+}
+
+/// The engineer's controls with the musician following `name`'s mix, or nobody's.
+private func following(_ name: String?, locked: Set<Int> = []) -> EngineerControls {
+    EngineerControls(lockedChannels: locked, following: name)
+}
+
+/// A session of three channels whose desk reported the engineer's `controls` with its mix.
+private func lockedBy(_ controls: EngineerControls, _ details: [SourceChannel]? = nil) -> MixSession {
+    running().after(
+        .configReceived(config(3, [], details)), .mixPushed(neutralMix().with(controls)))
 }

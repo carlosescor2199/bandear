@@ -12,6 +12,16 @@ public enum MixEvent: Equatable, Sendable {
     case masterVolumeChanged(level: Int)
     case masterMuteChanged(muted: Bool)
     case levelCapChanged(level: Int)
+    /// A session with a desk started. What the engineer set belongs to the last one, so it goes;
+    /// the mix's numbers stay (see ``MixSync``).
+    case sessionStarted
+    /// The session ended: a report that arrives after it changes nothing.
+    case sessionEnded
+    /// The desk pushed the musician's whole mix (`mix_state`), because it changed elsewhere.
+    case mixPushed(MixReport)
+    /// The desk answered the phone's mix number `sequence`: with the whole mix it now plays, or with
+    /// nil when it refused that mix or its answer could not be read.
+    case mixAnswered(sequence: UInt64, report: MixReport?)
 }
 
 /// The phone's side of the mix for one session, and the pure reducer over it.
@@ -21,8 +31,31 @@ public enum MixEvent: Equatable, Sendable {
 /// so each rule is tested by the events that reach it, exactly as Android's suite does.
 public struct MixSession: Equatable, Sendable {
     public var mix = MixState()
+    /// How the desk's answers are matched to the mixes this phone sent.
+    public var sync = MixSync()
+    /// True from ``MixEvent/sessionStarted`` until ``MixEvent/sessionEnded``. A report belongs to
+    /// a session, so one that arrives outside a session changes neither the mix nor what the
+    /// engineer set.
+    public var isSessionRunning = false
 
     public init() {}
+
+    /// ``reduced(by:)`` for a change the musician made. When `sends` says the change goes to the
+    /// desk, the same step numbers it as the phone's newest mix (``MixSync/changed()``): the change
+    /// and its number land in one value, so a send still queued already counts, and no answer from
+    /// the desk can be matched to a mix older than the one on screen.
+    ///
+    /// Ported from Android's `reduceChange` (`MonitorReducer.kt:196-208`). Which changes are sent is
+    /// the outgoing mix's rule (T5e); until then the caller says.
+    public func reducedSending(
+        _ event: MixEvent, sends: (_ before: MixSession, _ after: MixSession) -> Bool
+    ) -> MixSession {
+        var next = reduced(by: event)
+        if sends(self, next) {
+            next.sync = next.sync.changed()
+        }
+        return next
+    }
 
     /// The session after `event`.
     public func reduced(by event: MixEvent) -> MixSession {
@@ -52,12 +85,75 @@ public struct MixSession: Equatable, Sendable {
             next.mix.masterMuted = muted
         case .levelCapChanged(let level):
             next.mix.levelCap = Self.percent(level)
+        case .sessionStarted:
+            // This desk reports its own controls (an older one never does, and leaves all open).
+            next.isSessionRunning = true
+            next.mix.engineer = EngineerControls()
+        case .sessionEnded:
+            next.isSessionRunning = false
+        case .mixPushed(let report):
+            // A push while a change of the phone's is on its way is overtaken by that change's
+            // answer; the engineer's controls it carries hold at once (`MonitorReducer.kt:123-125`).
+            next.takeEngineerControls(report.engineerControls)
+            if next.sync.isSettled {
+                next.applyDeskMix(report)
+            }
+        case .mixAnswered(let sequence, let report):
+            next.answer(sequence, with: report)
         }
         return next
     }
 
-    private static func percent(_ value: Int) -> Int {
+    fileprivate static func percent(_ value: Int) -> Int {
         min(max(value, 0), 100)
+    }
+
+    /// The desk answered the phone's change number `sequence`, with the whole mix it now plays or
+    /// with nothing (it refused the mix, or its answer could not be read). The desk answers in
+    /// order, so every older change is answered too, even outside a session: the numbers only grow.
+    ///
+    /// Only the answer to the newest change is shown: an older one's mix is overtaken by a change
+    /// still on its way, whose own answer follows. The engineer's controls of any readable answer
+    /// hold at once; a refusal carries none and leaves them as they were (`MonitorReducer.kt:428-437`).
+    private mutating func answer(_ sequence: UInt64, with report: MixReport?) {
+        let answersNewest = sequence == sync.latest
+        sync = sync.answeredUpTo(sequence)
+        guard let report else { return }
+        takeEngineerControls(report.engineerControls)
+        if answersNewest {
+            applyDeskMix(report)
+        }
+    }
+
+    /// The engineer's `controls` as the desk reported them with a mix. They hold at once, even when
+    /// the mix they came with is overtaken by a change of the phone's still on its way: the phone
+    /// never sends them, so nothing of its own can overtake them, and the desk reports them in
+    /// order. Outside a session they change nothing (`MonitorReducer.kt:283-288`; what they do to
+    /// More of me is T5d's).
+    private mutating func takeEngineerControls(_ controls: EngineerControls) {
+        guard isSessionRunning, mix.engineer != controls else { return }
+        mix.engineer = controls
+    }
+
+    /// The desk's whole mix, pushed because it changed elsewhere or answering the phone's newest
+    /// change: it becomes the phone's mix, exactly as the desk plays it (`MonitorReducer.kt:450-462`).
+    ///
+    /// Outside a session it changes nothing. A report of the mix the phone already plays (an answer
+    /// to its own mix, or the whole mix the desk re-sends after it missed events) changes nothing
+    /// either: that is the echo check, which More of me (T5d) needs, since it turns itself off on any
+    /// other report.
+    private mutating func applyDeskMix(_ report: MixReport) {
+        guard isSessionRunning else { return }
+        let reported = mix.takingDeskMix(report)
+        guard reported != mixAsPlayed else { return }
+        mix = reported
+    }
+
+    /// The mix as the phone plays it, which is what the desk reports back when nothing changed
+    /// elsewhere. For now that is the stored mix; More of me (T5d) lifts the musician's channel at
+    /// send time without storing it, and makes this the lifted mix (`MonitorReducer.kt:516-521`).
+    private var mixAsPlayed: MixState {
+        mix
     }
 
     /// A `config`: resizes the per-channel lists when the channel count changed, takes the announced
@@ -106,10 +202,47 @@ public struct MixSession: Equatable, Sendable {
     }
 }
 
+extension MixState {
+    /// This mix with the desk's `report` applied to the channels and groups the desk announced
+    /// (`MonitorReducer.kt:492-506`). The report holds the desk's full tables (32 channels, 16
+    /// groups) and the rest is not shown. Before the first `config` the strips the phone shows keep
+    /// their count. A value the report lacks keeps what the phone has, and levels and pans stay
+    /// between 0 and 100. What the engineer set is not taken here: it holds on its own, before the
+    /// mix is weighed at all.
+    fileprivate func takingDeskMix(_ report: MixReport) -> MixState {
+        let announced = sourceChannels > 0
+        let channelCount = announced ? sourceChannels : levels.count
+        let groupCount = announced ? groups.count : groupLevels.count
+        let percent = MixSession.percent
+
+        var next = self
+        next.levels = report.channelGains.map(percent).resized(to: channelCount) {
+            levels.element(at: $0) ?? Self.neutralLevel
+        }
+        next.pans = report.pans.map(percent).resized(to: channelCount) {
+            pans.element(at: $0) ?? ChannelLayout.defaultPan(channel: $0)
+        }
+        next.mutes = report.channelMutes.resized(to: channelCount) { mutes.element(at: $0) ?? false }
+        next.solos = report.channelSolos.resized(to: channelCount) { solos.element(at: $0) ?? false }
+        next.groupLevels = report.groupLevels.map(percent).resized(to: groupCount) {
+            groupLevels.element(at: $0) ?? Self.neutralLevel
+        }
+        next.masterVolume = percent(report.volumePercent)
+        next.levelCap = percent(report.maxLevelPercent)
+        next.masterMuted = report.muted
+        return next
+    }
+}
+
 extension Array {
     /// The first `count` elements, then `filling(index)` for each index past the end.
     fileprivate func resized(to count: Int, filling: (Int) -> Element) -> [Element] {
         (0..<count).map { indices.contains($0) ? self[$0] : filling($0) }
+    }
+
+    /// The element at `index`, or nil when the array has none there.
+    fileprivate func element(at index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 
     /// Writes `value` at each of `indices` this array has.

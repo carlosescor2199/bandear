@@ -82,4 +82,86 @@ struct MixSessionTests {
         #expect(edited.mix.mutes == [false])
         #expect(edited.mix.levels == state.mix.levels)
     }
+
+    // MARK: Reconciliation with the desk
+
+    @Test("numbers each change as the newest and is settled once the desk answered the newest")
+    func syncArithmetic() {
+        let fresh = MixSync()
+        #expect(fresh == MixSync(latest: 0, answered: 0))
+        #expect(fresh.isSettled)
+
+        let twoChanges = fresh.changed().changed()
+        #expect(twoChanges == MixSync(latest: 2, answered: 0))
+        #expect(!twoChanges.isSettled)
+        #expect(!twoChanges.answeredUpTo(1).isSettled)
+        #expect(twoChanges.answeredUpTo(2).isSettled)
+    }
+
+    @Test("never takes an answered number back: the desk answers in order")
+    func answeredOnlyGrows() {
+        #expect(MixSync(latest: 5, answered: 4).answeredUpTo(2) == MixSync(latest: 5, answered: 4))
+        #expect(MixSync(latest: 5, answered: 4).answeredUpTo(5) == MixSync(latest: 5, answered: 5))
+    }
+
+    @Test("keeps its numbers across a reconnect, and forgets only what the engineer set")
+    func reconnectKeepsNumbers() {
+        var state = connectedWith(2).sent(.channelLevelChanged(channel: 0, level: 40))
+        state = state.after(.mixPushed(report().with(EngineerControls(limitPercent: 50))))
+
+        let reconnected = state.after(.sessionEnded, .sessionStarted)
+
+        #expect(reconnected.sync == MixSync(latest: 1, answered: 0))
+        #expect(reconnected.mix.engineer == EngineerControls())
+        #expect(reconnected.mix.levels == [40, 100])
+        #expect(reconnected.isSessionRunning)
+    }
+
+    /// Android's `answerMix` moves the answered number before it asks whether a session is running
+    /// (`MonitorReducer.kt:428-437`): the numbers only grow, across reconnects too.
+    @Test("counts a late answer as answered and changes nothing else outside a session")
+    func lateAnswerOnlyCounts() {
+        let ended = connectedWith(2).sent(.channelLevelChanged(channel: 0, level: 40))
+            .after(.sessionEnded)
+        let answer = report(gains: [10, 10]).with(EngineerControls(limitPercent: 30))
+
+        let answered = ended.after(.mixAnswered(sequence: 1, report: answer))
+
+        #expect(answered.sync == MixSync(latest: 1, answered: 1))
+        #expect(answered.mix == ended.mix)
+        #expect(!answered.isSessionRunning)
+    }
+
+    @Test("hands the predicate the session before and after the change, and numbers nothing it refuses")
+    func reducedSendingSeesBothSides() {
+        let state = connectedWith(2)
+        var seen: [[Int]] = []
+
+        let next = state.reducedSending(.channelLevelChanged(channel: 1, level: 30)) { before, after in
+            seen += [before.mix.levels, after.mix.levels]
+            return false
+        }
+
+        #expect(seen == [[100, 100], [100, 30]])
+        #expect(next.sync == MixSync())
+        #expect(next.mix.levels == [100, 30])
+    }
+
+    @Test("starts a session running and ends it")
+    func sessionRunningFlag() {
+        #expect(!MixSession().isSessionRunning)
+        #expect(running().isSessionRunning)
+        #expect(!running().after(.sessionEnded).isSessionRunning)
+    }
+
+    @Test("shows the answer to the newest mix even when an older answer never came")
+    func newestAnswerAfterALostOne() {
+        let twoInFlight = connectedWith(2).sent(.channelLevelChanged(channel: 0, level: 40))
+            .sent(.channelLevelChanged(channel: 0, level: 50))
+
+        let answered = twoInFlight.after(.mixAnswered(sequence: 2, report: report(gains: [60, 70])))
+
+        #expect(answered.mix.levels == [60, 70])
+        #expect(answered.sync == MixSync(latest: 2, answered: 2))
+    }
 }

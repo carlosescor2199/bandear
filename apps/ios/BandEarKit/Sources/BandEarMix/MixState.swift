@@ -15,6 +15,9 @@ public struct EngineerControls: Equatable, Sendable {
         self.following = following
     }
 
+    /// True when the engineer set a limit below full scale.
+    public var isLimited: Bool { limitPercent < 100 }
+
     public func isLocked(_ channel: Int) -> Bool {
         lockedChannels.contains(channel)
     }

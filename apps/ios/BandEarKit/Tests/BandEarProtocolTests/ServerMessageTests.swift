@@ -26,6 +26,14 @@ private let mixAckJSON = """
      "group_levels":[30],"engineer_limit_percent":90,"locked":[false,true],"following":null}
     """
 
+/// A whole one-channel `mix_state`, every field present, written on one line so a test can replace
+/// one field's text.
+private let wholeMixState = """
+    {"type":"mix_state","volume_percent":50,"max_level_percent":100,"muted":false,"channels":[5],\
+    "pans":[50],"mutes":[false],"solos":[false],"group_levels":[],"engineer_limit_percent":100,\
+    "locked":[false],"following":null}
+    """
+
 @Suite("Desk control messages")
 struct ServerMessageTests {
 
@@ -253,6 +261,96 @@ struct ServerMessageTests {
         ) {
             try decode(#"{"type":"mix_ack","max_level_percent":100,"muted":false}"#)
         }
+    }
+
+    // MARK: mix reports, read as the Android client's parseMixReport and parseEngineerControls
+
+    /// `parseMixReport` reads each of the five lists with `getJSONArray`, which throws when one is
+    /// missing (`ControlChannel.kt:601-613`): the desk always sends the whole mix.
+    @Test(
+        "refuses a pushed mix missing any of its lists",
+        arguments: ["channels", "pans", "mutes", "solos", "group_levels"])
+    func refusesReportMissingAList(list: String) throws {
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: Data(wholeMixState.utf8)) as? [String: Any])
+        object[list] = nil
+
+        #expect(throws: ServerMessageError.self) {
+            try ServerMessage(decodingJSON: JSONSerialization.data(withJSONObject: object))
+        }
+    }
+
+    @Test("refuses a pushed mix with an entry of the wrong type in a list")
+    func refusesReportWithWrongEntry() {
+        #expect(throws: ServerMessageError.self) {
+            try decode(wholeMixState.replacingOccurrences(of: #""mutes":[false]"#, with: #""mutes":[null]"#))
+        }
+    }
+
+    /// Android: "An ack whose mix cannot be read still answers its number" (`ControlChannel.kt:174`).
+    @Test(
+        "answers the number of an ack whose mix cannot be read",
+        arguments: [
+            #"{"type":"mix_ack","seq":12,"channels":[100]}"#,
+            #"{"type":"mix_ack","seq":12,"volume_percent":"loud"}"#,
+        ])
+    func numberedUnreadableAck(json: String) throws {
+        #expect(try decode(json) == .unreadableMixAck(sequence: 12))
+    }
+
+    /// `answeredSequence` (`ControlChannel.kt:631`) names a mix only with a number that is not
+    /// negative; anything else names none, and the ack still acknowledges.
+    @Test(
+        "reads an ack whose number is not a whole number that is not negative as one with none",
+        arguments: [#""seq":-1,"#, #""seq":"12","#, #""seq":1.5,"#, #""seq":null,"#])
+    func ackWithUnusableNumber(seq: String) throws {
+        let json = wholeMixState.replacingOccurrences(of: #""type":"mix_state","#, with: #""type":"mix_ack","# + seq)
+
+        guard case .mixAck(let report) = try decode(json) else {
+            Issue.record("expected a mix ack")
+            return
+        }
+        #expect(report.sequence == nil)
+        #expect(report.channelGains == [5])
+    }
+
+    @Test("ignores whatever number a pushed mix carries")
+    func pushedMixNumberIgnored() throws {
+        for seq in [#""seq":7,"#, #""seq":"x","#] {
+            let json = wholeMixState.replacingOccurrences(of: #""type":"mix_state","#, with: #""type":"mix_state","# + seq)
+            guard case .mixState(let report) = try decode(json) else {
+                Issue.record("expected a mix state")
+                return
+            }
+            #expect(report.sequence == nil)
+        }
+    }
+
+    /// Kotlin's `Number.toInt()` cuts a fraction toward zero before `coerceIn(0, 100)`; a boolean is
+    /// not a `Number`, so it is no limit.
+    @Test(
+        "reads a limit with a fraction as its whole part, and a limit that is not a number as none",
+        arguments: [("60.9", 60), ("-0.5", 0), ("100.5", 100), ("true", 100), ("null", 100)])
+    func limitLenient(limit: String, read: Int) throws {
+        let json = wholeMixState.replacingOccurrences(
+            of: #""engineer_limit_percent":100"#, with: #""engineer_limit_percent":"# + limit)
+
+        guard case .mixState(let report) = try decode(json) else {
+            Issue.record("expected a mix state")
+            return
+        }
+        #expect(report.engineerLimitPercent == read)
+    }
+
+    @Test("reads a locked list that is not a list as nothing locked")
+    func lockedNotAList() throws {
+        let json = wholeMixState.replacingOccurrences(of: #""locked":[false]"#, with: #""locked":{"0":true}"#)
+
+        guard case .mixState(let report) = try decode(json) else {
+            Issue.record("expected a mix state")
+            return
+        }
+        #expect(report.locked == [false])
     }
 
     // MARK: playback

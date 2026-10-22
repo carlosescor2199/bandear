@@ -66,3 +66,59 @@ func withChannels(_ count: Int, _ groups: [ChannelGroup] = []) -> MixSession {
 func withBand(_ groups: [ChannelGroup] = []) -> MixSession {
     MixSession().after(.configReceived(config(5, groups, band)))
 }
+
+// MARK: The desk's reports
+
+/// A whole mix as the desk reports it, with the defaults of Android's `MixSnapshot`: no lists,
+/// master and cap at 100, unmuted. The engineer set nothing, as an older desk reports.
+func report(
+    gains: [Int] = [], pans: [Int] = [], mutes: [Bool] = [], solos: [Bool] = [],
+    groupLevels: [Int] = [], volume: Int = 100, maxLevel: Int = 100, muted: Bool = false
+) -> MixReport {
+    MixReport(
+        sequence: nil, volumePercent: volume, maxLevelPercent: maxLevel, muted: muted,
+        channelGains: gains, pans: pans, channelMutes: mutes, channelSolos: solos,
+        groupLevels: groupLevels, engineerLimitPercent: MixReport.noEngineerLimitPercent,
+        locked: [], following: nil)
+}
+
+/// The mix as the phone holds it, reported back whole: Android's `MixUiState.toSnapshot()`.
+func report(of mix: MixState) -> MixReport {
+    report(
+        gains: mix.levels, pans: mix.pans, mutes: mix.mutes, solos: mix.solos,
+        groupLevels: mix.groupLevels, volume: mix.masterVolume, maxLevel: mix.levelCap,
+        muted: mix.masterMuted)
+}
+
+extension MixReport {
+    /// This report carrying the engineer's `controls`, as the desk writes them: a limit, one
+    /// `locked` entry per channel up to the last locked one, and whom the mix follows. Android hands
+    /// the controls beside the mix (`MixPushed(snapshot, engineer)`); the desk sends them inside it.
+    func with(_ controls: EngineerControls) -> MixReport {
+        let lockedCount = (controls.lockedChannels.max() ?? -1) + 1
+        return MixReport(
+            sequence: sequence, volumePercent: volumePercent, maxLevelPercent: maxLevelPercent,
+            muted: muted, channelGains: channelGains, pans: pans, channelMutes: channelMutes,
+            channelSolos: channelSolos, groupLevels: groupLevels,
+            engineerLimitPercent: controls.limitPercent,
+            locked: (0..<lockedCount).map(controls.isLocked), following: controls.following)
+    }
+}
+
+extension MixSession {
+    /// `event` as the musician's change that the phone sends, numbered as its newest mix: Android's
+    /// `sent` helper over `reduceChange`.
+    func sent(_ event: MixEvent) -> MixSession {
+        reducedSending(event) { _, _ in true }
+    }
+}
+
+/// A session that started and has heard nothing from its desk yet: Android's `running()`.
+func running() -> MixSession {
+    MixSession().after(.sessionStarted)
+}
+
+/// A running session whose first `config` announced `count` channels and `groups`.
+func connectedWith(_ count: Int, _ groups: [ChannelGroup] = []) -> MixSession {
+    running().after(.configReceived(config(count, groups)))
+}

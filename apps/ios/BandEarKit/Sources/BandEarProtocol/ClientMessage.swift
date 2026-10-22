@@ -136,11 +136,12 @@ public struct Registration: Equatable, Sendable, ControlPayload {
 
 // MARK: - mix
 
-/// The `mix` message: the master values, always, and whichever lists changed.
+/// The `mix` message: the master values, always, and the per-channel and group lists.
 ///
 /// A list left `nil` is left out of the JSON rather than sent as null: the desk reads an absent
-/// list as "unchanged" (`#[serde(default)] Option<Vec<…>>`, `apps/server/src/protocol.rs:21-37`),
-/// and sending a whole mix to move one fader would fight every other socket of the same musician.
+/// list as "unchanged" (`#[serde(default)] Option<Vec<…>>`, `apps/server/src/protocol.rs:21-37`).
+/// This client nonetheless sends every list on every `mix`, the whole mix as the phone plays it, as
+/// the Android client does (`ControlChannel.kt:470-504`).
 ///
 /// The Swift names say what the values are; `CodingKeys` maps them onto the keys the desk reads,
 /// where the channel gains are called `channels`.

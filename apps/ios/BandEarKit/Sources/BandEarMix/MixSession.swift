@@ -67,7 +67,7 @@ public struct MixSession: Equatable, Sendable {
     /// answer arrives would undo the change.
     ///
     /// Ported from Android's `reduceChange` (`MonitorReducer.kt:190-208`). Which changes are sent is
-    /// the outgoing mix's rule (T5e); until then the caller says.
+    /// ``sends(_:before:after:)``, and ``reducedNumberingSends(by:)`` applies it.
     public func reducedSending(
         _ event: MixEvent, sends: (_ before: MixSession, _ after: MixSession) -> Bool
     ) -> MixSession {
@@ -230,11 +230,11 @@ public struct MixSession: Equatable, Sendable {
         }
     }
 
-    /// The mix as the phone plays and sends it, which is what the desk reports back when nothing
-    /// changed elsewhere: with More of me on, the musician's strip lifted and every other channel
-    /// halved, except the channels the engineer locked (a pair whole when either side is), which
-    /// stay as stored (`MonitorReducer.kt:511-521`).
-    private var mixAsPlayed: MixState {
+    /// The mix as the phone plays and sends it (``outgoingMix()``), which is what the desk reports
+    /// back when nothing changed elsewhere: with More of me on, the musician's strip lifted and every
+    /// other channel halved, except the channels the engineer locked (a pair whole when either side
+    /// is), which stay as stored (`MonitorReducer.kt:511-521`).
+    var mixAsPlayed: MixState {
         guard moreOfMe.isEnabled else { return mix }
         var played = mix
         played.levels = MoreOfMe.liftedLevels(

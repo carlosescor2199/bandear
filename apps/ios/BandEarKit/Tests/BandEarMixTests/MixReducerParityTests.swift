@@ -237,6 +237,26 @@ struct MixReducerParityTests {
         #expect(state.mix.levelCap == 90)
     }
 
+    /// Android's snapshot is the stored mix; ``MixSession/outgoingMix()`` is the mix as played, which
+    /// is the same while More of me is off, as it is here.
+    @Test func theMixBecomesTheSnapshotTheControlChannelSends() {
+        let state = withChannels(2, [group("Band", [0, 1])]).after(
+            .channelLevelChanged(channel: 0, level: 30), .channelSoloChanged(channel: 1, soloed: true),
+            .groupLevelChanged(group: 0, level: 70), .masterVolumeChanged(level: 60),
+            .levelCapChanged(level: 85), .masterMuteChanged(muted: true))
+
+        let snapshot = state.outgoingMix()
+
+        #expect(snapshot.channelGains == [30, 100])
+        #expect(snapshot.pans == [0, 100])
+        #expect(snapshot.channelMutes == [false, false])
+        #expect(snapshot.channelSolos == [false, true])
+        #expect(snapshot.groupLevels == [70])
+        #expect(snapshot.volumePercent == 60)
+        #expect(snapshot.maxLevelPercent == 85)
+        #expect(snapshot.muted)
+    }
+
     // MARK: T5c, reconciliation with the desk
 
     // Server reports.
@@ -383,8 +403,6 @@ struct MixReducerParityTests {
         #expect(state.mix.effectiveCap == state.mix.levelCap)
     }
 
-    /// Android also reads the phone's cap back off the mix it sends (`toSnapshot().maxLevelPercent`);
-    /// the outgoing mix is T5e, which ports that assertion.
     @Test func theMusicianHearsTheLowerOfTheirCapAndTheEngineersLimit() {
         let limited = lockedBy(engineer(limit: 60))
 
@@ -394,6 +412,7 @@ struct MixReducerParityTests {
         let lowerCap = limited.after(.levelCapChanged(level: 50))
         #expect(lowerCap.mix.levelCap == 50)
         #expect(lowerCap.mix.effectiveCap == 50)
+        #expect(lowerCap.outgoingMix().maxLevelPercent == 50)
     }
 
     @Test func aLockedChannelCannotBeChangedFromThePhone() {

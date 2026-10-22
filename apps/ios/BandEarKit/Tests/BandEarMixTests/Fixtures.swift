@@ -42,3 +42,27 @@ func firstConfig(
     mix.channelDetails = details
     return mix
 }
+
+/// A `config` as the desk sends it: `count` channels, its groups, and its details or none.
+func config(
+    _ count: Int, _ groups: [ChannelGroup] = [], _ details: [SourceChannel]? = nil
+) -> DeskConfiguration {
+    DeskConfiguration(sourceChannels: UInt8(count), sampleRate: nil, groups: groups, channels: details)
+}
+
+extension MixSession {
+    /// The session after `events`, in order: Android's `after` helper.
+    func after(_ events: MixEvent...) -> MixSession {
+        events.reduce(self) { $0.reduced(by: $1) }
+    }
+}
+
+/// A session whose first `config` announced `count` channels and `groups`, with no details.
+func withChannels(_ count: Int, _ groups: [ChannelGroup] = []) -> MixSession {
+    MixSession().after(.configReceived(config(count, groups)))
+}
+
+/// A session whose first `config` announced the five-channel ``band``.
+func withBand(_ groups: [ChannelGroup] = []) -> MixSession {
+    MixSession().after(.configReceived(config(5, groups, band)))
+}

@@ -165,7 +165,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - [x] T7d — Ports of `Pcm16Processor` (local protection), the pure `PlaybackLatency` measures,
     and the arrival spacing and jitter estimate from `PmonPlayer.kt:222-233` (route: delegated
     writer B, launched together with T7c). Commit `0aa3674`.
-  - [ ] T7e — The receive engine and output, split at a seam the parent wrote first:
+  - [x] T7e — The receive engine and output, split at a seam the parent wrote first:
     `PlaybackSink` and `PlaybackSinkFactory` (`Sources/BandEarPlayback/PlaybackSink.swift`), this
     client's stand-in for Android's `AudioTrack`. Two delegated writers are launched together,
     each in its own worktree; each unit is over 100 lines with disjoint surfaces. Both touch
@@ -301,6 +301,12 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   decoder agrees, so the markers come off with the fix. Also for T7: `LinkStats` does not round the
   extras to a hundredth (Android does; one more known issue), and leaves `recovered` out when nil,
   where Android always sends it.
+- **Both clients count a refused packet as played.** The T7e review found it (R3-001/R4-001,
+  warnings). `ReceiveLoop.play` counts the packet, its rate and the packets per second before the
+  sink opens or the rate is checked. So a packet refused for a rate change, or because the sink
+  failed to open, still counts in `ReceiverStats.packets` and `packetsPerSecond`, and its error
+  also goes to `onError`. Android does the same (`PmonPlayer.kt:241-244`, before :257-260), so
+  changing it is a decision for both clients, not a port fix. Only the diagnostics are affected.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1113,4 +1119,18 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
       for the render callback until the engine has stopped.
     - A5: `RingPlaybackSink.init` calls `fatalError` when allocation fails. The factory must bound
       the sample rate before sizing the ring.
+- T7e native review:
+  - Assessed against `9c208e9` with item 4 escalated: `high`, due (19 paths, 3072 lines).
+  - The preflight asked first for the untracked declaration: `.atl/` excluded. That STATUS refuses
+    lenses and escalation flags; they go on the STATUS that offers START.
+  - START checked: base `5fb3a62` = `9c208e9`, candidate `d1ce0c3` = `13a1dac`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability.
+  - Approved. Lineage `review-9c2046daec99c0bb`, acknowledged. The reviewed boundary is now
+    `13a1dac`.
+  - Its two warnings are one finding: a refused packet is counted as played, which Android does
+    too. It is recorded under Follow-ups.
+  - Tooling note: the session restart cleared the scratchpad, so the capture launcher was
+    recreated before the reviewers could run.
+- T7e complete. Next: T7f, the wiring and the end-to-end listening. The verifier's A1-A5 and the
+  T7e1 inputs above are its inputs.
 

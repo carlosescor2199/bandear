@@ -1069,4 +1069,48 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Combined suite: 608 tests (playback 211), 0 known issues, 0 warnings on a clean copy.
   - `--sanitize=thread` over all 211 playback tests: exit 0, no reports.
   - The worktrees, their branches and the scratch folders were removed.
+- Closing the pending slice before the high-risk unit:
+  - The assessment always measures HEAD, so the slice `2e151e7..9c208e9` (T7a-T7d and the seam) was
+    reviewed from a detached worktree at `9c208e9`, under the home directory.
+  - Assessed `medium`, `under_budget` (34 paths, 4825 lines). START checked: base `d3ce3de` =
+    `2e151e7`, candidate `5fb3a62` = `9c208e9`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability, run
+    concurrently.
+  - Approved with no findings. Lineage `review-4ee1db544ed87fdc`, acknowledged. The reviewed
+    boundary is now `9c208e9`, and the worktree was removed.
+- T7e independent verifier (high-risk item 4). The previous session ended mid-run, so it was
+  resumed.
+  - Claims 1-3 and 5-7 PASS:
+    - Release object code shows acquire as `ldapr` and release as `stlr`.
+    - `render` calls only the ring's C functions, `_bzero` and the stack guard. It has no retain,
+      release or allocation, and no indirect call.
+    - A 12M-frame ring stress probe (capacity 1009, and 3) and a TSan run of 10M frames found no
+      torn, reordered, missing or extra frame.
+    - An end-to-end probe sent PMON over UDP to `AudioReceiver`, through `RingPlaybackSink`, to a
+      render thread. Every frame came out in order, also under TSan.
+    - Stop and restart, 300+300 rounds plus 150+150 under TSan: exactly one `onStopped` each time,
+      0 errors, every stop under 1 ms.
+    - The suite: 608 tests, TSan clean, 0 warnings.
+  - Claim 4 FAIL, blocker B1:
+    - A fixed cushion was sized in the current packet's frames but applied in the opening
+      packet's frames, so a mid-stream block-size change doubled it. The probe asked for 2048
+      frames where Android asks for 1024.
+    - Root cause in T3: `CushionController.onPacket` folded Android's `packetFrames` (the cushion
+      unit) and `packetSamples` (time) into one value.
+    - Correction `6a02bf1`: `onPacket` takes `packetFrames` and `playedFrames`, and the loop passes
+      the opening size and the played packet. RED against the old call: `[960, 2880]`.
+    - 610 tests, 0 warnings, TSan clean. The recheck, limited to B1: PASS, 1024 frames as on Android.
+  - Advisories, all inputs for T7f:
+    - A1: `start(port:)` resolves no host (Android checks that the name resolves,
+      `PmonPlayer.kt:155`). The phone binds a port and takes datagrams from any sender.
+    - A2, unproven: a loopback wake-up could arrive after the old socket closes and reach a newer
+      socket bound in that window, giving one spurious `headerTooShort`. It was not seen in 900
+      rounds.
+    - A3: `AudioReceiver.start` does not refuse while an older loop is still alive. T7f must wait
+      for `isAlive == false`, as Android's view model does ("The previous receiver is still
+      stopping").
+    - A4: the ring is freed in the sink's `deinit`. T7f must keep a strong reference to the sink
+      for the render callback until the engine has stopped.
+    - A5: `RingPlaybackSink.init` calls `fatalError` when allocation fails. The factory must bound
+      the sample rate before sizing the ring.
 

@@ -882,5 +882,11 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   showed Connected with 1 strip (the desk's one channel), and the name stored by the previous run
   was restored on relaunch. Disconnect ended the connection with no error on the desk, where the
   connections killed by relaunching logged a reset without a closing handshake.
-- T6 complete. Pending: the native review of T6d and the IPv4 fix, then T7, T8, T9, and the small
-  unit for `R3-001` (an injected clock on the transport).
+- Native review of T6d and the IPv4 fix: `--escalate-item 6` against `3540b25`, `high`, due (19
+  paths, 958 lines); START checked (base `b10869b` = `3540b25`, candidate `d3ce3de` = `HEAD`); the
+  user chose "Revisar este cambio" (`granted`); approved in 45 s. Its four non-blocking findings are
+  the verifier's advisories found again independently (a refused start saving an id, the device
+  name stored for an empty field, `NSNumber` bridging), already under Follow-ups for T8.
+  Acknowledged; the reviewed boundary is now `2e151e7`.
+- T6 complete. Pending: T7, T8, T9, and the small unit for `R3-001` (an injected clock on the
+  transport, so its deadline and pings run in the default suite).

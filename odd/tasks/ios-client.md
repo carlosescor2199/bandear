@@ -564,6 +564,18 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     kept Settings. Nothing in T8e writes the tab. Watch whether the shell resets it.
   - The `linkReport` checks added to the stale-figures tests are weak guards: an ended session
     already clears `linkReport`.
+- **From the T8e review (not fixed).**
+  - Warnings, both already known:
+    - R3-discovery-retry-narrowed: the verifier's A1. A failed browser now retries only after a
+      background trip.
+    - R3-app-models-untested: the app's change-only mirrors and the idempotent discovery have no
+      automated test, because the app has no test target.
+  - Suggestions:
+    - `DiagnosticsSection`'s `diagnostics` property (a `DiagnosticsModel`) reads close to the
+      `Diagnostics` type. A name such as `figures` would be clearer.
+    - The assign-if-changed rule is written by hand per field in both mirrors. A helper would keep
+      it in one place, but not an `inout` one: passing a `@Published` property `inout` always
+      writes it back and publishes (the T8e writer measured it). A key-path assignment would work.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1717,4 +1729,12 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Advisories: A1 (a failed browser retries only after a background trip) is already under
     Follow-ups. A2: the restored `linkReport` is always nil. A3: Mix's banners now look like
     Connect's. A4: the tab note remains unexplained.
+- T8e native review:
+  - Assessed against `de5d54f` with item 6 escalated: `high`, due (12 paths, 438 lines).
+  - START checked: base `0cdb31e` = `de5d54f`, candidate `8674c13` = `9907f62`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: reliability and readability.
+  - Approved. Lineage `review-f598fe3b1e0b5532`, acknowledged. The reviewed boundary is now
+    `9907f62`.
+  - Two warnings (both already known) and two suggestions are under Follow-ups.
+- T8e complete. Next: T9 (mix banks and recall), or the remaining follow-ups, as the user decides.
 

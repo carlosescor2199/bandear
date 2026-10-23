@@ -247,7 +247,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - `isPlaying` reads only that published value. The lock order is the output's lock, then the
     published one.
   - Commit recorded in Progress.
-- [ ] T8 — Screens: Connect, Mix, Mixes, Settings. The user asked "dale, seguí con T8" (2026-10-23).
+- [x] T8 — Screens: Connect, Mix, Mixes, Settings. The user asked "dale, seguí con T8" (2026-10-23).
   Asked about the look, the user chose "Nativo iOS, mismos textos y reglas (Recommended)": standard
   SwiftUI (`TabView`, `List`, `Slider`, sheets), with Android's content, its words verbatim and its
   rules. Android's own faders, theme, fonts and gesture maths are not ported.
@@ -299,7 +299,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
       writer found `SessionEnded` only resets link health, `MonitorReducer.kt:70-81`);
     - the T7f verifier's AD1 (reports from a previous launch), AD2 (a late link report after a
       stop) and AD3 (the weak owner read on the receive thread).
-  - [ ] T8d — The SwiftUI screens on top, replacing `DeskListView` and `SessionView`:
+  - [x] T8d — The SwiftUI screens on top, replacing `DeskListView` and `SessionView`:
     - [x] T8d1 — The seam (route: inline, by the parent). `SessionModel` publishes the session,
       the mix, the diagnostics, the tab, the manual form and the refusal. Its actions:
       `connect(to:)`, `connectManually()`, `disconnect()`, `setName(_:)`, `apply(_:)`. The app
@@ -523,6 +523,25 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     Android, with no helper in `BandEarScreens`.
   - A simulator app installed under a new bundle id can have its incoming UDP blocked by the macOS
     firewall ("Link silent"), while its control connection works.
+- **From the T8d review (warnings and suggestions, not fixed).**
+  - R4-mirror-republish-per-change (also the verifier's): `mirror()` assigns every published field
+    on every change, so each receiver report rebuilds the whole Mix list. Assign only what changed,
+    or move the per-packet figures out of the mix screen's observation.
+  - R2-duplicate-tone-mapping: `MixTone`, `MixBannerRow` and `MixConnectionPill` copy
+    `ConnectionToneStyle`, `ConnectionBannerRow` and `ConnectionToneDot` with different symbols, so
+    one state looks different on Mix and on Connect or Settings. Keep one.
+  - R3-refused-start-restore-unpublished: a refused start restores the last figures without calling
+    `stateDidChange`. `ControlSession.start` throws before any change (the verifier's claim 5), so
+    no observer sees the cleared values today. Calling it after the restore would make that
+    structural.
+  - R3-discovery-double-start: `RootView` starts discovery on appear and again when active unless it
+    is browsing, so it can start twice at launch. `DeskDiscoveryModel.start` bumps its run and
+    starts the browser again; whether that is harmless depends on `BonjourDeskBrowser.start`.
+  - Suggestions:
+    - `ChannelSheet` says it opens fully expanded but sets no detent;
+    - `ChannelSheetKey` and `StripKey` are near copies;
+    - the stale-figures tests do not check `linkReport`;
+    - `SessionModel`'s start path has no automated test.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1629,4 +1648,14 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     bundle id. The parent's run on the same commit had 185 packets/s.
   - 836 tests, 0 warnings, and the app builds. Its trivial advisory (an unused `import UIKit`) is
     fixed in the next commit; the rest are under Follow-ups.
+- T8d native review:
+  - Assessed against `1e315f0` with item 4 escalated: `high`, due (22 paths, 2098 lines).
+  - START checked: base `2c8bad3` = `1e315f0`, candidate `0cdb31e` = `de5d54f`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience, readability and
+    reliability.
+  - Approved. Lineage `review-37d22f13a853d20b`, acknowledged. The reviewed boundary is now
+    `de5d54f`.
+  - 4 warnings and 4 suggestions are under Follow-ups. They are not fixed: findings alone authorize
+    no change.
+- T8 complete. Saving, recalling, renaming and deleting mixes are T9's.
 

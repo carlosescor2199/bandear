@@ -6,7 +6,6 @@ import BandEarScreens
 import BandEarSession
 import Combine
 import Foundation
-import UIKit
 
 /// The session with one desk, its control connection and its audio, and the screens' own state,
 /// published for the views.

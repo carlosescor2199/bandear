@@ -393,14 +393,22 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - R3-003: the A5 bounds (8 000-192 000 Hz, 1-16 384 frames) have no test, because the app has no
     test target. Moving the check into `BandEarPlayback` as a pure function would let `swift test`
     pin it.
-- **Gaps left by T7g** (its writer named them):
-  - An interruption that begins with `.appWasSuspended` never ends, so the output stays
-    interrupted and becoming active does not restart it. The screen line shows it, and Disconnect
-    then Connect recovers.
+- **Gaps left by T7g** (named by its writer, its verifier and its review). An interruption that
+  never ends, `.appWasSuspended` included, no longer leaves the output stuck: becoming active ends
+  it (`3a469b8`).
+  - R4-001 / R3-001 of the T7g review: a restart runs `setActive(true)` and `engine.start()` under
+    the output's lock, and the receive thread's per-packet `isPlaying` read takes the same lock.
+    While a restart runs (tens to hundreds of ms, longer when a call refuses it), the receive
+    thread waits. Datagrams then queue in the socket and the arrival-timing stats inflate. Read
+    the flag without that lock, for example from an atomic kept beside the recovery.
+  - R4-002 (also the verifier's A3): a failed restart's error is dropped, so the screen cannot say
+    why the output stopped (a call, a format, the background). Keep or log the last error.
+  - R3-002: the app-side glue has no automated test, since the app has no test target. That glue is
+    the mapping from interruption notifications to events and the `follow(_:)` contract.
+  - A2 (verifier): a late `.appWasSuspended` beginning can mark the output stopped while it plays.
+    Only a device test settles the order.
   - `init` starts the engine outside the lock, so a configuration change in that window could race
-    a restart. This was already the case before T7g.
-  - A restart runs under the output's lock, so the receive thread's per-packet `isPlaying` read
-    waits for it.
+    a restart. This was already so before T7g.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1335,4 +1343,19 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - RED: the new test failed (2 expectations). Becoming active was taken out of "restarts nothing
     while interrupted".
   - GREEN: 659 tests, 0 warnings. The screen copy is now true.
+- T7g native review:
+  - Assessed against `e58e7e8` with item 4 escalated: `high`, due (11 paths, 497 lines).
+  - START checked: base `6a59918` = `e58e7e8`, candidate `8026d92` = `825e558`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability.
+  - Approved. Lineage `review-07942a25e4974537`, acknowledged. The reviewed boundary is now
+    `825e558`.
+  - Findings, all warnings or suggestions:
+    - R4-001 / R3-001: the restart holds the lock that the receive thread's `isPlaying` read
+      takes.
+    - R4-002: a failed restart's error is dropped.
+    - R3-002: the app glue has no test.
+    - R3-003: the stale `.appWasSuspended` gap in this document, rewritten above.
+  - The first three are under "Gaps left by T7g". They are not fixed, since findings alone
+    authorize no change.
+- T7g complete.
 

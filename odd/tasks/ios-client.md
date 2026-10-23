@@ -304,7 +304,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
       the mix, the diagnostics, the tab, the manual form and the refusal. Its actions:
       `connect(to:)`, `connectManually()`, `disconnect()`, `setName(_:)`, `apply(_:)`. The app
       links `BandEarScreens`.
-    - [ ] T8d2 — Connect, Settings (with Diagnostics), the app shell and the Mixes tab (route:
+    - [x] T8d2 — Connect, Settings (with Diagnostics), the app shell and the Mixes tab (route:
       delegated writer, launched together with T8d3):
       - the shell: Connect while no session runs, tabs Mix, Mixes and Settings while one runs, and
         the manual address opened from Connect, all chosen by `AppScreen`;
@@ -312,7 +312,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
       - Settings: the server card, Disconnect, the name, the manual connection, and Diagnostics
         with its expander;
       - Mixes: its layout and empty state only (T9 adds the rest).
-    - [ ] T8d3 — Mix and the channel sheet (route: delegated writer, launched together with
+    - [x] T8d3 — Mix and the channel sheet (route: delegated writer, launched together with
       T8d2). It covers:
       - the header, the pill and the banners;
       - More of me and the channel picker;
@@ -1554,4 +1554,51 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     - Approved. Lineage `review-3eab327013d37338`, acknowledged. The
       reviewed boundary is now `1e315f0`.
     - Two warnings, under Follow-ups: the launch tag's contract, and stale diagnostics at a start.
+- T8d:
+  - The seam: `SessionModel` (`ad8d2e1`) and a placeholder `MixView` with the shell's signature
+    (`19e804c`). Then two writers launched together, each in its own worktree.
+- T8d2 (shell, Connect, the manual address, Settings with Diagnostics, Mixes), `6badef1`:
+  - `RootView` picks the screen with `AppScreen`: Connect in a `NavigationStack`, with the manual
+    form pushed; a `TabView` while a session runs.
+  - Discovery stops in the background and starts again on return.
+  - The manual address screen is the Settings screen with a "Servers" back button, as on Android.
+  - It builds, the suite passes, and every visible word matched `BandEarScreens`.
+- T8d3 (Mix and the channel sheet), `c4a3bd1`:
+  - `MixView` is the container; `MixContent` is presentational and has debug-only previews.
+  - The pan `Slider` uses `PanScale` with the 5% detent. Once a drag leaves it, the thumb can
+    trail the finger; that is worth a feel test on a device.
+  - The sheet opens fully expanded (Android's `skipPartiallyExpanded`).
+  - Simulator screenshots with a sample mix covered channels, groups, the master with the limit,
+    the sheet, the notice, and following while reconnecting.
+- Parent's integration:
+  - The two units' helpers did not clash, and the copies were identical to the writers'.
+  - My first copy missed the two modified files (a relative `cd` in a subshell); copying them by
+    hand fixed the build.
+  - The model's leftovers from the provisional screen were dropped (`6f009f3`).
+  - The T8c verifier's A2 and the T8c review's warning were fixed test-first in `4f77237`:
+    - the last session's figures are cleared before `session.start`, and put back if the session
+      refuses the start;
+    - RED: the new test caught the stale figures;
+    - GREEN: 836 tests, 0 warnings, TSan clean, and the app builds;
+    - `AudioReceiving.isAlive` now states its contract.
+- End to end on the simulator against the desk on this Mac (`--device "Microsoft Teams Audio"
+  --target 127.0.0.1:59999`):
+  - Connect listed "BandEar server / BandEar on Carloss-M…" with Connect.
+  - After typing "Carlos" and connecting, the desk logged `registration ... as "Carlos"`, and the
+    app showed the Mix tab:
+    - "Carlos / BandEar on Carloss-Mac-mini" with the green Connected pill;
+    - More of me off, "MY CHANNEL None", and `CHANNELS · 1`;
+    - CH 1 at 100% with "L100". That is the desk's default (`default_pan`, even sources hard left,
+      `mix.rs:508-516`), not a fault.
+    - the master at 100% with "Level cap 100% · protects your ears".
+  - Mixes showed its intro and empty state.
+  - Settings showed:
+    - the server card ("… · connected") and Disconnect;
+    - the manual connection, disabled with "Disconnect first to connect to another server.";
+    - Diagnostics: Link good, 185 packets/s (the desk sends 187.5), loss 0.00 %, 0 underruns.
+  - Typing " E" after the name made the desk log `registration ... as "Carlos E"` on the same
+    connection: one announcement after the pause.
+- Risk for T8d: item 6. The views have no automated test; the app has no test target. Their rules
+  and words are tested in the package. Item 4 applies too: `4f77237` changes the order of the
+  coordinator's state at a start.
 

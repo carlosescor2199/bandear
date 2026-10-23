@@ -38,6 +38,27 @@ struct ConnectionToneDot: View {
     }
 }
 
+/// A ``ConnectionPill``: its words beside the dot of its tone, in a capsule tinted by that tone. A
+/// screen reader hears the state and its meaning instead.
+struct ConnectionPillBadge: View {
+    let pill: ConnectionPill
+
+    var body: some View {
+        let color = ConnectionToneStyle.color(pill.tone)
+        HStack(spacing: 6) {
+            ConnectionToneDot(tone: pill.tone)
+            Text(pill.words)
+                .font(.caption.weight(.semibold))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(color.opacity(0.15), in: Capsule())
+        .overlay(Capsule().strokeBorder(color.opacity(0.4)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(pill.spokenDescription)
+    }
+}
+
 /// A ``ConnectionBanner`` as a list row: its tone's symbol, its title and detail, and a spinner
 /// while it says the connection is being retried.
 struct ConnectionBannerRow: View {

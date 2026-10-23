@@ -7,14 +7,11 @@ import SwiftUI
 /// (``ManualAddressView``), as the Android client's `SettingsScreen.kt` is both.
 ///
 /// Every word comes from ``SettingsWords``, except the stopped output's line below.
+///
+/// It observes the session, which a receiver report leaves alone; the figures each report changes
+/// are observed only by the parts that show them (``DiagnosticsModel``).
 struct SettingsView: View {
     @ObservedObject var session: SessionModel
-
-    /// Shown while the system holds the audio output stopped: packets keep arriving then, so the
-    /// server card's "connected" alone would hide the silence. Verbatim from the provisional
-    /// session screen, kept here until `BandEarScreens` holds it.
-    private let outputStoppedLine =
-        "The audio output stopped. It resumes when the system allows, or when you return to the app."
 
     var body: some View {
         let status = ConnectionStatus(
@@ -24,7 +21,9 @@ struct SettingsView: View {
             serverSection(status)
             nameSection
             manualConnectionSection(status)
-            DiagnosticsSection(session: session, controlStatus: status.statusDetail)
+            DiagnosticsSection(
+                session: session, diagnostics: session.diagnostics,
+                controlStatus: status.statusDetail)
         }
         .scrollDismissesKeyboard(.interactively)
         .navigationTitle(SettingsWords.title)
@@ -51,15 +50,8 @@ struct SettingsView: View {
                     .buttonStyle(.bordered)
                 }
             }
-            if status.sessionRunning, !session.outputPlaying {
-                Label {
-                    Text(outputStoppedLine)
-                } icon: {
-                    Image(systemName: "speaker.slash.fill")
-                        .foregroundStyle(.orange)
-                }
-                .font(.subheadline)
-            }
+            OutputStoppedRow(
+                diagnostics: session.diagnostics, sessionRunning: status.sessionRunning)
         }
     }
 
@@ -118,6 +110,32 @@ struct SettingsView: View {
             if status.sessionRunning {
                 Text(SettingsWords.disconnectFirst)
             }
+        }
+    }
+}
+
+/// The line under the server card while the system holds the audio output stopped: packets keep
+/// arriving then, so the card's "connected" alone would hide the silence. Nothing while the output
+/// plays or no session runs.
+///
+/// A view of its own, so a receiver report rebuilds this line and not the whole of Settings.
+private struct OutputStoppedRow: View {
+    @ObservedObject var diagnostics: DiagnosticsModel
+    let sessionRunning: Bool
+
+    /// Verbatim from the provisional session screen, kept here until `BandEarScreens` holds it.
+    private let outputStoppedLine =
+        "The audio output stopped. It resumes when the system allows, or when you return to the app."
+
+    var body: some View {
+        if sessionRunning, !diagnostics.outputPlaying {
+            Label {
+                Text(outputStoppedLine)
+            } icon: {
+                Image(systemName: "speaker.slash.fill")
+                    .foregroundStyle(.orange)
+            }
+            .font(.subheadline)
         }
     }
 }

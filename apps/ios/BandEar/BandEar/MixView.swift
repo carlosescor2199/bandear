@@ -82,8 +82,8 @@ struct MixContent: View {
         let followed = ConnectionBanner.following(following)
         if connection != nil || followed != nil {
             Section {
-                if let connection { MixBannerRow(banner: connection) }
-                if let followed { MixBannerRow(banner: followed) }
+                if let connection { ConnectionBannerRow(banner: connection) }
+                if let followed { ConnectionBannerRow(banner: followed) }
             }
         }
     }

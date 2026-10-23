@@ -1,6 +1,5 @@
 import BandEarDiscovery
 import BandEarMix
-import BandEarPlayback
 import BandEarProtocol
 import BandEarScreens
 import BandEarSession
@@ -37,12 +36,9 @@ final class SessionModel: ObservableObject {
 
     // MARK: The audio
 
-    @Published private(set) var receiverStats: ReceiverStats?
-    @Published private(set) var linkReport: LinkStatsReport?
-    /// Underruns added up over this session's link reports.
-    @Published private(set) var underrunTotal: Int64 = 0
-    /// Why the receiver last refused a packet, failed to open the output, or lost its socket.
-    @Published private(set) var receiverError: (any Error)?
+    /// The receiver's figures, which change with almost every packet. They are published apart, so
+    /// a report rebuilds only the views that show them and never the screens observing this model.
+    let diagnostics: DiagnosticsModel
 
     // MARK: The screens
 
@@ -56,10 +52,6 @@ final class SessionModel: ObservableObject {
     /// Why the last connect started nothing, in Android's words, or nil.
     @Published private(set) var refusal: String?
 
-    /// Whether the audio output was reaching the musician at the last packet played; `true` until
-    /// a packet says otherwise.
-    @Published private(set) var outputPlaying = true
-
     /// Kept for the app's life: a receiver still running holds its own thread, and only the
     /// coordinator stops it.
     private let audio: MonitorAudio
@@ -69,6 +61,7 @@ final class SessionModel: ObservableObject {
             transport: WebSocketTransport(), scheduler: MainQueueScheduler(),
             store: UserDefaultsMusicianStore(UserDefaults.standard))
         audio = MonitorAudio(session: session, sinkFactory: EngineOutputFactory())
+        diagnostics = DiagnosticsModel()
         musicianName = session.musicianName
         // The coordinator owns the session's own callback; this is the one to observe.
         audio.stateDidChange = { [weak self] in self?.mirror() }
@@ -128,20 +121,20 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    /// Copies the coordinator's state after a change. A `@Published` property publishes on every
+    /// assignment, even of the value it holds, so each one is assigned only when it changed: a
+    /// receiver report, which changes only the diagnostics, then rebuilds no screen observing this
+    /// model.
     private func mirror() {
         let session = audio.session
-        isRunning = audio.isRunning
-        connection = session.connection
-        connectionError = session.connectionError
-        deskError = session.lastError
-        mixHeldByDesk = session.mixHeldByDesk
-        mixSession = session.mixSession
+        if isRunning != audio.isRunning { isRunning = audio.isRunning }
+        if connection != session.connection { connection = session.connection }
+        if connectionError != session.connectionError { connectionError = session.connectionError }
+        if deskError != session.lastError { deskError = session.lastError }
+        if mixHeldByDesk != session.mixHeldByDesk { mixHeldByDesk = session.mixHeldByDesk }
+        if mixSession != session.mixSession { mixSession = session.mixSession }
         if musicianName != session.musicianName { musicianName = session.musicianName }
-        receiverStats = audio.receiverStats
-        linkReport = audio.linkReport
-        underrunTotal = audio.underrunTotal
-        receiverError = audio.receiverError
-        outputPlaying = audio.receiverStats?.outputPlaying ?? true
+        diagnostics.mirror(audio)
         // A session that ended on its own, its receiver gone, takes its screen with it.
         if desk != nil, !audio.isRunning {
             desk = nil

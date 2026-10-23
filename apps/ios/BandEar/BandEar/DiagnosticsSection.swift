@@ -8,7 +8,11 @@ import SwiftUI
 /// Follows the Android client's `DiagnosticsCard` (`SettingsScreen.kt`); every word and number
 /// comes from ``Diagnostics`` and ``DiagnosticsWords``.
 struct DiagnosticsSection: View {
+    /// The desk's reply and the connection's outage, which a receiver report leaves alone.
     @ObservedObject var session: SessionModel
+    /// The receiver's figures, which change with almost every packet: each report rebuilds this
+    /// section, and not the screens around it.
+    @ObservedObject var diagnostics: DiagnosticsModel
     /// The control connection's state in words (``ConnectionStatus/statusDetail``), which leads
     /// the expanded counters.
     let controlStatus: String
@@ -16,9 +20,9 @@ struct DiagnosticsSection: View {
     @State private var expanded = false
 
     var body: some View {
-        let diagnostics = self.diagnostics
+        let readings = self.readings
         Section {
-            ForEach(diagnostics.summary, id: \.label) { reading in
+            ForEach(readings.summary, id: \.label) { reading in
                 ReadingRow(reading: reading)
             }
             Button {
@@ -36,7 +40,7 @@ struct DiagnosticsSection: View {
             .accessibilityValue(DiagnosticsWords.expanderState(expanded: expanded))
             if expanded {
                 // Every counter and the recent errors can be selected and copied, for a bug report.
-                ForEach(diagnostics.allReadings(controlStatus: controlStatus), id: \.label) { reading in
+                ForEach(readings.allReadings(controlStatus: controlStatus), id: \.label) { reading in
                     ReadingRow(reading: reading)
                         .textSelection(.enabled)
                 }
@@ -44,7 +48,7 @@ struct DiagnosticsSection: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .accessibilityAddTraits(.isHeader)
-                let errors = diagnostics.recentErrors
+                let errors = readings.recentErrors
                 if errors.isEmpty {
                     Text(DiagnosticsWords.noRecentErrors)
                         .font(.subheadline)
@@ -60,7 +64,7 @@ struct DiagnosticsSection: View {
             HStack {
                 Text(DiagnosticsWords.title)
                 Spacer(minLength: 8)
-                LinkHealthLight(health: diagnostics.linkHealth)
+                LinkHealthLight(health: readings.linkHealth)
             }
             .textCase(nil)
         }
@@ -68,10 +72,10 @@ struct DiagnosticsSection: View {
 
     /// What the session holds, as the diagnostics read it. The link health is judged from the
     /// latest link report (``LinkHealth/init(phoneReport:)``), and is unknown without one.
-    private var diagnostics: Diagnostics {
+    private var readings: Diagnostics {
         Diagnostics(
-            stats: session.receiverStats, linkReport: session.linkReport,
-            underruns: session.underrunTotal, receiverError: session.receiverError,
+            stats: diagnostics.receiverStats, linkReport: diagnostics.linkReport,
+            underruns: diagnostics.underrunTotal, receiverError: diagnostics.receiverError,
             deskError: session.deskError,
             // The outage's reason stays set on a connection the desk has not spoken on yet; while
             // connected it is no current error.

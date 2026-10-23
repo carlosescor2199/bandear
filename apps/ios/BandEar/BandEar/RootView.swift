@@ -7,8 +7,10 @@ import SwiftUI
 /// `MonitorApp` chooses.
 ///
 /// It owns the session and discovery for the app's life. Discovery listens while the app is in
-/// front: it stops in the background, and starts again on return unless it is browsing, which
-/// also retries after local network access was refused or the browser failed.
+/// front: it starts at launch, stops in the background, and starts again on each return, which
+/// also retries after the browser failed. Both triggers can fire at launch, appear and then the
+/// scene turning active; ``DeskDiscoveryModel/start()`` does nothing while a run is under way, so
+/// discovery starts once all the same.
 struct RootView: View {
     @StateObject private var session = SessionModel()
     @StateObject private var discovery = DeskDiscoveryModel()
@@ -20,7 +22,7 @@ struct RootView: View {
             .onChange(of: scenePhase) { phase in
                 switch phase {
                 case .active:
-                    if discovery.status != .browsing { discovery.start() }
+                    discovery.start()
                 case .background:
                     discovery.stop()
                 default:

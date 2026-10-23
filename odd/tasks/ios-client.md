@@ -184,7 +184,28 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
         injected clock.
       - It also ports `ReceiverLaunches`.
       - Commit `88408f6`.
-  - [ ] T7f — Wiring:
+  - [ ] T7f — Wiring, in three units:
+    - [ ] T7f1 — Session side in `BandEarKit` (route: delegated writer, launched together with
+      T7f2):
+      - `LinkStatsReport` converts to `LinkStats`, with Android's JSON check from
+        `HoldPlayoutTest.kt:113-114`.
+      - Registration announces the four capabilities.
+      - A coordinator in `BandEarSession` owns `PlayerControls` and an `AudioReceiving` port.
+      - It copies into the controls the session's buffer, hold, desk-owns-the-mix flag, volume, mute
+        and cap. The cap is the lower of the musician's cap and the engineer's limit.
+      - It forwards each link report to `send(stats:)`, and keeps the latest receiver stats for T8.
+      - It starts and stops the receiver with the session, and refuses to start while the previous
+        receiver is alive (A3).
+      - It includes ports of the `MonitorViewModelTest` cases for these rules.
+    - [ ] T7f2 — App-side output (route: delegated writer, launched together with T7f1):
+      - A `PlaybackSinkFactory` on `AVAudioEngine`, with an `AVAudioSourceNode` whose render block
+        calls `RingPlaybackSink.render`.
+      - The sample rate is bounded before the ring is sized (A5).
+      - The sink stays strongly held until the engine stops (A4).
+      - `outputLatencyFrames` comes from `AVAudioSession`, and the category is `.playback`.
+    - [ ] T7f3 — `SessionModel` joins the two, then the check by ear against the desk (route:
+      inline).
+    The original scope of T7f:
     - announce the four capabilities;
     - hand `playback` and `redundancy` to the player;
     - send `stats` through the session, with `recovered` always present as on Android;

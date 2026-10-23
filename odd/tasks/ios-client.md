@@ -149,7 +149,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
     T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
     observe. Ends with the end-to-end check against the user's own desk machine.
-- [ ] T7 — UDP receive path and AVAudioEngine output. Sliced from a read-only map of Android's audio
+- [x] T7 — UDP receive path and AVAudioEngine output. Sliced from a read-only map of Android's audio
   path (`PmonPlayer.kt`, about 470 lines with no test of its own, plus small pure helpers that are
   tested):
   - [x] T7a — Decoders and `stats` agree with Android (route: inline). A `playback` or
@@ -356,6 +356,18 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     `SessionModel` keeps the coordinator.
   - AD4: resuming after an interruption calls `engine.start()` without `setActive(true)`. Only a
     device test proves it.
+- **The app's output after an interruption, from the T7f review (warnings, not fixed).**
+  - R4-001 / R3-001: `restartIfStopped` calls `engine.start()` with `try?` and no `setActive(true)`
+    first, and an interruption that ends without `.shouldResume` never restarts. Either way the
+    output can stay silent for the rest of the session while the screen says Connected; only
+    short writes in the stats show it. Reactivate the session before restarting, and report a
+    failed restart (for example through the sink, so `onError` reaches the screen).
+  - R3-002: `EngineOutput.init` activates the audio session before it builds the format. A format
+    that cannot be built throws before `deinit` can run, which leaves the session active. Build the
+    format first.
+  - R3-003: the A5 bounds (8 000-192 000 Hz, 1-16 384 frames) have no test, because the app has no
+    test target. Moving the check into `BandEarPlayback` as a pure function would let `swift test`
+    pin it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1230,4 +1242,16 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     retains and releases the closure context once per callback.
   - Suite: 645 tests, TSan clean, 0 warnings, and the app builds.
   - Its four advisories are recorded under Follow-ups as T8 inputs.
+- T7f native review:
+  - Assessed against `13a1dac` with item 4 escalated: `high`, due (16 paths, 1754 lines).
+  - START checked: base `d1ce0c3` = `13a1dac`, candidate `6a59918` = `e58e7e8`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability.
+  - Approved. Lineage `review-86e00a7b8617fc95`, acknowledged. The reviewed boundary is now
+    `e58e7e8`.
+  - Its four warnings (R4-001, R3-001, R3-002, R3-003) are under Follow-ups. They are not fixed:
+    findings alone authorize no change.
+  - Tooling note: the scratchpad was cleared between turns, taking the capture launcher with it.
+    The grant and the captures then ran from one inline script.
+- T7 complete. Pending: T8 (screens), T9 (mixes), the small `R3-001` unit (the transport's
+  injected clock), and the follow-ups above, which are the user's to prioritise.
 

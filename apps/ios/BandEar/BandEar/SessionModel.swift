@@ -24,6 +24,9 @@ final class SessionModel: ObservableObject {
     @Published private(set) var packetsPlayed: Int64 = 0
     /// Why the receiver last refused a packet or lost its output, or nil.
     @Published private(set) var audioProblem: String?
+    /// Whether the audio output was reaching the musician at the last packet played; `true` until
+    /// a packet says otherwise.
+    @Published private(set) var outputPlaying = true
     /// Why the last connect started nothing, or nil.
     @Published private(set) var refusal: String?
     /// The name as typed. Empty connects under ``deviceName``.
@@ -76,6 +79,7 @@ final class SessionModel: ObservableObject {
         stripCount = session.mixSession.mix.strips.count
         packetsPlayed = audio.receiverStats?.packets ?? 0
         audioProblem = audio.receiverError.map { "\($0)" }
+        outputPlaying = audio.receiverStats?.outputPlaying ?? true
         // A session that ended on its own, its receiver gone, takes its screen with it.
         if desk != nil, !session.mixSession.isSessionRunning {
             desk = nil

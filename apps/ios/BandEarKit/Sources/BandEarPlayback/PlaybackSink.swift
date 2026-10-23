@@ -27,8 +27,19 @@ public protocol PlaybackSink: AnyObject {
     /// sink knows it (Android's `AudioTimestamp.framePosition` when `getTimestamp` succeeds).
     var presentedFrame: Int64? { get }
 
+    /// Whether the output is reaching the listener. It is `false` while the system holds the output
+    /// stopped, for example during a call, and after the output failed to start again. Frames
+    /// written meanwhile wait in the sink, and once it is full they come back as short writes.
+    ///
+    /// The default is `true`, for a sink that never stops on its own.
+    var isPlaying: Bool { get }
+
     /// Stops the output and lets it go. Nothing is written after this.
     func close()
+}
+
+extension PlaybackSink {
+    public var isPlaying: Bool { true }
 }
 
 /// Opens the sink once the first packet tells the stream's rate and packet size (Android opens its

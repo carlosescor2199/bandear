@@ -36,7 +36,7 @@ struct MonitorAudioTests {
     private static let stats = ReceiverStats(
         packets: 500, lost: 5, sampleRate: 48_000, packetsPerSecond: 100,
         interArrivalMilliseconds: 10, jitterMilliseconds: 0.3, discardedSamples: 0,
-        packetsWithDiscardedSamples: 0, playbackBacklogMilliseconds: 15)
+        packetsWithDiscardedSamples: 0, playbackBacklogMilliseconds: 15, outputPlaying: true)
 
     private static let report = LinkStatsReport(
         intervalMilliseconds: 1_000, packetsReceived: 100, packetsLost: 1, underruns: 2,

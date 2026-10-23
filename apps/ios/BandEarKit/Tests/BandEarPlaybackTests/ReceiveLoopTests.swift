@@ -67,6 +67,7 @@ private final class FakeSink: PlaybackSink {
     var applies: (Int) -> Int? = { $0 }
     var underruns = 0
     var presentedFrame: Int64?
+    var isPlaying = true
 
     private(set) var writes: [[Int16]] = []
     private(set) var targets: [Int] = []
@@ -438,7 +439,18 @@ struct ReceiveLoopTests {
                 == ReceiverStats(
                     packets: 2, lost: 1, sampleRate: 48_000, packetsPerSecond: 2 / 1.01,
                     interArrivalMilliseconds: 10, jitterMilliseconds: 0, discardedSamples: 0,
-                    packetsWithDiscardedSamples: 0, playbackBacklogMilliseconds: nil))
+                    packetsWithDiscardedSamples: 0, playbackBacklogMilliseconds: nil,
+                    outputPlaying: true))
+    }
+
+    @Test func eachPacketsStatsSayWhetherTheOutputWasPlaying() throws {
+        let rig = Rig()
+
+        try rig.arrive(sequence: 1, at: 0)
+        rig.sink.isPlaying = false
+        try rig.arrive(sequence: 2, at: 10)
+
+        #expect(rig.heard.stats.map(\.outputPlaying) == [true, false])
     }
 
     @Test func theBacklogIsSeededWithItsFirstValueThenSmoothedByATenth() throws {

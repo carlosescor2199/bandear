@@ -22,6 +22,14 @@ struct SessionView: View {
                 }
                 LabeledContent("Strips", value: "\(session.stripCount)")
                 LabeledContent("Audio packets", value: "\(session.packetsPlayed)")
+                // Packets keep arriving while the system holds the output stopped, so Connected
+                // alone would hide the silence.
+                if !session.outputPlaying {
+                    Text(
+                        "The audio output stopped. It resumes when the system allows, or when you return to the app."
+                    )
+                    .foregroundStyle(.secondary)
+                }
                 if let problem = session.audioProblem {
                     Text(problem)
                         .foregroundStyle(.secondary)

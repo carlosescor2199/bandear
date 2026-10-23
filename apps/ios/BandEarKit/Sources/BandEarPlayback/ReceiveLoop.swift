@@ -48,11 +48,16 @@ public struct ReceiverStats: Equatable, Sendable {
     public let packetsWithDiscardedSamples: Int64
     /// The audio queued ahead of the listener, smoothed by a tenth per packet.
     public let playbackBacklogMilliseconds: Double?
+    /// Whether the output was reaching the listener as this packet was written
+    /// (``PlaybackSink/isPlaying``). Not one of Android's values. While it is `false` the packets
+    /// still count as played, but nobody hears them.
+    public let outputPlaying: Bool
 
     public init(
         packets: Int64, lost: Int64, sampleRate: Int, packetsPerSecond: Double,
         interArrivalMilliseconds: Double?, jitterMilliseconds: Double?, discardedSamples: Int64,
-        packetsWithDiscardedSamples: Int64, playbackBacklogMilliseconds: Double?
+        packetsWithDiscardedSamples: Int64, playbackBacklogMilliseconds: Double?,
+        outputPlaying: Bool
     ) {
         self.packets = packets
         self.lost = lost
@@ -63,6 +68,7 @@ public struct ReceiverStats: Equatable, Sendable {
         self.discardedSamples = discardedSamples
         self.packetsWithDiscardedSamples = packetsWithDiscardedSamples
         self.playbackBacklogMilliseconds = playbackBacklogMilliseconds
+        self.outputPlaying = outputPlaying
     }
 }
 
@@ -325,7 +331,7 @@ public final class ReceiveLoop {
                 interArrivalMilliseconds: arrival.interArrivalMilliseconds,
                 jitterMilliseconds: arrival.jitterMilliseconds, discardedSamples: discardedSamples,
                 packetsWithDiscardedSamples: packetsWithDiscardedSamples,
-                playbackBacklogMilliseconds: backlogMilliseconds))
+                playbackBacklogMilliseconds: backlogMilliseconds, outputPlaying: sink.isPlaying))
 
         // The desk's buffer applies at once; once per second of audio the output's underruns move
         // an Auto cushion; a fixed one never moves.

@@ -1,5 +1,6 @@
 import AVFoundation
 import BandEarPlayback
+import UIKit
 
 /// The app's ``PlaybackSinkFactory``: each output it opens plays the desk's frames through its own
 /// `AVAudioEngine`.
@@ -65,12 +66,12 @@ nonisolated enum EngineOutputError: Error, Equatable {
 ///   It logs nothing. The bridge from block to Swift closure retains and releases the closure's
 ///   context once per call: an atomic count on an object the block keeps alive, so it never waits
 ///   and never frees anything.
-/// - Notification handlers, for a route change, an engine configuration change and the end of an
-///   interruption, hand their work to a private serial queue, where they update
-///   ``RingPlaybackSink/outputLatencyFrames`` and restart an engine that stopped. They reach the
-///   output through a weak reference, so the
-///   engine is never released on the engine's own notification queue, which its documentation
-///   says can deadlock.
+/// - Notification handlers hand their work to a private serial queue. A route change updates
+///   ``RingPlaybackSink/outputLatencyFrames``. An interruption's beginning and end, an engine
+///   configuration change and the app becoming active go to the output's ``OutputRecovery``, which
+///   decides when the engine starts again; see ``isPlaying``. The handlers reach the output through
+///   a weak reference, so the engine is never released on the engine's own notification queue,
+///   which its documentation says can deadlock.
 ///
 /// The ring outlives every render callback (advisory A4): the render block holds the ring strongly,
 /// the source node holds the block, the engine holds the node, and this output holds the engine.
@@ -91,6 +92,8 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
     private var closed = false
     /// Guarded by `lock`.
     private var observers: [any NSObjectProtocol] = []
+    /// When the engine starts again after the system stopped it. Guarded by `lock`.
+    private var recovery = OutputRecovery()
 
     /// Activates the audio session for playback, builds the ring and the engine for `sampleRate`
     /// and starts the engine. The caller has checked both values against the factory's ranges.
@@ -135,6 +138,11 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
     var underrunCount: Int { ring.underrunCount }
 
     var presentedFrame: Int64? { ring.presentedFrame }
+
+    /// Whether the engine is playing, as the ``OutputRecovery`` knows it: `false` from an
+    /// interruption or a configuration change until the engine started again, and after a restart
+    /// that failed, until the next event tries again.
+    var isPlaying: Bool { lock.withLock { recovery.isPlaying } }
 
     /// Stops the engine, then closes the ring, once, and lets other apps' audio resume. The engine
     /// is not restarted after this.
@@ -190,16 +198,29 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
             ((session.outputLatency + session.ioBufferDuration) * sampleRate).rounded())
     }
 
+    /// Hands `event` to the recovery and starts the engine again when it says so, unless the output
+    /// was closed.
+    ///
     /// The engine stops itself when the hardware's rate or channel count changes, for example when
-    /// headphones are plugged in, and the system stops it for an interruption such as a call. It is
-    /// started again unless the output was closed; if that fails the output stays silent, the ring
-    /// fills, and the receive loop's writes come back short.
-    private func restartIfStopped() {
-        lock.withLock {
-            guard !closed else { return }
-            try? engine.start()
+    /// headphones are plugged in, and the system stops it for an interruption such as a call. A
+    /// restart reactivates the audio session first, since the system may have deactivated it, then
+    /// starts the engine, under the lock so ``close()`` cannot run in between. Either step's error
+    /// is reported to the recovery as a failed restart, so ``isPlaying`` turns `false` and the
+    /// screen says the output stopped, while the ring fills and the receive loop's writes come
+    /// back short. The next event that allows it tries again.
+    private func follow(_ event: OutputRecovery.Event) {
+        let restarted = lock.withLock {
+            guard !closed, recovery.handle(event) else { return false }
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+                try engine.start()
+                recovery.restartSucceeded()
+            } catch {
+                recovery.restartFailed()
+            }
+            return true
         }
-        updateOutputLatency()
+        if restarted { updateOutputLatency() }
     }
 
     private func observeChanges() {
@@ -213,26 +234,43 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
         let configurationChange = center.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
         ) { _ in
-            Self.notifications.async { target.output?.restartIfStopped() }
+            Self.notifications.async { target.output?.follow(.configurationChanged) }
         }
         let interruption = center.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
         ) { notification in
-            guard Self.interruptionEndedAskingToResume(notification) else { return }
-            Self.notifications.async { target.output?.restartIfStopped() }
+            guard let event = Self.interruptionEvent(notification) else { return }
+            Self.notifications.async { target.output?.follow(event) }
         }
-        lock.withLock { observers = [routeChange, configurationChange, interruption] }
+        let becameActive = center.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
+        ) { _ in
+            Self.notifications.async { target.output?.follow(.becameActive) }
+        }
+        lock.withLock {
+            observers = [routeChange, configurationChange, interruption, becameActive]
+        }
     }
 
-    /// Whether `notification` ends an interruption after which the system expects playback to
-    /// resume (`AVAudioSession.InterruptionOptions.shouldResume`).
-    private static func interruptionEndedAskingToResume(_ notification: Notification) -> Bool {
+    /// The recovery's event for an interruption `notification`, or `nil` for one that names no type
+    /// this build knows. An end without options does not ask to resume
+    /// (`AVAudioSession.InterruptionOptions.shouldResume`).
+    private static func interruptionEvent(_ notification: Notification) -> OutputRecovery.Event? {
         let info = notification.userInfo
-        guard let type = info?[AVAudioSessionInterruptionTypeKey] as? UInt,
-            AVAudioSession.InterruptionType(rawValue: type) == .ended,
-            let options = info?[AVAudioSessionInterruptionOptionKey] as? UInt
-        else { return false }
-        return AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
+        guard let rawType = info?[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: rawType)
+        else { return nil }
+        switch type {
+        case .began:
+            return .interruptionBegan
+        case .ended:
+            let options = (info?[AVAudioSessionInterruptionOptionKey] as? UInt).map {
+                AVAudioSession.InterruptionOptions(rawValue: $0)
+            }
+            return .interruptionEnded(shouldResume: options?.contains(.shouldResume) ?? false)
+        @unknown default:
+            return nil
+        }
     }
 }
 

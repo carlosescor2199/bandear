@@ -299,8 +299,29 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
       writer found `SessionEnded` only resets link health, `MonitorReducer.kt:70-81`);
     - the T7f verifier's AD1 (reports from a previous launch), AD2 (a late link report after a
       stop) and AD3 (the weak owner read on the receive thread).
-  - [ ] T8d — The SwiftUI screens on top (route: decided once T8a-T8c land). It replaces
-    `DeskListView` and `SessionView`.
+  - [ ] T8d — The SwiftUI screens on top, replacing `DeskListView` and `SessionView`:
+    - [x] T8d1 — The seam (route: inline, by the parent). `SessionModel` publishes the session,
+      the mix, the diagnostics, the tab, the manual form and the refusal. Its actions:
+      `connect(to:)`, `connectManually()`, `disconnect()`, `setName(_:)`, `apply(_:)`. The app
+      links `BandEarScreens`.
+    - [ ] T8d2 — Connect, Settings (with Diagnostics), the app shell and the Mixes tab (route:
+      delegated writer, launched together with T8d3):
+      - the shell: Connect while no session runs, tabs Mix, Mixes and Settings while one runs, and
+        the manual address opened from Connect, all chosen by `AppScreen`;
+      - Connect: the name, the desks found, the manual entry, and the refusal banner;
+      - Settings: the server card, Disconnect, the name, the manual connection, and Diagnostics
+        with its expander;
+      - Mixes: its layout and empty state only (T9 adds the rest).
+    - [ ] T8d3 — Mix and the channel sheet (route: delegated writer, launched together with
+      T8d2). It covers:
+      - the header, the pill and the banners;
+      - More of me and the channel picker;
+      - channels and groups, each strip with a native `Slider`, mute and solo;
+      - the master card with volume, mute, the level cap and the engineer's limit;
+      - the channel sheet with pan (`PanScale` and its detent), level, mute, solo, and the locked
+        and stereo notes.
+    Both writers use only `SessionModel` and `BandEarScreens`, edit no package code, and never edit
+    `SessionModel.swift`. A gap in the model goes back to the parent.
   - Route: T8a, T8b and T8c are independent units with disjoint surfaces, each over 100 lines.
     They run as three writers, each in its own worktree. The parent first adds the empty
     `BandEarScreens` module, so no writer edits `Package.swift`.

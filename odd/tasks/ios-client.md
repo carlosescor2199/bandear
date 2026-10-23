@@ -224,7 +224,10 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - When an interruption ends without asking to resume, it stays stopped, as Apple's guidance
       asks (another app took the audio). It restarts when the app becomes active again.
     - A configuration change stops it and restarts it, unless it is interrupted.
-    - When the app becomes active, it restarts if stopped and not interrupted.
+    - When the app becomes active, any interruption ends and a stopped output restarts. This rule
+      was rewritten by the user's decision of 2026-10-23, logged below. A system that still holds
+      the audio, such as a call in progress, refuses the restart, which then leaves the output
+      stopped.
     - A restart that fails leaves it stopped, and the next of those events tries again.
   - `EngineOutput` follows `OutputRecovery`:
     - It reactivates the audio session (`setActive(true)`) before every restart.
@@ -1324,4 +1327,12 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     - A5: `ReceiverStats.init` now needs `outputPlaying`. Only callers in this repository use it.
   - Note: the simulator's `com.bandear.ios` is now the verifier's TSan harness build. Reinstall
     the app before the next run.
+- 2026-10-23, the user's decision on the verifier's A1. Question: "Si una interrupción nunca termina
+  (otra app que mantiene su sesión de audio activa), ¿qué hace la app cuando el músico vuelve a
+  abrirla?" Answer: "Volver a la app la reanuda (Recommended)".
+  - Done in `3a469b8`: `OutputRecovery` ends the interruption when the app becomes active and
+    restarts a stopped output.
+  - RED: the new test failed (2 expectations). Becoming active was taken out of "restarts nothing
+    while interrupted".
+  - GREEN: 659 tests, 0 warnings. The screen copy is now true.
 

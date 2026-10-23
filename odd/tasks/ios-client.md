@@ -1701,4 +1701,20 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Simulator tip: the desk's `--target 127.0.0.1:59999` reaches a manual connection to
     `127.0.0.1` with audio port 59999 over loopback, which the firewall does not block.
   - Risk: item 6. The app side has no automated test, only the probe and screenshots.
+- T8e independent verifier (item 6): no blocker. Claims 1-6 PASS on `072e170` against the base
+  `2d9c707`.
+  - Its own body counters at 186-187 packets/s, rebuilds every 2 s:
+    - base on Mix: about 380-401 rebuilds of `RootView`, `MixView` and `MixContent`;
+    - head on Mix: 0 over five readings;
+    - head on Settings: only `DiagnosticsSection` and the stopped-output row follow the reports.
+  - A refused start reports one change at the head and none at the base. A successful start is
+    unchanged.
+  - Discovery started once at launch, and once per return across six trips to the background.
+  - The tab after the background: not reproduced. Only a connect and the user write it. Nothing in
+    T8e touches it.
+  - 837 tests, 0 warnings, the app builds, and the end-to-end check against the desk passed
+    (connect, slider, rename, disconnect, Bonjour).
+  - Advisories: A1 (a failed browser retries only after a background trip) is already under
+    Follow-ups. A2: the restored `linkReport` is always nil. A3: Mix's banners now look like
+    Connect's. A4: the tab note remains unexplained.
 

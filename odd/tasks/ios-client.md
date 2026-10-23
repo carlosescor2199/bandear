@@ -513,6 +513,16 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - A3: Android's name field cuts only the text an edit inserts (`keptEdit`, `BandEarTextField.kt`).
     The session cuts the end of the whole name, which agrees for typing at the end but not for a
     paste inside a name. The field would need `keptEdit` to match exactly.
+- **From the T8d verifier (advisories).**
+  - The refusal order differs from Android: `SessionModel.start` checks the form before the
+    previous receiver. The words differ only when both apply, during a stop that lasts
+    milliseconds.
+  - `mirror()` republishes every field on every change, the receiver's per-packet stats included,
+    so the Mix list re-renders with each packet. This is performance only.
+  - The `held` check (locked or following) is written in both the strip and the sheet, as on
+    Android, with no helper in `BandEarScreens`.
+  - A simulator app installed under a new bundle id can have its incoming UDP blocked by the macOS
+    firewall ("Link silent"), while its control connection works.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1601,4 +1611,22 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - Risk for T8d: item 6. The views have no automated test; the app has no test target. Their rules
   and words are tested in the package. Item 4 applies too: `4f77237` changes the order of the
   coordinator's state at a start.
+- T8d independent verifier (items 6 and 4): no blocker. Claims 1-5 and 7 PASS, and claim 6 PASS for
+  every listed exercise.
+  - No copy in the views apart from the recorded stopped-output line.
+  - Navigation matches `AppScreen.kt`.
+  - Every edit goes through the model.
+  - The stale-figures fix: its test fails against the base `MonitorAudio` and passes at HEAD.
+  - End to end against the desk, through a passive observer WebSocket that receives the desk's
+    `mix_state` pushes:
+    - a slider to 62, mute on and off, pan dragged to centre (50);
+    - More of me lifting to 100, then back;
+    - a rename to "Verifier" on the same connection;
+    - a manual connect named `192.168.1.54:50001`;
+    - an empty name, registered "(unnamed)";
+    - a Bonjour connect, and Disconnect.
+  - Audio was not re-proven in its run: the macOS firewall blocked incoming UDP for its scratch
+    bundle id. The parent's run on the same commit had 185 packets/s.
+  - 836 tests, 0 warnings, and the app builds. Its trivial advisory (an unused `import UIKit`) is
+    fixed in the next commit; the rest are under Follow-ups.
 

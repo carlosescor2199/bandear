@@ -15,6 +15,7 @@ let package = Package(
         .library(name: "BandEarDiscovery", targets: ["BandEarDiscovery"]),
         .library(name: "BandEarMix", targets: ["BandEarMix"]),
         .library(name: "BandEarSession", targets: ["BandEarSession"]),
+        .library(name: "BandEarScreens", targets: ["BandEarScreens"]),
     ],
     targets: [
         .target(name: "BandEarProtocol"),
@@ -43,5 +44,19 @@ let package = Package(
         .testTarget(
             name: "BandEarSessionTests",
             dependencies: ["BandEarSession", "BandEarProtocol", "BandEarMix", "BandEarDiscovery"]),
+        // What the screens say and show: the words, verbatim from the Android client, and the values
+        // derived for display. Pure, so `swift test` proves the screens' rules without a simulator;
+        // it reads the other modules and nothing reads it but the app.
+        .target(
+            name: "BandEarScreens",
+            dependencies: [
+                "BandEarProtocol", "BandEarMix", "BandEarDiscovery", "BandEarPlayback", "BandEarSession",
+            ]),
+        .testTarget(
+            name: "BandEarScreensTests",
+            dependencies: [
+                "BandEarScreens", "BandEarProtocol", "BandEarMix", "BandEarDiscovery", "BandEarPlayback",
+                "BandEarSession",
+            ]),
     ]
 )

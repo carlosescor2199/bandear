@@ -1301,4 +1301,27 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     `close()`.
   - Commit `db53b76`. Risk: item 4 (the restart runs under the lock, and the handlers run on the
     private queue).
+- T7g independent verifier (high-risk item 4): no blocker. Claims 1-5 PASS.
+  - Policy and tests: 5 spot mutants killed.
+  - `setActive` comes before both `engine.start()` calls, and no `try?` remains.
+  - One lock order: the output's lock, then AVAudioSession/AVAudioEngine. The observers use
+    `queue: nil` and only enqueue async, so a notification posted inside `engine.start()` cannot
+    re-enter the lock.
+  - Package TSan probe: 6 seeds, clean.
+  - Simulator stress of the real `EngineOutput` (8 threads posting notifications, `close()`
+    racing), plain and under TSan: 40 of 40 opened, 0 restarts after close, 0 deadlocks, 0 TSan
+    warnings.
+  - 658 tests, 0 warnings, and the app builds.
+  - Advisories:
+    - A1, a product decision: an interruption whose end never comes (another app keeping its
+      session active) leaves the output stopped for the rest of the session. Becoming active does
+      not restart it while interrupted, and the screen copy ("or when you return to the app")
+      promises otherwise.
+    - A2: a late `.appWasSuspended` beginning can mark the output stopped while it plays.
+    - A3: a failed restart's error is not logged.
+    - A4: a configuration change can try a restart in the background. Only a device test proves
+      what happens.
+    - A5: `ReceiverStats.init` now needs `outputPlaying`. Only callers in this repository use it.
+  - Note: the simulator's `com.bandear.ios` is now the verifier's TSan harness build. Reinstall
+    the app before the next run.
 

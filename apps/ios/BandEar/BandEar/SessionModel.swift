@@ -57,14 +57,6 @@ final class SessionModel: ObservableObject {
     /// Why the last connect started nothing, in Android's words, or nil.
     @Published private(set) var refusal: String?
 
-    // MARK: Kept for the provisional session screen until T8d replaces it
-
-    /// How many strips the desk's `config` announced.
-    @Published private(set) var stripCount = 0
-    /// Packets of the desk's audio played this session.
-    @Published private(set) var packetsPlayed: Int64 = 0
-    /// Why the receiver last refused a packet or lost its output, or nil.
-    @Published private(set) var audioProblem: String?
     /// Whether the audio output was reaching the musician at the last packet played; `true` until
     /// a packet says otherwise.
     @Published private(set) var outputPlaying = true
@@ -150,9 +142,6 @@ final class SessionModel: ObservableObject {
         linkReport = audio.linkReport
         underrunTotal = audio.underrunTotal
         receiverError = audio.receiverError
-        stripCount = session.mixSession.mix.strips.count
-        packetsPlayed = audio.receiverStats?.packets ?? 0
-        audioProblem = audio.receiverError.map { "\($0)" }
         outputPlaying = audio.receiverStats?.outputPlaying ?? true
         // A session that ended on its own, its receiver gone, takes its screen with it.
         if desk != nil, !audio.isRunning {

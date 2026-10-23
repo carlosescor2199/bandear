@@ -418,6 +418,12 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     Only a device test settles the order.
   - `init` starts the engine outside the lock, so a configuration change in that window could race
     a restart. This was already so before T7g.
+  - T7h review (suggestions): the published flag starts as a literal `true` rather than a copy of
+    `recovery.isPlaying`. Both start playing today, so they agree. Seeding it from the recovery, or
+    publishing once at the end of `init`, keeps a single source if that default ever changes.
+    R3-002 of the same review: the publish order (a stop is published before a restart, the result
+    after) has only the verifier's simulator probe as proof. Moving that sequence into
+    `BandEarPlayback` would let `swift test` pin it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1389,4 +1395,13 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Advisories, all already true at the base:
     - `close()` can wait for one restart, so `onStopped` comes up to one restart later.
     - `isPlaying` keeps its last value after `close()`, which nobody reads.
+- T7h native review:
+  - Assessed against `825e558` with item 4 escalated: `high`, due (2 paths, 93 lines).
+  - START checked: base `8026d92` = `825e558`, candidate `bdc2a8d` = `9641033`.
+  - The user chose "Revisar este cambio" (`granted`).
+  - Approved. Lineage `review-03e2e6bd2a108df4`, acknowledged. The reviewed boundary is now
+    `9641033`.
+  - Findings: two suggestions (seed the flag from the recovery) and one warning (R3-002, the
+    publish order has no test). They are under "Gaps left by T7g" and not fixed.
+- T7h complete.
 

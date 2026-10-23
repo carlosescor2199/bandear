@@ -15,6 +15,11 @@
 /// - One that ends without asking leaves it stopped until the app becomes active again, because the
 ///   musician turned to another app's audio and has not come back yet.
 ///
+/// The app becoming active also ends an interruption, since Apple promises no end for every one:
+/// another app that keeps its session active never sends it. The musician coming back to the app is
+/// then the end; a system that still holds the audio, such as a call in progress, refuses the
+/// restart, and the output stays stopped until the next event.
+///
 /// A restart that fails leaves the output stopped, and the next event that allows a restart tries
 /// again. It holds two flags and no clock, so the app decides when its events happen.
 public struct OutputRecovery: Equatable, Sendable {
@@ -57,7 +62,8 @@ public struct OutputRecovery: Equatable, Sendable {
             isPlaying = false
             return !isInterrupted
         case .becameActive:
-            return !isPlaying && !isInterrupted
+            isInterrupted = false
+            return !isPlaying
         }
     }
 

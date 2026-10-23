@@ -102,11 +102,24 @@ struct OutputRecoveryTests {
         #expect(recovery.isPlaying)
     }
 
+    /// Apple promises no end for every interruption: another app that keeps its session active
+    /// never sends one. The musician coming back to the app is the end then, as the user decided
+    /// on 2026-10-23 ("Volver a la app la reanuda"); a system that still holds the audio, such as a
+    /// call in progress, refuses the restart, which ``restartFailed()`` then reports.
+    @Test("ends an interruption whose end never came when the app becomes active")
+    func becomingActiveEndsAnInterruption() {
+        var recovery = recovery(after: [.interruptionBegan])
+
+        let restarts = recovery.handle(.becameActive)
+
+        #expect(restarts)
+        #expect(!recovery.isInterrupted)
+        #expect(!recovery.isPlaying)
+    }
+
     @Test(
         "restarts nothing while interrupted",
-        arguments: [
-            OutputRecovery.Event.configurationChanged, .becameActive, .interruptionBegan,
-        ])
+        arguments: [OutputRecovery.Event.configurationChanged, .interruptionBegan])
     func nothingRestartsWhileInterrupted(event: OutputRecovery.Event) {
         var recovery = recovery(after: [.interruptionBegan])
 

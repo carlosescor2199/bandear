@@ -99,15 +99,14 @@ struct MonitorAudioTests {
         #expect(!session.mixSession.isSessionRunning)
     }
 
-    @Test("starts no receiver for a name the desk would store as no name")
-    func aBlankNameStartsNoReceiver() throws {
-        #expect(throws: ClientMessageError.nameIsBlank) {
-            try audio.start(toStage, musicianName: "   ")
-        }
+    @Test("starts the receiver for a blank name too, as Android connects whatever the field holds")
+    func aBlankNameStartsTheReceiver() throws {
+        try audio.start(toStage, musicianName: "   ")
 
-        #expect(try receivers.only().launches.isEmpty)
-        #expect(transport.opened.isEmpty)
-        #expect(!session.mixSession.isSessionRunning)
+        #expect(try receivers.only().launches == [toStage.audioPort])
+        #expect(transport.opened == [stage])
+        #expect(audio.isRunning)
+        #expect(session.mixSession.isSessionRunning)
     }
 
     @Test("stops the receiver when the session is stopped without it, and its report ends nothing more")
@@ -234,6 +233,9 @@ struct MonitorAudioTests {
         #expect(audio.linkReport == nil)
         #expect(audio.receiverStats == Self.stats)
         #expect(audio.receiverError as? ReceiveError == .tooManyChannels(40))
+        // Android keeps the counters of an ended session on show until the next one starts
+        // (`MonitorReducer.kt:78-81` resets only the link health).
+        #expect(audio.underrunTotal == Self.report.underruns)
 
         try receiver.finishStopping()
         await settle()
@@ -242,6 +244,169 @@ struct MonitorAudioTests {
         #expect(audio.receiverStats == nil)
         #expect(audio.linkReport == nil)
         #expect(audio.receiverError == nil)
+        #expect(audio.underrunTotal == 0)
+    }
+
+    // MARK: Whether a session runs
+
+    /// The screens choose Connect or the tabs by it. It agrees with
+    /// ``BandEarMix/MixSession/isSessionRunning`` at every change the coordinator reports, its start
+    /// included, so a screen reading either never sees one session in two states.
+    @Test("says whether a session runs, agreeing with the mix session at every change it reports")
+    func isRunningAgreesWithTheMixSession() async throws {
+        var heard: [Bool] = []
+        var disagreements: [String] = []
+        audio.stateDidChange = { [weak audio, session] in
+            guard let audio else { return }
+            heard.append(audio.isRunning)
+            if audio.isRunning != session.mixSession.isSessionRunning {
+                disagreements.append("running \(audio.isRunning) after change \(heard.count)")
+            }
+        }
+        let receiver = try receivers.only()
+        #expect(!audio.isRunning)
+
+        try audio.start(toStage, musicianName: "Ana")
+        #expect(audio.isRunning)
+        await desk.open()
+        audio.stop()
+        #expect(!audio.isRunning)
+        try receiver.finishStopping()
+        await settle()
+
+        try audio.start(toStage, musicianName: "Ana")
+        try receiver.endOnItsOwn()
+        await settle()
+        #expect(!audio.isRunning)
+
+        try audio.start(toStage, musicianName: "Ana")
+        session.stop()
+        #expect(!audio.isRunning)
+
+        #expect(disagreements.isEmpty)
+        #expect(heard.contains(true) && heard.contains(false))
+    }
+
+    @Test("a start refused while the previous receiver stops leaves no session running")
+    func aRefusedStartRunsNothing() async throws {
+        try await connected()
+        audio.stop()
+
+        #expect(throws: MonitorAudioError.previousReceiverStopping) {
+            try audio.start(toStage, musicianName: "Ana")
+        }
+
+        #expect(!audio.isRunning)
+    }
+
+    @Test("a start the session refuses leaves no session running and launches nothing")
+    func aStartTheSessionRefusesRunsNothing() throws {
+        #expect(throws: ClientMessageError.udpPortMustNotBeZero) {
+            try audio.start(ConnectionRequest(endpoint: stage, audioPort: 0), musicianName: "Ana")
+        }
+
+        #expect(!audio.isRunning)
+        #expect(try receivers.only().launches.isEmpty)
+        #expect(transport.opened.isEmpty)
+
+        // Nothing was left half started: the next start runs as usual.
+        try audio.start(toStage, musicianName: "Ana")
+
+        #expect(audio.isRunning)
+        #expect(try receivers.only().launches == [toStage.audioPort])
+    }
+
+    // MARK: Reports that belong to no running session (the T7f verifier's AD1 and AD2)
+
+    /// AD1. The musician stops and connects again within one turn of the main queue, while the last
+    /// launch's reports are still on their way to it: each report says which launch made it, and the
+    /// new session's diagnostics take only its own.
+    @Test("reports of the last launch, still queued when the next session starts, touch none of it")
+    func reportsOfThePreviousLaunchAreDropped() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+        let stats = Self.stats
+        let report = Self.report
+        #expect(
+            onReceiveThread(receiver.listener) { listener in
+                listener.onStats(stats)
+                listener.onLinkStats(report)
+                listener.onError(ReceiveError.tooManyChannels(40))
+            }, "the receive thread hung")
+        audio.stop()
+        try receiver.finishStopping()
+
+        try audio.start(toStage, musicianName: "Ana")
+        await settle()
+
+        #expect(audio.receiverStats == nil)
+        #expect(audio.linkReport == nil)
+        #expect(audio.receiverError == nil)
+        #expect(audio.underrunTotal == 0)
+        #expect(audio.isRunning)
+        #expect(session.mixSession.isSessionRunning)
+
+        // The new launch's own reports still count.
+        receiver.listener.onStats(stats)
+        receiver.listener.onLinkStats(report)
+        await settle()
+
+        #expect(audio.receiverStats == stats)
+        #expect(audio.linkReport == report)
+        #expect(audio.underrunTotal == report.underruns)
+    }
+
+    /// AD2. The loop's last report can reach the main actor after Stop. Android sets its link health
+    /// from it all the same (`MonitorReducer.kt:177`); here it describes a link no longer known.
+    @Test("a link report that arrives after stop is neither kept, nor counted, nor sent")
+    func aLinkReportAfterStopIsDropped() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+        let report = Self.report
+        let sent = try transport.sent(ofType: "stats").count
+
+        audio.stop()
+        #expect(onReceiveThread(receiver.listener) { $0.onLinkStats(report) }, "the receive thread hung")
+        await settle()
+
+        #expect(audio.linkReport == nil)
+        #expect(audio.underrunTotal == 0)
+        #expect(try transport.sent(ofType: "stats").count == sent)
+    }
+
+    @Test("a link report that arrives after the session stopped directly is dropped too")
+    func aLinkReportAfterTheSessionStoppedIsDropped() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+
+        receiver.listener.onLinkStats(Self.report)
+        session.stop()
+        await settle()
+
+        #expect(audio.linkReport == nil)
+        #expect(audio.underrunTotal == 0)
+    }
+
+    // MARK: The listener's owner (the T7f verifier's AD3)
+
+    /// AD3. The listener looks its coordinator up inside the block the main queue runs, never on
+    /// the receive thread that hands the report over, so the last reference to the coordinator is
+    /// never let go off the main actor. Seen here through a report handed over before the
+    /// coordinator attached itself: looked up on handing over, it would find no one.
+    @Test("looks its coordinator up when the main actor handles a report, not when it is handed over")
+    func readsItsOwnerOnTheMainActor() async throws {
+        let session = ControlSession(
+            transport: FakeTransport(), scheduler: ManualScheduler(), store: FakeMusicianStore())
+        let audio = MonitorAudio(
+            session: session, sinkFactory: FakeSinkFactory(),
+            makeReceiver: { sinkFactory, controls, listener in
+                listener.onError(ReceiveError.tooManyChannels(40))
+                return FakeReceiver(sinkFactory, controls, listener)
+            })
+
+        await settle()
+
+        #expect(audio.receiverError as? ReceiveError == .tooManyChannels(40))
     }
 
     @Test("tells its observer after every change of the session and every report")

@@ -75,14 +75,20 @@ struct ControlSessionTests {
                 == [Self.capabilities, Self.capabilities])
     }
 
-    @Test("starts nothing for a name the desk would store as no name")
-    func aBlankNameStartsNothing() {
-        #expect(throws: ClientMessageError.nameIsBlank) {
-            try session.start(toStage, musicianName: "   ")
-        }
-        #expect(transport.opened.isEmpty)
-        #expect(session.connection == .idle)
-        #expect(!session.mixSession.isSessionRunning)
+    /// Android connects whatever the name field holds and registers it trimmed
+    /// (`buildRegisterMessage`, `ControlChannel.kt:545-557`); the desk stores an empty name as none.
+    @Test("starts a session for a blank name, which registers as an empty name")
+    func aBlankNameStartsASessionWithNoName() async throws {
+        try session.start(toStage, musicianName: "   ")
+
+        #expect(transport.opened == [stage])
+        #expect(session.mixSession.isSessionRunning)
+
+        await desk.open()
+
+        let registers = try transport.sent(ofType: "register")
+        try #require(registers.count == 1)
+        #expect(registers[0]["name"] as? String == "")
     }
 
     // MARK: Sending only while open

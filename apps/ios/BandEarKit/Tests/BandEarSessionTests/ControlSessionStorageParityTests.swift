@@ -29,6 +29,7 @@ struct ControlSessionStorageParityTests {
         """#
 
     private let transport = FakeTransport()
+    private let scheduler = ManualScheduler()
     private let store = FakeMusicianStore(musicianName: "Ana")
     private let desk: FakeDesk
 
@@ -39,7 +40,7 @@ struct ControlSessionStorageParityTests {
     /// Android's `viewModel by lazy`: the app launches when a test first needs it, after the test
     /// set what an earlier launch left in the store.
     private func launched() -> ControlSession {
-        ControlSession(transport: transport, scheduler: ManualScheduler(), store: store)
+        ControlSession(transport: transport, scheduler: scheduler, store: store)
     }
 
     /// Android's `connected(channels)`: connects as Ana, opens, and the desk announces `channels`.
@@ -75,6 +76,34 @@ struct ControlSessionStorageParityTests {
         #expect(registers[0]["name"] as? String == "Ana")
         #expect(registers[0]["udp_port"] as? Int == Int(ConnectionForm.defaultAudioPort))
         #expect(try transport.sentTypes() == ["register", "mix"])
+    }
+
+    // MonitorViewModelTest.kt:1104. Android's fake store trims what it is given, as its real one
+    // does (`MixBankStore.kt:61-63`); here the session hands the store the trimmed name itself.
+    @Test func aNameChangeIsStoredAndAnnouncedAfterThePause() async throws {
+        let session = try await connected()
+
+        session.setMusicianName("Bea ")
+
+        let socket = try #require(transport.attempts.last)
+        #expect(session.musicianName == "Bea ")
+        #expect(store.musicianName == "Bea")
+        #expect(try socket.sent(ofType: "register").count == 1)
+        #expect(scheduler.pendingDelays == [.milliseconds(400)])
+
+        try scheduler.runNextDue()
+
+        #expect(try socket.sent(ofType: "register").last?["name"] as? String == "Bea")
+    }
+
+    // MonitorReducerTest.kt:1406, `theNameIsKeptAsTyped`: Android's reducer keeps the name exactly
+    // as typed, which is the name the session shows.
+    @Test func theNameIsKeptAsTyped() {
+        let session = launched()
+
+        session.setMusicianName(" Ana ")
+
+        #expect(session.musicianName == " Ana ")
     }
 
     @Test func aChannelTheServerDidNotAnnounceIsNotStored() async throws {

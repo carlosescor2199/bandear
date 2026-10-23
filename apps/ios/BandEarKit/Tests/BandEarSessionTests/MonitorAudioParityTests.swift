@@ -383,4 +383,48 @@ struct MonitorAudioParityTests {
             audio.receiverError as? AudioDatagramDecodingError == .headerTooShort(byteCount: 3))
         #expect(session.lastError == DeskError(message: "mix refused", sequence: nil))
     }
+
+    /// Android's `report(received, underruns)` (`MonitorReducerTest.kt:79-80`).
+    private func report(received: Int64 = 100, underruns: Int64 = 0) -> LinkStatsReport {
+        LinkStatsReport(
+            intervalMilliseconds: 1_000, packetsReceived: received, packetsLost: 0,
+            underruns: underruns, receiveTimeouts: 0)
+    }
+
+    // MonitorReducerTest.kt:1384, the underrun half. Android also sets the link health from each
+    // report; the screens derive it in T8, from the report kept here.
+    @Test func linkReportsSetTheLinkHealthAndAddUpUnderruns() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+
+        receiver.listener.onLinkStats(report(underruns: 1))
+        await settle()
+        let warned = audio.underrunTotal
+        receiver.listener.onLinkStats(report(underruns: 0))
+        await settle()
+        let recovered = audio.underrunTotal
+        receiver.listener.onLinkStats(report(received: 0))
+        await settle()
+
+        #expect(warned == 1)
+        #expect(recovered == 1)
+        #expect(audio.underrunTotal == 1)
+    }
+
+    // MonitorReducerTest.kt:104, the underrun half: Android's `SessionStarted` starts the
+    // diagnostics again (`MonitorReducer.kt:70-72`), its counters among them.
+    @Test func aStartedSessionClearsTheLastSessionsCountersErrorsAndProblem() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+        receiver.listener.onLinkStats(report(underruns: 1))
+        await settle()
+        try #require(audio.underrunTotal == 1)
+        audio.stop()
+        try receiver.finishStopping()
+        await settle()
+
+        try audio.start(toStage, musicianName: "Ana")
+
+        #expect(audio.underrunTotal == 0)
+    }
 }

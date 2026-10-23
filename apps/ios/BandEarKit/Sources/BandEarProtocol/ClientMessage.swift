@@ -60,8 +60,10 @@ public enum ClientCapability: String, Equatable, Sendable, CaseIterable {
 ///
 /// The initializer normalises exactly as the desk does, so what the phone shows is what the desk
 /// stores: the name is trimmed and capped, and a client id the desk would discard is dropped here
-/// instead of being sent and silently ignored. A zero UDP port is refused outright, because the
-/// desk refuses the whole registration for it.
+/// instead of being sent and silently ignored. A name with nothing in it is sent empty, as Android
+/// sends it (`buildRegisterMessage`, `ControlChannel.kt:545-557`): the desk registers the musician
+/// with no name and still sends them audio (`registered_name`, `apps/server/src/protocol.rs:330`).
+/// A zero UDP port is refused outright, because the desk refuses the whole registration for it.
 public struct Registration: Equatable, Sendable, ControlPayload {
     static let messageType = "register"
 
@@ -81,10 +83,7 @@ public struct Registration: Equatable, Sendable, ControlPayload {
     ) throws {
         guard udpPort != 0 else { throw ClientMessageError.udpPortMustNotBeZero }
 
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw ClientMessageError.nameIsBlank }
-
-        self.name = Self.capped(trimmed)
+        self.name = Self.capped(name.trimmingCharacters(in: .whitespacesAndNewlines))
         self.udpPort = udpPort
         self.clientID = clientID.flatMap(Self.keptClientID)
         self.capabilities = capabilities.deduplicated()
@@ -302,8 +301,6 @@ public struct LinkStats: Equatable, Sendable, ControlPayload {
 public enum ClientMessageError: Error, Equatable, Sendable {
     /// The desk refuses a registration without a port to send audio to.
     case udpPortMustNotBeZero
-    /// A name of only whitespace, which the desk stores as no name at all.
-    case nameIsBlank
     /// Outside 1 to ``LinkStats/maximumIntervalMilliseconds``; the desk cannot normalise rates by it.
     case statsIntervalOutOfRange(UInt32)
 }

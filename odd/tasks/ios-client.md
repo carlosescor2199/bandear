@@ -238,6 +238,15 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     instead of showing Connected over silence.
   - Out of scope: R3-002 (the session activated before the format) and R3-003 (the bounds' tests)
     stay under Follow-ups, since the user asked only for the interruption warnings.
+- [x] T7h — The receive thread never waits for an output restart (route: inline, a small fix in
+  one file). The user asked for it on 2026-10-23: "dale, arreglá el bloqueo del hilo de
+  recepción". It fixes the T7g review's R4-001 and R3-001:
+  - `EngineOutput` publishes `recovery.isPlaying` behind its own `OSAllocatedUnfairLock`, held
+    only to copy one value.
+  - The value is updated after every recovery change, including before a restart is tried.
+  - `isPlaying` reads only that published value. The lock order is the output's lock, then the
+    published one.
+  - Commit recorded in Progress.
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
 ## Follow-ups
@@ -396,11 +405,11 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - **Gaps left by T7g** (named by its writer, its verifier and its review). An interruption that
   never ends, `.appWasSuspended` included, no longer leaves the output stuck: becoming active ends
   it (`3a469b8`).
-  - R4-001 / R3-001 of the T7g review: a restart runs `setActive(true)` and `engine.start()` under
-    the output's lock, and the receive thread's per-packet `isPlaying` read takes the same lock.
-    While a restart runs (tens to hundreds of ms, longer when a call refuses it), the receive
-    thread waits. Datagrams then queue in the socket and the arrival-timing stats inflate. Read
-    the flag without that lock, for example from an atomic kept beside the recovery.
+  - (Fixed in T7h.) R4-001 / R3-001 of the T7g review: a restart runs `setActive(true)` and
+    `engine.start()` under the output's lock, and the receive thread's per-packet `isPlaying` read
+    took the same lock. While a restart ran (tens to hundreds of ms, longer when a call refuses
+    it), the receive thread waited. Datagrams then queued in the socket and the arrival-timing
+    stats inflated.
   - R4-002 (also the verifier's A3): a failed restart's error is dropped, so the screen cannot say
     why the output stopped (a call, a format, the background). Keep or log the last error.
   - R3-002: the app-side glue has no automated test, since the app has no test target. That glue is
@@ -1358,4 +1367,13 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - The first three are under "Gaps left by T7g". They are not fixed, since findings alone
     authorize no change.
 - T7g complete.
+- T7h (inline), commit `58c1b24`:
+  - `EngineOutput.isPlaying` now reads a value published behind its own lock. The recovery
+    publishes it after `handle` (so a stopping event shows before the restart) and again after the
+    restart's result.
+  - Every access to `recovery` stays under the output's lock. The receive thread takes only the
+    published lock, and none of its calls (`write`, `setTargetFrames`, `underrunCount`,
+    `presentedFrame`, `isPlaying`) takes the output's lock.
+  - The app builds with no warning in its files. There is no automated test, because the app has
+    no test target; its independent verifier is asked for a runtime probe.
 

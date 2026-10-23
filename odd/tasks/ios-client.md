@@ -213,7 +213,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - set the cap to the lower of the musician's cap and the engineer's limit;
     - set up the app's audio session, and start and stop with the control session;
     - check it end to end by listening to the desk.
-- [ ] T7g — The output after an interruption never goes silent unnoticed. The user asked for it
+- [x] T7g — The output after an interruption never goes silent unnoticed. The user asked for it
   on 2026-10-23: "dale, arreglá primero los warnings de interrupción". It fixes the T7f review's
   R4-001 and R3-001 (quoted under Follow-ups). Route: one delegated writer, because the parent
   context is past the long-session backstop.
@@ -390,6 +390,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - R3-003: the A5 bounds (8 000-192 000 Hz, 1-16 384 frames) have no test, because the app has no
     test target. Moving the check into `BandEarPlayback` as a pure function would let `swift test`
     pin it.
+- **Gaps left by T7g** (its writer named them):
+  - An interruption that begins with `.appWasSuspended` never ends, so the output stays
+    interrupted and becoming active does not restart it. The screen line shows it, and Disconnect
+    then Connect recovers.
+  - `init` starts the engine outside the lock, so a configuration change in that window could race
+    a restart. This was already the case before T7g.
+  - A restart runs under the output's lock, so the receive thread's per-packet `isPlaying` read
+    waits for it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1276,4 +1284,21 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     The grant and the captures then ran from one inline script.
 - T7 complete. Pending: T8 (screens), T9 (mixes), the small `R3-001` unit (the transport's
   injected clock), and the follow-ups above, which are the user's to prioritise.
+- T7g, one writer in a worktree (long-session backstop). The previous session ended mid-run, so it
+  was resumed.
+  - `OutputRecovery` (pure, 12 tests). `PlaybackSink.isPlaying`, with a default of `true`.
+    `ReceiverStats.outputPlaying`.
+  - `EngineOutput` follows the recovery: `setActive(true)` before every restart, no `try?`, and
+    nothing after `close()`. It now also listens for an interruption beginning and for
+    `didBecomeActive`.
+  - The screen line shows while the output is stopped.
+  - RED: 11 of 12 recovery tests failed against stubs (15 failed expectations), plus 1 loop test.
+  - GREEN: 658 tests, 0 warnings on a never-built copy, and the app builds. 11 of 11 mutants were
+    killed.
+  - Smoke check on the simulator, with interruption notifications posted by hand and the real
+    `setActive` and `engine.start()`: `isPlaying` went true → false → true (resume) → false
+    (began, then an end without resume) → true (became active), and stayed false after
+    `close()`.
+  - Commit `db53b76`. Risk: item 4 (the restart runs under the lock, and the handlers run on the
+    private queue).
 

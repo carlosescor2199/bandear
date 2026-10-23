@@ -1,4 +1,5 @@
 import BandEarDiscovery
+import BandEarScreens
 import SwiftUI
 
 /// The musician's name and the desks found on the local network, with one line saying what
@@ -13,7 +14,9 @@ struct DeskListView: View {
         NavigationStack {
             List {
                 Section("Your name") {
-                    TextField(session.deviceName, text: $session.musicianName)
+                    TextField(
+                        ConnectWords.nameLabel,
+                        text: Binding(get: { session.musicianName }, set: { session.setName($0) }))
                 }
                 Section("Desks") {
                     if let statusLine {

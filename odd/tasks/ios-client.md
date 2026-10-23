@@ -264,7 +264,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     "Save the current mix above, then bring it back here with one tap.") and the pure text helpers
     of `SavedMixesText.kt`. Storage, the snapshot, recall and the notices driven by the store are
     T9's.
-  - [ ] T8a — Connection and diagnostics words, in a new pure module `BandEarScreens` (route:
+  - [x] T8a — Connection and diagnostics words, in a new pure module `BandEarScreens` (route:
     delegated writer, launched together with T8b and T8c). It covers:
     - the screen choice (`appScreenFor`);
     - the connection pill words;
@@ -277,7 +277,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 
     It ports `AppScreenTest`, `ConnectionPillTest`, `SettingsTextTest`, `LinkHealthTest` and
     `PhoneLinkHealthTest`, plus the reducer's pill, banner and diagnostics cases.
-  - [ ] T8b — Mix words, in the same module (route: delegated writer, launched together with T8a
+  - [x] T8b — Mix words, in the same module (route: delegated writer, launched together with T8a
     and T8c). It covers:
     - strip and group text, and pan text with its 5% detent;
     - master, cap and the engineer's limit;
@@ -290,12 +290,13 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 
     It ports `MixScreenTextTest`, `ChannelSheetTextTest`, `PanScaleTest` (text and detent),
     `AtomLabelsTest` and `SavedMixesTextTest`.
-  - [ ] T8c — The session's gaps for the screens, in `BandEarSession` (route: delegated writer,
+  - [x] T8c — The session's gaps for the screens, in `BandEarSession` (route: delegated writer,
     launched together with T8a and T8b):
     - the name is stored as typed and re-announced to the desk after a typing pause, as Android
       does (`aNameChangeIsStoredAndAnnouncedAfterThePause`);
     - whether a session runs, made public;
-    - the running underrun total per session, reset when a session ends;
+    - the running underrun total per session, reset when a session starts, as Android does (its
+      writer found `SessionEnded` only resets link health, `MonitorReducer.kt:70-81`);
     - the T7f verifier's AD1 (reports from a previous launch), AD2 (a late link report after a
       stop) and AD3 (the weak owner read on the receive thread).
   - [ ] T8d — The SwiftUI screens on top (route: decided once T8a-T8c land). It replaces
@@ -1459,4 +1460,37 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Findings: two suggestions (seed the flag from the recovery) and one warning (R3-002, the
     publish order has no test). They are under "Gaps left by T7g" and not fixed.
 - T7h complete.
+- T8a, T8b and T8c: three writers launched together, each in its own worktree, all on `4801871`
+  (the empty `BandEarScreens` module).
+- T8a (connection and diagnostics words): 76 tests (RED 70 of 77), 10 of 10 mutants caught.
+  - Numbers round half up, as Java's `String.format` does, so one packet lost in 800 reads
+    "0.13 %".
+  - Android's `UNAVAILABLE` and `CLOSED` control states have no iOS counterpart, and their words
+    are not ported.
+  - A desk typed by hand is named "host:port".
+  - After the parent's message it maps no `nameIsBlank`, since T8c removed that error.
+- T8b (Mix words): 71 tests (51 ported, RED 70 of 71), 10 of 10 mutants caught.
+  - `PanScale` binds a native `Slider` over 0...1, with Android's 5% detent each side of centre.
+  - The kind labels come from `ChannelKind.label` (`ClientMixState.kt`), which no Android test
+    pins.
+  - Android's gesture tests are skipped, since its own faders are not ported.
+- T8c (the session's gaps): 27 tests, TSan clean, 15 of 15 mutants caught.
+  - The name is kept as typed (cut at 64 UTF-16 units without splitting a character) and stored
+    trimmed. A rename is announced 400 ms after typing stops (`NAME_RESEND_DEBOUNCE_MS`).
+  - A blank name registers as `""`, as Android does, so `ClientMessageError.nameIsBlank` is gone.
+  - `MonitorAudio.isRunning` and `underrunTotal`.
+  - AD1: reports are tagged with their launch. AD2: late link reports are dropped. AD3: the owner
+    is read on main.
+  - Changed expectations, on purpose: the blank-name cases in five tests.
+- Parent's integration:
+  - Every path was inside its writer's surfaces, on the same base, and the copies were identical.
+  - The following banner's words existed twice (T8a's `ConnectionBanner`, T8b's `MixWords`).
+    `ConnectionBanner.following` now uses `MixWords`, since Android keeps those words in
+    `MixScreenText.kt`.
+  - Combined suite: 834 tests (660 + 76 + 71 + 27), 0 warnings on a never-built copy, and the app
+    builds.
+  - Commits: `bb5562a` (T8b), `3e590c3` (T8a), `1e315f0` (T8c, alone, since it touches
+    concurrency, item 4).
+- Open for T8d: `SessionModel` connects under the device name when the field is empty. Android
+  sends a blank name, and the user chose Android's rules, so T8d drops that substitution.
 

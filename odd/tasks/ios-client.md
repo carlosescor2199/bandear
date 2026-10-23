@@ -113,7 +113,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - [x] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
     the musician's own levels put back after a link.
   - [x] T5e — The outgoing mix and when one is sent.
-- [ ] T8e — The T8d review's four warnings, which the user asked for on 2026-10-23: "dale, arreglá
+- [x] T8e — The T8d review's four warnings, which the user asked for on 2026-10-23: "dale, arreglá
   primero los warnings de T8". Route: one delegated writer, because the parent context is past the
   long-session backstop. The review's suggestions stay under Follow-ups.
   - R4-mirror-republish-per-change: a receiver report must not rebuild the Mix screen.
@@ -537,7 +537,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     Android, with no helper in `BandEarScreens`.
   - A simulator app installed under a new bundle id can have its incoming UDP blocked by the macOS
     firewall ("Link silent"), while its control connection works.
-- **From the T8d review (warnings and suggestions, not fixed).**
+- **From the T8d review. The four warnings are fixed in T8e; the suggestions are not.**
   - R4-mirror-republish-per-change (also the verifier's): `mirror()` assigns every published field
     on every change, so each receiver report rebuilds the whole Mix list. Assign only what changed,
     or move the per-packet figures out of the mix screen's observation.
@@ -556,6 +556,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - `ChannelSheetKey` and `StripKey` are near copies;
     - the stale-figures tests do not check `linkReport`;
     - `SessionModel`'s start path has no automated test.
+- **From T8e (its writer named these).**
+  - A failed discovery browser is now retried only after a return from the background, and no
+    longer after a brief interruption such as Control Center. The local network wait clears by
+    itself once access is granted.
+  - Once, coming back from the background, the app showed Mix instead of Settings, and a second try
+    kept Settings. Nothing in T8e writes the tab. Watch whether the shell resets it.
+  - The `linkReport` checks added to the stale-figures tests are weak guards: an ended session
+    already clears `linkReport`.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1672,4 +1680,25 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - 4 warnings and 4 suggestions are under Follow-ups. They are not fixed: findings alone authorize
     no change.
 - T8 complete. Saving, recalling, renaming and deleting mixes are T9's.
+- T8e (one writer in a worktree), commits `980f814` (package) and `bebd734` (app):
+  - R4: the per-packet figures moved to `DiagnosticsModel` (`session.diagnostics`), which only
+    `DiagnosticsSection` and the stopped-output row observe. `mirror()` assigns only changed
+    values; errors are compared by type and `String(reflecting:)`, since a cast to `any Equatable`
+    warns on Darwin.
+    - Measured with scratch body counters at 185-187 packets/s: on Mix, `MixView.body` went up 375
+      times every 2 s at the base. At the head it stays flat while `DiagnosticsSection` follows the
+      reports.
+  - R2: `MixTone`, `MixBannerRow` and `MixConnectionPill` are deleted. Mix uses
+    `ConnectionBannerRow` and a new shared `ConnectionPillBadge`.
+  - R3 (refused start): `MonitorAudio` reports one change after it restores the figures.
+    - RED: the new test heard nothing. GREEN: 837 tests.
+    - A mutant without the call is caught.
+    - The `linkReport` suggestion was folded in.
+  - R3 (discovery): `DeskDiscoveryModel.start()` does nothing until `stop()`. iOS 16 has no
+    `onChange(initial:)`, so both triggers stay and the model is idempotent. Launch started the
+    browser once, and each return from the background starts it once.
+  - Checks: 0 warnings on a never-built copy, and the app builds.
+  - Simulator tip: the desk's `--target 127.0.0.1:59999` reaches a manual connection to
+    `127.0.0.1` with audio port 59999 over loopback, which the firewall does not block.
+  - Risk: item 6. The app side has no automated test, only the probe and screenshots.
 

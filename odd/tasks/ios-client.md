@@ -1372,8 +1372,21 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     publishes it after `handle` (so a stopping event shows before the restart) and again after the
     restart's result.
   - Every access to `recovery` stays under the output's lock. The receive thread takes only the
-    published lock, and none of its calls (`write`, `setTargetFrames`, `underrunCount`,
-    `presentedFrame`, `isPlaying`) takes the output's lock.
+    published lock, and none of its calls (`capacityFrames`, `write`, `setTargetFrames`,
+    `underrunCount`, `presentedFrame`, `isPlaying`) takes the output's lock.
   - The app builds with no warning in its files. There is no automated test, because the app has
     no test target; its independent verifier is asked for a runtime probe.
+- T7h independent verifier (high-risk item 4): no blocker; claims 1-5 PASS.
+  - Measured on the simulator: a scratch hook held the restart for 300 ms under the lock while a
+    reader called `isPlaying` every ~200 µs.
+    - Longest read: 0.009 ms and 0.384 ms at `58c1b24`, against 309.7 ms and 305.5 ms at the base
+      (one blocked read per restart).
+    - The reader saw `false` from the interruption's beginning through the restart, then `true`
+      0.2-0.3 ms after it.
+  - Thread Sanitizer, linked into the simulator build: 4 runs with 0 warnings. A deliberate race
+    produced 1 warning, which shows TSan was active.
+  - 659 tests, and the app builds.
+  - Advisories, all already true at the base:
+    - `close()` can wait for one restart, so `onStopped` comes up to one restart later.
+    - `isPlaying` keeps its last value after `close()`, which nobody reads.
 

@@ -505,7 +505,11 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - A2: `ControlSession.start` reports a change before `MonitorAudio` resets its diagnostics, so
     the first change of a start still carries the previous session's underruns and error. A model
     that reads them inside `stateDidChange` shows them for one change. Reset the figures before
-    `session.start` to close it.
+    `session.start` to close it. The T8c review found it again (`R3-start-observer-stale-diagnostics`),
+    so T8d's integration fixes it.
+  - T8c review, `R4-launch-tag-read-at-delivery`: the launch tag is right only while a receiver
+    stays alive until its `onStopped` has returned. `AudioReceiver` honours that (verified), and
+    `AudioReceiving`'s documentation should state it as the port's contract.
   - A3: Android's name field cuts only the text an edit inserts (`keptEdit`, `BandEarTextField.kt`).
     The session cuts the end of the whole name, which agrees for typing at the end but not for a
     paste inside a name. The field would need `keptEdit` to match exactly.
@@ -1535,4 +1539,19 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     counted.
   - A2 and A3 are T8d inputs (Follow-ups). A4: Android adds a late report's underruns to an ended
     session; iOS drops them, as AD2 asks.
+- Native reviews for T8a-T8c:
+  - The pending slice `9641033..3e590c3` (the T8 plan, the module, T8b, T8a) was reviewed from a
+    detached worktree at `3e590c3`: `medium`, `under_budget` (44 paths). The user chose "Revisar
+    este cambio" (`granted`). Lenses: reliability and readability.
+    - Approved. Lineage `review-ce445ad2b433a1b5`.
+    - R2-001: the header names a desk by `DiscoveredDesk.name`, the banners by
+      `ConnectionWords.deskLabel`. The model names a typed desk by `deskLabel`, so they agree.
+    - R2-002 and R2-003: two test names overstate their bodies.
+    - R3-001: `PanScale.value` does not guard non-finite input. That is defensive only, since a
+      `Slider` does not produce it.
+  - T8c (`3e590c3..1e315f0`), from a detached worktree at `1e315f0`, with item 4 escalated: `high`
+    (11 paths, 857 lines). The user chose `granted`. Lenses: resilience and reliability.
+    - Approved. Lineage `review-3eab327013d37338`, acknowledged. The
+      reviewed boundary is now `1e315f0`.
+    - Two warnings, under Follow-ups: the launch tag's contract, and stale diagnostics at a start.
 

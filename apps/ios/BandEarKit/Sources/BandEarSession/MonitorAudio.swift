@@ -8,7 +8,10 @@ import Foundation
 /// Android's `AudioReceiver` seam over `PmonPlayer` (`MonitorCollaborators.kt:25-34`). A launch
 /// takes only the port: the receiver takes datagrams from any sender, so it needs no host.
 public protocol AudioReceiving: AnyObject {
-    /// True from ``start(port:)`` until the latest launch's loop has ended and reported its stop.
+    /// True from ``start(port:)`` until the latest launch's loop has ended and its
+    /// ``ReceiverListener/onStopped()`` has returned. The coordinator tags each report with its
+    /// launch while the report is handed over, which is right only because no new launch can start
+    /// before then (the T8c review).
     var isAlive: Bool { get }
 
     /// Launches a receiver on `port`. Called only while ``isAlive`` is false, since an older loop
@@ -162,23 +165,27 @@ public final class MonitorAudio {
         guard !isRunning else { return }
         guard !receiver.isAlive else { throw MonitorAudioError.previousReceiverStopping }
         // Raised before the session starts, so the change the session reports as it starts already
-        // says a session runs, as the session itself then does.
+        // says a session runs, as the session itself then does. The last session's figures go before
+        // it too, so no observer reads them as the new session's; a start the session refuses puts
+        // them back, since Android keeps them on show until a session does start.
         isRunning = true
+        let lastFigures = (receiverStats, linkReport, underrunTotal, receiverError)
+        receiverStats = nil
+        linkReport = nil
+        underrunTotal = 0
+        receiverError = nil
         do {
             // The session resets the desk's settings as it starts, and the controls follow it at
             // once, so the receiver launched below never plays by the last desk's buffer or hold.
             try session.start(request, musicianName: musicianName)
         } catch {
             isRunning = false
+            (receiverStats, linkReport, underrunTotal, receiverError) = lastFigures
             throw error
         }
         launched += 1
         // The reports the new receiver makes carry this launch from now on.
         events.launch = launched
-        receiverStats = nil
-        linkReport = nil
-        underrunTotal = 0
-        receiverError = nil
         receiver.start(port: request.audioPort)
         stateDidChange?()
     }

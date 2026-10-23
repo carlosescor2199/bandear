@@ -247,6 +247,55 @@ struct MonitorAudioTests {
         #expect(audio.underrunTotal == 0)
     }
 
+    /// The T8c verifier's A2: the screens read the figures inside ``MonitorAudio/stateDidChange``,
+    /// so the change the session reports as it starts must already show none of the last session's.
+    @Test("every change a start reports shows none of the last session's figures")
+    func aStartShowsNoFigureOfTheLastSession() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+        receiver.listener.onStats(Self.stats)
+        receiver.listener.onLinkStats(Self.report)
+        receiver.listener.onError(ReceiveError.tooManyChannels(40))
+        await settle()
+        audio.stop()
+        try receiver.finishStopping()
+        await settle()
+        var stale: [String] = []
+        audio.stateDidChange = { [weak audio] in
+            guard let audio, audio.isRunning else { return }
+            if audio.receiverStats != nil { stale.append("stats") }
+            if audio.underrunTotal != 0 { stale.append("underruns") }
+            if audio.receiverError != nil { stale.append("error") }
+        }
+
+        try audio.start(toStage, musicianName: "Ana")
+
+        #expect(stale.isEmpty, "\(stale)")
+    }
+
+    /// Android keeps the last session's diagnostics on show after a connect it refused, since only
+    /// `SessionStarted` starts them again (`MonitorReducer.kt:70-72`).
+    @Test("a start the session refuses keeps the last session's figures")
+    func aRefusedStartKeepsTheLastSessionsFigures() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+        receiver.listener.onStats(Self.stats)
+        receiver.listener.onLinkStats(Self.report)
+        receiver.listener.onError(ReceiveError.tooManyChannels(40))
+        await settle()
+        audio.stop()
+        try receiver.finishStopping()
+        await settle()
+
+        #expect(throws: ClientMessageError.udpPortMustNotBeZero) {
+            try audio.start(ConnectionRequest(endpoint: stage, audioPort: 0), musicianName: "Ana")
+        }
+
+        #expect(audio.receiverStats == Self.stats)
+        #expect(audio.underrunTotal == Self.report.underruns)
+        #expect(audio.receiverError as? ReceiveError == .tooManyChannels(40))
+    }
+
     // MARK: Whether a session runs
 
     /// The screens choose Connect or the tabs by it. It agrees with

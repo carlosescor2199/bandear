@@ -264,6 +264,7 @@ struct MonitorAudioTests {
         audio.stateDidChange = { [weak audio] in
             guard let audio, audio.isRunning else { return }
             if audio.receiverStats != nil { stale.append("stats") }
+            if audio.linkReport != nil { stale.append("link report") }
             if audio.underrunTotal != 0 { stale.append("underruns") }
             if audio.receiverError != nil { stale.append("error") }
         }
@@ -292,8 +293,42 @@ struct MonitorAudioTests {
         }
 
         #expect(audio.receiverStats == Self.stats)
+        // The ended session's link is no longer known, so the refused start brings none back.
+        #expect(audio.linkReport == nil)
         #expect(audio.underrunTotal == Self.report.underruns)
         #expect(audio.receiverError as? ReceiveError == .tooManyChannels(40))
+    }
+
+    /// A refused start clears the last figures and puts them back. An observer reads them only when
+    /// told of a change, so the start tells it once they are back, whatever the session reported
+    /// before it refused.
+    @Test("a start the session refuses tells its observer once the last figures are back")
+    func aRefusedStartReportsTheRestoredFigures() async throws {
+        try await connected()
+        let receiver = try receivers.only()
+        receiver.listener.onStats(Self.stats)
+        receiver.listener.onLinkStats(Self.report)
+        receiver.listener.onError(ReceiveError.tooManyChannels(40))
+        await settle()
+        audio.stop()
+        try receiver.finishStopping()
+        await settle()
+        var heard: [ObservedFigures] = []
+        audio.stateDidChange = { [weak audio] in
+            guard let audio else { return }
+            heard.append(ObservedFigures(audio))
+        }
+
+        #expect(throws: ClientMessageError.udpPortMustNotBeZero) {
+            try audio.start(ConnectionRequest(endpoint: stage, audioPort: 0), musicianName: "Ana")
+        }
+
+        let last = try #require(heard.last, "the refused start told its observer nothing")
+        #expect(!last.isRunning)
+        #expect(last.stats == Self.stats)
+        #expect(last.linkReport == nil)
+        #expect(last.underrunTotal == Self.report.underruns)
+        #expect(last.error as? ReceiveError == .tooManyChannels(40))
     }
 
     // MARK: Whether a session runs
@@ -519,6 +554,24 @@ struct MonitorAudioTests {
         #expect(!session.mixSession.isSessionRunning)
         #expect(transport.closes == 1)
         #expect(changesOnMain.allSatisfy { $0 })
+    }
+}
+
+/// What an observer reads of the coordinator when it is told of a change.
+@MainActor
+private struct ObservedFigures {
+    let isRunning: Bool
+    let stats: ReceiverStats?
+    let linkReport: LinkStatsReport?
+    let underrunTotal: Int64
+    let error: (any Error)?
+
+    init(_ audio: MonitorAudio) {
+        isRunning = audio.isRunning
+        stats = audio.receiverStats
+        linkReport = audio.linkReport
+        underrunTotal = audio.underrunTotal
+        error = audio.receiverError
     }
 }
 

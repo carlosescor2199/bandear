@@ -160,7 +160,8 @@ public final class MonitorAudio {
     /// Does nothing while a session runs, as Android ignores a second Connect: stop it first.
     /// Throws, and starts nothing, while the previous session's receiver is still stopping
     /// (``MonitorAudioError/previousReceiverStopping``), or for a registration the desk would refuse
-    /// (``ClientMessageError/udpPortMustNotBeZero``).
+    /// (``ClientMessageError/udpPortMustNotBeZero``). A start the session refuses reports one change
+    /// before it throws, with the last session's figures back.
     public func start(_ request: ConnectionRequest, musicianName: String) throws {
         guard !isRunning else { return }
         guard !receiver.isAlive else { throw MonitorAudioError.previousReceiverStopping }
@@ -181,6 +182,9 @@ public final class MonitorAudio {
         } catch {
             isRunning = false
             (receiverStats, linkReport, underrunTotal, receiverError) = lastFigures
+            // Whatever the session reported before it refused, the last change says what holds now:
+            // no session, and the last figures back.
+            stateDidChange?()
             throw error
         }
         launched += 1

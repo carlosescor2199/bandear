@@ -21,6 +21,11 @@ struct SessionView: View {
                         .foregroundStyle(.secondary)
                 }
                 LabeledContent("Strips", value: "\(session.stripCount)")
+                LabeledContent("Audio packets", value: "\(session.packetsPlayed)")
+                if let problem = session.audioProblem {
+                    Text(problem)
+                        .foregroundStyle(.secondary)
+                }
             }
             Section {
                 Button("Disconnect", role: .destructive) {

@@ -65,9 +65,10 @@ nonisolated enum EngineOutputError: Error, Equatable {
 ///   It logs nothing. The bridge from block to Swift closure retains and releases the closure's
 ///   context once per call: an atomic count on an object the block keeps alive, so it never waits
 ///   and never frees anything.
-/// - Notification handlers, for a route change and an engine configuration change, hand their work
-///   to a private serial queue, where they update ``RingPlaybackSink/outputLatencyFrames`` and
-///   restart an engine that stopped itself. They reach the output through a weak reference, so the
+/// - Notification handlers, for a route change, an engine configuration change and the end of an
+///   interruption, hand their work to a private serial queue, where they update
+///   ``RingPlaybackSink/outputLatencyFrames`` and restart an engine that stopped. They reach the
+///   output through a weak reference, so the
 ///   engine is never released on the engine's own notification queue, which its documentation
 ///   says can deadlock.
 ///
@@ -96,6 +97,9 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
     fileprivate init(sampleRate: Int, packetFrames: Int) throws {
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback)
+        // The shortest buffer the hardware gives, as Android asks for a low-latency track. A longer
+        // one granted instead is counted in `outputLatencyFrames`, so a refusal is not an error.
+        try? session.setPreferredIOBufferDuration(Self.preferredIOBufferDuration)
         try session.setActive(true)
         guard
             let format = AVAudioFormat(
@@ -132,10 +136,11 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
 
     var presentedFrame: Int64? { ring.presentedFrame }
 
-    /// Stops the engine, then closes the ring, once. The engine is not restarted after this.
+    /// Stops the engine, then closes the ring, once, and lets other apps' audio resume. The engine
+    /// is not restarted after this.
     func close() {
-        let removed: [any NSObjectProtocol] = lock.withLock {
-            guard !closed else { return [] }
+        let removed: [any NSObjectProtocol]? = lock.withLock {
+            guard !closed else { return nil }
             closed = true
             engine.stop()
             ring.close()
@@ -143,10 +148,15 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
             observers = []
             return current
         }
+        guard let removed else { return }
         for observer in removed {
             NotificationCenter.default.removeObserver(observer)
         }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
+
+    /// 5 ms, a quarter of what iOS gives by default.
+    private static let preferredIOBufferDuration: TimeInterval = 0.005
 
     /// The block the audio thread calls for each buffer. Made here, outside the main actor, so it
     /// is not main-actor code; see the type's documentation.
@@ -181,9 +191,10 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
     }
 
     /// The engine stops itself when the hardware's rate or channel count changes, for example when
-    /// headphones are plugged in. It is started again unless the output was closed; if that fails
-    /// the output stays silent, the ring fills, and the receive loop's writes come back short.
-    private func restartAfterConfigurationChange() {
+    /// headphones are plugged in, and the system stops it for an interruption such as a call. It is
+    /// started again unless the output was closed; if that fails the output stays silent, the ring
+    /// fills, and the receive loop's writes come back short.
+    private func restartIfStopped() {
         lock.withLock {
             guard !closed else { return }
             try? engine.start()
@@ -202,9 +213,26 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
         let configurationChange = center.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
         ) { _ in
-            Self.notifications.async { target.output?.restartAfterConfigurationChange() }
+            Self.notifications.async { target.output?.restartIfStopped() }
         }
-        lock.withLock { observers = [routeChange, configurationChange] }
+        let interruption = center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
+        ) { notification in
+            guard Self.interruptionEndedAskingToResume(notification) else { return }
+            Self.notifications.async { target.output?.restartIfStopped() }
+        }
+        lock.withLock { observers = [routeChange, configurationChange, interruption] }
+    }
+
+    /// Whether `notification` ends an interruption after which the system expects playback to
+    /// resume (`AVAudioSession.InterruptionOptions.shouldResume`).
+    private static func interruptionEndedAskingToResume(_ notification: Notification) -> Bool {
+        let info = notification.userInfo
+        guard let type = info?[AVAudioSessionInterruptionTypeKey] as? UInt,
+            AVAudioSession.InterruptionType(rawValue: type) == .ended,
+            let options = info?[AVAudioSessionInterruptionOptionKey] as? UInt
+        else { return false }
+        return AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
     }
 }
 

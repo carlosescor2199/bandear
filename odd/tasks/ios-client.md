@@ -113,6 +113,20 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - [x] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
     the musician's own levels put back after a link.
   - [x] T5e — The outgoing mix and when one is sent.
+- [ ] T8e — The T8d review's four warnings, which the user asked for on 2026-10-23: "dale, arreglá
+  primero los warnings de T8". Route: one delegated writer, because the parent context is past the
+  long-session backstop. The review's suggestions stay under Follow-ups.
+  - R4-mirror-republish-per-change: a receiver report must not rebuild the Mix screen.
+    - The per-packet figures (receiver stats, link report, underrun total, receiver error,
+      `outputPlaying`) move to a model of their own that only Settings and Diagnostics observe.
+    - `mirror()` assigns a published value only when it changed.
+  - R2-duplicate-tone-mapping: one tone, colour, symbol, pill and banner style for every screen. The
+    Mix header uses the shared `ConnectionToneStyle`, `ConnectionToneDot` and `ConnectionBannerRow`;
+    its copies (`MixTone`, `MixBannerRow`, `MixConnectionPill`) go.
+  - R3-refused-start-restore-unpublished: `MonitorAudio.start` reports a change after it puts the
+    last figures back on a refused start, with a test.
+  - R3-discovery-double-start: discovery starts once per return to the foreground, never twice at
+    launch.
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
   (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
   storage, which the pure mix module does not have.

@@ -184,8 +184,8 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
         injected clock.
       - It also ports `ReceiverLaunches`.
       - Commit `88408f6`.
-  - [ ] T7f — Wiring, in three units:
-    - [ ] T7f1 — Session side in `BandEarKit` (route: delegated writer, launched together with
+  - [x] T7f — Wiring, in three units:
+    - [x] T7f1 — Session side in `BandEarKit` (route: delegated writer, launched together with
       T7f2):
       - `LinkStatsReport` converts to `LinkStats`, with Android's JSON check from
         `HoldPlayoutTest.kt:113-114`.
@@ -197,13 +197,13 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
       - It starts and stops the receiver with the session, and refuses to start while the previous
         receiver is alive (A3).
       - It includes ports of the `MonitorViewModelTest` cases for these rules.
-    - [ ] T7f2 — App-side output (route: delegated writer, launched together with T7f1):
+    - [x] T7f2 — App-side output (route: delegated writer, launched together with T7f1):
       - A `PlaybackSinkFactory` on `AVAudioEngine`, with an `AVAudioSourceNode` whose render block
         calls `RingPlaybackSink.render`.
       - The sample rate is bounded before the ring is sized (A5).
       - The sink stays strongly held until the engine stops (A4).
       - `outputLatencyFrames` comes from `AVAudioSession`, and the category is `.playback`.
-    - [ ] T7f3 — `SessionModel` joins the two, then the check by ear against the desk (route:
+    - [x] T7f3 — `SessionModel` joins the two, then the check by ear against the desk (route:
       inline).
     The original scope of T7f:
     - announce the four capabilities;
@@ -328,6 +328,23 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   failed to open, still counts in `ReceiverStats.packets` and `packetsPerSecond`, and its error
   also goes to `onError`. Android does the same (`PmonPlayer.kt:241-244`, before :257-260), so
   changing it is a decision for both clients, not a port fix. Only the diagnostics are affected.
+- **A desk restarted mid-session stalls the phone's playback until it reconnects (T7f3, end to
+  end).**
+  - What happened: the restarted desk numbered its packets from 0 again, while the phone's reorder
+    hold was past 16 000. The counter of played packets stopped, while the socket received the full
+    stream.
+  - A new session (Disconnect, Connect) played at once.
+  - To do: check Android's `ReorderHold` for the same jump back. If both stall, it is a decision for
+    both clients.
+- **Desk-side findings from the T7f3 end-to-end check** (server, for the user to decide):
+  - Its own mDNS publishes, on `lo0`, only IPv6 for its host name, so from the desk's Mac an IPv4
+    connection resolved over `lo0` finds no address. The phone connects once its reconnect lands on
+    Wi-Fi: up to about 40 s, or at once.
+  - Its default `--target 127.0.0.1:50000` lands on the simulator's socket next to the registered
+    stream, so the phone receives two numberings of the same audio. A real phone never sees the
+    loopback target.
+  - Capture from a Continuity microphone stops when the iPhone leaves: the desk then exits with
+    `OSStatus 1937010544`.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1154,4 +1171,45 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     recreated before the reviewers could run.
 - T7e complete. Next: T7f, the wiring and the end-to-end listening. The verifier's A1-A5 and the
   T7e1 inputs above are its inputs.
+- T7f1 (session side), writer in a worktree:
+  - `MonitorAudio` coordinator plus `AudioReceiving`, the four capabilities announced, and
+    `LinkStats(LinkStatsReport)` with `recovered` always present. Android's JSON check from
+    `HoldPlayoutTest.kt:113-114` is ported.
+  - RED: 36 of 36 tests. GREEN: 645 in the full suite. TSan clean, 0 warnings, 17 of 17 mutants
+    caught.
+  - One mutant first survived: a late stop report ending the next session. It is now pinned by a
+    test where three sessions start and stop back to back.
+  - Divergences: stop reports reach the main actor late, so they are matched to launches by count.
+    A refusal while the previous receiver stops throws Android's exact message.
+  - Commit `40dea66`, with a stale comment in `ControlSession` fixed.
+- T7f2 (app output), writer in a worktree:
+  - `EngineOutputFactory` and `EngineOutput`: the ring held by the render block, which is made in
+    a `nonisolated` function so the app's main-actor default never reaches the audio thread.
+  - Bounds: 8 000-192 000 Hz and 1-16 384 frames (A5).
+  - `close()` stops the engine, then the ring (A4).
+  - A configuration change restarts the engine.
+  - Smoke test on the simulator: 2 s of sine, `close` in 3-20 ms, no isolation trap.
+  - Disassembly of the render path shows no lock, no allocation and no actor hop.
+    `UnsafeMutableAudioBufferListPointer` was replaced with plain pointers, because its accessors
+    are not inlined across modules.
+  - Commit `6522b37`.
+- T7f3 (inline):
+  - `SessionModel` runs through `MonitorAudio` with `EngineOutputFactory`, and clears `desk` when a
+    session ends on its own. The screen shows the packets played and the receiver's problem.
+  - `EngineOutput` gained a 5 ms preferred I/O buffer (Android's low-latency track), a restart after
+    an interruption that asks to resume, and session deactivation on close.
+  - `Info.plist` declares `UIBackgroundModes` `audio`.
+  - Commit `dc368e3`. The app builds with no warning in its files, and the package suite is 645,
+    0 known issues.
+  - An app-side fix was tried and reverted: keeping Bonjour off loopback broke the in-process
+    Bonjour round trip (`BANDEAR_WS_IT=1`). A connection to the Mac's own address goes through
+    `lo0`, so the cause stays with the desk's announcement.
+- End to end against the desk on this Mac (simulator, iPhone 17 Pro):
+  - The desk was run with `--device "Microsoft Teams Audio" --target 127.0.0.1:59999`.
+  - The app found the desk, registered (`control registration ... as "iPhone 17 Pro"`), showed
+    Connected and 1 strip, and played 3 935 packets in about 21 s. That is about 183 per second
+    against the desk's 187.5 (48 000 / 256), within the screenshots' timing.
+  - Over the same window, `nettop` showed the app receiving exactly what the desk sent to it.
+  - The sound itself was not judged by ear: the virtual input carries silence. The user can listen
+    with a live input.
 

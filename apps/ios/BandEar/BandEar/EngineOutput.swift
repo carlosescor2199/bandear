@@ -1,5 +1,6 @@
 import AVFoundation
 import BandEarPlayback
+import os
 import UIKit
 
 /// The app's ``PlaybackSinkFactory``: each output it opens plays the desk's frames through its own
@@ -94,6 +95,12 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
     private var observers: [any NSObjectProtocol] = []
     /// When the engine starts again after the system stopped it. Guarded by `lock`.
     private var recovery = OutputRecovery()
+    /// `recovery.isPlaying` as last published, for the receive thread, which reads it with every
+    /// packet. It has a lock of its own, held only to copy one value, because a restart holds
+    /// `lock` through `setActive` and `engine.start()` (tens to hundreds of milliseconds) and the
+    /// receive thread must never wait for that. Written only while `lock` is held, so the order is
+    /// always `lock`, then this.
+    private let published = OSAllocatedUnfairLock(initialState: true)
 
     /// Activates the audio session for playback, builds the ring and the engine for `sampleRate`
     /// and starts the engine. The caller has checked both values against the factory's ranges.
@@ -141,8 +148,9 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
 
     /// Whether the engine is playing, as the ``OutputRecovery`` knows it: `false` from an
     /// interruption or a configuration change until the engine started again, and after a restart
-    /// that failed, until the next event tries again.
-    var isPlaying: Bool { lock.withLock { recovery.isPlaying } }
+    /// that failed, until the next event tries again. It never waits for a restart in progress; it
+    /// answers what the recovery said before that restart began.
+    var isPlaying: Bool { published.withLock { $0 } }
 
     /// Stops the engine, then closes the ring, once, and lets other apps' audio resume. The engine
     /// is not restarted after this.
@@ -210,7 +218,11 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
     /// back short. The next event that allows it tries again.
     private func follow(_ event: OutputRecovery.Event) {
         let restarted = lock.withLock {
-            guard !closed, recovery.handle(event) else { return false }
+            guard !closed else { return false }
+            let restart = recovery.handle(event)
+            // An event that stopped the output says so before any restart is tried.
+            publishPlaying()
+            guard restart else { return false }
             do {
                 try AVAudioSession.sharedInstance().setActive(true)
                 try engine.start()
@@ -218,9 +230,16 @@ nonisolated final class EngineOutput: PlaybackSink, @unchecked Sendable {
             } catch {
                 recovery.restartFailed()
             }
+            publishPlaying()
             return true
         }
         if restarted { updateOutputLatency() }
+    }
+
+    /// Copies the recovery's verdict to where ``isPlaying`` reads it. Called with `lock` held.
+    private func publishPlaying() {
+        let playing = recovery.isPlaying
+        published.withLock { $0 = playing }
     }
 
     private func observeChanges() {

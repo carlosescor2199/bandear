@@ -1,3 +1,5 @@
+import BandEarProtocol
+import Foundation
 import Testing
 
 @testable import BandEarPlayback
@@ -33,16 +35,26 @@ extension HoldPlayout where Packet == UInt64 {
 /// the player drives it, a packet a delayed copy brought is played, counted in `packets_received`
 /// and in `recovered`, never in `packets_lost`. Same wake-ups, same plays, same reports.
 ///
-/// One assertion is left for the unit that sends `stats`: Android's first case also turns its
-/// report into the message (`buildStatsMessage`) and compares it with the JSON the server's own
-/// protocol test reads (`protocol::tests::the_stats_a_phone_sends_after_a_copy_filled_a_gap`,
-/// `HoldPlayoutTest.kt:113-114`). That conversion does not exist here yet. Its input does: the case
-/// pins the whole report, every field the message carries, with the extras absent.
+/// Android's first case also turns its report into the message (`buildStatsMessage`) and compares
+/// it with the JSON the server's own protocol test reads
+/// (`protocol::tests::the_stats_a_phone_sends_after_a_copy_filled_a_gap`,
+/// `HoldPlayoutTest.kt:113-114`); here the report goes through ``LinkStats/init(_:)``, as the
+/// session sends it, and the two are compared parsed, so key order does not matter.
 @Suite("Hold playout: Android parity")
 struct HoldPlayoutParityTests {
+    /// Android's `STATS_AFTER_A_COPY_FILLED_A_GAP`: a one-second report, four packets played, one
+    /// of them brought by a delayed copy.
+    private static let statsAfterACopyFilledAGap =
+        #"{"type":"stats","interval_ms":1000,"packets_received":4,"packets_lost":0,"underruns":0,"receive_timeouts":1,"recovered":1}"#
+
     private func playout() -> HoldPlayout<UInt64> {
         HoldPlayout(
             hold: ReorderHold<UInt64>(), linkStats: LinkStatsAccumulator(startedAtMilliseconds: 0))
+    }
+
+    /// `json` as the desk reads it.
+    private func parsed(_ json: Data) throws -> NSDictionary {
+        try #require(try JSONSerialization.jsonObject(with: json) as? NSDictionary)
     }
 
     // HoldPlayoutTest.kt:40
@@ -63,12 +75,11 @@ struct HoldPlayoutParityTests {
         #expect(report.receiveTimeouts == 1)
         #expect(playout.lost == 0)
 
-        // Everything Android's JSON comparison reads (see the suite's note).
+        // The same `stats` the server's protocol test reads
+        // (`protocol::tests::the_stats_a_phone_sends_after_a_copy_filled_a_gap`): keep them equal.
         #expect(
-            report
-                == LinkStatsReport(
-                    intervalMilliseconds: 1_000, packetsReceived: 4, packetsLost: 0, underruns: 0,
-                    receiveTimeouts: 1, recovered: 1))
+            try parsed(ClientMessage.stats(LinkStats(report)).encodedJSON())
+                == parsed(Data(Self.statsAfterACopyFilledAGap.utf8)))
     }
 
     // HoldPlayoutTest.kt:66

@@ -1,5 +1,6 @@
 import BandEarDiscovery
 import BandEarMix
+import BandEarPlayback
 import BandEarProtocol
 import Foundation
 import Testing
@@ -348,4 +349,111 @@ func mixReport(_ type: String, firstLevel: Int = 10, seq: Int? = nil) -> [String
 /// The whole numbers under `key` of a parsed message: Android's `ints(key)`.
 func ints(_ object: [String: Any], _ key: String) -> [Int]? {
     object[key] as? [Int]
+}
+
+// MARK: - The audio receiver
+
+/// An audio receiver the test drives by hand, as Android's `FakeReceiver` (`MonitorFakes.kt:56-122`)
+/// is: it records what ``MonitorAudio`` launches and stops, and keeps what the coordinator handed it
+/// (the output's factory, the controls, the listener), so a test reads the controls as the receive
+/// thread would and reports through the listener as the receive thread does.
+///
+/// Like the real receiver, it counts as alive from a launch until the latest launch's loop has ended
+/// and reported its stop, and ``stop()`` only asks the loop to end: ``finishStopping(beforeReport:)``
+/// and ``endOnItsOwn(beforeReport:)`` end it, so a test decides when the report comes. Loops end
+/// oldest first, each reporting once, as the real receiver's do.
+///
+/// Used from the main actor; only ``listener`` is handed to other threads.
+final class FakeReceiver: AudioReceiving {
+    let sinkFactory: any PlaybackSinkFactory
+    let controls: PlayerControls
+    let listener: any ReceiverListener
+
+    /// The port of every launch, in order.
+    private(set) var launches: [UInt16] = []
+    /// What the controls held at each launch, in order: what the new loop's first wake-up reads.
+    private(set) var settingsAtLaunch: [PlayerSettings] = []
+    private(set) var stops = 0
+    /// True after a ``stop()`` whose report ``finishStopping(beforeReport:)`` has not delivered yet.
+    private(set) var stopping = false
+    /// The launches whose loops still run, oldest first, by their index in ``launches``.
+    private var loops: [Int] = []
+    /// The latest launch, until its loop has ended and reported.
+    private var latest: Int?
+
+    init(
+        _ sinkFactory: any PlaybackSinkFactory, _ controls: PlayerControls,
+        _ listener: any ReceiverListener
+    ) {
+        self.sinkFactory = sinkFactory
+        self.controls = controls
+        self.listener = listener
+    }
+
+    var isAlive: Bool { latest != nil }
+
+    func start(port: UInt16) {
+        loops.append(launches.count)
+        latest = launches.count
+        launches.append(port)
+        settingsAtLaunch.append(controls.snapshot)
+    }
+
+    func stop() {
+        stops += 1
+        stopping = true
+    }
+
+    /// The loop asked to stop ends now and reports it, as the real one does once its receive answers.
+    func finishStopping(
+        beforeReport: () -> Void = {}, sourceLocation: SourceLocation = #_sourceLocation
+    ) throws {
+        try #require(stopping, "stop() was not called", sourceLocation: sourceLocation)
+        stopping = false
+        try endOnItsOwn(beforeReport: beforeReport, sourceLocation: sourceLocation)
+    }
+
+    /// The oldest running loop ends the way the real one does: it reports `onStopped`, and only then
+    /// is the receiver free. `beforeReport` runs first, while the receiver is still alive, where the
+    /// musician can still act before the report.
+    func endOnItsOwn(
+        beforeReport: () -> Void = {}, sourceLocation: SourceLocation = #_sourceLocation
+    ) throws {
+        try #require(!loops.isEmpty, "no receive loop is running", sourceLocation: sourceLocation)
+        let loop = loops.removeFirst()
+        beforeReport()
+        listener.onStopped()
+        if latest == loop { latest = nil }
+    }
+}
+
+/// Builds a ``FakeReceiver`` where ``MonitorAudio`` builds its receiver, and keeps it for the test.
+@MainActor
+final class FakeReceivers {
+    /// Every receiver built, in order; a coordinator builds one.
+    private(set) var made: [FakeReceiver] = []
+
+    func make(
+        _ sinkFactory: any PlaybackSinkFactory, _ controls: PlayerControls,
+        _ listener: any ReceiverListener
+    ) -> any AudioReceiving {
+        let receiver = FakeReceiver(sinkFactory, controls, listener)
+        made.append(receiver)
+        return receiver
+    }
+
+    /// The receiver the coordinator built.
+    func only(sourceLocation: SourceLocation = #_sourceLocation) throws -> FakeReceiver {
+        try #require(made.count == 1, "the coordinator built \(made.count) receivers", sourceLocation: sourceLocation)
+        return made[0]
+    }
+}
+
+/// An output factory that is never asked for an output: the coordinator only hands it on.
+final class FakeSinkFactory: PlaybackSinkFactory {
+    struct Unused: Error {}
+
+    func open(sampleRate: Int, packetFrames: Int) throws -> any PlaybackSink {
+        throw Unused()
+    }
 }

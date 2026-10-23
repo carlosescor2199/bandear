@@ -7,10 +7,10 @@ import Foundation
 ///
 /// Ported from the Android client's `ControlChannel.kt` and the session half of
 /// `MonitorViewModel.kt`:
-/// - On every open it registers first, then sends the opening mix (`ControlChannel.kt:134-146`):
-///   the desk adds this musician as a target from the registration, so the mix that follows finds
-///   one to join. A reopened connection does exactly the same, so the desk gets the musician's name
-///   and mix back under the newest number.
+/// - On every open it registers first, announcing every ``ClientCapability``, then sends the opening
+///   mix (`ControlChannel.kt:134-146`): the desk adds this musician as a target from the
+///   registration, so the mix that follows finds one to join. A reopened connection does exactly
+///   the same, so the desk gets the musician's name and mix back under the newest number.
 /// - Every event, the desk's and the musician's, goes through
 ///   ``MixSession/reducedNumberingSends(by:)``, and the phone sends ``MixSession/outgoingMix()``
 ///   whenever that numbered a new mix (`MonitorViewModel.kt:346-348,390-394`).
@@ -51,11 +51,12 @@ public final class ControlSession {
     /// the desk then plays the musician's mix itself (Android's `mixAcknowledged`, shown as
     /// `mixHeldByServer`).
     public private(set) var mixHeldByDesk = false
-    /// The cushion the desk set, for the player (T7). Every session starts on Auto, as Android's does
-    /// (`MonitorViewModel.kt:254-256`): a desk that sets one says so again when the musician registers.
+    /// The cushion the desk set, which ``MonitorAudio`` hands the player. Every session starts on
+    /// Auto, as Android's does (`MonitorViewModel.kt:254-256`): a desk that sets one says so again
+    /// when the musician registers.
     public private(set) var playbackBuffer: PlaybackBufferSetting = .auto
-    /// How many packets late the desk sends its redundant copies, for the player (T7); none until the
-    /// desk says so (`MonitorViewModel.kt:257-258`).
+    /// How many packets late the desk sends its redundant copies, which ``MonitorAudio`` hands the
+    /// player; none until the desk says so (`MonitorViewModel.kt:257-258`).
     public private(set) var redundancyHoldBlocks: UInt8 = 0
     /// The desk's latest `error`, for a screen to show.
     public private(set) var lastError: DeskError?
@@ -69,7 +70,8 @@ public final class ControlSession {
     /// The name the musician last started a session with, as the desk stores it; remembered across
     /// launches, and empty before the first.
     public private(set) var musicianName: String
-    /// Called on the main actor after anything above may have changed.
+    /// Called on the main actor after anything above may have changed. A ``MonitorAudio`` made with
+    /// this session takes it over, and calls its own after following the change.
     public var stateDidChange: (() -> Void)?
 
     private let transport: any ControlTransport
@@ -115,9 +117,12 @@ public final class ControlSession {
     /// Throws, and starts nothing, for a name the desk would store as no name
     /// (``ClientMessageError/nameIsBlank``).
     public func start(_ request: ConnectionRequest, musicianName: String) throws {
+        // Every capability this build implements, as Android announces all of its own on every
+        // registration (`ControlChannel.kt:531-558`): the desk then sends the `playback` and
+        // `redundancy` settings the player follows, and reads the extras and `recovered` of `stats`.
         let registration = try Registration(
             name: musicianName, udpPort: request.audioPort,
-            clientID: ClientIdentity.clientID(in: store))
+            clientID: ClientIdentity.clientID(in: store), capabilities: ClientCapability.allCases)
         self.registration = registration
         self.musicianName = registration.name
         store.musicianName = registration.name
@@ -191,8 +196,9 @@ public final class ControlSession {
         if mixSession.moreOfMe.musicianChannel != before.moreOfMe.musicianChannel {
             store.musicianChannel = mixSession.moreOfMe.musicianChannel
         }
-        // An outage belongs to a running session: one that ended on its own, as the player (T7) will
-        // end it, has none left to report, exactly as after ``stop()`` (T6c's review, `R3-002`).
+        // An outage belongs to a running session: one that ended, whether by ``stop()`` or by
+        // ``MonitorAudio`` stopping it when its receiver ends, has none left to report (T6c's
+        // review, `R3-002`).
         if before.isSessionRunning, !mixSession.isSessionRunning {
             connectionError = nil
         }

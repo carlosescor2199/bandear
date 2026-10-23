@@ -34,11 +34,12 @@ let package = Package(
         // depends on the protocol module; nothing in the protocol depends on the mix.
         .target(name: "BandEarMix", dependencies: ["BandEarProtocol"]),
         .testTarget(name: "BandEarMixTests", dependencies: ["BandEarMix", "BandEarProtocol"]),
-        // The control session joins the other three: it connects to a desk found by discovery,
-        // speaks the protocol over the connection, and runs the mix through it.
+        // The control session joins the other four: it connects to a desk found by discovery,
+        // speaks the protocol over the connection, runs the mix through it, and plays the audio
+        // the desk sends by the session's settings.
         .target(
             name: "BandEarSession",
-            dependencies: ["BandEarProtocol", "BandEarMix", "BandEarDiscovery"]),
+            dependencies: ["BandEarProtocol", "BandEarMix", "BandEarDiscovery", "BandEarPlayback"]),
         .testTarget(
             name: "BandEarSessionTests",
             dependencies: ["BandEarSession", "BandEarProtocol", "BandEarMix", "BandEarDiscovery"]),

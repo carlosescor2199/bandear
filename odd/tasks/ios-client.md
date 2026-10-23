@@ -213,6 +213,28 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - set the cap to the lower of the musician's cap and the engineer's limit;
     - set up the app's audio session, and start and stop with the control session;
     - check it end to end by listening to the desk.
+- [ ] T7g — The output after an interruption never goes silent unnoticed. The user asked for it
+  on 2026-10-23: "dale, arreglá primero los warnings de interrupción". It fixes the T7f review's
+  R4-001 and R3-001 (quoted under Follow-ups). Route: one delegated writer, because the parent
+  context is past the long-session backstop.
+  - `OutputRecovery` in `BandEarPlayback`, a pure state machine tested with `swift test`, decides
+    when the app's output restarts and whether it plays:
+    - When an interruption begins, the output stops and is interrupted.
+    - When an interruption ends asking to resume, it restarts.
+    - When an interruption ends without asking to resume, it stays stopped, as Apple's guidance
+      asks (another app took the audio). It restarts when the app becomes active again.
+    - A configuration change stops it and restarts it, unless it is interrupted.
+    - When the app becomes active, it restarts if stopped and not interrupted.
+    - A restart that fails leaves it stopped, and the next of those events tries again.
+  - `EngineOutput` follows `OutputRecovery`:
+    - It reactivates the audio session (`setActive(true)`) before every restart.
+    - It never drops a restart's error silently: a failure marks the output stopped.
+    - It also listens for the app becoming active.
+  - `PlaybackSink` gains `isPlaying` (default `true`). `ReceiverStats` gains `outputPlaying`,
+    sampled from the sink with each packet. The session screen says when the output has stopped,
+    instead of showing Connected over silence.
+  - Out of scope: R3-002 (the session activated before the format) and R3-003 (the bounds' tests)
+    stay under Follow-ups, since the user asked only for the interruption warnings.
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
 ## Follow-ups

@@ -345,6 +345,17 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     loopback target.
   - Capture from a Continuity microphone stops when the iPhone leaves: the desk then exits with
     `OSStatus 1937010544`.
+- **T8 inputs from the T7f verifier.**
+  - AD2: a link report that arrives after `stop()` sets `linkReport` again. Android does the same
+    (`MonitorReducer.kt:177`), but the link health shown in T8 should ignore it.
+  - AD1: reports still queued from the previous launch can be applied after a new start in the same
+    main-queue turn. That is unreachable from the UI. Tagging events with their launch would close
+    it.
+  - AD3: `ReceiverEvents` reads its weak `owner` on the receive thread. Read inside the main-queue
+    block instead, so a release at that moment cannot deinit off main. It is unreachable while
+    `SessionModel` keeps the coordinator.
+  - AD4: resuming after an interruption calls `engine.start()` without `setActive(true)`. Only a
+    device test proves it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1212,4 +1223,11 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Over the same window, `nettop` showed the app receiving exactly what the desk sent to it.
   - The sound itself was not judged by ear: the virtual input carries silence. The user can listen
     with a live input.
+- T7f independent verifier (high-risk item 4): no blocker; claims 1-6 PASS.
+  - Probe: 3 seeds × 120 rounds; 8 threads per launch, 28 800 reports. No race under TSan, no
+    session ended by an old report, every report applied on main.
+  - Release disassembly: the render closure calls only `RingPlaybackSink.render`. The block thunk
+    retains and releases the closure context once per callback.
+  - Suite: 645 tests, TSan clean, 0 warnings, and the app builds.
+  - Its four advisories are recorded under Follow-ups as T8 inputs.
 

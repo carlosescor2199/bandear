@@ -127,9 +127,42 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     last figures back on a refused start, with a test.
   - R3-discovery-double-start: discovery starts once per return to the foreground, never twice at
     launch.
-- [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
-  (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
-  storage, which the pure mix module does not have.
+- [ ] T9 — Mix banks and recall. Device-local saved mixes (`MixBankStore.kt`) and recalling one
+  into the mix. Split from T5 because it needs device storage, which the pure mix module does not
+  have. The user asked "dale, seguí con T9" (2026-10-23). The look follows T8's decision ("Nativo
+  iOS, mismos textos y reglas").
+  - Sources:
+    - the T8 map of Android's UI (Progress, "T8 inputs");
+    - `MixBankStore.kt` and `MixSnapshot.kt` (with `MixSnapshotTest.kt` and `GroupSnapshotTest.kt`);
+    - the recall rules in `MonitorReducer.kt:404-419` and their reducer tests;
+    - the saved-mix actions in `MonitorViewModel.kt:433-478`;
+    - the `MonitorViewModelTest` cases `savingAndRecallingAMix`,
+      `savingUnderAnExistingNameReplacesThatMix`, `savingNeedsAName`,
+      `recallingAMixThatIsGoneRefreshesTheList`, `renamingAndDeletingAMix` and
+      `recallingWhileFollowingSendsNothingAndSaysWhy`;
+    - the `SavedMixesScreen.kt` copy.
+  - [ ] T9a — The domain (route: one delegated writer, past the long-session backstop).
+    - In `BandEarMix`:
+      - the snapshot of a mix;
+      - the list of saved mixes with Android's rules (save under a name, a name already taken
+        replaces that mix, rename, delete, which one is active);
+      - recall as a `MixEvent`, reduced as Android does: locked sides kept, refused while
+        following, strips sized from the saved mix until the next `config`, and the musician's
+        channel surviving a recall.
+    - In `BandEarSession`:
+      - a store port;
+      - a `UserDefaults` adapter that keeps the saved mixes as JSON and reads them back as
+        tolerantly as Android does.
+    - It ports Android's snapshot, bank and recall tests, including the recall cases deferred in
+      `MixReducerParityTests`.
+  - [ ] T9b — The coordinator and the Mixes screen (route: one delegated writer, after T9a). It
+    covers:
+    - save, recall, rename and delete through the session, with the store's results as Android's
+      notices in `BandEarScreens`, and the active mix tracked;
+    - a recall sent to the desk by the existing send rule;
+    - the Mixes screen in native SwiftUI: the save field, the list with "Active now" and Recall,
+      Rename and Delete under the ⋮ menu, their dialogs, and the notices;
+    - ports of the six `MonitorViewModelTest` cases.
 - [x] T6 — App shell, project file and control session. Grown since first written: the follow-ups
   of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
   - [x] T6a — The project and a shell that builds (route: delegated writer; trigger: the

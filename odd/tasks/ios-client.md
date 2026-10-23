@@ -501,6 +501,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     R3-002 of the same review: the publish order (a stop is published before a restart, the result
     after) has only the verifier's simulator probe as proof. Moving that sequence into
     `BandEarPlayback` would let `swift test` pin it.
+- **T8d inputs from the T8c verifier.**
+  - A2: `ControlSession.start` reports a change before `MonitorAudio` resets its diagnostics, so
+    the first change of a start still carries the previous session's underruns and error. A model
+    that reads them inside `stateDidChange` shows them for one change. Reset the figures before
+    `session.start` to close it.
+  - A3: Android's name field cuts only the text an edit inserts (`keptEdit`, `BandEarTextField.kt`).
+    The session cuts the end of the whole name, which agrees for typing at the end but not for a
+    paste inside a name. The field would need `keptEdit` to match exactly.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1502,7 +1510,9 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - `MonitorAudio.isRunning` and `underrunTotal`.
   - AD1: reports are tagged with their launch. AD2: late link reports are dropped. AD3: the owner
     is read on main.
-  - Changed expectations, on purpose: the blank-name cases in five tests.
+  - Changed expectations, on purpose: four blank-name cases, plus `remembersTheName` (the session
+    now keeps `" Bea "` as typed while the store keeps `"Bea"`). The verifier's A1 corrected
+    this count.
 - Parent's integration:
   - Every path was inside its writer's surfaces, on the same base, and the copies were identical.
   - The following banner's words existed twice (T8a's `ConnectionBanner`, T8b's `MixWords`).
@@ -1514,4 +1524,15 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     concurrency, item 4).
 - Open for T8d: `SessionModel` connects under the device name when the field is empty. Android
   sends a blank name, and the user chose Android's rules, so T8d drops that substitution.
+- T8c independent verifier (high-risk item 4): no blocker; claims 1-5 PASS.
+  - Real-time pauses: five renames 100 ms apart send exactly one `register`, about 400 ms after the
+    last.
+  - `isRunning` agreed with `isSessionRunning` at every change over 650 starts.
+  - Hammer probe under TSan (25 s, 9 956 steps, 1 627 renames): 0 violations.
+  - Mutants removing the AD1 or AD2 guard, or reading the tag on main, were caught.
+  - 834 tests, 0 warnings, and the app builds.
+  - The differential against the base matches the changed expectations once A1's correction is
+    counted.
+  - A2 and A3 are T8d inputs (Follow-ups). A4: Android adds a late report's underruns to an ended
+    session; iOS drops them, as AD2 asks.
 

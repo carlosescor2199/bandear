@@ -247,7 +247,62 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - `isPlaying` reads only that published value. The lock order is the output's lock, then the
     published one.
   - Commit recorded in Progress.
-- [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
+- [ ] T8 — Screens: Connect, Mix, Mixes, Settings. The user asked "dale, seguí con T8" (2026-10-23).
+  Asked about the look, the user chose "Nativo iOS, mismos textos y reglas (Recommended)": standard
+  SwiftUI (`TabView`, `List`, `Slider`, sheets), with Android's content, its words verbatim and its
+  rules. Android's own faders, theme, fonts and gesture maths are not ported.
+  - Sources:
+    - A read-only map of Android's UI (`ui/screens`, `ui/components`, `ui/state`). Every string is
+      hard-coded in Kotlin.
+    - The T8 inputs under Follow-ups.
+  - Screens, as Android has them (`AppScreen.kt`, `MonitorApp.kt`):
+    - Connect, while no session runs, with the manual address reached from it.
+    - Then tabs: Mix, Mixes and Settings. Back goes to Mix, and a session start shows Mix.
+    - The channel sheet opens from a strip.
+    - Diagnostics live inside Settings.
+  - The split with T9: T8 builds the Mixes tab's layout and empty state ("No saved mixes yet" /
+    "Save the current mix above, then bring it back here with one tap.") and the pure text helpers
+    of `SavedMixesText.kt`. Storage, the snapshot, recall and the notices driven by the store are
+    T9's.
+  - [ ] T8a — Connection and diagnostics words, in a new pure module `BandEarScreens` (route:
+    delegated writer, launched together with T8b and T8c). It covers:
+    - the screen choice (`appScreenFor`);
+    - the connection pill words;
+    - the control status detail;
+    - the reconnecting, lost and following banners;
+    - the connection form's errors, and `previousReceiverStopping`;
+    - Settings text;
+    - link health (`phoneLinkHealth`, the words and their meanings);
+    - loss, the diagnostics formats, and Connect's copy.
+
+    It ports `AppScreenTest`, `ConnectionPillTest`, `SettingsTextTest`, `LinkHealthTest` and
+    `PhoneLinkHealthTest`, plus the reducer's pill, banner and diagnostics cases.
+  - [ ] T8b — Mix words, in the same module (route: delegated writer, launched together with T8a
+    and T8c). It covers:
+    - strip and group text, and pan text with its 5% detent;
+    - master, cap and the engineer's limit;
+    - More of me's caption and its seven notices;
+    - the channel sheet's text;
+    - the amber strip rule;
+    - the labels per channel kind;
+    - the empty rows;
+    - the `SavedMixesText.kt` helpers.
+
+    It ports `MixScreenTextTest`, `ChannelSheetTextTest`, `PanScaleTest` (text and detent),
+    `AtomLabelsTest` and `SavedMixesTextTest`.
+  - [ ] T8c — The session's gaps for the screens, in `BandEarSession` (route: delegated writer,
+    launched together with T8a and T8b):
+    - the name is stored as typed and re-announced to the desk after a typing pause, as Android
+      does (`aNameChangeIsStoredAndAnnouncedAfterThePause`);
+    - whether a session runs, made public;
+    - the running underrun total per session, reset when a session ends;
+    - the T7f verifier's AD1 (reports from a previous launch), AD2 (a late link report after a
+      stop) and AD3 (the weak owner read on the receive thread).
+  - [ ] T8d — The SwiftUI screens on top (route: decided once T8a-T8c land). It replaces
+    `DeskListView` and `SessionView`.
+  - Route: T8a, T8b and T8c are independent units with disjoint surfaces, each over 100 lines.
+    They run as three writers, each in its own worktree. The parent first adds the empty
+    `BandEarScreens` module, so no writer edits `Package.swift`.
 
 ## Follow-ups
 

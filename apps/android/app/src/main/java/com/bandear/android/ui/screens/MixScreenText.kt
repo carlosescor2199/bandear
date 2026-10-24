@@ -95,6 +95,12 @@ fun groupMembersText(members: List<String>): String =
 /** The small capitals over the row of strips, with how many it holds. */
 fun sectionTitle(view: MixView, count: Int): String = "${view.label.uppercase()} · $count"
 
+/**
+ * What the portrait console says beside [sectionTitle] while its strips run past the screen's
+ * edge, so the musician knows the row scrolls sideways.
+ */
+const val SWIPE_FOR_MORE = "Swipe for more"
+
 /** The master level in the Master card's corner; muted says so in words. */
 fun masterValueText(volume: Int, muted: Boolean): String = if (muted) "muted" else "$volume%"
 

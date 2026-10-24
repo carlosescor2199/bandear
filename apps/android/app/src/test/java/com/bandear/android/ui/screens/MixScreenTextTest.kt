@@ -106,6 +106,11 @@ class MixScreenTextTest {
     }
 
     @Test
+    fun anOverflowingRowSaysToSwipeForMore() {
+        assertEquals("Swipe for more", SWIPE_FOR_MORE)
+    }
+
+    @Test
     fun theMasterSaysMutedInWords() {
         assertEquals("85%", masterValueText(volume = 85, muted = false))
         assertEquals("muted", masterValueText(volume = 85, muted = true))

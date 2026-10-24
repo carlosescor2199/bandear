@@ -12,7 +12,8 @@ import Foundation
 /// Wiring only, and so with no tests of its own: the rules live in `BandEarSession`, where
 /// `swift test` proves them, and every word the screens show lives in `BandEarScreens`. The
 /// coordinator runs on the main actor and says when it changed; each change is copied into the
-/// values a view reads. The views call the actions below and nothing else.
+/// values a view reads. The views call the actions below and nothing else, except the Mixes tab,
+/// which calls the saved mixes' own (``MixesModel``).
 @MainActor
 final class SessionModel: ObservableObject {
     // MARK: The session
@@ -40,6 +41,13 @@ final class SessionModel: ObservableObject {
     /// a report rebuilds only the views that show them and never the screens observing this model.
     let diagnostics: DiagnosticsModel
 
+    // MARK: The saved mixes
+
+    /// The mixes saved on this phone, published apart for the Mixes tab, which calls their actions:
+    /// they change only when the musician saves, recalls, renames or deletes one. A recall changes
+    /// the mix through the session, so the Mix screen follows it here, as it follows any edit.
+    let mixes: MixesModel
+
     // MARK: The screens
 
     /// The tab shown while a session runs. A session start shows Mix, as Android's does.
@@ -62,6 +70,8 @@ final class SessionModel: ObservableObject {
             store: UserDefaultsMusicianStore(UserDefaults.standard))
         audio = MonitorAudio(session: session, sinkFactory: EngineOutputFactory())
         diagnostics = DiagnosticsModel()
+        mixes = MixesModel(
+            SavedMixes(session: session, store: UserDefaultsMixBankStore(UserDefaults.standard)))
         musicianName = session.musicianName
         // The coordinator owns the session's own callback; this is the one to observe.
         audio.stateDidChange = { [weak self] in self?.mirror() }

@@ -44,7 +44,7 @@ struct RootView: View {
                 MixView(session: session)
                     .tabItem { Label(AppTab.mix.label, systemImage: "slider.vertical.3") }
                     .tag(AppTab.mix)
-                NavigationStack { MixesView() }
+                NavigationStack { MixesView(mixes: session.mixes) }
                     .tabItem { Label(AppTab.mixes.label, systemImage: "square.stack") }
                     .tag(AppTab.mixes)
                 NavigationStack { SettingsView(session: session) }

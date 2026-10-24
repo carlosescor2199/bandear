@@ -48,6 +48,8 @@ extension MixSession {
     /// - Toggling More of me is sent when it actually turned on or off.
     /// - Choosing a channel is sent when the choice was taken while More of me was on: the mix then
     ///   lifts another channel, or none.
+    /// - A recalled mix is sent unless the mix was following another musician's
+    ///   (``MixSession/recallRefusal``), even when it changed nothing (`MonitorViewModel.kt:454`).
     ///
     /// The desk's reports and the start and end of a session are never sent: the desk already plays
     /// what it reports. The one report the phone answers with a mix, the first after a link turned
@@ -64,6 +66,8 @@ extension MixSession {
             return before.moreOfMe.isEnabled != after.moreOfMe.isEnabled
         case .musicianChannelChosen(let channel):
             return before.moreOfMe.isEnabled && after.moreOfMe.musicianChannel == channel
+        case .mixRecalled:
+            return before.recallRefusal == nil
         case .sessionStarted, .sessionEnded, .mixPushed, .mixAnswered:
             return false
         }

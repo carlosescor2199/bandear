@@ -26,6 +26,16 @@ public enum MixEvent: Equatable, Sendable {
     case moreOfMeToggled(on: Bool)
     /// The musician called a channel theirs, by the channel its strip is known by, or none.
     case musicianChannelChosen(Int?)
+    /// The musician recalled a saved mix: it applies as if every control had been moved by hand,
+    /// unless ``MixSession/recallRefusal`` says why it cannot.
+    case mixRecalled(MixSnapshot)
+}
+
+/// Why a saved mix cannot be recalled now. The screen words it (T9b).
+public enum RecallRefusal: Equatable, Sendable {
+    /// The mix follows `leader`'s, whose channels and groups the desk keeps, so a saved mix is not
+    /// recalled at all, not even its master. `leader` may be empty: the desk names nobody.
+    case following(leader: String)
 }
 
 /// The phone's side of the mix for one session, and the pure reducer over it.
@@ -128,8 +138,20 @@ public struct MixSession: Equatable, Sendable {
             next.moreOfMe = moreOfMe.toggled(on: on, in: mix)
         case .musicianChannelChosen(let channel):
             next.moreOfMe = moreOfMe.choosing(channel, in: mix)
+        case .mixRecalled(let snapshot):
+            if recallRefusal == nil {
+                next.mix = mix.recalling(snapshot)
+            }
         }
         return next
+    }
+
+    /// Why a saved mix cannot be recalled now, or nil when it can: a recall is refused while the mix
+    /// follows another musician's (`MonitorReducer.kt:136-149`). The reducer refuses
+    /// ``MixEvent/mixRecalled(_:)`` by it, ``sends(_:before:after:)`` sends nothing by it, and the
+    /// phone reads it to say why.
+    public var recallRefusal: RecallRefusal? {
+        mix.following.map { .following(leader: $0) }
     }
 
     fileprivate static func percent(_ value: Int) -> Int {
@@ -327,6 +349,42 @@ extension MixState {
         next.masterVolume = percent(report.volumePercent)
         next.levelCap = percent(report.maxLevelPercent)
         next.masterMuted = report.muted
+        return next
+    }
+
+    /// This mix with the saved `snapshot` applied, as if every control had been moved by hand
+    /// (`MonitorReducer.kt:397-419`). What the desk announced (the channel count, the groups, the
+    /// details) and what the engineer set are kept; the strips take the saved mix's size until the
+    /// desk announces again, and a saved list shorter than its levels reads as the default pans and
+    /// nothing muted or soloed. A channel the engineer locked keeps the level, pan, mute and solo it
+    /// has, as a moved control on it would, and a pair is locked whole (``lockedSides``). The values
+    /// are taken as saved, as Android takes them: the phone only saves values it holds.
+    fileprivate func recalling(_ snapshot: MixSnapshot) -> MixState {
+        let count = snapshot.channelGains.count
+        let locked = lockedSides
+        func kept<Value>(_ channel: Int, _ current: [Value], saved: () -> Value) -> Value {
+            locked.contains(channel) && current.indices.contains(channel) ? current[channel] : saved()
+        }
+
+        var next = self
+        next.levels = (0..<count).map { channel in
+            kept(channel, levels) { snapshot.channelGains[channel] }
+        }
+        next.pans = (0..<count).map { channel in
+            kept(channel, pans) {
+                snapshot.channelPans.element(at: channel) ?? ChannelLayout.defaultPan(channel: channel)
+            }
+        }
+        next.mutes = (0..<count).map { channel in
+            kept(channel, mutes) { snapshot.channelMutes.element(at: channel) ?? false }
+        }
+        next.solos = (0..<count).map { channel in
+            kept(channel, solos) { snapshot.channelSolos.element(at: channel) ?? false }
+        }
+        next.groupLevels = snapshot.groupLevels
+        next.masterVolume = snapshot.volumePercent
+        next.levelCap = snapshot.maxLevelPercent
+        next.masterMuted = snapshot.muted
         return next
     }
 }

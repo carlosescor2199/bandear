@@ -140,4 +140,40 @@ class PanScaleTest {
     fun aScreenReaderStepIgnoresTheDetent() {
         assertEquals(48, panGesture().step(target = 48f, current = PAN_CENTRE))
     }
+
+    @Test
+    fun theThumbsCentreRunsFromHalfAThumbInToHalfAThumbFromTheRightEnd() {
+        // The strip pan's dot stops 4 px in from each end of a 208 px pan (an 8 px thumb for the
+        // maths), so its centre travels 200 px, from 4 px to 204 px.
+        assertEquals(4f, panCentreOf(PAN_LEFT, lengthPx = 208f, thumbPx = 8f), 0.001f)
+        assertEquals(204f, panCentreOf(PAN_RIGHT, lengthPx = 208f, thumbPx = 8f), 0.001f)
+        assertEquals(4f + 90f - 1.8f, panCentreOf(49, lengthPx = 208f, thumbPx = 8f), 0.001f)
+    }
+
+    @Test
+    fun theCentreIsDrawnInTheMiddleOfTheControl() {
+        assertEquals(104f, panCentreOf(PAN_CENTRE, lengthPx = 208f, thumbPx = 8f), 0.001f)
+        assertEquals(37f, panCentreOf(PAN_CENTRE, lengthPx = 74f, thumbPx = 8f), 0.001f)
+    }
+
+    @Test
+    fun thePanControlsThumbIsDrawnWhereItWasBefore() {
+        // PanControl drew its 32 px thumb at panPositionOf over the width minus the thumb, plus half a thumb.
+        for (pan in PAN_LEFT..PAN_RIGHT) {
+            assertEquals("pan $pan", panPositionOf(pan, 328f - 32f) + 16f, panCentreOf(pan, lengthPx = 328f, thumbPx = 32f), 0.001f)
+        }
+    }
+
+    @Test
+    fun aControlNoWiderThanItsThumbKeepsTheThumbAtTheStart() {
+        assertEquals(4f, panCentreOf(PAN_RIGHT, lengthPx = 6f, thumbPx = 8f), 0.001f)
+    }
+
+    @Test
+    fun aTapOnTheDrawnThumbReadsBackAsItsPan() {
+        val gesture = HorizontalFaderGesture(thumbWidthPx = 8f, scale = PanScale).apply { widthPx = 208f }
+        for (pan in PAN_LEFT..PAN_RIGHT) {
+            assertEquals("pan $pan", pan, gesture.tap(xPx = panCentreOf(pan, 208f, 8f), current = -1))
+        }
+    }
 }

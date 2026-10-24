@@ -9,9 +9,11 @@ import SwiftUI
 /// named `voiceOverLabel` ("Mute CH 3", ``StripWords/muteDescription(for:)``) that says it is
 /// selected while on. `onToggle` gets the state the key asks for, the opposite of `isOn`.
 ///
-/// A ``Size/letter`` key ("M", "S") is 28 pt tall in mono digits, a ``Size/word`` key ("Mute" on the
-/// master strip) 32 pt in the text face; both take the width their container gives them. Inside a
-/// disabled view it fades to 40% but keeps its colours, so it still shows whether it is on.
+/// A ``Size/letter`` key ("M", "S") is drawn 28 pt tall in mono digits, a ``Size/word`` key ("Mute"
+/// on the master strip) 32 pt in the text face; both take the width their container gives them. The
+/// key is drawn in the middle of a touch target ``touchHeight`` tall, so it lays out 44 pt tall: on
+/// a strip the space above and below the drawn key is the strip's padding and the gap to the pan.
+/// Inside a disabled view it fades to 40% but keeps its colours, so it still shows whether it is on.
 struct ConsoleKey: View {
     enum Kind: Equatable, Sendable {
         case mute
@@ -34,8 +36,12 @@ struct ConsoleKey: View {
 
     @Environment(\.isEnabled) private var isEnabled
 
+    /// The height of a key's touch target, around the key as drawn.
+    static let touchHeight: CGFloat = 44
+
     var body: some View {
         let shape = BandEarShapes.rounded(BandEarShapes.key)
+        let drawnHeight: CGFloat = size == .letter ? 28 : 32
         let onColour = kind == .mute ? BandEarColors.red : BandEarColors.accent
         let offText = size == .letter ? BandEarColors.textSecondary : BandEarColors.text
         Button {
@@ -49,10 +55,11 @@ struct ConsoleKey: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
                 .padding(.horizontal, 2)
-                .frame(maxWidth: .infinity, minHeight: size == .letter ? 28 : 32)
+                .frame(maxWidth: .infinity, minHeight: drawnHeight)
                 .background(isOn ? onColour : BandEarColors.surfaceRaised, in: shape)
                 .overlay(shape.strokeBorder(isOn ? onColour : BandEarColors.border, lineWidth: 1))
-                .contentShape(shape)
+                .padding(.vertical, (Self.touchHeight - drawnHeight) / 2)
+                .contentShape(Rectangle())
         }
         .buttonStyle(PressedDimStyle())
         .opacity(isEnabled ? 1 : 0.4)

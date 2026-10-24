@@ -48,6 +48,10 @@ public enum MixWords {
         "\(row.label.uppercased()) · \(count)"
     }
 
+    /// What the portrait console says beside ``sectionTitle(_:count:)`` while its strips run past the
+    /// screen's edge, so the musician knows the row scrolls sideways.
+    public static let swipeForMore = "Swipe for more"
+
     /// What the channel row says before the desk announced any channel (`MixStrips.kt:95`).
     public static let waitingForChannels = "Waiting for the server to announce its channels."
 

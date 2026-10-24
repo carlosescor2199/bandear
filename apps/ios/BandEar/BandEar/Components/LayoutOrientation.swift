@@ -1,3 +1,4 @@
+import BandEarScreens
 import SwiftUI
 
 /// Which way the space a screen has is laid out: landscape when it is wider than it is tall,
@@ -15,9 +16,10 @@ enum LayoutOrientation: Equatable, Sendable {
     case portrait
     case landscape
 
-    /// The orientation of a space `size` big.
+    /// The orientation of a space `size` big (``LayoutRules/isLandscape(width:height:)``).
     init(_ size: CGSize) {
-        self = size.width > size.height ? .landscape : .portrait
+        let landscape = LayoutRules.isLandscape(width: Double(size.width), height: Double(size.height))
+        self = landscape ? .landscape : .portrait
     }
 
     var isLandscape: Bool {

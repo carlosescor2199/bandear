@@ -1,3 +1,4 @@
+import BandEarScreens
 import SwiftUI
 import UIKit
 
@@ -192,7 +193,9 @@ private struct ModalPanelSurface<Header: View, Panel: View>: View {
                 }
                 .buttonStyle(PressedDimStyle())
             }
-            ContentHeightLayout(maxHeight: landscape ? .infinity : available.height * 0.75) {
+            let maxHeight = LayoutRules.panelContentMaxHeight(
+                spaceHeight: Double(available.height), isLandscape: landscape)
+            ContentHeightLayout(maxHeight: CGFloat(maxHeight)) {
                 ScrollView {
                     panel()
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -223,15 +226,18 @@ private struct ModalPanelSurface<Header: View, Panel: View>: View {
 }
 
 /// Sizes its one child, a scroll view, to the height of what it scrolls, up to `maxHeight` and the
-/// height offered: a short panel hugs its content and a tall one scrolls.
+/// height offered: a short panel hugs its content and a tall one scrolls
+/// (``LayoutRules/panelContentHeight(ideal:maxHeight:proposed:)``).
 private struct ContentHeightLayout: Layout {
     let maxHeight: CGFloat
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         guard let child = subviews.first else { return .zero }
         let ideal = child.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
-        let height = min(ideal.height, maxHeight, proposal.height ?? .infinity)
-        return CGSize(width: proposal.width ?? ideal.width, height: height)
+        let height = LayoutRules.panelContentHeight(
+            ideal: Double(ideal.height), maxHeight: Double(maxHeight),
+            proposed: proposal.height.map(Double.init))
+        return CGSize(width: proposal.width ?? ideal.width, height: CGFloat(height))
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {

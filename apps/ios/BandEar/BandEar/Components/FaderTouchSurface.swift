@@ -1,3 +1,4 @@
+import BandEarScreens
 import SwiftUI
 import UIKit
 
@@ -12,9 +13,9 @@ enum FaderAxis: Equatable, Sendable {
 /// A transparent UIKit view laid over a fader that takes its touches: a tap where the finger lifts
 /// without moving, and a drag along `axis` only.
 ///
-/// A drag that starts across the axis is not the fader's: its pan recogniser declines to begin when
-/// the finger first moves further across the axis than along it, and leaves the touch to whatever
-/// is behind. A sideways swipe on a vertical fader therefore still scrolls the row of strips, as
+/// A drag that starts across the axis is not the fader's: its pan recogniser declines to begin
+/// unless the finger first moves further along the axis than across it, and leaves the touch to
+/// whatever is behind. A sideways swipe on a vertical fader therefore still scrolls the row of strips, as
 /// Android's `draggable(orientation = Vertical)` leaves it to the parent. A drag along the axis is
 /// the fader's even inside a scroll view that scrolls the same way: an enclosing scroll view's pan
 /// waits for the fader's to fail, so the strip pan moves under a sideways drag instead of the row.
@@ -114,15 +115,15 @@ struct FaderTouchSurface: UIViewRepresentable {
             }
         }
 
-        /// A drag starts only when the finger has moved further along the axis than across it.
+        /// A drag starts only when the finger has moved further along the axis than across it
+        /// (``LayoutRules/dragBegins(movedAlong:movedAcross:velocityAlong:velocityAcross:)``).
         func gestureRecognizerShouldBegin(_ recogniser: UIGestureRecognizer) -> Bool {
             guard let pan = recogniser as? UIPanGestureRecognizer, let view = pan.view else { return true }
-            var moved = pan.translation(in: view)
-            if moved == .zero { moved = pan.velocity(in: view) }
-            switch surface.axis {
-            case .vertical: return abs(moved.y) > abs(moved.x)
-            case .horizontal: return abs(moved.x) > abs(moved.y)
-            }
+            let moved = pan.translation(in: view)
+            let velocity = pan.velocity(in: view)
+            return LayoutRules.dragBegins(
+                movedAlong: along(moved), movedAcross: across(moved),
+                velocityAlong: along(velocity), velocityAcross: across(velocity))
         }
 
         /// An enclosing scroll view's pan waits for the fader's drag to fail, so a drag along the
@@ -137,6 +138,10 @@ struct FaderTouchSurface: UIViewRepresentable {
 
         private func along(_ point: CGPoint) -> Double {
             Double(surface.axis == .vertical ? point.y : point.x)
+        }
+
+        private func across(_ point: CGPoint) -> Double {
+            Double(surface.axis == .vertical ? point.x : point.y)
         }
     }
 }

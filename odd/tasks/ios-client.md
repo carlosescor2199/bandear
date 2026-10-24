@@ -1901,4 +1901,11 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - 921 tests, 0 warnings, no stray preferences file, and the app builds.
   - Risk: item 6. The two `MixesContent` changes have no automated test; they rest on the simulator
     and the logging build.
+- T9c independent verifier (item 6): no blocker. Claims 1-3 PASS.
+  - Exact-count probe over 17 steps, plus 8 of its own mutants (7 caught). Adding 2 instead of 1
+    survives: the tests check only that the number changed, while the comment promises "one more".
+    That is an advisory, harmless to the screen.
+  - A logging build announced #1-#11, each exactly once. Delete then save "Verse" showed no
+    dialog, and opening another mix's menu afterwards showed only the menu.
+  - 921 tests, 0 warnings, and the app builds.
 

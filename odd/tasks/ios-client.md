@@ -632,18 +632,19 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     volume, cap, group levels and channel values are applied and sent without clamping. The
     tolerant reader accepts any whole number. Only damaged or hand-edited storage reaches this.
     Android does not clamp either.
-  - T9b, warnings:
-    - R2-init-doc-misleading: `SavedMixes.init`'s comment says the stored mixes are recalled into
-      the session; `init` only builds the bank.
-    - R3-delete-dialog-state-not-cleared: the delete confirmation does not clear `deleting` itself.
-      It relies on SwiftUI calling `isPresented`'s setter for a row the delete removes. If that
-      does not happen, deleting "Verse" and then saving "Verse" again could show the dialog again.
-    - R3-repeated-notice-not-announced: VoiceOver hears a notice only when its text changes, so a
-      repeated outcome (a second blank save, a re-save) is not announced.
+  - T9b, warnings, all fixed in T9c (`2574f1b`):
+    - R2-init-doc-misleading: `SavedMixes.init`'s comment said the stored mixes were recalled into
+      the session, while `init` only builds the bank.
+    - R3-delete-dialog-state-not-cleared: the delete confirmation did not clear `deleting` itself.
+    - R3-repeated-notice-not-announced: VoiceOver heard a notice only when its text changed.
   - T9b, suggestions:
-    - `SavedMixesNotice.notRecalled`'s comment names a `reason` parameter that is labelled
-      `because`;
+    - (Fixed in T9c.) `SavedMixesNotice.notRecalled`'s comment named a `reason` parameter that is
+      labelled `because`;
     - `MixesModel` and `MixesContent` have no automated test.
+- **From the T9c verifier and review (suggestions, not fixed).** `noticeNumber`'s comment
+  promises "one more than the last", but the tests only check that it changed, so a bump of 2
+  survives. Either assert `+ 1` or say only that it changes. A small `MixesModel` test that the
+  number follows `SavedMixes` would also prove the forwarding the logging build showed.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1908,4 +1909,13 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - A logging build announced #1-#11, each exactly once. Delete then save "Verse" showed no
     dialog, and opening another mix's menu afterwards showed only the menu.
   - 921 tests, 0 warnings, and the app builds.
+- T9c native review:
+  - Assessed against `55cd593` with item 6 escalated: `high`, due (7 paths, 188 lines).
+  - START checked: base `2ac50a9` = `55cd593`, candidate `d31f7b0` = `99b691c`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: reliability and readability.
+  - Approved, suggestions only. Lineage `review-2bcdca291f8111d7`, acknowledged. The reviewed
+    boundary is now `99b691c`.
+  - Its suggestion that Follow-ups listed T9c's fixed warnings as open is applied in this
+    document. The rest are under Follow-ups.
+- T9c complete. Every task of the plan, and every review warning the user asked to fix, is done.
 

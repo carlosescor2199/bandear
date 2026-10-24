@@ -1,10 +1,9 @@
 /// How a pan is written, and how the pan control's centre detent turns a position into a pan.
 ///
 /// Ported from the Android client's `PanScale.kt`: its words and the pure arithmetic of its detent.
-/// Android's own fader gesture is not ported. The native `Slider` takes the touches, and binds its
+/// Android's pan gesture is ported in `FaderMath.swift` (`HorizontalFaderGesture`), and binds a
 /// position to a pan through ``value(at:travel:detentShare:)`` and
-/// ``position(of:travel:detentShare:)`` over a travel of its own, `0...1` for example, so a pan near
-/// the centre snaps to it there too.
+/// ``position(of:travel:detentShare:)``, so a pan near the centre snaps to it there too.
 public enum PanScale {
     /// Hard left: the channel plays only in the left ear.
     public static let left = 0

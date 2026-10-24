@@ -15,8 +15,7 @@ private func isClose(_ actual: Double, _ expected: Double) -> Bool {
 ///
 /// Its last five cases (`aTapNearTheMiddleLandsOnTheCentre` through
 /// `aScreenReaderStepIgnoresTheDetent`, lines 104-142) drive Android's own fader gesture
-/// (`HorizontalFaderGesture`), which iOS does not port: the native `Slider` takes the touches and
-/// asks ``PanScale`` for the pan under them.
+/// (`HorizontalFaderGesture`); they are ported with that gesture, in `FaderMathParityTests`.
 @Suite("Pan scale: Android parity")
 struct PanScaleParityTests {
 

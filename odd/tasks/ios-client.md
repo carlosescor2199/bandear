@@ -163,6 +163,17 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - the Mixes screen in native SwiftUI: the save field, the list with "Active now" and Recall,
       Rename and Delete under the ⋮ menu, their dialogs, and the notices;
     - ports of the six `MonitorViewModelTest` cases.
+  - [ ] T9c — The T9b review's three warnings, which the user asked for on 2026-10-23: "dale,
+    arreglá primero los warnings de T9". Route: one delegated writer, past the long-session
+    backstop.
+    - R3-delete-dialog-state-not-cleared: confirming a delete clears the pending delete itself, so
+      deleting "Verse" and then saving "Verse" again never shows the dialog.
+    - R3-repeated-notice-not-announced: every action that gives an outcome is announced to
+      VoiceOver, even when its words equal the last notice's (a second blank save, a re-save).
+    - R2-init-doc-misleading: `SavedMixes.init`'s comment says what `init` does (it builds the bank
+      from the store and applies nothing). The adjacent suggestion is fixed too: `notRecalled`'s
+      comment names its real label, `because`.
+    - T9a's unclamped recall values and the views' missing tests stay under Follow-ups.
 - [x] T6 — App shell, project file and control session. Grown since first written: the follow-ups
   of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
   - [x] T6a — The project and a shell that builds (route: delegated writer; trigger: the

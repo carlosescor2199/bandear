@@ -127,7 +127,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     last figures back on a refused start, with a test.
   - R3-discovery-double-start: discovery starts once per return to the foreground, never twice at
     launch.
-- [ ] T9 — Mix banks and recall. Device-local saved mixes (`MixBankStore.kt`) and recalling one
+- [x] T9 — Mix banks and recall. Device-local saved mixes (`MixBankStore.kt`) and recalling one
   into the mix. Split from T5 because it needs device storage, which the pure mix module does not
   have. The user asked "dale, seguí con T9" (2026-10-23). The look follows T8's decision ("Nativo
   iOS, mismos textos y reglas").
@@ -616,6 +616,23 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     name. Android shows it as a label.
   - Stored keys are written sorted, where Android keeps insertion order. The JSON means the same.
   - A refused recall while following was not exercised end to end. Tests and mutants cover it.
+- **From the T9 reviews (not fixed).**
+  - T9a, R3-recall-unclamped-values / R4-recall-unclamped-stored-values: a recalled snapshot's
+    volume, cap, group levels and channel values are applied and sent without clamping. The
+    tolerant reader accepts any whole number. Only damaged or hand-edited storage reaches this.
+    Android does not clamp either.
+  - T9b, warnings:
+    - R2-init-doc-misleading: `SavedMixes.init`'s comment says the stored mixes are recalled into
+      the session; `init` only builds the bank.
+    - R3-delete-dialog-state-not-cleared: the delete confirmation does not clear `deleting` itself.
+      It relies on SwiftUI calling `isPresented`'s setter for a row the delete removes. If that
+      does not happen, deleting "Verse" and then saving "Verse" again could show the dialog again.
+    - R3-repeated-notice-not-announced: VoiceOver hears a notice only when its text changes, so a
+      repeated outcome (a second blank save, a re-save) is not announced.
+  - T9b, suggestions:
+    - `SavedMixesNotice.notRecalled`'s comment names a `reason` parameter that is labelled
+      `because`;
+    - `MixesModel` and `MixesContent` have no automated test.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1844,4 +1861,16 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - The stored shape matches Android's: a `snapshot` held as a JSON string.
   - 919 tests, 0 warnings, the app builds, and Mix, Settings and Connect are unchanged.
   - Its minor advisories are under Follow-ups.
+- Native reviews for T9:
+  - The pending slice `9907f62..b2893cd` (the T9 plan and T9a) was reviewed from a detached worktree
+    at `b2893cd`: `medium`, `under_budget` (12 paths).
+    - The user chose `granted`. Lenses: reliability and resilience.
+    - Approved. Lineage `review-a550eb0d00308ffc`.
+    - One finding, unclamped recall values (Follow-ups).
+  - T9b (`b2893cd..55cd593`), with item 6 escalated: `high` (12 paths, 1351 lines).
+    - The user chose `granted`. Lenses: reliability and readability.
+    - Approved, and acknowledged. The reviewed boundary is now `55cd593`.
+    - Three warnings and two suggestions (Follow-ups).
+- T9 complete. Every task of the plan (T1-T9) is done. What remains is under Follow-ups, for the user
+  to prioritise. Pushing, pull requests and merging remain the user's decisions.
 

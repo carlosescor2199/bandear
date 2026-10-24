@@ -5,11 +5,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -39,9 +44,14 @@ enum class MainTab(val label: String) {
 }
 
 /**
- * The bottom bar that switches between [MainTab]s. The selected tab is amber, bolder and marked
- * with a bar above its icon, so it is not told by colour alone; a screen reader hears each as a
- * tab and which one is selected.
+ * The bottom bar that switches between [MainTab]s in the portrait layout ([NavigationRail] takes
+ * its place in landscape). It sits on the bar colour under a hairline; the selected tab is amber,
+ * bolder and marked with a bar above its icon, so it is not told by colour alone; a screen reader
+ * hears each as a tab and which one is selected.
+ *
+ * Its colour reaches under the navigation bar, and it keeps its tabs clear of it and of the
+ * sides' cutouts: it pads for the bottom and side safe-drawing insets itself, unless something
+ * around it already did.
  */
 @Composable
 fun BottomTabBar(selected: MainTab, onSelect: (MainTab) -> Unit, modifier: Modifier = Modifier) {
@@ -51,12 +61,13 @@ fun BottomTabBar(selected: MainTab, onSelect: (MainTab) -> Unit, modifier: Modif
             Modifier
                 .fillMaxWidth()
                 .height(1.dp)
-                .background(colors.surfaceRaised),
+                .background(colors.border),
         )
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 14.dp)
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal))
+                .padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 8.dp)
                 .selectableGroup(),
         ) {
             MainTab.entries.forEach { tab ->
@@ -98,7 +109,8 @@ private fun TabItem(tab: MainTab, selected: Boolean, onClick: () -> Unit, modifi
     }
 }
 
-private fun tabIcon(tab: MainTab): ImageVector = when (tab) {
+/** The line icon of [tab], the same in the bottom bar and the rail. */
+internal fun tabIcon(tab: MainTab): ImageVector = when (tab) {
     MainTab.MIX -> MixIcon
     MainTab.MIXES -> MixesIcon
     MainTab.SETTINGS -> SettingsIcon
@@ -123,7 +135,7 @@ private val SettingsIcon: ImageVector by lazy {
     )
 }
 
-@Preview(showBackground = true, backgroundColor = 0xFF0D1117)
+@Preview(showBackground = true, backgroundColor = 0xFF0D1117, widthDp = 390)
 @Composable
 private fun BottomTabBarPreview() {
     BandEarTheme {

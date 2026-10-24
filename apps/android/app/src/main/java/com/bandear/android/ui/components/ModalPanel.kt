@@ -82,7 +82,8 @@ private const val SidePanelExitMillis = 180
  * it is open (in the ViewModel or `rememberSaveable`, so it stays open across a rotation) and
  * stops composing it in [onDismiss]. A tap on the dimmed screen, the back key and, for the sheet,
  * a swipe down close it; [content] gets a `dismiss` function to close it the same way from its own
- * Done button, sliding it away first and calling [onDismiss] after.
+ * Done button, sliding it away first and calling [onDismiss] after. However many of these arrive,
+ * [onDismiss] is called once, when the panel has slid off the screen (see [ModalPanelDismissal]).
  *
  * [content] is composed in one place for as long as the layout stays the same, so its own state
  * survives every recomposition, and its `rememberSaveable` state a recreation of the Activity in
@@ -116,16 +117,20 @@ private fun BottomSheetPanel(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     val currentOnDismiss by rememberUpdatedState(onDismiss)
+    val dismissal = remember { ModalPanelDismissal(onDismiss = { currentOnDismiss() }) }
     val dismiss: () -> Unit = remember(sheetState, scope) {
         {
             // Slide the sheet away first, then forget it, as a swipe down does.
-            scope.launch { sheetState.hide() }.invokeOnCompletion {
-                if (!sheetState.isVisible) currentOnDismiss()
+            if (dismissal.requestClose()) {
+                scope.launch { sheetState.hide() }.invokeOnCompletion {
+                    dismissal.slideEnded(hidden = !sheetState.isVisible)
+                }
             }
         }
     }
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        // The sheet's own dismissals (scrim, back, swipe down) slide it away before they ask.
+        onDismissRequest = { dismissal.slideEnded(hidden = !sheetState.isVisible) },
         modifier = modifier,
         sheetState = sheetState,
         shape = SheetShape,
@@ -150,18 +155,19 @@ private fun SidePanel(
     content: @Composable (dismiss: () -> Unit) -> Unit,
 ) {
     val currentOnDismiss by rememberUpdatedState(onDismiss)
+    val dismissal = remember { ModalPanelDismissal(onDismiss = { currentOnDismiss() }) }
     // 0 off the screen past the end edge, 1 in place.
     val shown = remember { Animatable(0f) }
     var leaving by remember { mutableStateOf(false) }
     LaunchedEffect(leaving) {
         if (leaving) {
             shown.animateTo(0f, tween(SidePanelExitMillis))
-            currentOnDismiss()
+            dismissal.slideEnded(hidden = true)
         } else {
             shown.animateTo(1f, tween(SidePanelEnterMillis))
         }
     }
-    val dismiss: () -> Unit = remember { { leaving = true } }
+    val dismiss: () -> Unit = remember { { if (dismissal.requestClose()) leaving = true } }
     val towardEnd = if (LocalLayoutDirection.current == LayoutDirection.Ltr) 1f else -1f
 
     Dialog(

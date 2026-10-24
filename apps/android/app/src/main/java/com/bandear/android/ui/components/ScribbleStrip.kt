@@ -25,8 +25,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -94,7 +96,8 @@ fun scribbleColors(tone: ScribbleTone, colors: BandEarColors): ScribbleColors = 
  * title is cut short here rather than wrapped. For a screen reader it is one button, built as the
  * strip's label button is today: named [contentDescription] (the full name, of which the visible
  * texts are the short form), with [stateDescription] as its state and [onClickLabel] as what a
- * double tap does. The stereo icon has no name of its own; the description says it.
+ * double tap does, and nothing else: the visible texts are not read again after the name. The
+ * stereo icon has no name of its own; the description says it.
  */
 @Composable
 fun ScribbleStrip(
@@ -121,9 +124,17 @@ fun ScribbleStrip(
                 onClickLabel = onClickLabel,
                 onClick = onClick,
             )
-            .semantics {
+            // All a screen reader hears, in place of the texts inside. The role and the click
+            // action are set again here so the button keeps them, with their label, whichever of
+            // these two modifiers Compose applies last.
+            .clearAndSetSemantics {
                 this.contentDescription = contentDescription
                 if (stateDescription != null) this.stateDescription = stateDescription
+                role = Role.Button
+                this.onClick(label = onClickLabel) {
+                    onClick()
+                    true
+                }
             },
         contentAlignment = Alignment.Center,
     ) {

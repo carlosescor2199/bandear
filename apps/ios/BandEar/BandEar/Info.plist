@@ -8,6 +8,11 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>BandEar looks for the desk on your local network and receives your personal mix from it.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>ibm_plex_sans_variable.ttf</string>
+		<string>jetbrains_mono_variable.ttf</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

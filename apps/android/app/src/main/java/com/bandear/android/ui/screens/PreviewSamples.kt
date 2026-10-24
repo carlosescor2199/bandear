@@ -99,6 +99,18 @@ internal object PreviewSamples {
         mix = mix.copy(levelCap = 80, engineer = EngineerControls(limitPercent = 60, lockedChannels = setOf(0, 1))),
     )
 
+    /**
+     * The console as the Mix boards draw it: the kick locked, Vox lifted by More of me, the keys
+     * pair, the guitar muted, and the engineer's limit of 85% under a level cap of 90%.
+     */
+    val console = connected.copy(
+        mix = mix.copy(
+            mutes = listOf(false, false, false, false, false, true, false, false),
+            levelCap = 90,
+            engineer = EngineerControls(limitPercent = 85, lockedChannels = setOf(0)),
+        ),
+    )
+
     /** The engineer has this mix follow Lead vocal's; the kick stays locked as well. */
     val following = moreOfMeOff.copy(
         mix = mix.copy(engineer = EngineerControls(lockedChannels = setOf(0), following = "Lead vocal")),

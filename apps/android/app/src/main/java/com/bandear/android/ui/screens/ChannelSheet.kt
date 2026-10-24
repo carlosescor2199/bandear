@@ -17,11 +17,8 @@ import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -40,6 +37,7 @@ import androidx.compose.ui.unit.sp
 import com.bandear.android.ui.components.GroupChip
 import com.bandear.android.ui.components.HorizontalFader
 import com.bandear.android.ui.components.LineIcons
+import com.bandear.android.ui.components.ModalPanel
 import com.bandear.android.ui.components.PAN_CENTRE
 import com.bandear.android.ui.components.PAN_LEFT
 import com.bandear.android.ui.components.PAN_RIGHT
@@ -52,7 +50,6 @@ import com.bandear.android.ui.state.ChannelUiState
 import com.bandear.android.ui.theme.BandEarShapes
 import com.bandear.android.ui.theme.BandEarTheme
 import com.bandear.android.ui.theme.BandEarType
-import kotlinx.coroutines.launch
 
 /** The sheet's top corners; its bottom sits on the screen's edge. */
 private val SheetShape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
@@ -61,14 +58,15 @@ private val SheetShape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
 private const val DISABLED_KEY_ALPHA = 0.4f
 
 /**
- * One channel's sheet, opened from its strip's label: the pan, which the strips have no room for,
- * then the channel's level, Mute and Solo, so everything about the channel is in one place.
+ * One channel's panel, opened from its strip's scribble strip: its pan, level, Mute and Solo, so
+ * everything about the channel is in one place, in a [ModalPanel]: a bottom sheet in portrait, a
+ * panel from the end edge in landscape.
  *
- * It slides up over the Mix screen and closes with Done, a swipe down, a tap outside it or the back
- * key, each of which ends in [onDismiss]. It always shows [channel] as it is now, so a change made
- * on the strip shows here at once.
+ * It closes with Done, a tap outside it, the back key and, as a sheet, a swipe down, each of which
+ * ends in [onDismiss]; the caller keeps which channel's panel is open, so it stays open across a
+ * rotation. It always shows [channel] as it is now, so a change made on the strip shows here at
+ * once.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun ChannelSheet(
     channel: ChannelUiState,
@@ -80,19 +78,7 @@ internal fun ChannelSheet(
     onMuted: (Boolean) -> Unit,
     onSoloed: (Boolean) -> Unit,
 ) {
-    val colors = BandEarTheme.colors
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val scope = rememberCoroutineScope()
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        shape = SheetShape,
-        containerColor = colors.surface,
-        contentColor = colors.text,
-        tonalElevation = 0.dp,
-        scrimColor = Color.Black.copy(alpha = 0.6f),
-        dragHandle = { BottomSheetDefaults.DragHandle(color = colors.textSecondary) },
-    ) {
+    ModalPanel(onDismiss = onDismiss) { dismiss ->
         ChannelSheetContent(
             channel = channel,
             mine = mine,
@@ -101,12 +87,8 @@ internal fun ChannelSheet(
             onLevel = onLevel,
             onMuted = onMuted,
             onSoloed = onSoloed,
-            onDone = {
-                // Slide the sheet away first, then forget it, as a swipe down does.
-                scope.launch { sheetState.hide() }.invokeOnCompletion {
-                    if (!sheetState.isVisible) onDismiss()
-                }
-            },
+            // Slide the panel away first, then forget it, as a swipe down does.
+            onDone = dismiss,
         )
     }
 }

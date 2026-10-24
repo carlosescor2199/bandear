@@ -21,6 +21,12 @@ class AtomLabelsTest {
     }
 
     @Test
+    fun theKeysNameTheChannelTheyActOn() {
+        assertEquals("Mute CH 3", muteKeyDescription("CH 3"))
+        assertEquals("Solo CH 3", soloKeyDescription("CH 3"))
+    }
+
+    @Test
     fun groupsTakeTheTonesInTurn() {
         assertEquals(GroupTone.TEAL, groupToneFor(0))
         assertEquals(GroupTone.VIOLET, groupToneFor(1))

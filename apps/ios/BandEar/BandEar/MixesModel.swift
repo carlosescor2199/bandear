@@ -17,6 +17,9 @@ final class MixesModel: ObservableObject {
     @Published private(set) var activeName: String?
     /// What the last save, recall, rename or delete did, or why it did nothing.
     @Published private(set) var notice: SavedMixesNotice?
+    /// The notice's number, which changes with every notice an action gives, even in the words of
+    /// the last one.
+    @Published private(set) var noticeNumber = 0
 
     private let savedMixes: SavedMixes
 
@@ -55,5 +58,6 @@ final class MixesModel: ObservableObject {
         if mixes != savedMixes.mixes { mixes = savedMixes.mixes }
         if activeName != savedMixes.activeName { activeName = savedMixes.activeName }
         if notice != savedMixes.notice { notice = savedMixes.notice }
+        if noticeNumber != savedMixes.noticeNumber { noticeNumber = savedMixes.noticeNumber }
     }
 }

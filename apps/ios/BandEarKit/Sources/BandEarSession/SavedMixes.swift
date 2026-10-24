@@ -11,7 +11,7 @@ public enum SavedMixesNotice: Equatable, Sendable {
     case bank(MixBankOutcome)
     /// The mix saved as `name` is the mix now: "Recalled \"name\"".
     case recalled(name: String)
-    /// The mix saved as `name` was not recalled, and `reason` says why.
+    /// The mix saved as `name` was not recalled, and `because` says why.
     case notRecalled(name: String, because: RecallRefusal)
 }
 
@@ -41,6 +41,11 @@ public final class SavedMixes {
     public var activeName: String? { bank.activeName }
     /// What the last action did, or why it did nothing; nil until the first one.
     public private(set) var notice: SavedMixesNotice?
+    /// The number of ``notice`` among the notices given, 0 until the first. Every action that says
+    /// something numbers its notice one more than the last, even when it says what the last one
+    /// said, so a screen tells a repeated outcome (a second blank save, a re-save) from none; an
+    /// action that says nothing leaves it as it was.
+    public private(set) var noticeNumber = 0
     /// Called on the main actor after anything above may have changed.
     public var stateDidChange: (() -> Void)?
 
@@ -48,8 +53,9 @@ public final class SavedMixes {
     private let session: ControlSession
     private let store: any MixBankStore
 
-    /// The saved mixes `store` keeps, recalled into `session`'s mix: Android's `MixesLoaded` at
-    /// launch (`MonitorViewModel.kt:519-526`).
+    /// Lists the saved mixes `store` keeps, with none active and nothing said: Android's
+    /// `MixesLoaded` at launch (`MonitorViewModel.kt:519-526`). It only reads the store: nothing is
+    /// applied to `session`'s mix, and nothing is sent or written.
     public init(session: ControlSession, store: any MixBankStore) {
         self.session = session
         self.store = store
@@ -73,14 +79,14 @@ public final class SavedMixes {
         bank.reload(store.savedMixes)
         if let saved = bank.mix(named: name) {
             if let refusal = session.mixSession.recallRefusal {
-                notice = .notRecalled(name: name, because: refusal)
+                say(.notRecalled(name: name, because: refusal))
             } else {
                 session.apply(.mixRecalled(saved.snapshot))
                 bank.activate(name)
-                notice = .recalled(name: name)
+                say(.recalled(name: name))
             }
         } else {
-            notice = .bank(.missing(name: name))
+            say(.bank(.missing(name: name)))
         }
         stateDidChange?()
     }
@@ -109,9 +115,15 @@ public final class SavedMixes {
             store.savedMixes = bank.mixes
         }
         if outcome != .unchanged {
-            notice = .bank(outcome)
+            say(.bank(outcome))
         }
         stateDidChange?()
         return outcome
+    }
+
+    /// Shows `notice` as a new one, numbered after the last, even in the last one's words.
+    private func say(_ notice: SavedMixesNotice) {
+        self.notice = notice
+        noticeNumber += 1
     }
 }

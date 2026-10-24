@@ -14,6 +14,7 @@ struct MixesView: View {
             names: mixes.mixes.map(\.name),
             activeName: mixes.activeName,
             notice: mixes.notice,
+            noticeNumber: mixes.noticeNumber,
             save: { mixes.save(as: $0) },
             recall: { mixes.recall($0) },
             rename: { mixes.rename($0, to: $1) },

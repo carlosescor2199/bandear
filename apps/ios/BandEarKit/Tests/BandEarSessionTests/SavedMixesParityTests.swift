@@ -73,8 +73,8 @@ struct SavedMixesParityTests {
             session: session, sinkFactory: FakeSinkFactory(), makeReceiver: receivers.make)
     }
 
-    /// Android's view model, built now: the saved mixes as the store holds them, recalled into the
-    /// session.
+    /// Android's view model, built now: the saved mixes listed as the store holds them, none active
+    /// and none applied to the session.
     private func launched() -> SavedMixes {
         SavedMixes(session: session, store: store)
     }

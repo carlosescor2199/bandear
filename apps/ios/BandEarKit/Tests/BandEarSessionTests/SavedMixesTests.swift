@@ -25,6 +25,13 @@ private func saved(_ name: String, _ snapshot: MixSnapshot = MixSnapshot()) -> S
     SavedMix(name: name, snapshot: snapshot)
 }
 
+/// The desk's push of a mix that follows `leader`'s, every channel at 70.
+private func following(_ leader: String) -> [String: Any] {
+    var object = mixState(levels: [Int](repeating: 70, count: 32))
+    object["following"] = leader
+    return object
+}
+
 /// A throwaway `UserDefaults` suite for `body`, whose every call of `launch` is one launch of the
 /// app: a fresh `UserDefaults` over the same suite, as a new process opens it.
 ///
@@ -130,11 +137,54 @@ struct SavedMixesTests {
     func anUnchangedRenameKeepsTheLastNotice() {
         let mixes = SavedMixes(session: session, store: CountingMixBankStore())
         mixes.save(as: "Verse")
+        let number = mixes.noticeNumber
 
         mixes.rename("Verse", to: " Verse ")
 
         #expect(mixes.notice == .bank(.saved(name: "Verse")))
+        #expect(mixes.noticeNumber == number)
         #expect(mixes.activeName == "Verse")
+    }
+
+    @Test("an action that says what the last one said is still a notice of its own")
+    func aRepeatedOutcomeIsANewNotice() {
+        let mixes = SavedMixes(
+            session: session, store: CountingMixBankStore([saved("Verse"), saved("Chorus")]))
+        let actions: [(label: String, run: () -> Void)] = [
+            ("a blank save", { mixes.save(as: " ") }),
+            ("a save under a name already saved", { mixes.save(as: "Verse") }),
+            ("a recall", { mixes.recall("Verse") }),
+            ("a recall of a mix no longer saved", { mixes.recall("Gone") }),
+            ("a rename to a name already taken", { mixes.rename("Verse", to: "Chorus") }),
+            ("a blank rename", { mixes.rename("Verse", to: " ") }),
+            ("a delete of a mix no longer saved", { mixes.delete("Gone") }),
+        ]
+
+        for action in actions {
+            action.run()
+            let first = (notice: mixes.notice, number: mixes.noticeNumber)
+
+            action.run()
+
+            #expect(mixes.notice == first.notice, "\(action.label)")
+            #expect(mixes.noticeNumber != first.number, "\(action.label)")
+        }
+    }
+
+    @Test("a second refused recall is still a notice of its own")
+    func aRepeatedRefusedRecallIsANewNotice() async throws {
+        let mixes = SavedMixes(session: session, store: CountingMixBankStore([saved("Verse")]))
+        try await connected(channels: 2)
+        try await desk.answerMixes()
+        try await desk.receive(following("Ana"))
+        mixes.recall("Verse")
+        try #require(mixes.notice == .notRecalled(name: "Verse", because: .following(leader: "Ana")))
+        let first = mixes.noticeNumber
+
+        mixes.recall("Verse")
+
+        #expect(mixes.notice == .notRecalled(name: "Verse", because: .following(leader: "Ana")))
+        #expect(mixes.noticeNumber != first)
     }
 
     @Test("observers hear every action, refused or not")

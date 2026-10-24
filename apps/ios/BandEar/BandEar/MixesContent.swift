@@ -16,6 +16,8 @@ struct MixesContent: View {
     let names: [String]
     let activeName: String?
     let notice: SavedMixesNotice?
+    /// The notice's number, new with every notice an action gives, even in the last one's words.
+    let noticeNumber: Int
     /// Saves the current mix under the name typed; says whether it was saved.
     let save: @MainActor (String) -> Bool
     let recall: @MainActor (String) -> Void
@@ -49,9 +51,12 @@ struct MixesContent: View {
                 .disabled(!SavedMixesWords.canRename(from: from, to: newName))
             Button(SavedMixesWords.cancel, role: .cancel) {}
         }
-        // Android reads the notice out as a polite live region whenever its words change.
-        .onChange(of: noticeText) { text in
-            if let text {
+        // Android reads the notice out as a polite live region whenever its words change. Here every
+        // notice is read out, even in the last one's words (a second blank save, a re-save): its
+        // number tells them apart. Both are in the value watched, so the words read out are the ones
+        // handed to the closure.
+        .onChange(of: Announcement(number: noticeNumber, text: noticeText)) { announcement in
+            if let text = announcement.text {
                 UIAccessibility.post(notification: .announcement, argument: text)
             }
         }
@@ -60,6 +65,12 @@ struct MixesContent: View {
     /// What the last action did, in words, or nil.
     private var noticeText: String? {
         notice.flatMap(SavedMixesWords.notice)
+    }
+
+    /// A notice as VoiceOver reads it out: its words, and its number, which changes with each one.
+    private struct Announcement: Equatable {
+        let number: Int
+        let text: String?
     }
 
     private var introSection: some View {
@@ -171,8 +182,8 @@ struct MixesContent: View {
                     set: { if !$0 { deleting = nil } }),
                 titleVisibility: .visible
             ) {
-                Button(SavedMixesWords.delete, role: .destructive) { delete(name) }
-                Button(SavedMixesWords.cancel, role: .cancel) {}
+                Button(SavedMixesWords.delete, role: .destructive) { confirmDelete(name) }
+                Button(SavedMixesWords.cancel, role: .cancel) { deleting = nil }
             } message: {
                 Text(SavedMixesWords.deleteMessage)
             }
@@ -202,6 +213,14 @@ struct MixesContent: View {
         }
     }
 
+    /// Lets the delete dialog go, then deletes the mix. The dialog hangs from the mix's row, which
+    /// the delete removes, so nothing else may close it; left open, a mix saved again under the
+    /// same name would show it again.
+    private func confirmDelete(_ name: String) {
+        deleting = nil
+        delete(name)
+    }
+
     /// Shown while `item` holds a mix; closing the dialog lets it go.
     private func shown(_ item: Binding<String?>) -> Binding<Bool> {
         Binding(
@@ -215,16 +234,16 @@ struct MixesContent: View {
         NavigationStack {
             MixesContent(
                 names: ["Soundcheck", "Ballads", "Main set"], activeName: "Ballads",
-                notice: .recalled(name: "Ballads"), save: { _ in true }, recall: { _ in },
-                rename: { _, _ in }, delete: { _ in })
+                notice: .recalled(name: "Ballads"), noticeNumber: 1, save: { _ in true },
+                recall: { _ in }, rename: { _, _ in }, delete: { _ in })
         }
     }
 
     #Preview("Mixes · empty") {
         NavigationStack {
             MixesContent(
-                names: [], activeName: nil, notice: nil, save: { _ in false }, recall: { _ in },
-                rename: { _, _ in }, delete: { _ in })
+                names: [], activeName: nil, notice: nil, noticeNumber: 0, save: { _ in false },
+                recall: { _ in }, rename: { _, _ in }, delete: { _ in })
         }
     }
 #endif

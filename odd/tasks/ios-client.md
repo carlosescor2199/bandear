@@ -609,6 +609,13 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - The assign-if-changed rule is written by hand per field in both mirrors. A helper would keep
       it in one place, but not an `inout` one: passing a `@Published` property `inout` always
       writes it back and publishes (the T8e writer measured it). A key-path assignment would work.
+- **From the T9 verifier (advisories).**
+  - The delete confirmation, a popover anchored to the ⋮, shows no Cancel button: tapping outside
+    cancels. Android shows Cancel.
+  - "New name" is the rename field's placeholder, so it is hidden while the field holds the old
+    name. Android shows it as a label.
+  - Stored keys are written sorted, where Android keeps insertion order. The JSON means the same.
+  - A refused recall while following was not exercised end to end. Tests and mutants cover it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1823,4 +1830,18 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     - a rename gave `Renamed "Ballads" to "Main set"`;
     - a delete gave `Deleted "Main set"`, with `bandear.banks` holding `[]`.
   - Risk: item 6. The views have no automated test; their rules and words are tested in the package.
+- T9 independent verifier (item 6; T9a and T9b together, against the base `9907f62`): no blocker.
+  Claims 1-6 PASS.
+  - Its own 12 mutants were all caught.
+  - End to end on its own iPhone 17 simulator, watched by a passive observer:
+    - a blank save stored nothing;
+    - " Verse " was saved and active;
+    - 47 recalled to 100;
+    - a re-save at 31 kept a single entry;
+    - after a relaunch, Recall gave 31 at the desk;
+    - a rename gave "Main set", still active;
+    - a delete left `[]`.
+  - The stored shape matches Android's: a `snapshot` held as a JSON string.
+  - 919 tests, 0 warnings, the app builds, and Mix, Settings and Connect are unchanged.
+  - Its minor advisories are under Follow-ups.
 

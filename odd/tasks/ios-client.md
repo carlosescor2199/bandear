@@ -141,7 +141,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
       `recallingAMixThatIsGoneRefreshesTheList`, `renamingAndDeletingAMix` and
       `recallingWhileFollowingSendsNothingAndSaysWhy`;
     - the `SavedMixesScreen.kt` copy.
-  - [ ] T9a — The domain (route: one delegated writer, past the long-session backstop).
+  - [x] T9a — The domain (route: one delegated writer, past the long-session backstop).
     - In `BandEarMix`:
       - the snapshot of a mix;
       - the list of saved mixes with Android's rules (save under a name, a name already taken
@@ -1770,4 +1770,30 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     `9907f62`.
   - Two warnings (both already known) and two suggestions are under Follow-ups.
 - T8e complete. Next: T9 (mix banks and recall), or the remaining follow-ups, as the user decides.
+- T9a (one writer in a worktree), commit `0f5537b`:
+  - It stopped once, correctly: a new `MixEvent` case needs a branch in `OutgoingMix.swift`'s
+    exhaustive switch, a file the parent had left out of its surfaces. The parent widened the
+    surface by that file, with Android's rule: a recall is sent unless the mix was following
+    someone (`MonitorViewModel.kt:454`).
+  - `MixSnapshot` (`MixState.snapshot`, never the More of me lift).
+  - `MixBank`:
+    - save trims the name, and a taken name replaces that mix;
+    - rename refuses a blank, missing, unchanged or taken name, in Android's order;
+    - delete;
+    - the active mix is always a saved one.
+  - `MixBankStore` and `UserDefaultsMixBankStore`, keyed `bandear.banks`, use Android's JSON. A
+    damaged entry loses only itself.
+  - `MixEvent.mixRecalled(MixSnapshot)` with `MixSession.recallRefusal` (`.following(leader:)`). It
+    is the one rule the reducer, the send rule and the screens read.
+  - The deferred recall cases at `MixReducerParityTests.swift:218` and `:296` are completed.
+  - RED: 25 of 31 failed, then 10 of 10 for the recall. GREEN: 876 tests, 0 warnings, no stray
+    preferences file, and 10 of 10 mutants caught.
+  - Divergences:
+    - stored text where a number belongs reads as the default, as in the `config` decoder;
+    - a rename removes exactly the renamed mix;
+    - `.mixRecalled` carries no name, since the active mix belongs to `MixBank`;
+    - recalled values are not clamped, as on Android.
+  - Not pinned: a recall that changes nothing is still sent, as on Android.
+  - Risk: none. It adds a public `MixEvent` case, whose only exhaustive switches are updated. The
+    `bandear.banks` key stores new data only.
 

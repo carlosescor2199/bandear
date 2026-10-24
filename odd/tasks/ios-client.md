@@ -155,7 +155,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
         tolerantly as Android does.
     - It ports Android's snapshot, bank and recall tests, including the recall cases deferred in
       `MixReducerParityTests`.
-  - [ ] T9b — The coordinator and the Mixes screen (route: one delegated writer, after T9a). It
+  - [x] T9b — The coordinator and the Mixes screen (route: one delegated writer, after T9a). It
     covers:
     - save, recall, rename and delete through the session, with the store's results as Android's
       notices in `BandEarScreens`, and the active mix tracked;
@@ -1796,4 +1796,31 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Not pinned: a recall that changes nothing is still sent, as on Android.
   - Risk: none. It adds a public `MixEvent` case, whose only exhaustive switches are updated. The
     `bandear.banks` key stores new data only.
+- T9b (one writer in a worktree), commits `469d6ca` (package) and `0090894` (app):
+  - `SavedMixes` (`@MainActor`, in `BandEarSession`) holds `mixes`, `activeName`, a typed `notice`
+    and `stateDidChange`, and offers `save(as:)`, `recall(_:)`, `rename(_:to:)` and `delete(_:)`.
+    It reuses `MixBank` and `recallRefusal`.
+  - Android's notices and the remaining Mixes copy are in `SavedMixesWords`, verbatim.
+  - `MixesModel` is observed only by the Mixes tab. `MixesContent` has the save field, the list with
+    "Active now" and Recall, Rename and Delete in a ⋮ menu with their dialogs, the notice and the
+    empty state.
+    - `.menuOrder(.fixed)`: an upward menu on iOS 26 otherwise put Delete where Rename was drawn.
+  - RED: 41 of 43 new tests failed. GREEN: 919 tests, 0 warnings, no stray preferences file, and
+    12 of 12 mutants caught.
+  - Divergences:
+    - the list is read back before every action;
+    - it is written only when it changed;
+    - a refused recall never reaches the session;
+    - delete asks in a popover anchored to the row's ⋮.
+  - The writer again needed a file outside its surfaces: `RootView` constructs every tab. The parent
+    applied that one line at integration (`MixesView(mixes: session.mixes)`).
+  - End to end against the desk (a manual connection to `127.0.0.1`, audio port 59999, watched by a
+    passive observer):
+    - a blank save showed "Enter a name for the mix";
+    - " Ballads " was saved as `Saved "Ballads"`, Active now;
+    - CH 1 moved from 49 to 92, and Recall brought back 49 on screen and at the desk;
+    - after a relaunch "Ballads" was still listed, and recalling it again gave 49;
+    - a rename gave `Renamed "Ballads" to "Main set"`;
+    - a delete gave `Deleted "Main set"`, with `bandear.banks` holding `[]`.
+  - Risk: item 6. The views have no automated test; their rules and words are tested in the package.
 

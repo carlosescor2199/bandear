@@ -163,7 +163,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - the Mixes screen in native SwiftUI: the save field, the list with "Active now" and Recall,
       Rename and Delete under the ⋮ menu, their dialogs, and the notices;
     - ports of the six `MonitorViewModelTest` cases.
-  - [ ] T9c — The T9b review's three warnings, which the user asked for on 2026-10-23: "dale,
+  - [x] T9c — The T9b review's three warnings, which the user asked for on 2026-10-23: "dale,
     arreglá primero los warnings de T9". Route: one delegated writer, past the long-session
     backstop.
     - R3-delete-dialog-state-not-cleared: confirming a delete clears the pending delete itself, so
@@ -627,7 +627,7 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     name. Android shows it as a label.
   - Stored keys are written sorted, where Android keeps insertion order. The JSON means the same.
   - A refused recall while following was not exercised end to end. Tests and mutants cover it.
-- **From the T9 reviews (not fixed).**
+- **From the T9 reviews. T9b's warnings, and the `because` suggestion, are fixed in T9c; the rest is not.**
   - T9a, R3-recall-unclamped-values / R4-recall-unclamped-stored-values: a recalled snapshot's
     volume, cap, group levels and channel values are applied and sent without clamping. The
     tolerant reader accepts any whole number. Only damaged or hand-edited storage reaches this.
@@ -1884,4 +1884,21 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     - Three warnings and two suggestions (Follow-ups).
 - T9 complete. Every task of the plan (T1-T9) is done. What remains is under Follow-ups, for the user
   to prioritise. Pushing, pull requests and merging remain the user's decisions.
+- T9c (one writer in a worktree), commit `2574f1b`:
+  - Delete: `confirmDelete(name)` clears `deleting` before it deletes, and Cancel clears it too. On
+    the simulator, deleting "Verse" and saving "Verse" again showed no dialog. The popover's Cancel
+    cannot be reached on screen, since tapping outside closes it.
+  - Notices: `SavedMixes.noticeNumber` goes up with every outcome, equal words included, and stays
+    the same for an action with none (an unchanged rename). `MixesModel` publishes it, and the tab
+    announces on it.
+    - RED: 2 of 11 tests failed. GREEN: 921 tests.
+    - Two mutants caught: no bump on equal words, and a bump with no outcome.
+    - A scratch logging build confirmed six separate announcements for repeated blank saves, saves
+      and recalls.
+  - Comments: `init` says it lists the store's mixes, none active, applying and sending nothing.
+    `notRecalled` names `because`. The parent fixed the same wrong wording on a test helper at
+    integration.
+  - 921 tests, 0 warnings, no stray preferences file, and the app builds.
+  - Risk: item 6. The two `MixesContent` changes have no automated test; they rest on the simulator
+    and the logging build.
 

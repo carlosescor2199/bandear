@@ -275,12 +275,8 @@ private fun ChannelStrip(
             onClickLabel = "Open the channel's settings",
             stateDescription = channelPanState(channel.pan, channel.stereo),
             // The group is read after the button as its chip was beside the label button. A held
-            // strip's tag took the chip's place, so its group is left to the panel, as it was.
-            subtitleDescription = when {
-                !open -> null
-                group != null -> groupChipDescription(group.name)
-                else -> subtitle
-            },
+            // strip shows its group here too, so it reads it as well, as iOS does.
+            subtitleDescription = if (group != null) groupChipDescription(group.name) else subtitle,
             stereo = channel.stereo,
         )
     }

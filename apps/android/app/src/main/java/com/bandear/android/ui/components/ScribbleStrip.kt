@@ -27,8 +27,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.onClick
-import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -93,11 +92,13 @@ fun scribbleColors(tone: ScribbleTone, colors: BandEarColors): ScribbleColors = 
  * [subtitle] (its group, "No group", "My channel"), coloured by [tone] (see [scribbleColors]).
  *
  * It is as wide as the strip and drawn 40 dp tall in the middle of a 48 dp touch target, so a long
- * title is cut short here rather than wrapped. For a screen reader it is one button, built as the
- * strip's label button is today: named [contentDescription] (the full name, of which the visible
- * texts are the short form), with [stateDescription] as its state and [onClickLabel] as what a
- * double tap does, and nothing else: the visible texts are not read again after the name. The
- * stereo icon has no name of its own; the description says it.
+ * title is cut short here rather than wrapped. For a screen reader it is a button, built as the
+ * strip's label button is today: named [contentDescription] (the full name, of which the title is
+ * the short form), with [stateDescription] as its state and [onClickLabel] as what a double tap
+ * does; the title is not read again after the name. The subtitle is an element of its own after
+ * the button, read as [subtitleDescription] (as the group chip beside the label button was:
+ * "Group: Drums", "No group"), or not at all when that is null. The stereo icon has no name of its
+ * own; the description says it.
  */
 @Composable
 fun ScribbleStrip(
@@ -109,6 +110,7 @@ fun ScribbleStrip(
     modifier: Modifier = Modifier,
     onClickLabel: String? = null,
     stateDescription: String? = null,
+    subtitleDescription: String? = null,
     stereo: Boolean = false,
 ) {
     val colors = scribbleColors(tone, BandEarTheme.colors)
@@ -124,17 +126,9 @@ fun ScribbleStrip(
                 onClickLabel = onClickLabel,
                 onClick = onClick,
             )
-            // All a screen reader hears, in place of the texts inside. The role and the click
-            // action are set again here so the button keeps them, with their label, whichever of
-            // these two modifiers Compose applies last.
-            .clearAndSetSemantics {
+            .semantics {
                 this.contentDescription = contentDescription
                 if (stateDescription != null) this.stateDescription = stateDescription
-                role = Role.Button
-                this.onClick(label = onClickLabel) {
-                    onClick()
-                    true
-                }
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -150,7 +144,9 @@ fun ScribbleStrip(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(2.dp, alignment = Alignment.CenterVertically),
         ) {
+            // The button's name already says the title.
             Row(
+                modifier = Modifier.clearAndSetSemantics {},
                 horizontalArrangement = Arrangement.spacedBy(4.dp, alignment = Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -168,6 +164,7 @@ fun ScribbleStrip(
             }
             Text(
                 text = subtitle,
+                modifier = subtitleSemantics(subtitleDescription),
                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, lineHeight = 12.sp),
                 color = colors.content.copy(alpha = SubtitleAlpha),
                 maxLines = 1,
@@ -176,6 +173,20 @@ fun ScribbleStrip(
         }
     }
 }
+
+/**
+ * The subtitle's semantics: read as [description] in a stop of its own, which the button's merge
+ * leaves out (the merge boundary has to come before the clearing, which would otherwise drop it),
+ * or silent when [description] is null.
+ */
+private fun subtitleSemantics(description: String?): Modifier =
+    if (description == null) {
+        Modifier.clearAndSetSemantics {}
+    } else {
+        Modifier
+            .semantics(mergeDescendants = true) {}
+            .clearAndSetSemantics { contentDescription = description }
+    }
 
 @Preview(showBackground = true, backgroundColor = 0xFF0D1117)
 @Composable

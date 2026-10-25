@@ -39,4 +39,10 @@ class AtomLabelsTest {
     fun aNegativeIndexStillGetsATone() {
         assertEquals(GroupTone.BLUE, groupToneFor(-1))
     }
+
+    @Test
+    fun aGroupIsNamedAsAGroup() {
+        assertEquals("Group: Drums", groupChipDescription("Drums"))
+        assertEquals("Group: Lead vox", groupChipDescription("Lead vox"))
+    }
 }

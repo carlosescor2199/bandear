@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.shape.ZeroCornerSize
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -53,7 +52,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
-import com.bandear.android.ui.theme.BandEarShapes
 import com.bandear.android.ui.theme.BandEarTheme
 import kotlinx.coroutines.launch
 
@@ -63,8 +61,8 @@ private const val ScrimAlpha = 0.6f
 /** The bottom sheet's top corners; its bottom sits on the screen's edge. */
 private val SheetShape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
 
-/** The side panel's corners on the start side; its end sits on the screen's edge. */
-private val SidePanelShape = BandEarShapes.Panel.copy(topEnd = ZeroCornerSize, bottomEnd = ZeroCornerSize)
+/** The side panel's corners on the start side, as round as the sheet's; its end sits on the screen's edge. */
+private val SidePanelShape = RoundedCornerShape(topStart = 22.dp, bottomStart = 22.dp)
 
 /** How wide the side panel is, or the whole window when that is narrower. */
 private val SidePanelWidth = 400.dp

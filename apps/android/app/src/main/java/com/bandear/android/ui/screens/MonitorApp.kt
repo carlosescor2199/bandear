@@ -14,10 +14,12 @@ import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
@@ -38,9 +40,10 @@ import com.bandear.android.ui.theme.BandEarTheme
  * instance (the reducer copies only what changes), so the screens it feeds are skipped when only
  * the receiver's statistics moved.
  *
- * The only state kept here is whether the manual address form was opened from Connect. The back
- * key closes it, and from the Mixes or Settings tab returns to Mix. The selected tab lives in
- * [state], so it outlasts the Activity being recreated when the phone turns.
+ * The only state kept here is whether the manual address form was opened from Connect, and what
+ * the screen on show keeps for the current visit. The back key closes the form, and from the Mixes
+ * or Settings tab returns to Mix. The selected tab lives in [state], so it outlasts the Activity
+ * being recreated when the phone turns.
  */
 @Composable
 fun MonitorApp(
@@ -63,6 +66,16 @@ fun MonitorApp(
     BackHandler(enabled = screen == AppScreen.MANUAL_ADDRESS) { manualAddressOpen = false }
     BackHandler(enabled = screen == AppScreen.MIXES || screen == AppScreen.SETTINGS) {
         actions.selectTab(MainTab.MIX)
+    }
+
+    // What each visit to a screen keeps in rememberSaveable (its scroll, a typed draft) is held
+    // under that screen and dropped once the musician leaves it, so the next visit starts afresh:
+    // left to the Activity's own saved state, a value a screen saved in one layout and never read
+    // back in the other (a landscape column's scroll, the phone turned to portrait) outlived the
+    // visit and scrolled a later one. Turning the phone saves the visit before anything is dropped.
+    val screenStates = rememberSaveableStateHolder()
+    DisposableEffect(screen) {
+        onDispose { screenStates.removeState(screen) }
     }
 
     // The bar and the rail pad for the insets on their own side (the navigation bar, a cutout);
@@ -90,7 +103,9 @@ fun MonitorApp(
                     .fillMaxWidth()
                     .windowInsetsPadding(WindowInsets.safeDrawing.only(screenSides)),
             ) {
-                ScreenContent(screen, state, actions, landscape, onManualAddress = { manualAddressOpen = it })
+                screenStates.SaveableStateProvider(screen) {
+                    ScreenContent(screen, state, actions, landscape, onManualAddress = { manualAddressOpen = it })
+                }
             }
             if (bottomBar) BottomTabBar(selected = state.tab, onSelect = { actions.selectTab(it) })
         }

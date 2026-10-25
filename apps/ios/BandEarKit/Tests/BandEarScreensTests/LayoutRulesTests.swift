@@ -104,3 +104,48 @@ struct PanelContentHeightRuleTests {
         #expect(LayoutRules.panelContentHeight(ideal: 900, maxHeight: .infinity, proposed: nil) == 900)
     }
 }
+
+/// How tall the Mix screen's console is: what the parts above it leave of the space, but never less
+/// than its least height, so a short window scrolls rather than leaving the faders no travel.
+@Suite("Layout rules: console height")
+struct ConsoleHeightRuleTests {
+    @Test func theConsoleFillsWhatThePartsAboveLeave() {
+        #expect(LayoutRules.consoleHeight(spaceHeight: 360, topHeight: 52, least: 240) == 308)
+    }
+
+    @Test func theConsoleKeepsItsLeastHeightWhenTheSpaceIsShort() {
+        // Two banners under a landscape header: the screen scrolls instead.
+        #expect(LayoutRules.consoleHeight(spaceHeight: 360, topHeight: 186, least: 240) == 240)
+    }
+
+    @Test func exactlyTheLeastHeightLeftIsKept() {
+        #expect(LayoutRules.consoleHeight(spaceHeight: 360, topHeight: 120, least: 240) == 240)
+    }
+
+    @Test func partsTallerThanTheSpaceStillLeaveTheLeastHeight() {
+        #expect(LayoutRules.consoleHeight(spaceHeight: 200, topHeight: 260, least: 240) == 240)
+    }
+}
+
+/// Whether letting go of a drag down a portrait bottom sheet's top closes it, or the sheet springs
+/// back.
+@Suite("Layout rules: bottom sheet drag")
+struct SheetDragRuleTests {
+    @Test func aLongPullCloses() {
+        #expect(LayoutRules.sheetDragCloses(predictedPull: 180))
+    }
+
+    @Test func aShortPullSpringsBack() {
+        #expect(!LayoutRules.sheetDragCloses(predictedPull: 40))
+    }
+
+    @Test func thePullMustPassTheCloseDistance() {
+        #expect(!LayoutRules.sheetDragCloses(predictedPull: LayoutRules.sheetCloseDistance))
+        #expect(LayoutRules.sheetDragCloses(predictedPull: LayoutRules.sheetCloseDistance + 1))
+    }
+
+    @Test func aDragPushedBackUpSpringsBack() {
+        #expect(!LayoutRules.sheetDragCloses(predictedPull: -60))
+        #expect(!LayoutRules.sheetDragCloses(predictedPull: 0))
+    }
+}

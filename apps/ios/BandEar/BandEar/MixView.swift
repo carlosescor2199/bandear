@@ -33,7 +33,9 @@ typealias MixApply = @MainActor (MixEvent) -> Void
 ///
 /// Portrait stacks the header, More of me, the choice of row and its title over the console, whose
 /// strips scroll sideways ("Swipe for more" says so while they overflow). Landscape puts the header,
-/// the choice and More of me on one line over a console that shows every strip that fits.
+/// the choice and More of me on one line over a console that shows every strip that fits. The
+/// console fills the height the rest leaves; the screen itself does not scroll, unless that would
+/// leave the console less than ``consoleLeastHeight``, as when banners stack in landscape.
 ///
 /// The presentational half: it shows the values it is given and reports edits through `apply`,
 /// with every word from `BandEarScreens` and every rule from the mix. Which row shows and which
@@ -45,6 +47,12 @@ struct MixContent: View {
     let status: ConnectionStatus
     let mixSession: MixSession
     let apply: MixApply
+
+    /// The least height the console keeps for its strips: their keys, pan, value and scribble strip,
+    /// and a fader of about 70 pt travel, long enough to set by hand. That is what one banner leaves
+    /// it in landscape on a phone 402 pt tall, so a second banner scrolls the screen instead of
+    /// taking the faders' travel (Android keeps 260 dp, `MinConsoleHeight` in `MixScreen.kt`).
+    static let consoleLeastHeight: CGFloat = 240
 
     @State private var row: MixRow = .channels
     /// The channel whose panel is open, by the channel its strip is known by.
@@ -61,37 +69,45 @@ struct MixContent: View {
             let metrics = MixConsoleMetrics(
                 width: proxy.size.width - 2 * padding, count: count, landscape: landscape)
             let title = MixWords.sectionTitle(row, count: count)
-            VStack(alignment: .leading, spacing: landscape ? 8 : 12) {
-                if landscape {
-                    landscapeHeader
-                } else {
-                    MixHeaderRow(name: headerName, server: headerServer, pill: status.pill) {
-                        EmptyView()
+            let topPadding: CGFloat = landscape ? 10 : 8
+            let bottomPadding: CGFloat = 12
+            ScrollView(.vertical) {
+                MixColumnLayout(
+                    spaceHeight: proxy.size.height - topPadding - bottomPadding,
+                    spacing: landscape ? 8 : 12, consoleLeastHeight: Self.consoleLeastHeight
+                ) {
+                    if landscape {
+                        landscapeHeader
+                    } else {
+                        MixHeaderRow(name: headerName, server: headerServer, pill: status.pill) {
+                            EmptyView()
+                        }
                     }
-                }
-                banners(following: mix.following)
-                if !landscape {
-                    HStack(spacing: 8) {
-                        MoreOfMeSwitch(mixSession: mixSession, apply: apply)
-                        MoreOfMeChannelPicker(mixSession: mixSession, apply: apply)
-                            .fixedSize()
+                    banners(following: mix.following)
+                    if !landscape {
+                        HStack(spacing: 8) {
+                            MoreOfMeSwitch(mixSession: mixSession, apply: apply)
+                            MoreOfMeChannelPicker(mixSession: mixSession, apply: apply)
+                                .fixedSize()
+                        }
                     }
+                    if let notice = mixSession.moreOfMe.notice {
+                        MoreOfMeNoticeLine(notice: notice)
+                    }
+                    if !landscape {
+                        rowChoice
+                        rowTitle(title, overflows: metrics.overflows)
+                    }
+                    MixConsoleRow(
+                        row: row, mixSession: mixSession, metrics: metrics,
+                        title: landscape ? title : nil, apply: apply,
+                        openChannel: { openChannel = $0 }, openMaster: { masterPanelOpen = true })
                 }
-                if let notice = mixSession.moreOfMe.notice {
-                    MoreOfMeNoticeLine(notice: notice)
-                }
-                if !landscape {
-                    rowChoice
-                    rowTitle(title, overflows: metrics.overflows)
-                }
-                MixConsoleRow(
-                    row: row, mixSession: mixSession, metrics: metrics, title: landscape ? title : nil,
-                    apply: apply, openChannel: { openChannel = $0 }, openMaster: { masterPanelOpen = true })
+                .padding(.horizontal, padding)
+                .padding(.top, topPadding)
+                .padding(.bottom, bottomPadding)
             }
-            .padding(.horizontal, padding)
-            .padding(.top, landscape ? 10 : 8)
-            .padding(.bottom, 12)
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+            .bouncesOnlyWhenScrollable()
         }
         .background(BandEarColors.ground.ignoresSafeArea())
         .modalPanel(
@@ -189,6 +205,63 @@ struct MixContent: View {
         }
         if let followed = ConnectionBanner.following(following) {
             MixBanner(banner: followed)
+        }
+    }
+}
+
+/// The Mix screen's column: the parts above the console one under the other, `spacing` apart and
+/// as tall as they need, at the leading edge; then the console, the last part, the whole width and
+/// as tall as they leave of `spaceHeight`, but never less than `consoleLeastHeight`
+/// (``LayoutRules/consoleHeight(spaceHeight:topHeight:least:)``). The column is then taller than the
+/// space, and the scroll view around it scrolls.
+private struct MixColumnLayout: Layout {
+    let spaceHeight: CGFloat
+    let spacing: CGFloat
+    let consoleLeastHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.replacingUnspecifiedDimensions().width
+        let heights = heights(width: width, subviews: subviews)
+        return CGSize(width: width, height: heights.reduce(0, +) + gaps(subviews))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for (subview, height) in zip(subviews, heights(width: bounds.width, subviews: subviews)) {
+            subview.place(
+                at: CGPoint(x: bounds.minX, y: y), anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: height))
+            y += height + spacing
+        }
+    }
+
+    /// Each part's height: the parts above the console as tall as they would like at `width`, and
+    /// the console what they leave.
+    private func heights(width: CGFloat, subviews: Subviews) -> [CGFloat] {
+        guard !subviews.isEmpty else { return [] }
+        let top = subviews.dropLast().map {
+            $0.sizeThatFits(ProposedViewSize(width: width, height: nil)).height
+        }
+        let console = LayoutRules.consoleHeight(
+            spaceHeight: Double(spaceHeight), topHeight: Double(top.reduce(0, +) + gaps(subviews)),
+            least: Double(consoleLeastHeight))
+        return top + [CGFloat(console)]
+    }
+
+    private func gaps(_ subviews: Subviews) -> CGFloat {
+        spacing * CGFloat(max(subviews.count - 1, 0))
+    }
+}
+
+extension View {
+    /// A scroll view that bounces only when what it holds is taller than it is, so a screen that
+    /// fits does not move under a drag. iOS 16.0 to 16.3 have no such setting and bounce always.
+    @ViewBuilder
+    fileprivate func bouncesOnlyWhenScrollable() -> some View {
+        if #available(iOS 16.4, *) {
+            scrollBounceBehavior(.basedOnSize)
+        } else {
+            self
         }
     }
 }

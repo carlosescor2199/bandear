@@ -11,6 +11,9 @@ import SwiftUI
 /// its tag, and its pan and fader are dimmed and take no input; its scribble strip still opens the
 /// panel, whose notes say why. The musician's own strip is raised and edged in the accent's tint.
 ///
+/// VoiceOver reads the strip's group, or "No group", after its scribble strip as an element of its
+/// own, as it read the group's chip beside the label button before.
+///
 /// It takes the width and the height its container gives it.
 struct ConsoleChannelStrip: View {
     let strip: ChannelStrip

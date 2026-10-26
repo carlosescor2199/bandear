@@ -258,10 +258,12 @@ public struct LinkStats: Equatable, Sendable, ControlPayload {
     }
 
     /// A measurement worth sending: finite, and inside the range the desk keeps. Anything else
-    /// becomes absent, which is what the desk would have made of it.
+    /// becomes absent, which is what the desk would have made of it. What is kept is rounded to a
+    /// hundredth of a millisecond, after the range check, as Android does (`ControlChannel.kt:586`).
     private static func reportable(_ milliseconds: Double?) -> Double? {
         milliseconds.flatMap { value in
-            value.isFinite && (0...maximumReportedMilliseconds).contains(value) ? value : nil
+            value.isFinite && (0...maximumReportedMilliseconds).contains(value)
+                ? (value * 100).rounded() / 100 : nil
         }
     }
 

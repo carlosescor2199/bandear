@@ -467,19 +467,30 @@ private struct WirePlayback: Decodable {
         let ms: Int?
     }
 
+    /// A buffer this phone cannot honour is refused, so the session keeps the one it had, as
+    /// Android does (`parsePlaybackBuffer`, `ControlChannel.kt:689`).
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let buffer = try container.decode(WireBuffer.self, forKey: .buffer)
 
-        // A pinned cushion with no length, or a mode this build does not know, cannot be honoured;
-        // adapting on our own is the safe reading, and dropping the message would guess too.
-        guard buffer.mode == "fixed", let milliseconds = buffer.ms else {
+        switch buffer.mode {
+        case "auto":
             value = .auto
-            return
+        case "fixed":
+            guard let milliseconds = buffer.ms else {
+                throw ServerMessageError.missingField("ms", inMessageType: "playback")
+            }
+            let allowed =
+                Int(PlaybackBufferSetting.minimumFixedMilliseconds)
+                ...
+                Int(PlaybackBufferSetting.maximumFixedMilliseconds)
+            guard allowed.contains(milliseconds) else {
+                throw ServerMessageError.unusableField("ms", inMessageType: "playback")
+            }
+            value = .fixed(milliseconds: UInt16(milliseconds))
+        default:
+            throw ServerMessageError.unusableField("mode", inMessageType: "playback")
         }
-        let lowest = Int(PlaybackBufferSetting.minimumFixedMilliseconds)
-        let highest = Int(PlaybackBufferSetting.maximumFixedMilliseconds)
-        value = .fixed(milliseconds: UInt16(milliseconds.clamped(to: lowest...highest)))
     }
 }
 
@@ -488,10 +499,15 @@ private struct WireRedundancy: Decodable {
 
     private enum CodingKeys: String, CodingKey { case delayBlocks = "delay_blocks" }
 
+    /// A delay this phone cannot hold is refused, so the session keeps the hold it had, as Android
+    /// does (`parseRedundancyHold`, `ControlChannel.kt:708`).
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let blocks = try container.decode(Int.self, forKey: .delayBlocks)
-        value = UInt8(blocks.clamped(to: 0...Int(ServerMessage.maximumRedundancyHoldBlocks)))
+        guard (0...Int(ServerMessage.maximumRedundancyHoldBlocks)).contains(blocks) else {
+            throw ServerMessageError.unusableField("delay_blocks", inMessageType: "redundancy")
+        }
+        value = UInt8(blocks)
     }
 }
 
@@ -528,4 +544,7 @@ public enum ServerMessageError: Error, Equatable, Sendable {
     case missingType
     /// A known message type missing a field it cannot be read without.
     case missingField(String, inMessageType: String)
+    /// A known message type whose field holds a value this client cannot use, so the message is
+    /// ignored and what it would have changed stays as it was.
+    case unusableField(String, inMessageType: String)
 }

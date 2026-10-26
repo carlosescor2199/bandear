@@ -1,3 +1,5 @@
+import BandEarProtocol
+
 /// The pure rules behind the playback cushion: how many packets of audio the player keeps queued
 /// ahead of what it is playing.
 ///
@@ -126,24 +128,25 @@ public final class CushionController {
         cushionPackets = startPackets
     }
 
-    /// The receive loop's step for one packet of `packetFrames` frames: follows the desk's
-    /// `setting` (read once per packet) at the player's `playbackRate`, or the packet's
-    /// `packetRate` while no player set one, in a player of `capacityFrames`, and counts the
-    /// frames played.
+    /// The receive loop's step for one packet: follows the desk's `setting` (read once per packet)
+    /// at the player's `playbackRate`, or the packet's `packetRate` while no player set one, in a
+    /// player of `capacityFrames`, and counts the `playedFrames` played.
     ///
-    /// Android takes the packet's samples as well and divides them by a fixed two channels to count
-    /// time. The frame count from the datagram header already carries the real channel count, so
-    /// one number does both jobs here and counting samples as frames cannot be written at all.
+    /// `packetFrames` is the packet size the player opened with, the unit the cushion is counted in;
+    /// `playedFrames` is the size of the packet just played, which counts the time. They differ once
+    /// the desk changes its block size mid-stream. Android passes the packet's samples for the
+    /// second and divides them by a fixed two channels; the frame count from the datagram header
+    /// already carries the real channel count, so counting samples as frames cannot be written.
     public func onPacket(
-        setting: PlaybackBufferSetting, packetFrames: Int, playbackRate: Int?, packetRate: Int,
-        capacityFrames: Int
+        setting: PlaybackBufferSetting, packetFrames: Int, playedFrames: Int, playbackRate: Int?,
+        packetRate: Int, capacityFrames: Int
     ) -> CushionStep {
         let rate = playbackRate ?? packetRate
         var step: CushionStep = []
         if follow(setting, packetFrames: packetFrames, sampleRate: rate, capacityFrames: capacityFrames) {
             step.insert(.apply)
         }
-        if onPlayed(frames: packetFrames, sampleRate: rate) {
+        if onPlayed(frames: playedFrames, sampleRate: rate) {
             step.insert(.adjust)
         }
         return step

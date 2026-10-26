@@ -149,7 +149,104 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
     T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
     observe. Ends with the end-to-end check against the user's own desk machine.
-- [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
+- [x] T7 — UDP receive path and AVAudioEngine output. Sliced from a read-only map of Android's audio
+  path (`PmonPlayer.kt`, about 470 lines with no test of its own, plus small pure helpers that are
+  tested):
+  - [x] T7a — Decoders and `stats` agree with Android (route: inline). A `playback` or
+    `redundancy` message the phone cannot use is refused (`ServerMessageError.unusableField`, or
+    `missingField("ms")` for a fixed buffer with no length), so the session keeps its setting.
+    `LinkStats` rounds each extra to 0.01 after its range check. All 7 known issues are gone.
+    Commit `7556156`.
+  - [x] T7b — A `BandEarPlayback` module that depends on `BandEarProtocol`. `ReorderHold` and
+    `CushionController` move there with their tests (route: inline, mechanical). Commit `c2e9bc5`.
+  - [x] T7c — Ports of `HoldPlayout` and `LinkStatsAccumulator`, with Android's tests (route:
+    delegated writer A, launched together with T7d: two independent units with disjoint surfaces,
+    each over 100 lines). Commit `06eb2b0`.
+  - [x] T7d — Ports of `Pcm16Processor` (local protection), the pure `PlaybackLatency` measures,
+    and the arrival spacing and jitter estimate from `PmonPlayer.kt:222-233` (route: delegated
+    writer B, launched together with T7c). Commit `0aa3674`.
+  - [x] T7e — The receive engine and output, split at a seam the parent wrote first:
+    `PlaybackSink` and `PlaybackSinkFactory` (`Sources/BandEarPlayback/PlaybackSink.swift`), this
+    client's stand-in for Android's `AudioTrack`. Two delegated writers are launched together,
+    each in its own worktree; each unit is over 100 lines with disjoint surfaces. Both touch
+    concurrency (high-risk item 4), so each gets an independent verifier and a native review.
+    - [x] T7e1 — Output: a single-producer, single-consumer ring of PCM16 frames in a small C
+      target with C11 atomics, and a `RingPlaybackSink` conforming to `PlaybackSink`.
+      - Its render side is a pure function: it fills two `Float` channels, needs no lock and
+        allocates nothing.
+      - It plays silence until the target is queued, and starts over after it runs dry, counting
+        an underrun.
+      - The app's `AVAudioSourceNode` will call it in T7f.
+      - Commit `67d35df`.
+    - [x] T7e2 — Receive: a UDP socket with `SO_RCVTIMEO` 250 ms on its own thread, and the
+      receive loop ported from `PmonPlayer.kt:113-357`.
+      - It is written against the protocol, with a fake sink, a fake datagram source and an
+        injected clock.
+      - It also ports `ReceiverLaunches`.
+      - Commit `88408f6`.
+  - [x] T7f — Wiring, in three units:
+    - [x] T7f1 — Session side in `BandEarKit` (route: delegated writer, launched together with
+      T7f2):
+      - `LinkStatsReport` converts to `LinkStats`, with Android's JSON check from
+        `HoldPlayoutTest.kt:113-114`.
+      - Registration announces the four capabilities.
+      - A coordinator in `BandEarSession` owns `PlayerControls` and an `AudioReceiving` port.
+      - It copies into the controls the session's buffer, hold, desk-owns-the-mix flag, volume, mute
+        and cap. The cap is the lower of the musician's cap and the engineer's limit.
+      - It forwards each link report to `send(stats:)`, and keeps the latest receiver stats for T8.
+      - It starts and stops the receiver with the session, and refuses to start while the previous
+        receiver is alive (A3).
+      - It includes ports of the `MonitorViewModelTest` cases for these rules.
+    - [x] T7f2 — App-side output (route: delegated writer, launched together with T7f1):
+      - A `PlaybackSinkFactory` on `AVAudioEngine`, with an `AVAudioSourceNode` whose render block
+        calls `RingPlaybackSink.render`.
+      - The sample rate is bounded before the ring is sized (A5).
+      - The sink stays strongly held until the engine stops (A4).
+      - `outputLatencyFrames` comes from `AVAudioSession`, and the category is `.playback`.
+    - [x] T7f3 — `SessionModel` joins the two, then the check by ear against the desk (route:
+      inline).
+    The original scope of T7f:
+    - announce the four capabilities;
+    - hand `playback` and `redundancy` to the player;
+    - send `stats` through the session, with `recovered` always present as on Android;
+    - apply local protection only while the desk has not acknowledged a mix;
+    - set the cap to the lower of the musician's cap and the engineer's limit;
+    - set up the app's audio session, and start and stop with the control session;
+    - check it end to end by listening to the desk.
+- [x] T7g — The output after an interruption never goes silent unnoticed. The user asked for it
+  on 2026-10-23: "dale, arreglá primero los warnings de interrupción". It fixes the T7f review's
+  R4-001 and R3-001 (quoted under Follow-ups). Route: one delegated writer, because the parent
+  context is past the long-session backstop.
+  - `OutputRecovery` in `BandEarPlayback`, a pure state machine tested with `swift test`, decides
+    when the app's output restarts and whether it plays:
+    - When an interruption begins, the output stops and is interrupted.
+    - When an interruption ends asking to resume, it restarts.
+    - When an interruption ends without asking to resume, it stays stopped, as Apple's guidance
+      asks (another app took the audio). It restarts when the app becomes active again.
+    - A configuration change stops it and restarts it, unless it is interrupted.
+    - When the app becomes active, any interruption ends and a stopped output restarts. This rule
+      was rewritten by the user's decision of 2026-10-23, logged below. A system that still holds
+      the audio, such as a call in progress, refuses the restart, which then leaves the output
+      stopped.
+    - A restart that fails leaves it stopped, and the next of those events tries again.
+  - `EngineOutput` follows `OutputRecovery`:
+    - It reactivates the audio session (`setActive(true)`) before every restart.
+    - It never drops a restart's error silently: a failure marks the output stopped.
+    - It also listens for the app becoming active.
+  - `PlaybackSink` gains `isPlaying` (default `true`). `ReceiverStats` gains `outputPlaying`,
+    sampled from the sink with each packet. The session screen says when the output has stopped,
+    instead of showing Connected over silence.
+  - Out of scope: R3-002 (the session activated before the format) and R3-003 (the bounds' tests)
+    stay under Follow-ups, since the user asked only for the interruption warnings.
+- [x] T7h — The receive thread never waits for an output restart (route: inline, a small fix in
+  one file). The user asked for it on 2026-10-23: "dale, arreglá el bloqueo del hilo de
+  recepción". It fixes the T7g review's R4-001 and R3-001:
+  - `EngineOutput` publishes `recovery.isPlaying` behind its own `OSAllocatedUnfairLock`, held
+    only to copy one value.
+  - The value is updated after every recovery change, including before a restart is tried.
+  - `isPlaying` reads only that published value. The lock order is the output's lock, then the
+    published one.
+  - Commit recorded in Progress.
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
 ## Follow-ups
@@ -248,7 +345,8 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   session that ends on its own leaves `SessionView` on screen with the desk set (T7 or T8). A stored
   `Bool` or a whole `Double` reads as a channel through `NSNumber` bridging; the app never writes
   either.
-- **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
+- **(Done in T7a, except `recovered`, which is for T7f.) T7 inputs from T6b: align the `playback` and
+  `redundancy` decoders with Android.** The T2b
   decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
   delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
   has. That reading was a guess made in T2b, the same kind T2c corrected for `config`. Parent's
@@ -258,9 +356,77 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   decoder agrees, so the markers come off with the fix. Also for T7: `LinkStats` does not round the
   extras to a hundredth (Android does; one more known issue), and leaves `recovered` out when nil,
   where Android always sends it.
+- **Both clients count a refused packet as played.** The T7e review found it (R3-001/R4-001,
+  warnings). `ReceiveLoop.play` counts the packet, its rate and the packets per second before the
+  sink opens or the rate is checked. So a packet refused for a rate change, or because the sink
+  failed to open, still counts in `ReceiverStats.packets` and `packetsPerSecond`, and its error
+  also goes to `onError`. Android does the same (`PmonPlayer.kt:241-244`, before :257-260), so
+  changing it is a decision for both clients, not a port fix. Only the diagnostics are affected.
+- **A desk restarted mid-session stalls the phone's playback until it reconnects (T7f3, end to
+  end).**
+  - What happened: the restarted desk numbered its packets from 0 again, while the phone's reorder
+    hold was past 16 000. The counter of played packets stopped, while the socket received the full
+    stream.
+  - A new session (Disconnect, Connect) played at once.
+  - To do: check Android's `ReorderHold` for the same jump back. If both stall, it is a decision for
+    both clients.
+- **Desk-side findings from the T7f3 end-to-end check** (server, for the user to decide):
+  - Its own mDNS publishes, on `lo0`, only IPv6 for its host name, so from the desk's Mac an IPv4
+    connection resolved over `lo0` finds no address. The phone connects once its reconnect lands on
+    Wi-Fi: up to about 40 s, or at once.
+  - Its default `--target 127.0.0.1:50000` lands on the simulator's socket next to the registered
+    stream, so the phone receives two numberings of the same audio. A real phone never sees the
+    loopback target.
+  - Capture from a Continuity microphone stops when the iPhone leaves: the desk then exits with
+    `OSStatus 1937010544`.
+- **T8 inputs from the T7f verifier.**
+  - AD2: a link report that arrives after `stop()` sets `linkReport` again. Android does the same
+    (`MonitorReducer.kt:177`), but the link health shown in T8 should ignore it.
+  - AD1: reports still queued from the previous launch can be applied after a new start in the same
+    main-queue turn. That is unreachable from the UI. Tagging events with their launch would close
+    it.
+  - AD3: `ReceiverEvents` reads its weak `owner` on the receive thread. Read inside the main-queue
+    block instead, so a release at that moment cannot deinit off main. It is unreachable while
+    `SessionModel` keeps the coordinator.
+  - AD4: resuming after an interruption calls `engine.start()` without `setActive(true)`. Only a
+    device test proves it.
+- **The app's output after an interruption, from the T7f review (warnings, not fixed).**
+  - R4-001 / R3-001: `restartIfStopped` calls `engine.start()` with `try?` and no `setActive(true)`
+    first, and an interruption that ends without `.shouldResume` never restarts. Either way the
+    output can stay silent for the rest of the session while the screen says Connected; only
+    short writes in the stats show it. Reactivate the session before restarting, and report a
+    failed restart (for example through the sink, so `onError` reaches the screen).
+  - R3-002: `EngineOutput.init` activates the audio session before it builds the format. A format
+    that cannot be built throws before `deinit` can run, which leaves the session active. Build the
+    format first.
+  - R3-003: the A5 bounds (8 000-192 000 Hz, 1-16 384 frames) have no test, because the app has no
+    test target. Moving the check into `BandEarPlayback` as a pure function would let `swift test`
+    pin it.
+- **Gaps left by T7g** (named by its writer, its verifier and its review). An interruption that
+  never ends, `.appWasSuspended` included, no longer leaves the output stuck: becoming active ends
+  it (`3a469b8`).
+  - (Fixed in T7h.) R4-001 / R3-001 of the T7g review: a restart runs `setActive(true)` and
+    `engine.start()` under the output's lock, and the receive thread's per-packet `isPlaying` read
+    took the same lock. While a restart ran (tens to hundreds of ms, longer when a call refuses
+    it), the receive thread waited. Datagrams then queued in the socket and the arrival-timing
+    stats inflated.
+  - R4-002 (also the verifier's A3): a failed restart's error is dropped, so the screen cannot say
+    why the output stopped (a call, a format, the background). Keep or log the last error.
+  - R3-002: the app-side glue has no automated test, since the app has no test target. That glue is
+    the mapping from interruption notifications to events and the `follow(_:)` contract.
+  - A2 (verifier): a late `.appWasSuspended` beginning can mark the output stopped while it plays.
+    Only a device test settles the order.
+  - `init` starts the engine outside the lock, so a configuration change in that window could race
+    a restart. This was already so before T7g.
+  - T7h review (suggestions): the published flag starts as a literal `true` rather than a copy of
+    `recovery.isPlaying`. Both start playing today, so they agree. Seeding it from the recovery, or
+    publishing once at the end of `init`, keeps a single source if that default ever changes.
+    R3-002 of the same review: the publish order (a stop is published before a restart, the result
+    after) has only the verifier's simulator probe as proof. Moving that sequence into
+    `BandEarPlayback` would let `swift test` pin it.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
-- **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
+- **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
 - **T6 inputs from T4.** `Info.plist` needs `NSBonjourServices` = `_bandear._tcp` and an
@@ -302,8 +468,10 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - T1: inline, one unit of behaviour (package manifest plus one decoder with its tests).
 - T2, T3, T5: inline, one unit each.
 - T4: inline, with the browser isolated behind a protocol so the policy stays testable.
-- T6, T7, T8: route decided when reached; T7 and T8 are candidates for parallel writers once the
-  shell exists and their edit surfaces are disjoint.
+- T6, T8: route decided when reached.
+- T7: T7a and T7b inline. T7c and T7d are delegated writers launched together: two independent
+  units with disjoint surfaces in `BandEarPlayback`, each over 100 lines. T7e and T7f are decided
+  when reached.
 
 ## Delivery forecast
 
@@ -890,3 +1058,350 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   Acknowledged; the reviewed boundary is now `2e151e7`.
 - T6 complete. Pending: T7, T8, T9, and the small unit for `R3-001` (an injected clock on the
   transport, so its deadline and pings run in the default suite).
+- T7 started. The user chose "T7: el audio". A read-only explorer mapped Android's audio path. What
+  the T7 units must keep in mind:
+  - Android takes datagrams from any sender (no `connect`, no source filter).
+  - The 250 ms socket timeout is the only clock for link reports and hold releases.
+  - `WRITE_BLOCKING` paces the loop.
+  - A sample-rate change drops every later packet with an error and never reopens the track.
+  - The `stats` jitter is the mean absolute deviation, per interval, from an EWMA-0.1 arrival
+    spacing (not RFC 3550's 1/16).
+  - Local gain is linear with no ramp, and applies only while `mixAcknowledged` is false.
+  - The cap is `min(levelCap, engineer limit)`.
+  - `ClientMixState`'s per-channel fields are never read by the player.
+
+  Parent's technical choices for T7e, to confirm when it is reached:
+  - A BSD socket with `SO_RCVTIMEO`, to keep Android's loop and clock.
+  - The ring's indices in a small C target with C11 atomics, because iOS 16 has no
+    `Synchronization.Atomic` and a package dependency would be a delivery risk.
+  - The source node declares the desk's format and lets the engine convert it to the hardware
+    rate.
+- T7a (inline, test-first):
+  - RED: the 7 former known issues, plus the new refusal and rounding cases (25 issues across 3
+    suites).
+  - GREEN: 461 tests with 0 known issues. A clean copy builds with 0 warnings.
+  - `-0.004` and `60_000.004` were already dropped and stay dropped. They pin the order: the range
+    check runs on the measured value, before rounding.
+  - Commit `7556156`. Assessed against `2e151e7` with `.atl/` excluded: `medium`, `under_budget`.
+    It stays pending in the slice, and the boundary stays `2e151e7`.
+- T7b (inline): `git mv` of the two sources and four test files; `CushionController` imports
+  `BandEarProtocol` for `PlaybackBufferSetting`. 461 tests, the same as before the move (protocol
+  152 → 88, playback 64). 0 warnings on a clean copy. Commit `c2e9bc5`.
+- T7c and T7d ran as two delegated writers, launched together, each in its own worktree. The
+  worktrees kept the shared module building for each writer, since a half-written file from one
+  would break the other's build. Both worktrees were created from `main`, so each writer first
+  moved its own throwaway branch to `bf10548`. A writer with worktree isolation must check its base
+  before it writes.
+- T7c, writer A: `HoldPlayout`, `LinkStatsAccumulator` and `LinkStatsReport`.
+  - RED: 29 of 32 tests failed against stubs. The other 3 hold on an empty stub: the two "no report
+    yet" cases and the constants.
+  - GREEN: 32 tests, 493 in the full suite. 0 warnings on a clean copy.
+  - Mutants: 13 of 14 caught. The 1 ms lower clamp on the interval can never be reached, because a
+    report is due only after 1000 ms. It is kept to match Android line for line.
+  - Two mutants are caught only by Swift tests Android lacks: the floor at 0 on underruns, and the
+    playout passing on its underruns and extras.
+  - Divergences:
+    - `nil` instead of NaN.
+    - The playout owns its accumulator and adds `onArrivalDeviation`.
+    - The interval limit is read from `LinkStats.maximumIntervalMilliseconds`.
+    - Android's first `HoldPlayoutTest` case also checks the JSON its report becomes. That needs
+      the conversion to `LinkStats`, so it waits for T7f (`HoldPlayoutTest.kt:113-114`).
+  - Parent's correction: it was first a struct holding the `ReorderHold` class, so a copy would
+    have shared the hold but split the counts. It is now a `final class`, like `ReorderHold` and
+    `CushionController`.
+- T7d, writer B: `Pcm16Processor`, `PlaybackLatency` and `ArrivalTiming`.
+  - RED: 27 of 32 tests failed against stubs.
+  - GREEN: 34 tests after the correction below, 495 in the full suite. 0 warnings.
+  - 8 of 8 mutants caught, plus 4 on the clock change.
+  - Local protection works in place on an `UnsafeMutableBufferPointer<Int16>` (or an `inout [Int16]`
+    overload), so no packet allocates. Android returns a new array.
+  - Halves round up, as with Kotlin's `roundToInt`, using `(x + 0.5).rounded(.down)`. A probe
+    matched the JDK's `Math.round` on all 6,619,136 combinations of sample and whole-percent
+    volume.
+  - Reused from `CushionController.swift`: `capacityFrames` (Android's `trackCapacityFrames`) and
+    `next` (`nextCushion`).
+  - Not ported: `keepsLowLatency`, which only means something for an `AudioTrack`.
+  - `reportExtras` takes `presentedFrame: Int64?`, where Android takes a flag and a frame.
+  - Parent's correction: `ArrivalTiming` takes `nowNanoseconds: UInt64`, because Android times
+    arrivals with `System.nanoTime()` (`PmonPlayer.kt:222`). A millisecond clock added about
+    0.44 ms of false jitter at 5.33 ms spacing.
+  - The interval is `Int64(bitPattern: now &- previous)`. A clock that goes backwards yields a
+    negative interval, as Android's `Long` does, instead of trapping on the receive thread.
+- Parent's integration:
+  - Every path was inside its writer's surfaces, and the copies were byte-identical.
+  - Combined suite: 527 tests (playback 130), 0 known issues, 0 warnings on a clean copy. No name
+    collided across the two units.
+  - The worktrees, their branches and both scratch folders were removed.
+  - The slice was assessed against `2e151e7` with `.atl/` excluded: `medium`, `under_budget` (33
+    paths). The boundary stays `2e151e7`.
+- The desk always sends stereo: `OUTPUT_CHANNELS = 2` (`apps/server/src/mix.rs:11`).
+- T7e: two delegated writers launched together, each in its own worktree, against the seam
+  `9c208e9`. Both checked their base first (`git merge --ff-only feat/ios-client`, then
+  `9c208e9`).
+- T7e2 (receive), writer:
+  - RED: 55 of 57 tests failed against stubs.
+  - GREEN: 61 tests after the correction below.
+  - Thread Sanitizer clean; 0 warnings; 17 of 17 mutants caught.
+  - Finding: on Darwin, `shutdown(SHUT_RDWR)` on an unconnected UDP socket fails with `ENOTCONN`
+    and does not wake a blocked `recv`. Closing the socket from another thread does not wake it
+    reliably either. So a stop took up to one 250 ms timeout.
+  - Parent's correction: T7f restarts the receiver on the same port when it reconnects, and a
+    socket still bound would make the new `bind` fail with `EADDRINUSE`. Now:
+    - `stop` lowers `running`, then `wake()` sends one empty datagram to `127.0.0.1` on the bound
+      port. It holds the source's lock and does nothing once the source is closed, so a late
+      wake-up cannot reach a newer socket bound to the same port.
+    - The loop leaves before parsing once `running` is down.
+    - The descriptor is still closed on the loop thread.
+    - Tests: a stop takes under 100 ms; `onStopped` is reported once, with no error; a restart on
+      the same port within 100 ms binds and plays.
+  - Divergences from Android:
+    - The controls are one locked snapshot read per wake-up. Android reads each value as it uses
+      it.
+    - `serverOwnsMix` is one of the controls.
+    - The sink opens at the packet's rate, with no 48 kHz fallback.
+    - A stat not yet measured is `nil`. The backlog is seeded once.
+    - `onError` takes `any Error`.
+    - `EINTR` is retried.
+    - The loop closes the sink, then the socket, then reports.
+    - A change of sample rate errors for every later packet and never reopens the sink, as on
+      Android.
+  - `AudioDatagram` allocates its samples per packet. That is acceptable on the receive thread,
+    which is not real time.
+- T7e1 (output), writer:
+  - RED: 20 of 20 tests failed against stubs. GREEN: 20.
+  - 13 of 13 mutants caught, the three memory-ordering mutants by Thread Sanitizer.
+  - Finding: in a debug build, `memcpy` becomes the fortified `__memcpy_chk`, which Thread
+    Sanitizer does not see. A relaxed publish would pass unnoticed, so the ring copies sample by
+    sample. `Thread.sleep` creates a happens-before edge under TSan, so race probes must spin.
+  - Design: C provides only write, queued, peek and consume; the state machine and the Float
+    conversion are in Swift. The render reads straight from the ring.
+    - Frames consumed is the read position.
+    - `outputLatencyFrames` is atomic.
+    - `close()` keeps the storage until `deinit`.
+    - The first callback that finds the target queued plays it at once.
+    - A capacity of 0 or less becomes 1.
+- Inputs for T7f:
+  - `AudioDatagram.sampleRate` is a `UInt32` with no upper bound, and the ring's capacity grows
+    with it. The factory must check the rate before sizing the ring.
+  - A target smaller than the render callback counts an underrun on each start from priming, and
+    the cushion controller then grows the target.
+  - `HoldPlayoutTest.kt:113-114`: a report's JSON, once the conversion to `LinkStats` exists.
+- Parent's integration:
+  - Every path was inside its writer's surfaces, and the copies were byte-identical.
+  - `Package.swift` had not changed on the branch since the base.
+  - Combined suite: 608 tests (playback 211), 0 known issues, 0 warnings on a clean copy.
+  - `--sanitize=thread` over all 211 playback tests: exit 0, no reports.
+  - The worktrees, their branches and the scratch folders were removed.
+- Closing the pending slice before the high-risk unit:
+  - The assessment always measures HEAD, so the slice `2e151e7..9c208e9` (T7a-T7d and the seam) was
+    reviewed from a detached worktree at `9c208e9`, under the home directory.
+  - Assessed `medium`, `under_budget` (34 paths, 4825 lines). START checked: base `d3ce3de` =
+    `2e151e7`, candidate `5fb3a62` = `9c208e9`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability, run
+    concurrently.
+  - Approved with no findings. Lineage `review-4ee1db544ed87fdc`, acknowledged. The reviewed
+    boundary is now `9c208e9`, and the worktree was removed.
+- T7e independent verifier (high-risk item 4). The previous session ended mid-run, so it was
+  resumed.
+  - Claims 1-3 and 5-7 PASS:
+    - Release object code shows acquire as `ldapr` and release as `stlr`.
+    - `render` calls only the ring's C functions, `_bzero` and the stack guard. It has no retain,
+      release or allocation, and no indirect call.
+    - A 12M-frame ring stress probe (capacity 1009, and 3) and a TSan run of 10M frames found no
+      torn, reordered, missing or extra frame.
+    - An end-to-end probe sent PMON over UDP to `AudioReceiver`, through `RingPlaybackSink`, to a
+      render thread. Every frame came out in order, also under TSan.
+    - Stop and restart, 300+300 rounds plus 150+150 under TSan: exactly one `onStopped` each time,
+      0 errors, every stop under 1 ms.
+    - The suite: 608 tests, TSan clean, 0 warnings.
+  - Claim 4 FAIL, blocker B1:
+    - A fixed cushion was sized in the current packet's frames but applied in the opening
+      packet's frames, so a mid-stream block-size change doubled it. The probe asked for 2048
+      frames where Android asks for 1024.
+    - Root cause in T3: `CushionController.onPacket` folded Android's `packetFrames` (the cushion
+      unit) and `packetSamples` (time) into one value.
+    - Correction `6a02bf1`: `onPacket` takes `packetFrames` and `playedFrames`, and the loop passes
+      the opening size and the played packet. RED against the old call: `[960, 2880]`.
+    - 610 tests, 0 warnings, TSan clean. The recheck, limited to B1: PASS, 1024 frames as on Android.
+  - Advisories, all inputs for T7f:
+    - A1: `start(port:)` resolves no host (Android checks that the name resolves,
+      `PmonPlayer.kt:155`). The phone binds a port and takes datagrams from any sender.
+    - A2, unproven: a loopback wake-up could arrive after the old socket closes and reach a newer
+      socket bound in that window, giving one spurious `headerTooShort`. It was not seen in 900
+      rounds.
+    - A3: `AudioReceiver.start` does not refuse while an older loop is still alive. T7f must wait
+      for `isAlive == false`, as Android's view model does ("The previous receiver is still
+      stopping").
+    - A4: the ring is freed in the sink's `deinit`. T7f must keep a strong reference to the sink
+      for the render callback until the engine has stopped.
+    - A5: `RingPlaybackSink.init` calls `fatalError` when allocation fails. The factory must bound
+      the sample rate before sizing the ring.
+- T7e native review:
+  - Assessed against `9c208e9` with item 4 escalated: `high`, due (19 paths, 3072 lines).
+  - The preflight asked first for the untracked declaration: `.atl/` excluded. That STATUS refuses
+    lenses and escalation flags; they go on the STATUS that offers START.
+  - START checked: base `5fb3a62` = `9c208e9`, candidate `d1ce0c3` = `13a1dac`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability.
+  - Approved. Lineage `review-9c2046daec99c0bb`, acknowledged. The reviewed boundary is now
+    `13a1dac`.
+  - Its two warnings are one finding: a refused packet is counted as played, which Android does
+    too. It is recorded under Follow-ups.
+  - Tooling note: the session restart cleared the scratchpad, so the capture launcher was
+    recreated before the reviewers could run.
+- T7e complete. Next: T7f, the wiring and the end-to-end listening. The verifier's A1-A5 and the
+  T7e1 inputs above are its inputs.
+- T7f1 (session side), writer in a worktree:
+  - `MonitorAudio` coordinator plus `AudioReceiving`, the four capabilities announced, and
+    `LinkStats(LinkStatsReport)` with `recovered` always present. Android's JSON check from
+    `HoldPlayoutTest.kt:113-114` is ported.
+  - RED: 36 of 36 tests. GREEN: 645 in the full suite. TSan clean, 0 warnings, 17 of 17 mutants
+    caught.
+  - One mutant first survived: a late stop report ending the next session. It is now pinned by a
+    test where three sessions start and stop back to back.
+  - Divergences: stop reports reach the main actor late, so they are matched to launches by count.
+    A refusal while the previous receiver stops throws Android's exact message.
+  - Commit `40dea66`, with a stale comment in `ControlSession` fixed.
+- T7f2 (app output), writer in a worktree:
+  - `EngineOutputFactory` and `EngineOutput`: the ring held by the render block, which is made in
+    a `nonisolated` function so the app's main-actor default never reaches the audio thread.
+  - Bounds: 8 000-192 000 Hz and 1-16 384 frames (A5).
+  - `close()` stops the engine, then the ring (A4).
+  - A configuration change restarts the engine.
+  - Smoke test on the simulator: 2 s of sine, `close` in 3-20 ms, no isolation trap.
+  - Disassembly of the render path shows no lock, no allocation and no actor hop.
+    `UnsafeMutableAudioBufferListPointer` was replaced with plain pointers, because its accessors
+    are not inlined across modules.
+  - Commit `6522b37`.
+- T7f3 (inline):
+  - `SessionModel` runs through `MonitorAudio` with `EngineOutputFactory`, and clears `desk` when a
+    session ends on its own. The screen shows the packets played and the receiver's problem.
+  - `EngineOutput` gained a 5 ms preferred I/O buffer (Android's low-latency track), a restart after
+    an interruption that asks to resume, and session deactivation on close.
+  - `Info.plist` declares `UIBackgroundModes` `audio`.
+  - Commit `dc368e3`. The app builds with no warning in its files, and the package suite is 645,
+    0 known issues.
+  - An app-side fix was tried and reverted: keeping Bonjour off loopback broke the in-process
+    Bonjour round trip (`BANDEAR_WS_IT=1`). A connection to the Mac's own address goes through
+    `lo0`, so the cause stays with the desk's announcement.
+- End to end against the desk on this Mac (simulator, iPhone 17 Pro):
+  - The desk was run with `--device "Microsoft Teams Audio" --target 127.0.0.1:59999`.
+  - The app found the desk, registered (`control registration ... as "iPhone 17 Pro"`), showed
+    Connected and 1 strip, and played 3 935 packets in about 21 s. That is about 183 per second
+    against the desk's 187.5 (48 000 / 256), within the screenshots' timing.
+  - Over the same window, `nettop` showed the app receiving exactly what the desk sent to it.
+  - The sound itself was not judged by ear: the virtual input carries silence. The user can listen
+    with a live input.
+- T7f independent verifier (high-risk item 4): no blocker; claims 1-6 PASS.
+  - Probe: 3 seeds × 120 rounds; 8 threads per launch, 28 800 reports. No race under TSan, no
+    session ended by an old report, every report applied on main.
+  - Release disassembly: the render closure calls only `RingPlaybackSink.render`. The block thunk
+    retains and releases the closure context once per callback.
+  - Suite: 645 tests, TSan clean, 0 warnings, and the app builds.
+  - Its four advisories are recorded under Follow-ups as T8 inputs.
+- T7f native review:
+  - Assessed against `13a1dac` with item 4 escalated: `high`, due (16 paths, 1754 lines).
+  - START checked: base `d1ce0c3` = `13a1dac`, candidate `6a59918` = `e58e7e8`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability.
+  - Approved. Lineage `review-86e00a7b8617fc95`, acknowledged. The reviewed boundary is now
+    `e58e7e8`.
+  - Its four warnings (R4-001, R3-001, R3-002, R3-003) are under Follow-ups. They are not fixed:
+    findings alone authorize no change.
+  - Tooling note: the scratchpad was cleared between turns, taking the capture launcher with it.
+    The grant and the captures then ran from one inline script.
+- T7 complete. Pending: T8 (screens), T9 (mixes), the small `R3-001` unit (the transport's
+  injected clock), and the follow-ups above, which are the user's to prioritise.
+- T7g, one writer in a worktree (long-session backstop). The previous session ended mid-run, so it
+  was resumed.
+  - `OutputRecovery` (pure, 12 tests). `PlaybackSink.isPlaying`, with a default of `true`.
+    `ReceiverStats.outputPlaying`.
+  - `EngineOutput` follows the recovery: `setActive(true)` before every restart, no `try?`, and
+    nothing after `close()`. It now also listens for an interruption beginning and for
+    `didBecomeActive`.
+  - The screen line shows while the output is stopped.
+  - RED: 11 of 12 recovery tests failed against stubs (15 failed expectations), plus 1 loop test.
+  - GREEN: 658 tests, 0 warnings on a never-built copy, and the app builds. 11 of 11 mutants were
+    killed.
+  - Smoke check on the simulator, with interruption notifications posted by hand and the real
+    `setActive` and `engine.start()`: `isPlaying` went true → false → true (resume) → false
+    (began, then an end without resume) → true (became active), and stayed false after
+    `close()`.
+  - Commit `db53b76`. Risk: item 4 (the restart runs under the lock, and the handlers run on the
+    private queue).
+- T7g independent verifier (high-risk item 4): no blocker. Claims 1-5 PASS.
+  - Policy and tests: 5 spot mutants killed.
+  - `setActive` comes before both `engine.start()` calls, and no `try?` remains.
+  - One lock order: the output's lock, then AVAudioSession/AVAudioEngine. The observers use
+    `queue: nil` and only enqueue async, so a notification posted inside `engine.start()` cannot
+    re-enter the lock.
+  - Package TSan probe: 6 seeds, clean.
+  - Simulator stress of the real `EngineOutput` (8 threads posting notifications, `close()`
+    racing), plain and under TSan: 40 of 40 opened, 0 restarts after close, 0 deadlocks, 0 TSan
+    warnings.
+  - 658 tests, 0 warnings, and the app builds.
+  - Advisories:
+    - A1, a product decision: an interruption whose end never comes (another app keeping its
+      session active) leaves the output stopped for the rest of the session. Becoming active does
+      not restart it while interrupted, and the screen copy ("or when you return to the app")
+      promises otherwise.
+    - A2: a late `.appWasSuspended` beginning can mark the output stopped while it plays.
+    - A3: a failed restart's error is not logged.
+    - A4: a configuration change can try a restart in the background. Only a device test proves
+      what happens.
+    - A5: `ReceiverStats.init` now needs `outputPlaying`. Only callers in this repository use it.
+  - Note: the simulator's `com.bandear.ios` is now the verifier's TSan harness build. Reinstall
+    the app before the next run.
+- 2026-10-23, the user's decision on the verifier's A1. Question: "Si una interrupción nunca termina
+  (otra app que mantiene su sesión de audio activa), ¿qué hace la app cuando el músico vuelve a
+  abrirla?" Answer: "Volver a la app la reanuda (Recommended)".
+  - Done in `3a469b8`: `OutputRecovery` ends the interruption when the app becomes active and
+    restarts a stopped output.
+  - RED: the new test failed (2 expectations). Becoming active was taken out of "restarts nothing
+    while interrupted".
+  - GREEN: 659 tests, 0 warnings. The screen copy is now true.
+- T7g native review:
+  - Assessed against `e58e7e8` with item 4 escalated: `high`, due (11 paths, 497 lines).
+  - START checked: base `6a59918` = `e58e7e8`, candidate `8026d92` = `825e558`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience and reliability.
+  - Approved. Lineage `review-07942a25e4974537`, acknowledged. The reviewed boundary is now
+    `825e558`.
+  - Findings, all warnings or suggestions:
+    - R4-001 / R3-001: the restart holds the lock that the receive thread's `isPlaying` read
+      takes.
+    - R4-002: a failed restart's error is dropped.
+    - R3-002: the app glue has no test.
+    - R3-003: the stale `.appWasSuspended` gap in this document, rewritten above.
+  - The first three are under "Gaps left by T7g". They are not fixed, since findings alone
+    authorize no change.
+- T7g complete.
+- T7h (inline), commit `58c1b24`:
+  - `EngineOutput.isPlaying` now reads a value published behind its own lock. The recovery
+    publishes it after `handle` (so a stopping event shows before the restart) and again after the
+    restart's result.
+  - Every access to `recovery` stays under the output's lock. The receive thread takes only the
+    published lock, and none of its calls (`capacityFrames`, `write`, `setTargetFrames`,
+    `underrunCount`, `presentedFrame`, `isPlaying`) takes the output's lock.
+  - The app builds with no warning in its files. There is no automated test, because the app has
+    no test target; its independent verifier is asked for a runtime probe.
+- T7h independent verifier (high-risk item 4): no blocker; claims 1-5 PASS.
+  - Measured on the simulator: a scratch hook held the restart for 300 ms under the lock while a
+    reader called `isPlaying` every ~200 µs.
+    - Longest read: 0.009 ms and 0.384 ms at `58c1b24`, against 309.7 ms and 305.5 ms at the base
+      (one blocked read per restart).
+    - The reader saw `false` from the interruption's beginning through the restart, then `true`
+      0.2-0.3 ms after it.
+  - Thread Sanitizer, linked into the simulator build: 4 runs with 0 warnings. A deliberate race
+    produced 1 warning, which shows TSan was active.
+  - 659 tests, and the app builds.
+  - Advisories, all already true at the base:
+    - `close()` can wait for one restart, so `onStopped` comes up to one restart later.
+    - `isPlaying` keeps its last value after `close()`, which nobody reads.
+- T7h native review:
+  - Assessed against `825e558` with item 4 escalated: `high`, due (2 paths, 93 lines).
+  - START checked: base `8026d92` = `825e558`, candidate `bdc2a8d` = `9641033`.
+  - The user chose "Revisar este cambio" (`granted`).
+  - Approved. Lineage `review-03e2e6bd2a108df4`, acknowledged. The reviewed boundary is now
+    `9641033`.
+  - Findings: two suggestions (seed the flag from the recovery) and one warning (R3-002, the
+    publish order has no test). They are under "Gaps left by T7g" and not fixed.
+- T7h complete.
+

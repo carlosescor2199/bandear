@@ -32,7 +32,13 @@ struct ControlSessionTests {
 
     // MARK: Opening
 
-    @Test("registers first, with no capabilities, and then sends the opening mix")
+    /// The four capabilities this build implements, in Android's order (`ControlChannel.kt:531-558`,
+    /// `RegistrationMessageTest.announcesWhatThisBuildImplements`).
+    private static let capabilities = [
+        "stats.v2", "playback.buffer", "redundancy.recovered", "redundancy.hold",
+    ]
+
+    @Test("registers first, with the four capabilities, and then sends the opening mix")
     func registersThenSendsTheOpeningMix() async throws {
         store.clientID = "phone-1"
         try session.start(toStage, musicianName: " Ana ")
@@ -48,8 +54,25 @@ struct ControlSessionTests {
             NSDictionary(dictionary: sent[0])
                 == NSDictionary(dictionary: [
                     "type": "register", "name": "Ana", "udp_port": 50_000, "client_id": "phone-1",
+                    "capabilities": Self.capabilities,
                 ]))
         #expect(sent[1]["seq"] as? Int == 0)
+    }
+
+    /// Android's `theChannelAnnouncesTheSameClientIdOnEveryOpenAndOnARename`, its capability check:
+    /// a connection opened again after one was lost registers exactly as the first did.
+    @Test("announces the same capabilities on every open, a reopened connection's too")
+    func everyOpenAnnouncesTheCapabilities() async throws {
+        try await connected()
+        await desk.fails("wifi gone")
+        try scheduler.runNextDue()
+        await desk.open()
+
+        let registers = try transport.sent(ofType: "register")
+        try #require(registers.count == 2)
+        #expect(
+            registers.map { $0["capabilities"] as? [String] }
+                == [Self.capabilities, Self.capabilities])
     }
 
     @Test("starts nothing for a name the desk would store as no name")

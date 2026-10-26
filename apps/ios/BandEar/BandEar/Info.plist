@@ -8,5 +8,9 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>BandEar looks for the desk on your local network and receives your personal mix from it.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 </dict>
 </plist>

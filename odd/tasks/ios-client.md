@@ -127,9 +127,53 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     last figures back on a refused start, with a test.
   - R3-discovery-double-start: discovery starts once per return to the foreground, never twice at
     launch.
-- [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
-  (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
-  storage, which the pure mix module does not have.
+- [x] T9 — Mix banks and recall. Device-local saved mixes (`MixBankStore.kt`) and recalling one
+  into the mix. Split from T5 because it needs device storage, which the pure mix module does not
+  have. The user asked "dale, seguí con T9" (2026-10-23). The look follows T8's decision ("Nativo
+  iOS, mismos textos y reglas").
+  - Sources:
+    - the T8 map of Android's UI (Progress, "T8 inputs");
+    - `MixBankStore.kt` and `MixSnapshot.kt` (with `MixSnapshotTest.kt` and `GroupSnapshotTest.kt`);
+    - the recall rules in `MonitorReducer.kt:404-419` and their reducer tests;
+    - the saved-mix actions in `MonitorViewModel.kt:433-478`;
+    - the `MonitorViewModelTest` cases `savingAndRecallingAMix`,
+      `savingUnderAnExistingNameReplacesThatMix`, `savingNeedsAName`,
+      `recallingAMixThatIsGoneRefreshesTheList`, `renamingAndDeletingAMix` and
+      `recallingWhileFollowingSendsNothingAndSaysWhy`;
+    - the `SavedMixesScreen.kt` copy.
+  - [x] T9a — The domain (route: one delegated writer, past the long-session backstop).
+    - In `BandEarMix`:
+      - the snapshot of a mix;
+      - the list of saved mixes with Android's rules (save under a name, a name already taken
+        replaces that mix, rename, delete, which one is active);
+      - recall as a `MixEvent`, reduced as Android does: locked sides kept, refused while
+        following, strips sized from the saved mix until the next `config`, and the musician's
+        channel surviving a recall.
+    - In `BandEarSession`:
+      - a store port;
+      - a `UserDefaults` adapter that keeps the saved mixes as JSON and reads them back as
+        tolerantly as Android does.
+    - It ports Android's snapshot, bank and recall tests, including the recall cases deferred in
+      `MixReducerParityTests`.
+  - [x] T9b — The coordinator and the Mixes screen (route: one delegated writer, after T9a). It
+    covers:
+    - save, recall, rename and delete through the session, with the store's results as Android's
+      notices in `BandEarScreens`, and the active mix tracked;
+    - a recall sent to the desk by the existing send rule;
+    - the Mixes screen in native SwiftUI: the save field, the list with "Active now" and Recall,
+      Rename and Delete under the ⋮ menu, their dialogs, and the notices;
+    - ports of the six `MonitorViewModelTest` cases.
+  - [x] T9c — The T9b review's three warnings, which the user asked for on 2026-10-23: "dale,
+    arreglá primero los warnings de T9". Route: one delegated writer, past the long-session
+    backstop.
+    - R3-delete-dialog-state-not-cleared: confirming a delete clears the pending delete itself, so
+      deleting "Verse" and then saving "Verse" again never shows the dialog.
+    - R3-repeated-notice-not-announced: every action that gives an outcome is announced to
+      VoiceOver, even when its words equal the last notice's (a second blank save, a re-save).
+    - R2-init-doc-misleading: `SavedMixes.init`'s comment says what `init` does (it builds the bank
+      from the store and applies nothing). The adjacent suggestion is fixed too: `notRecalled`'s
+      comment names its real label, `because`.
+    - T9a's unclamped recall values and the views' missing tests stay under Follow-ups.
 - [x] T6 — App shell, project file and control session. Grown since first written: the follow-ups
   of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
   - [x] T6a — The project and a shell that builds (route: delegated writer; trigger: the
@@ -576,6 +620,31 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     - The assign-if-changed rule is written by hand per field in both mirrors. A helper would keep
       it in one place, but not an `inout` one: passing a `@Published` property `inout` always
       writes it back and publishes (the T8e writer measured it). A key-path assignment would work.
+- **From the T9 verifier (advisories).**
+  - The delete confirmation, a popover anchored to the ⋮, shows no Cancel button: tapping outside
+    cancels. Android shows Cancel.
+  - "New name" is the rename field's placeholder, so it is hidden while the field holds the old
+    name. Android shows it as a label.
+  - Stored keys are written sorted, where Android keeps insertion order. The JSON means the same.
+  - A refused recall while following was not exercised end to end. Tests and mutants cover it.
+- **From the T9 reviews. T9b's warnings, and the `because` suggestion, are fixed in T9c; the rest is not.**
+  - T9a, R3-recall-unclamped-values / R4-recall-unclamped-stored-values: a recalled snapshot's
+    volume, cap, group levels and channel values are applied and sent without clamping. The
+    tolerant reader accepts any whole number. Only damaged or hand-edited storage reaches this.
+    Android does not clamp either.
+  - T9b, warnings, all fixed in T9c (`2574f1b`):
+    - R2-init-doc-misleading: `SavedMixes.init`'s comment said the stored mixes were recalled into
+      the session, while `init` only builds the bank.
+    - R3-delete-dialog-state-not-cleared: the delete confirmation did not clear `deleting` itself.
+    - R3-repeated-notice-not-announced: VoiceOver heard a notice only when its text changed.
+  - T9b, suggestions:
+    - (Fixed in T9c.) `SavedMixesNotice.notRecalled`'s comment named a `reason` parameter that is
+      labelled `because`;
+    - `MixesModel` and `MixesContent` have no automated test.
+- **From the T9c verifier and review (suggestions, not fixed).** `noticeNumber`'s comment
+  promises "one more than the last", but the tests only check that it changed, so a bump of 2
+  survives. Either assert `+ 1` or say only that it changes. A small `MixesModel` test that the
+  number follows `SavedMixes` would also prove the forwarding the logging build showed.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1737,4 +1806,116 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     `9907f62`.
   - Two warnings (both already known) and two suggestions are under Follow-ups.
 - T8e complete. Next: T9 (mix banks and recall), or the remaining follow-ups, as the user decides.
+- T9a (one writer in a worktree), commit `0f5537b`:
+  - It stopped once, correctly: a new `MixEvent` case needs a branch in `OutgoingMix.swift`'s
+    exhaustive switch, a file the parent had left out of its surfaces. The parent widened the
+    surface by that file, with Android's rule: a recall is sent unless the mix was following
+    someone (`MonitorViewModel.kt:454`).
+  - `MixSnapshot` (`MixState.snapshot`, never the More of me lift).
+  - `MixBank`:
+    - save trims the name, and a taken name replaces that mix;
+    - rename refuses a blank, missing, unchanged or taken name, in Android's order;
+    - delete;
+    - the active mix is always a saved one.
+  - `MixBankStore` and `UserDefaultsMixBankStore`, keyed `bandear.banks`, use Android's JSON. A
+    damaged entry loses only itself.
+  - `MixEvent.mixRecalled(MixSnapshot)` with `MixSession.recallRefusal` (`.following(leader:)`). It
+    is the one rule the reducer, the send rule and the screens read.
+  - The deferred recall cases at `MixReducerParityTests.swift:218` and `:296` are completed.
+  - RED: 25 of 31 failed, then 10 of 10 for the recall. GREEN: 876 tests, 0 warnings, no stray
+    preferences file, and 10 of 10 mutants caught.
+  - Divergences:
+    - stored text where a number belongs reads as the default, as in the `config` decoder;
+    - a rename removes exactly the renamed mix;
+    - `.mixRecalled` carries no name, since the active mix belongs to `MixBank`;
+    - recalled values are not clamped, as on Android.
+  - Not pinned: a recall that changes nothing is still sent, as on Android.
+  - Risk: none. It adds a public `MixEvent` case, whose only exhaustive switches are updated. The
+    `bandear.banks` key stores new data only.
+- T9b (one writer in a worktree), commits `469d6ca` (package) and `0090894` (app):
+  - `SavedMixes` (`@MainActor`, in `BandEarSession`) holds `mixes`, `activeName`, a typed `notice`
+    and `stateDidChange`, and offers `save(as:)`, `recall(_:)`, `rename(_:to:)` and `delete(_:)`.
+    It reuses `MixBank` and `recallRefusal`.
+  - Android's notices and the remaining Mixes copy are in `SavedMixesWords`, verbatim.
+  - `MixesModel` is observed only by the Mixes tab. `MixesContent` has the save field, the list with
+    "Active now" and Recall, Rename and Delete in a ⋮ menu with their dialogs, the notice and the
+    empty state.
+    - `.menuOrder(.fixed)`: an upward menu on iOS 26 otherwise put Delete where Rename was drawn.
+  - RED: 41 of 43 new tests failed. GREEN: 919 tests, 0 warnings, no stray preferences file, and
+    12 of 12 mutants caught.
+  - Divergences:
+    - the list is read back before every action;
+    - it is written only when it changed;
+    - a refused recall never reaches the session;
+    - delete asks in a popover anchored to the row's ⋮.
+  - The writer again needed a file outside its surfaces: `RootView` constructs every tab. The parent
+    applied that one line at integration (`MixesView(mixes: session.mixes)`).
+  - End to end against the desk (a manual connection to `127.0.0.1`, audio port 59999, watched by a
+    passive observer):
+    - a blank save showed "Enter a name for the mix";
+    - " Ballads " was saved as `Saved "Ballads"`, Active now;
+    - CH 1 moved from 49 to 92, and Recall brought back 49 on screen and at the desk;
+    - after a relaunch "Ballads" was still listed, and recalling it again gave 49;
+    - a rename gave `Renamed "Ballads" to "Main set"`;
+    - a delete gave `Deleted "Main set"`, with `bandear.banks` holding `[]`.
+  - Risk: item 6. The views have no automated test; their rules and words are tested in the package.
+- T9 independent verifier (item 6; T9a and T9b together, against the base `9907f62`): no blocker.
+  Claims 1-6 PASS.
+  - Its own 12 mutants were all caught.
+  - End to end on its own iPhone 17 simulator, watched by a passive observer:
+    - a blank save stored nothing;
+    - " Verse " was saved and active;
+    - 47 recalled to 100;
+    - a re-save at 31 kept a single entry;
+    - after a relaunch, Recall gave 31 at the desk;
+    - a rename gave "Main set", still active;
+    - a delete left `[]`.
+  - The stored shape matches Android's: a `snapshot` held as a JSON string.
+  - 919 tests, 0 warnings, the app builds, and Mix, Settings and Connect are unchanged.
+  - Its minor advisories are under Follow-ups.
+- Native reviews for T9:
+  - The pending slice `9907f62..b2893cd` (the T9 plan and T9a) was reviewed from a detached worktree
+    at `b2893cd`: `medium`, `under_budget` (12 paths).
+    - The user chose `granted`. Lenses: reliability and resilience.
+    - Approved. Lineage `review-a550eb0d00308ffc`.
+    - One finding, unclamped recall values (Follow-ups).
+  - T9b (`b2893cd..55cd593`), with item 6 escalated: `high` (12 paths, 1351 lines).
+    - The user chose `granted`. Lenses: reliability and readability.
+    - Approved, and acknowledged. The reviewed boundary is now `55cd593`.
+    - Three warnings and two suggestions (Follow-ups).
+- T9 complete. Every task of the plan (T1-T9) is done. What remains is under Follow-ups, for the user
+  to prioritise. Pushing, pull requests and merging remain the user's decisions.
+- T9c (one writer in a worktree), commit `2574f1b`:
+  - Delete: `confirmDelete(name)` clears `deleting` before it deletes, and Cancel clears it too. On
+    the simulator, deleting "Verse" and saving "Verse" again showed no dialog. The popover's Cancel
+    cannot be reached on screen, since tapping outside closes it.
+  - Notices: `SavedMixes.noticeNumber` goes up with every outcome, equal words included, and stays
+    the same for an action with none (an unchanged rename). `MixesModel` publishes it, and the tab
+    announces on it.
+    - RED: 2 of 11 tests failed. GREEN: 921 tests.
+    - Two mutants caught: no bump on equal words, and a bump with no outcome.
+    - A scratch logging build confirmed six separate announcements for repeated blank saves, saves
+      and recalls.
+  - Comments: `init` says it lists the store's mixes, none active, applying and sending nothing.
+    `notRecalled` names `because`. The parent fixed the same wrong wording on a test helper at
+    integration.
+  - 921 tests, 0 warnings, no stray preferences file, and the app builds.
+  - Risk: item 6. The two `MixesContent` changes have no automated test; they rest on the simulator
+    and the logging build.
+- T9c independent verifier (item 6): no blocker. Claims 1-3 PASS.
+  - Exact-count probe over 17 steps, plus 8 of its own mutants (7 caught). Adding 2 instead of 1
+    survives: the tests check only that the number changed, while the comment promises "one more".
+    That is an advisory, harmless to the screen.
+  - A logging build announced #1-#11, each exactly once. Delete then save "Verse" showed no
+    dialog, and opening another mix's menu afterwards showed only the menu.
+  - 921 tests, 0 warnings, and the app builds.
+- T9c native review:
+  - Assessed against `55cd593` with item 6 escalated: `high`, due (7 paths, 188 lines).
+  - START checked: base `2ac50a9` = `55cd593`, candidate `d31f7b0` = `99b691c`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: reliability and readability.
+  - Approved, suggestions only. Lineage `review-2bcdca291f8111d7`, acknowledged. The reviewed
+    boundary is now `99b691c`.
+  - Its suggestion that Follow-ups listed T9c's fixed warnings as open is applied in this
+    document. The rest are under Follow-ups.
+- T9c complete. Every task of the plan, and every review warning the user asked to fix, is done.
 

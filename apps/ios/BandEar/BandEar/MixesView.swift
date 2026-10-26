@@ -1,33 +1,23 @@
+import BandEarMix
 import BandEarScreens
 import SwiftUI
 
-/// The Mixes tab: its title and introduction, and the empty state.
+/// The Mixes tab: the mixes saved on this phone while a session runs.
 ///
-/// Follows the Android client's `SavedMixesScreen.kt`, words from ``SavedMixesWords``. Its layout
-/// and empty state only: the save field, the list and what the store reports come with the saved
-/// mixes themselves (T9).
+/// The container: it reads the saved mixes and hands their values to ``MixesContent``, which lays
+/// them out, and sends every action back through ``MixesModel``.
 struct MixesView: View {
+    @ObservedObject var mixes: MixesModel
+
     var body: some View {
-        List {
-            Section {
-                Text(SavedMixesWords.screenIntro)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-            }
-            Section {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(SavedMixesWords.emptyTitle)
-                        .font(.headline)
-                    Text(SavedMixesWords.emptyDetail)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 4)
-                .accessibilityElement(children: .combine)
-            }
-        }
-        .navigationTitle(SavedMixesWords.screenTitle)
+        MixesContent(
+            names: mixes.mixes.map(\.name),
+            activeName: mixes.activeName,
+            notice: mixes.notice,
+            noticeNumber: mixes.noticeNumber,
+            save: { mixes.save(as: $0) },
+            recall: { mixes.recall($0) },
+            rename: { mixes.rename($0, to: $1) },
+            delete: { mixes.delete($0) })
     }
 }

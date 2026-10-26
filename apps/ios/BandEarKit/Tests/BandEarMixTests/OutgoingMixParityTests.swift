@@ -476,6 +476,46 @@ struct OutgoingMixParityTests {
 
         #expect(phone.session.mix.levels == [50, 60])
     }
+
+    // MARK: MonitorViewModelTest.kt, a saved mix recalled
+
+    // The session's half of two saved-mix tests: what a recall sends. Their store, the active mix
+    // and the notices are T9b's, which ports them whole through the session; the save is
+    // ``MixBank``'s (`MixBankParityTests`).
+
+    /// The recall half of `MonitorViewModelTest.kt:1027-1045`. Android's `receiver.mixState` is the
+    /// app's (T6), so the master is checked on the session and in the mix sent.
+    @Test func savingAndRecallingAMix() throws {
+        var phone = Phone.connected(2)
+        phone.apply(.channelLevelChanged(channel: 0, level: 30))
+        let saved = phone.session.mix.snapshot
+        phone.apply(.channelLevelChanged(channel: 0, level: 90), .masterVolumeChanged(level: 50))
+        let sent = phone.sent.count
+
+        phone.apply(.mixRecalled(saved))
+
+        #expect(phone.session.mix.levels == [30, 100])
+        // Not in Android's test: the recall is numbered as one change and sent once.
+        #expect(phone.sent.count == sent + 1)
+        #expect(try phone.lastMix().ints("channels") == [30, 100])
+        #expect(phone.session.mix.masterVolume == 100)
+        #expect(try phone.lastMix().int("volume_percent") == 100)
+    }
+
+    /// `MonitorViewModelTest.kt:657-670`. Its notice is the screen's (T9b); the refusal it words is
+    /// checked here.
+    @Test func recallingWhileFollowingSendsNothingAndSaysWhy() throws {
+        var phone = Phone.connected(3)
+        try phone.answerMixes()
+        try phone.receive(followingState("Ana", level: 70))
+        let sent = phone.sent.count
+
+        phone.apply(.mixRecalled(MixSnapshot(channelGains: [10, 20, 30])))
+
+        #expect(phone.sent.count == sent)
+        #expect(phone.session.recallRefusal == .following(leader: "Ana"))
+        #expect(phone.session.mix.levels == [70, 70, 70])
+    }
 }
 
 // MARK: - Fixtures, as `MonitorViewModelTest.kt` names them

@@ -215,12 +215,10 @@ struct MixReducerParityTests {
                 .groupLevelChanged(group: 0, level: 50)) == state)
     }
 
-    /// Android reaches a group list shorter than the groups through a recalled mix (T9, mix banks);
-    /// the one-entry list is set directly here, which is the state that recall leaves.
     @Test func aGroupLevelFillsTheOtherGroupsAsTheyRead() {
         let groups = [group("A", [0]), group("B", [1]), group("C", [1])]
-        var recalledShort = withChannels(2)
-        recalledShort.mix.groupLevels = [20]
+        let recalledShort = withChannels(2).after(
+            .mixRecalled(MixSnapshot(channelGains: [100, 100], groupLevels: [20])))
         let announced = recalledShort.after(.configReceived(config(2, groups)))
 
         let state = announced.after(.groupLevelChanged(group: 2, level: 70))
@@ -293,12 +291,9 @@ struct MixReducerParityTests {
         #expect(pushed.mix.levelCap == 0)
     }
 
-    /// Android reaches the strips before the first `config` through a recalled mix (T9, mix banks);
-    /// the recalled levels are set directly here, which is the state that recall leaves.
     @Test func aPushedMixBeforeTheFirstConfigKeepsTheStripsThePhoneShows() {
-        var recalled = running()
-        recalled.mix.levels = [30, 30, 30]
-        recalled.mix.groupLevels = [20]
+        let recalled = running().after(
+            .mixRecalled(MixSnapshot(channelGains: [30, 30, 30], groupLevels: [20])))
 
         let pushed = recalled.after(.mixPushed(serverMix))
 
@@ -839,6 +834,106 @@ struct MixReducerParityTests {
         #expect(!asked.moreOfMe.isEnabled)
         #expect(asked.moreOfMe.notice == .following)
         #expect(asked.after(.musicianChannelChosen(2)).moreOfMe.musicianChannel == 2)
+    }
+
+    // MARK: T9a, recalling a saved mix
+
+    // Android's `MixRecalled(name, snapshot)` also makes the mix the active one and words a notice.
+    // Here the session takes only the mix; the active mix is ``MixBank``'s (`MixBankParityTests`),
+    // and the notices are the screen's (T9b), so where Android checks one a test checks
+    // ``MixSession/recallRefusal`` or leaves it to them. `aPushedMixLeavesTheSavedMixesAsTheyWere`
+    // is not ported: the saved mixes are not part of the session, so a push cannot reach them.
+
+    @Test func recallingASavedMixLeavesLockedChannelsAsTheyAre() {
+        let state = lockedBy(engineer(locked: [1]))
+        let saved = MixSnapshot(
+            channelGains: [10, 20, 30], channelPans: [50, 50, 50], channelMutes: [true, true, true],
+            channelSolos: [true, true, true])
+
+        let recalled = state.after(.mixRecalled(saved)).mix
+
+        #expect(recalled.levels == [10, 100, 30])
+        #expect(recalled.pans == [50, 100, 50])
+        #expect(recalled.mutes == [true, false, true])
+        #expect(recalled.solos == [true, false, true])
+    }
+
+    @Test func recallKeepsAPairWholeWhenOnlyOneSideIsLocked() {
+        let state = lockedBy(engineer(locked: [1]), keysPair)
+        let saved = MixSnapshot(
+            channelGains: [10, 20, 30], channelPans: [50, 50, 50], channelMutes: [true, true, true],
+            channelSolos: [true, true, true])
+
+        let recalled = state.after(.mixRecalled(saved)).mix
+
+        // The pair is locked as one strip: neither side takes the saved values, so they stay equal.
+        #expect(recalled.levels == [100, 100, 30])
+        #expect(recalled.pans == [0, 100, 50])
+        #expect(recalled.mutes == [false, false, true])
+        #expect(recalled.solos == [false, false, true])
+        #expect(recalled.lockedSides == [0, 1])
+    }
+
+    /// Android's notice, "\"Verse\" was not recalled: your mix follows Ana's", and its unchanged
+    /// active mix are the screen's and the bank's (T9b); the refusal they come from is checked here.
+    @Test func recallingASavedMixWhileFollowingIsRefusedAndSaysWhy() {
+        let state = lockedBy(following("Ana"))
+
+        let refused = state.after(
+            .mixRecalled(MixSnapshot(channelGains: [10, 20, 30], volumePercent: 40)))
+
+        #expect(refused.mix == state.mix)
+        #expect(state.recallRefusal == .following(leader: "Ana"))
+        // A leader with no name is still a refusal; the screen names them in words (T9b).
+        let nameless = lockedBy(following(""))
+        #expect(nameless.after(.mixRecalled(MixSnapshot())).mix == nameless.mix)
+        #expect(nameless.recallRefusal == .following(leader: ""))
+    }
+
+    /// Android also checks that the recalled mix is the active one and its notice: ``MixBank``'s
+    /// `activate` and the screen's (T9b).
+    @Test func recallingAMixAppliesItsValuesAndKeepsWhatTheServerAnnounced() {
+        let groups = [group("Band", [0, 1])]
+        let live = withChannels(2, groups).after(.musicianChannelChosen(1))
+        let snapshot = MixSnapshot(
+            channelGains: [30, 60], channelPans: [20, 80], channelMutes: [true, false],
+            channelSolos: [false, true], groupLevels: [40], volumePercent: 70, maxLevelPercent: 90,
+            muted: true)
+
+        let recalled = live.after(.mixRecalled(snapshot))
+
+        #expect(recalled.mix.levels == [30, 60])
+        #expect(recalled.mix.pans == [20, 80])
+        #expect(recalled.mix.mutes == [true, false])
+        #expect(recalled.mix.solos == [false, true])
+        #expect(recalled.mix.groupLevels == [40])
+        #expect(recalled.mix.masterVolume == 70)
+        #expect(recalled.mix.levelCap == 90)
+        #expect(recalled.mix.masterMuted)
+        #expect(recalled.mix.sourceChannels == 2)
+        #expect(recalled.mix.groups == groups)
+        #expect(recalled.moreOfMe.musicianChannel == 1)
+    }
+
+    @Test func aMixRecalledBeforeTheServerAnnouncesKeepsItsGroupLevels() {
+        let recalled = MixSession().after(
+            .mixRecalled(MixSnapshot(channelGains: [50, 50], groupLevels: [30, 40])))
+
+        let announced = recalled.after(.configReceived(config(2, [group("A", [0]), group("B", [1])])))
+
+        #expect(announced.mix.groupFaders.map(\.level) == [30, 40])
+        #expect(announced.mix.levels == [50, 50])
+    }
+
+    @Test func aRecalledMixWithAnotherChannelCountShowsItsStripsUntilTheServerAnnouncesAgain() {
+        let recalled = withChannels(2).after(.mixRecalled(MixSnapshot(channelGains: [10, 20, 30, 40])))
+
+        #expect(recalled.mix.levels == [10, 20, 30, 40])
+        #expect(recalled.mix.pans == [0, 100, 0, 100])
+
+        let reannounced = recalled.after(.configReceived(config(2)))
+
+        #expect(reannounced.mix.levels == [10, 20])
     }
 }
 

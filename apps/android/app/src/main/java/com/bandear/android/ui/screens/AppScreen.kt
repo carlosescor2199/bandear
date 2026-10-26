@@ -2,7 +2,10 @@ package com.bandear.android.ui.screens
 
 import com.bandear.android.ui.components.MainTab
 
-/** The screens of the app. Only the three of a running session sit above the bottom tab bar. */
+/**
+ * The screens of the app. Only the three of a running session show the tabs: the bottom tab bar
+ * in portrait, the navigation rail in landscape.
+ */
 enum class AppScreen(val showsTabs: Boolean) {
     /** Pick a found server; shows whenever no session runs. */
     CONNECT(showsTabs = false),

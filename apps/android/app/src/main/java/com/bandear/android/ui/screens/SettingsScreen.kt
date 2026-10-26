@@ -6,15 +6,18 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -27,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -38,15 +42,17 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.bandear.android.ui.components.BandEarTextField
 import com.bandear.android.ui.components.FieldFace
 import com.bandear.android.ui.components.FieldLabel
 import com.bandear.android.ui.components.LineIcons
 import com.bandear.android.ui.components.LinkDot
-import com.bandear.android.ui.components.BandEarTextField
-import com.bandear.android.ui.components.SecondaryButton
+import com.bandear.android.ui.components.PrimaryButton
 import com.bandear.android.ui.components.StatusBanner
+import com.bandear.android.ui.components.isLandscapeLayout
 import com.bandear.android.ui.components.linkHealthDescription
 import com.bandear.android.ui.components.pillToken
 import com.bandear.android.ui.state.ConnectionUiState
@@ -54,10 +60,16 @@ import com.bandear.android.ui.state.DiagnosticsUiState
 import com.bandear.android.ui.state.MAX_NAME_LENGTH
 import com.bandear.android.ui.state.ManualAddress
 import com.bandear.android.ui.state.MonitorUiState
-import com.bandear.android.ui.theme.ColorToken
 import com.bandear.android.ui.theme.BandEarShapes
 import com.bandear.android.ui.theme.BandEarTheme
 import com.bandear.android.ui.theme.BandEarType
+import com.bandear.android.ui.theme.ColorToken
+
+/** The back link's height and the gap under it, above the title of the manual address form. */
+private val BackLinkSpace = 52.dp
+
+/** The title's line and the gap under it, so the landscape Diagnostics start level with the server card. */
+private val LandscapeTitleSpace = 52.dp
 
 /**
  * The session's server with Disconnect, the musician's name, the manual connection form and the
@@ -66,6 +78,9 @@ import com.bandear.android.ui.theme.BandEarType
  *
  * Opened from Connect, with no session, it is the manual address form: [onBack] then returns to
  * Connect, and a refused Connect shows its reason under the form.
+ *
+ * In portrait it is one column; in [landscape] the connection (server, name, manual address) sits
+ * beside the diagnostics, and each side scrolls on its own when it does not fit.
  */
 @Composable
 fun SettingsScreen(
@@ -79,33 +94,73 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
     onBack: (() -> Unit)? = null,
     initiallyExpanded: Boolean = false,
+    landscape: Boolean = isLandscapeLayout(),
 ) {
     val colors = BandEarTheme.colors
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .background(colors.ground)
-            .verticalScroll(rememberScrollState())
-            .padding(start = 16.dp, end = 16.dp, top = if (onBack == null) 20.dp else 8.dp, bottom = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        if (onBack != null) BackToServers(onBack)
-        Text("Settings", style = MaterialTheme.typography.titleLarge, color = colors.text)
-        ServerCard(connection, onDisconnect)
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            FieldLabel("YOUR NAME")
-            BandEarTextField(
-                value = musicianName,
-                onValueChange = onNameChange,
-                label = "Your name",
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = "Your name",
-                capitalization = KeyboardCapitalization.Words,
-                maxLength = MAX_NAME_LENGTH,
-            )
+    // Kept here, above both layouts, so the counters stay open when the phone turns.
+    var expanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
+    val topSpace = if (onBack == null) 0.dp else BackLinkSpace
+
+    val connectionParts = @Composable {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (onBack != null) BackToServers(onBack)
+            ScreenHeading("Settings", landscape)
         }
-        ManualConnectionCard(connection, onManualAddressChange, onConnectManual)
-        DiagnosticsCard(diagnostics, connection.statusDetail, initiallyExpanded)
+        ServerCard(connection, onDisconnect, landscape)
+        NameSection(musicianName, onNameChange, landscape)
+        ManualConnectionSection(connection, onManualAddressChange, onConnectManual, landscape)
+    }
+    val diagnosticsPart = @Composable {
+        DiagnosticsSection(
+            diagnostics = diagnostics,
+            controlStatus = connection.statusDetail,
+            expanded = expanded,
+            onExpandedChange = { expanded = it },
+            landscape = landscape,
+        )
+    }
+
+    if (landscape) {
+        val top = if (onBack == null) 22.dp else 8.dp
+        Row(
+            modifier = modifier
+                .fillMaxSize()
+                .background(colors.ground)
+                .padding(horizontal = 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(28.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(5f)
+                    .fillMaxHeight()
+                    .verticalScroll(rememberScrollState())
+                    .padding(top = top, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(22.dp),
+            ) {
+                connectionParts()
+            }
+            Column(
+                modifier = Modifier
+                    .weight(4f)
+                    .fillMaxHeight()
+                    .verticalScroll(rememberScrollState())
+                    .padding(top = top + topSpace + LandscapeTitleSpace, bottom = 24.dp),
+            ) {
+                diagnosticsPart()
+            }
+        }
+    } else {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .background(colors.ground)
+                .verticalScroll(rememberScrollState())
+                .padding(start = 20.dp, end = 20.dp, top = if (onBack == null) 28.dp else 8.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(28.dp),
+        ) {
+            connectionParts()
+            diagnosticsPart()
+        }
     }
 }
 
@@ -114,7 +169,7 @@ private fun BackToServers(onBack: () -> Unit) {
     val colors = BandEarTheme.colors
     Row(
         modifier = Modifier
-            .heightIn(min = 44.dp)
+            .heightIn(min = 48.dp)
             .clip(BandEarShapes.Control)
             .clickable(role = Role.Button, onClick = onBack)
             .padding(end = 12.dp),
@@ -132,84 +187,133 @@ private fun BackToServers(onBack: () -> Unit) {
 
 /** Where the phone is connected, in words beside the coloured dot, and the way out. */
 @Composable
-private fun ServerCard(connection: ConnectionUiState, onDisconnect: () -> Unit) {
+private fun ServerCard(connection: ConnectionUiState, onDisconnect: () -> Unit, landscape: Boolean) {
     val colors = BandEarTheme.colors
     val token = if (connection.sessionRunning) pillToken(connection.pill) else ColorToken.NEUTRAL
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(BandEarShapes.Panel)
-            .background(colors.surface)
-            .border(1.dp, colors.border, BandEarShapes.Panel)
-            .padding(14.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            Modifier
-                .size(10.dp)
-                .background(colors.solid(token), CircleShape),
-        )
-        Column(
+    GroupedCard(outlined = landscape) {
+        Row(
             modifier = Modifier
-                .weight(1f)
-                .semantics(mergeDescendants = true) {},
-            verticalArrangement = Arrangement.spacedBy(2.dp),
+                .fillMaxWidth()
+                .heightIn(min = 68.dp)
+                .padding(start = 16.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = serverCardTitle(connection),
-                style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.SemiBold),
-                color = colors.text,
+            Box(
+                Modifier
+                    .size(8.dp)
+                    .background(colors.solid(token), CircleShape),
             )
-            Text(serverCardDetail(connection), style = BandEarType.NumberSmall, color = colors.textSecondary)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .semantics(mergeDescendants = true) {},
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = serverCardTitle(connection),
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        fontSize = if (landscape) 15.sp else 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    ),
+                    color = colors.text,
+                )
+                Text(
+                    text = serverCardDetail(connection),
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = if (landscape) 12.sp else 13.sp),
+                    color = colors.textSecondary,
+                )
+            }
+            if (connection.sessionRunning) DisconnectButton(onDisconnect)
         }
-        if (connection.sessionRunning) SecondaryButton("Disconnect", onClick = onDisconnect)
+    }
+}
+
+/**
+ * Ends the session, in the boards' danger look: red words on a red tint, so it reads as the way
+ * out without the weight of the solid red that confirms a delete.
+ */
+@Composable
+private fun DisconnectButton(onClick: () -> Unit) {
+    val colors = BandEarTheme.colors
+    Box(
+        modifier = Modifier
+            .heightIn(min = 48.dp)
+            .clip(BandEarShapes.Control)
+            .background(colors.tint(ColorToken.RED))
+            .border(1.dp, colors.tintBorder(ColorToken.RED), BandEarShapes.Control)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text = "Disconnect", style = MaterialTheme.typography.labelLarge, color = colors.red)
     }
 }
 
 @Composable
-private fun ManualConnectionCard(
+private fun NameSection(musicianName: String, onNameChange: (String) -> Unit, landscape: Boolean) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        FieldLabel("YOUR NAME")
+        BandEarTextField(
+            value = musicianName,
+            onValueChange = onNameChange,
+            label = "Your name",
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = controlHeight(landscape)),
+            placeholder = "Your name",
+            capitalization = KeyboardCapitalization.Words,
+            maxLength = MAX_NAME_LENGTH,
+        )
+    }
+}
+
+@Composable
+private fun ManualConnectionSection(
     connection: ConnectionUiState,
     onManualAddressChange: (ManualAddress) -> Unit,
     onConnectManual: (host: String, controlPort: String, audioPort: String) -> Unit,
+    landscape: Boolean,
 ) {
     val colors = BandEarTheme.colors
     val manual = connection.manual
     val running = connection.sessionRunning
-    SettingsCard {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("MANUAL CONNECTION", style = BandEarType.Caps, color = colors.textSecondary)
-        LabelledField(label = "Server address") {
-            BandEarTextField(
-                value = manual.host,
-                onValueChange = { onManualAddressChange(manual.copy(host = it)) },
-                label = "Server address",
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = "192.168.1.34",
-                face = FieldFace.NUMBERS,
-                fill = colors.ground,
-                keyboardType = KeyboardType.Uri,
-                imeAction = ImeAction.Next,
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            LabelledField(label = "Audio port", modifier = Modifier.weight(1f)) {
+        GroupedCard(outlined = landscape) {
+            AddressRow(label = "Server address") { fieldModifier ->
+                BandEarTextField(
+                    value = manual.host,
+                    onValueChange = { onManualAddressChange(manual.copy(host = it)) },
+                    label = "Server address",
+                    modifier = fieldModifier,
+                    placeholder = "192.168.1.34",
+                    face = FieldFace.NUMBERS,
+                    fill = colors.ground,
+                    keyboardType = KeyboardType.Uri,
+                    imeAction = ImeAction.Next,
+                )
+            }
+            GroupedCardDivider()
+            AddressRow(label = "Audio port") { fieldModifier ->
                 BandEarTextField(
                     value = manual.audioPort,
                     onValueChange = { onManualAddressChange(manual.copy(audioPort = it)) },
                     label = "Audio port",
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = fieldModifier,
                     face = FieldFace.NUMBERS,
                     fill = colors.ground,
                     keyboardType = KeyboardType.Number,
                     imeAction = ImeAction.Next,
                 )
             }
-            LabelledField(label = "Control port", modifier = Modifier.weight(1f)) {
+            GroupedCardDivider()
+            AddressRow(label = "Control port") { fieldModifier ->
                 BandEarTextField(
                     value = manual.controlPort,
                     onValueChange = { onManualAddressChange(manual.copy(controlPort = it)) },
                     label = "Control port",
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = fieldModifier,
                     face = FieldFace.NUMBERS,
                     fill = colors.ground,
                     keyboardType = KeyboardType.Number,
@@ -225,10 +329,12 @@ private fun ManualConnectionCard(
                 modifier = Modifier.fillMaxWidth(),
             )
         }
-        SecondaryButton(
+        PrimaryButton(
             text = "Connect to this address",
             onClick = { onConnectManual(manual.host, manual.controlPort, manual.audioPort) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = controlHeight(landscape)),
             enabled = !running,
         )
         if (running) {
@@ -241,11 +347,42 @@ private fun ManualConnectionCard(
     }
 }
 
+/**
+ * One row of the manual connection card: what the field holds on the left, the field on the
+ * right. The field carries that name for a screen reader, so the words beside it are not read
+ * twice.
+ */
 @Composable
-private fun DiagnosticsCard(diagnostics: DiagnosticsUiState, controlStatus: String, initiallyExpanded: Boolean) {
+private fun AddressRow(label: String, field: @Composable (Modifier) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier
+                .weight(1f)
+                .clearAndSetSemantics {},
+            style = MaterialTheme.typography.bodyLarge,
+            color = BandEarTheme.colors.text,
+        )
+        field(Modifier.weight(1.2f))
+    }
+}
+
+@Composable
+private fun DiagnosticsSection(
+    diagnostics: DiagnosticsUiState,
+    controlStatus: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    landscape: Boolean,
+) {
     val colors = BandEarTheme.colors
-    var expanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
-    SettingsCard {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -262,47 +399,96 @@ private fun DiagnosticsCard(diagnostics: DiagnosticsUiState, controlStatus: Stri
                 LinkDot(diagnostics.linkHealth)
                 Text(
                     text = linkSummaryText(diagnostics.linkHealth),
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
                     color = colors.text,
                 )
             }
         }
-        diagnosticsSummary(diagnostics).chunked(2).forEach { pair ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                pair.forEach { reading -> ReadingTile(reading, Modifier.weight(1f)) }
-            }
-        }
+        ReadingsGrid(diagnosticsSummary(diagnostics), landscape)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 44.dp)
-                .clickable(role = Role.Button) { expanded = !expanded }
-                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" },
+                .heightIn(min = 48.dp)
+                .clip(BandEarShapes.Control)
+                .clickable(role = Role.Button) { onExpandedChange(!expanded) }
+                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
                 text = if (expanded) "Hide all counters and recent errors" else "Show all counters and recent errors",
-                style = MaterialTheme.typography.labelLarge,
-                color = colors.accent,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyLarge.copy(
+                    fontSize = if (landscape) 14.sp else 15.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = colors.text,
+            )
+            Icon(
+                imageVector = LineIcons.ChevronDown,
+                contentDescription = null,
+                tint = colors.textSecondary,
+                modifier = Modifier
+                    .size(16.dp)
+                    .rotate(if (expanded) 180f else 0f),
             )
         }
-        if (expanded) AllCounters(diagnostics, controlStatus)
+        if (expanded) {
+            GroupedCard(outlined = landscape) {
+                Box(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) { AllCounters(diagnostics, controlStatus) }
+            }
+        }
+    }
+}
+
+/** The six key readings, two to a row, split by hairlines. */
+@Composable
+private fun ReadingsGrid(readings: List<Reading>, landscape: Boolean) {
+    val colors = BandEarTheme.colors
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(BandEarShapes.Panel)
+            .background(colors.border)
+            .then(if (landscape) Modifier.border(1.dp, colors.border, BandEarShapes.Panel) else Modifier),
+        verticalArrangement = Arrangement.spacedBy(1.dp),
+    ) {
+        readings.chunked(2).forEach { pair ->
+            Row(
+                modifier = Modifier.height(IntrinsicSize.Min),
+                horizontalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                pair.forEach { reading ->
+                    ReadingTile(
+                        reading = reading,
+                        landscape = landscape,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight(),
+                    )
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun ReadingTile(reading: Reading, modifier: Modifier = Modifier) {
+private fun ReadingTile(reading: Reading, landscape: Boolean, modifier: Modifier = Modifier) {
     val colors = BandEarTheme.colors
     Column(
         modifier = modifier
-            .clip(BandEarShapes.Control)
-            .background(colors.ground)
-            .padding(horizontal = 10.dp, vertical = 8.dp)
+            .background(colors.surface)
+            .padding(horizontal = if (landscape) 14.dp else 16.dp, vertical = if (landscape) 12.dp else 14.dp)
             .semantics(mergeDescendants = true) {},
-        verticalArrangement = Arrangement.spacedBy(2.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(reading.label, style = MaterialTheme.typography.labelMedium, color = colors.textSecondary)
-        Text(reading.value, style = BandEarType.Number.copy(fontSize = 15.sp), color = colors.text)
+        Text(
+            text = reading.value,
+            style = BandEarType.Number.copy(fontSize = if (landscape) 17.sp else 18.sp),
+            color = colors.text,
+        )
     }
 }
 
@@ -353,33 +539,16 @@ private fun AllCountersText(diagnostics: DiagnosticsUiState, controlStatus: Stri
     }
 }
 
-@Composable
-private fun LabelledField(label: String, modifier: Modifier = Modifier, field: @Composable () -> Unit) {
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        FieldLabel(label, caps = false)
-        field()
-    }
-}
-
-/** A Settings card: a bordered surface holding a column of rows. */
-@Composable
-private fun SettingsCard(content: @Composable () -> Unit) {
-    val colors = BandEarTheme.colors
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(BandEarShapes.Panel)
-            .background(colors.surface)
-            .border(1.dp, colors.border, BandEarShapes.Panel)
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        content()
-    }
-}
+/** The height of the name field and the Connect button: a little lower where landscape is short. */
+private fun controlHeight(landscape: Boolean): Dp = if (landscape) 48.dp else 52.dp
 
 @Composable
-private fun SettingsPreview(state: MonitorUiState, onBack: (() -> Unit)? = null, expanded: Boolean = false) {
+private fun SettingsPreview(
+    state: MonitorUiState,
+    onBack: (() -> Unit)? = null,
+    expanded: Boolean = false,
+    landscape: Boolean = false,
+) {
     BandEarTheme {
         SettingsScreen(
             musicianName = state.musicianName,
@@ -391,6 +560,7 @@ private fun SettingsPreview(state: MonitorUiState, onBack: (() -> Unit)? = null,
             onDisconnect = {},
             onBack = onBack,
             initiallyExpanded = expanded,
+            landscape = landscape,
         )
     }
 }
@@ -404,6 +574,16 @@ private fun SettingsPreview(state: MonitorUiState, onBack: (() -> Unit)? = null,
 )
 @Composable
 private fun SettingsConnectedPreview() = SettingsPreview(PreviewSamples.connected)
+
+@Preview(
+    name = "Settings · connected, landscape",
+    widthDp = PREVIEW_HEIGHT_DP,
+    heightDp = PREVIEW_WIDTH_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun SettingsConnectedLandscapePreview() = SettingsPreview(PreviewSamples.connected, landscape = true)
 
 @Preview(
     name = "Settings · lost the server, all counters",
@@ -424,3 +604,13 @@ private fun SettingsExpandedPreview() = SettingsPreview(PreviewSamples.lostServe
 )
 @Composable
 private fun SettingsManualPreview() = SettingsPreview(PreviewSamples.refused, onBack = {})
+
+@Preview(
+    name = "Settings · manual address, refused, landscape",
+    widthDp = PREVIEW_HEIGHT_DP,
+    heightDp = PREVIEW_WIDTH_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun SettingsManualLandscapePreview() = SettingsPreview(PreviewSamples.refused, onBack = {}, landscape = true)

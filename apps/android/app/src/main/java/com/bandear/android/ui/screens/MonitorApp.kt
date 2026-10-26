@@ -4,8 +4,10 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.only
@@ -21,23 +23,32 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import com.bandear.android.ui.components.BottomTabBar
 import com.bandear.android.ui.components.MainTab
+import com.bandear.android.ui.components.NavigationRail
+import com.bandear.android.ui.components.isLandscapeLayout
 import com.bandear.android.ui.state.MonitorUiState
 import com.bandear.android.ui.theme.BandEarTheme
 
 /**
- * The whole app: Connect while no session runs, and the Mix, Mixes and Settings tabs with the
- * bottom bar while one does. Everything it shows comes from [state]; everything the musician does
- * goes to [actions].
+ * The whole app: Connect while no session runs, and the Mix, Mixes and Settings tabs while one
+ * does, with the bottom bar under them in the portrait layout and the rail beside them in
+ * landscape. Everything it shows comes from [state]; everything the musician does goes to
+ * [actions].
  *
  * Each screen gets only the parts of [state] it shows. A part that did not change keeps its
  * instance (the reducer copies only what changes), so the screens it feeds are skipped when only
  * the receiver's statistics moved.
  *
  * The only state kept here is whether the manual address form was opened from Connect. The back
- * key closes it, and from the Mixes or Settings tab returns to Mix.
+ * key closes it, and from the Mixes or Settings tab returns to Mix. The selected tab lives in
+ * [state], so it outlasts the Activity being recreated when the phone turns.
  */
 @Composable
-fun MonitorApp(state: MonitorUiState, actions: MonitorActions, modifier: Modifier = Modifier) {
+fun MonitorApp(
+    state: MonitorUiState,
+    actions: MonitorActions,
+    modifier: Modifier = Modifier,
+    landscape: Boolean = isLandscapeLayout(),
+) {
     val colors = BandEarTheme.colors
     val sessionRunning = state.connection.sessionRunning
     var manualAddressOpen by rememberSaveable { mutableStateOf(false) }
@@ -46,33 +57,42 @@ fun MonitorApp(state: MonitorUiState, actions: MonitorActions, modifier: Modifie
         if (sessionRunning) manualAddressOpen = false
     }
     val screen = appScreenFor(sessionRunning, state.tab, manualAddressOpen)
+    val rail = landscape && screen.showsTabs
+    val bottomBar = !landscape && screen.showsTabs
 
     BackHandler(enabled = screen == AppScreen.MANUAL_ADDRESS) { manualAddressOpen = false }
     BackHandler(enabled = screen == AppScreen.MIXES || screen == AppScreen.SETTINGS) {
         actions.selectTab(MainTab.MIX)
     }
 
-    Column(
+    // The bar and the rail pad for the insets on their own side (the navigation bar, a cutout);
+    // the screen pads for the rest. The screen is called from this one place in both layouts, so
+    // what it keeps in rememberSaveable is found again after the phone turns.
+    val screenSides = when {
+        rail -> WindowInsetsSides.Top + WindowInsetsSides.End + WindowInsetsSides.Bottom
+        bottomBar -> WindowInsetsSides.Top + WindowInsetsSides.Horizontal
+        else -> WindowInsetsSides.Vertical + WindowInsetsSides.Horizontal
+    }
+    Row(
         modifier = modifier
             .fillMaxSize()
             .background(colors.ground),
     ) {
-        Box(
+        if (rail) NavigationRail(selected = state.tab, onSelect = { actions.selectTab(it) })
+        Column(
             modifier = Modifier
                 .weight(1f)
-                .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)),
+                .fillMaxHeight(),
         ) {
-            ScreenContent(screen, state, actions, onManualAddress = { manualAddressOpen = it })
-        }
-        // The bar reaches under the navigation bar; its items stay above it.
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(if (screen.showsTabs) colors.bar else colors.ground)
-                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal)),
-        ) {
-            if (screen.showsTabs) BottomTabBar(selected = state.tab, onSelect = { actions.selectTab(it) })
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(screenSides)),
+            ) {
+                ScreenContent(screen, state, actions, landscape, onManualAddress = { manualAddressOpen = it })
+            }
+            if (bottomBar) BottomTabBar(selected = state.tab, onSelect = { actions.selectTab(it) })
         }
     }
 }
@@ -82,6 +102,7 @@ private fun ScreenContent(
     screen: AppScreen,
     state: MonitorUiState,
     actions: MonitorActions,
+    landscape: Boolean,
     onManualAddress: (open: Boolean) -> Unit,
 ) {
     when (screen) {
@@ -92,6 +113,7 @@ private fun ScreenContent(
             onNameChange = { actions.setName(it) },
             onConnect = { actions.connect(it) },
             onManualAddress = { onManualAddress(true) },
+            landscape = landscape,
         )
         AppScreen.MANUAL_ADDRESS, AppScreen.SETTINGS -> SettingsScreen(
             musicianName = state.musicianName,
@@ -102,6 +124,7 @@ private fun ScreenContent(
             onConnectManual = { host, controlPort, audioPort -> actions.connectManual(host, controlPort, audioPort) },
             onDisconnect = { actions.disconnect() },
             onBack = if (screen == AppScreen.MANUAL_ADDRESS) ({ onManualAddress(false) }) else null,
+            landscape = landscape,
         )
         AppScreen.MIX -> MixScreen(
             musicianName = state.musicianName,
@@ -125,14 +148,15 @@ private fun ScreenContent(
             onRecall = { actions.recallMix(it) },
             onRename = { from, to -> actions.renameMix(from, to) },
             onDelete = { actions.deleteMix(it) },
+            landscape = landscape,
         )
     }
 }
 
 @Composable
-private fun AppPreview(state: MonitorUiState) {
+private fun AppPreview(state: MonitorUiState, landscape: Boolean = false) {
     BandEarTheme {
-        MonitorApp(state = state, actions = PreviewActions)
+        MonitorApp(state = state, actions = PreviewActions, landscape = landscape)
     }
 }
 
@@ -147,6 +171,16 @@ private fun AppPreview(state: MonitorUiState) {
 private fun AppNotConnectedPreview() = AppPreview(PreviewSamples.notConnected)
 
 @Preview(
+    name = "App · not connected, landscape",
+    widthDp = PREVIEW_HEIGHT_DP,
+    heightDp = PREVIEW_WIDTH_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun AppNotConnectedLandscapePreview() = AppPreview(PreviewSamples.notConnected, landscape = true)
+
+@Preview(
     name = "App · Mix tab",
     widthDp = PREVIEW_WIDTH_DP,
     heightDp = PREVIEW_HEIGHT_DP,
@@ -155,6 +189,16 @@ private fun AppNotConnectedPreview() = AppPreview(PreviewSamples.notConnected)
 )
 @Composable
 private fun AppMixPreview() = AppPreview(PreviewSamples.connected)
+
+@Preview(
+    name = "App · Mix tab, landscape",
+    widthDp = PREVIEW_HEIGHT_DP,
+    heightDp = PREVIEW_WIDTH_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun AppMixLandscapePreview() = AppPreview(PreviewSamples.connected, landscape = true)
 
 @Preview(
     name = "App · Mixes tab",
@@ -167,6 +211,16 @@ private fun AppMixPreview() = AppPreview(PreviewSamples.connected)
 private fun AppMixesPreview() = AppPreview(PreviewSamples.connected.copy(tab = MainTab.MIXES))
 
 @Preview(
+    name = "App · Mixes tab, landscape",
+    widthDp = PREVIEW_HEIGHT_DP,
+    heightDp = PREVIEW_WIDTH_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun AppMixesLandscapePreview() = AppPreview(PreviewSamples.connected.copy(tab = MainTab.MIXES), landscape = true)
+
+@Preview(
     name = "App · Settings tab, reconnecting",
     widthDp = PREVIEW_WIDTH_DP,
     heightDp = PREVIEW_HEIGHT_DP,
@@ -175,3 +229,14 @@ private fun AppMixesPreview() = AppPreview(PreviewSamples.connected.copy(tab = M
 )
 @Composable
 private fun AppSettingsPreview() = AppPreview(PreviewSamples.reconnecting.copy(tab = MainTab.SETTINGS))
+
+@Preview(
+    name = "App · Settings tab, reconnecting, landscape",
+    widthDp = PREVIEW_HEIGHT_DP,
+    heightDp = PREVIEW_WIDTH_DP,
+    showBackground = true,
+    backgroundColor = PREVIEW_BACKGROUND,
+)
+@Composable
+private fun AppSettingsLandscapePreview() =
+    AppPreview(PreviewSamples.reconnecting.copy(tab = MainTab.SETTINGS), landscape = true)

@@ -27,6 +27,15 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   (`apps/server/src/discovery.rs:9-26`) is unreachable from iOS without
   `com.apple.developer.networking.multicast`. `NWBrowser` over `_bandear._tcp` needs only the
   local-network permission. A typed host/port form is the fallback, as on Android.
+- **No staleness timer for Bonjour (T4).** Android drops a desk it has not heard for 5 s
+  (`ServerBeacon.STALE_TIMEOUT_MS`) because a UDP beacon has no way to say it stopped. Bonjour
+  has one: the desk sends a goodbye when it unregisters, and the OS expires records it stops
+  hearing. A present desk raises no new events, it stays in the browser's set, so porting the
+  timer would remove live desks. `NWBrowser` hands over its whole current set on every change, so
+  the directory is one pure function from that set to the list. The original T4 line said
+  "staleness handling"; this is what it turned into.
+- **Discovery is its own module (T4).** `BandEarDiscovery` sits beside `BandEarProtocol` and
+  depends on nothing in it, so the package names its features rather than its layers.
 - **The Android jitter strategy is ported, not reinvented (T3).** Cushion counted in packets, 1 to 4,
   starting at 2, shrinking only after 3 clean intervals (`PlaybackLatency.kt:15-21`,
   `CushionController.kt:34-101`), and a reorder hold of up to 4 packets that reads a sequence 256
@@ -74,16 +83,78 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `config`, `mix_ack`, `mix_state`, `playback`, `redundancy`, `error` in. Field-for-field against
   `apps/server/src/protocol.rs`, with the `register` name truncation at 64 characters and the
   `client_id` character rule.
+- [x] T2c — Read `config` as leniently as Android (route: inline). Found while porting T5b: the
+  T2b decoder required `sample_rate`, a group `id` and all four channel fields, so a desk older
+  than any of them (the desk added the channel details after the groups, and a group's `id` after
+  its name and channels) would cost the musician the whole configuration. Commit `68cb553`.
 - [x] T3 — Reorder hold and cushion policy (route: inline). Ported from `ReorderHold.kt` and
   `CushionController.kt`, including server-restart detection.
-- [ ] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
-  `sr` (`apps/server/src/mdns.rs:63-66`), staleness handling, and the manual host/port fallback.
-- [ ] T5 — Mix domain and reducer (route: inline). 32 channels, 16 groups, gains, pans, mutes,
-  solos, group levels, engineer limit, locked channels, following.
+- [x] T4 — Bonjour discovery (route: inline). `NWBrowser` over `_bandear._tcp`, TXT keys `v` and
+  `sr` (`apps/server/src/mdns.rs:63-66`), and the manual host/port fallback. Staleness is the
+  browser's, not a timer of ours: see the design decision below.
+- [x] T5 — Mix domain and reducer, in a `BandEarMix` module (route: inline per unit). 32 channels,
+  16 groups, gains, pans, mutes, solos, group levels, engineer limit, locked channels, following.
+  Mapped by one read-only explorer first (the Android reducer holds the whole app's state, about
+  2 500 lines with its tests, beyond an inline read); its reconciliation claim spot-checked against
+  `MonitorReducer.kt:123-125,428-437` and `MonitorUiState.kt:262-278`. Sliced into units of
+  behaviour, each with its Android parity suite:
+  - [x] T5a — Channel layout: strips, stereo pairs, balance and pans, labels, the musician's
+    channel choices (`ChannelLayout.kt`, `ChannelLayoutTest.kt`, the layout tests of
+    `MonitorReducerTest.kt`).
+  - [x] T5b — Edits and config: applying `config`, strip edits through pairs, locks and following,
+    group levels, master, mute and cap, clamping.
+  - [x] T5c — Reconciliation with the desk: `MixSyncState` numbering, `mix_state` and `mix_ack`
+    rules, the engineer's controls, the echo check, session start.
+  - [x] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
+    the musician's own levels put back after a link.
+  - [x] T5e — The outgoing mix and when one is sent.
+- [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
+  (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
+  storage, which the pure mix module does not have.
 - [ ] T6 — App shell and project file (route: to be decided). SwiftUI app, `Info.plist` with
   `NSLocalNetworkUsageDescription` and `NSBonjourServices`, composition root over `BandEarKit`.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
+
+## Follow-ups
+
+- **T6 inputs from T5c.** `MixEvent(reportedBy:)` maps `config` to nil, so the session layer
+  sends `.configReceived` to the reducer itself. Two decoding divergences left on purpose, both
+  about what T6 shows: a `mix_ack` with no number whose mix cannot be read still throws, where
+  Android only counts it as acknowledged (unreachable while every `mix` is numbered, which T5e
+  keeps; if the pill needs it, give `unreadableMixAck` an optional sequence); and an `error` whose
+  `seq` is negative or not a number fails as a whole message, where Android shows the error and
+  answers nothing (make its `seq` as lenient as the ack's). The "acknowledged" counting and
+  "nothing sent back" assertions of `ControlChannelTest.kt` belong to T6's transport.
+- **T6, T8 and T9 inputs from T5d.** Storing the musician's channel across launches is T6's
+  (Android's `startingRestoresTheName…`, `aChannelTheServerDidNotAnnounceIsNotStored`,
+  `aConfigWithoutTheRememberedChannelForgetsIt` in `MonitorViewModelTest.kt`). The amber strip
+  while More of me lifts it is T8's (`MixScreenTextTest.theMusiciansOwnStripIsAmberOnlyWhileMoreOfMeLiftsIt`);
+  so are the seven notices' words. The musician's channel surviving a recall is T9's (the More of me
+  assertion of `recallingAMixAppliesItsValuesAndKeepsWhatTheServerAnnounced`).
+- **T6 inputs from T5e.** The session layer routes every event through
+  `MixSession.reducedNumberingSends(by:)` and sends `outgoingMix()` whenever `sync.latest` grew,
+  which also covers the restore after a link, numbering itself. Every mix is numbered, the opening
+  one too (seq 0, all five lists as empty arrays before the first `config`, which the desk's
+  `merge_levels` reads as changing nothing, `mix.rs:1003-1027`). Left for T6 by T5e, needing a
+  socket, a queue or storage: Android's `aConfigArrivingBeforeTheOpeningMixIsSent…`,
+  `anAnswerArrivingBeforeAQueuedChangeIsSentNeitherUndoesNorLosesIt`,
+  `aReconnectStillSendsThePhonesOwnMix`,
+  `aReconnectSendsTheMixAgainUnderItsNewestNumberAndItsAnswerSettlesIt`,
+  `ControlChannelReconnectTest.everyOpenRegistersFirstAndThenSendsTheMix`,
+  `anAckWithoutANumberOnlySaysTheServerHoldsTheMix`, and the storage tests listed under T5d.
+- **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
+  playback timing. When T7 adds the player that depends on them, move them to a
+  `BandEarPlayback` module so every module names its feature.
+- **T6 inputs from T4.** `Info.plist` needs `NSBonjourServices` = `_bandear._tcp` and an
+  `NSLocalNetworkUsageDescription`, or the browser waits on `kDNSServiceErr_PolicyDenied`
+  forever. The browser spells a found desk's endpoint `type="_bandear._tcp"` (no trailing dot)
+  and `domain="local."` (with one), observed in the round-trip test.
+- **T8 inputs from T4.** The connect screen owns the form's words and must use Android's:
+  `missingHost` "Enter the server IP address or host name", `invalidAudioPort` "Enter a valid UDP
+  port between 1 and 65535", `invalidControlPort` "Enter a valid WebSocket control port between 1
+  and 65535". `DiscoveryStatus.localNetworkDenied` needs its own message: without it the screen
+  says "searching" for a desk that can never appear.
 
 ## Acceptance criteria
 
@@ -99,9 +170,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 ## Checks
 
 - `swift test --package-path apps/ios/BandEarKit`.
-- `swift build --build-tests --package-path apps/ios/BandEarKit` with no warnings. A plain
-  `swift build` does not compile the test targets, so it reports their warnings as clean.
+- `swift build --build-tests` on a **clean copy** of the package (`rsync` without `.build`) with no
+  warnings. A plain `swift build` does not compile the test targets, and an incremental build
+  after `swift test` recompiles nothing and so prints no warnings at all: both report clean
+  whatever the code says.
 - `grep -rE 'import (SwiftUI|UIKit|AVFoundation)' apps/ios/BandEarKit/Sources` returns nothing.
+- `BANDEAR_BONJOUR_IT=1 swift test --package-path apps/ios/BandEarKit --filter roundTrip`: the
+  Bonjour round trip. Opt-in, because it announces a service on the local network; the
+  adapter has no other coverage, so run it whenever `BonjourDeskBrowser` changes.
 - Manual, later: `dns-sd -B _bandear._tcp` lists the desk, then the app connects and audio plays.
 
 ## Route
@@ -176,8 +252,9 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
     the desk stores: the name trimmed and capped, a client id the desk would discard dropped here
     rather than sent, capabilities deduplicated in order, and a zero UDP port refused outright.
     `MixCommand` leaves an unset list out of the JSON instead of sending null, because the desk
-    reads an absent list as unchanged and sending a whole mix to move one fader would fight every
-    other socket of the same musician. `LinkStats` validates the interval and sanitises the
+    reads an absent list as unchanged (Corrected in T5e: this note first claimed that sending a whole mix to move one fader "would
+    fight every other socket of the same musician"; that was never checked, and the Android client
+    sends all five lists on every `mix`, as this client now does.) `LinkStats` validates the interval and sanitises the
     optional measurements on the way in.
   - T2b `Sources/BandEarProtocol/ServerMessage.swift` (+ tests): `ServerMessage` decoding
     `config`, `mix_ack`, `mix_state`, `playback`, `redundancy` and `error`. An unknown `type`
@@ -267,4 +344,239 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
 - Risk: none. Additive files in a package nothing depends on yet.
 - Native review assessment of the T3 slice against base f09c8bc: `medium`, `review_due: false`,
   reason `under_budget` (6 paths, 1446 lines). The slice stays open.
-- Pending: T4 onward. The `.xcodeproj` decision is still open and belongs to T6.
+- T4 done in two work units (route: inline), in a new `BandEarDiscovery` module.
+  - Reference first, this time from the start: `ServerDiscovery.kt` and `ServerDiscoveryTest.kt`
+    (the beacon parse and the 5 s expiry), the desk's `mdns.rs`, and the Android connection form
+    in `MonitorViewModel.startSession` with its test `aManualAddressIsCheckedBeforeAnythingStarts`.
+    The Network APIs were checked against the iOS 27 SDK's `Network.swiftinterface` and
+    `dns_sd.h` before use, not recalled.
+  - T4a `Sources/BandEarDiscovery/DeskDirectory.swift`: `DeskDirectory.desks(from:)`, a pure
+    function from the browser's current set to the list. A desk is listed once its TXT record
+    has arrived and only at discovery version 1, as Android ignores a beacon of another version.
+    `sr` is informational: anything but a positive whole number is no rate. A service reported
+    twice is listed once, and when its copies disagree on the rate the rate is dropped, so the
+    answer never depends on the set's iteration order. The order is by name, ignoring case and
+    reading digits as numbers, then domain and type, so it is total and stable between snapshots.
+    The service type is not filtered on: the browser was asked for that type only, and its
+    spelling in a result was not yet known. `Sources/BandEarDiscovery/ConnectionForm.swift`: the
+    Android checks in Android's order (host, then this phone's UDP port, then the desk's control
+    port), ports 1 through 65535 trimmed of blanks, defaults 50001 and 50000; a desk found over
+    Bonjour only needs this phone's port. The checks return cases; the words belong to T8 (see
+    Follow-ups). `ConnectionFormParityTests` ports Android's inputs. Commit `b27458c`.
+  - T4b `Sources/BandEarDiscovery/DiscoveryStatus.swift`: the browser state read as what the
+    screen says, with `localNetworkDenied` for `kDNSServiceErr_PolicyDenied` (-65570, verified
+    in the SDK's `dns_sd.h:801`) whether the browser waits or fails on it.
+    `Sources/BandEarDiscovery/BonjourDeskBrowser.swift`: the thin `NWBrowser` adapter. It clears
+    a browser's handlers before cancelling it, so an old browser's `cancelled` cannot land after a
+    new one reported browsing and make a live screen read idle. Its state is only touched on its
+    own serial queue. Commit `9ece87a`.
+  - The adapter cannot be unit tested; its input is a network. `BonjourDeskBrowserIntegrationTests`
+    announces a desk from the test process with `NWListener` (TXT `v=1`, `sr=48000`), finds it,
+    cancels the listener and waits for it to leave the list. RED against a stub that never
+    reported: failed after 10 s with the listener `ready`, so a later pass is the browser's doing.
+    GREEN: passed in 1.0 s; the desk was found with its rate and left the list on its own once the
+    listener stopped, which is the evidence behind having no staleness timer. It announced
+    `BandEar IT <8 hex>` on the local network for about a second.
+- Test-first: RED before each implementation. T4a: 24 new tests, 37 failed expectations. T4b: 5
+  new tests, 8 failed expectations, plus the round trip's RED above.
+- Checks: `swift test --package-path apps/ios/BandEarKit`: 156 passed, 0 failed (127 in
+  `BandEarProtocolTests`, 29 in `BandEarDiscoveryTests`; the round trip is skipped unless opted
+  in). `BANDEAR_BONJOUR_IT=1 … --filter roundTrip`: passed. `swift build --build-tests`: no
+  warnings. No SwiftUI, UIKit or AVFoundation import in `Sources`. The only earlier file touched
+  is `Package.swift`, which gained the new target; the earlier 127 tests pass unchanged.
+- Risk: none. Additive module nothing depends on yet. The adapter's only coverage is the opt-in
+  round trip, recorded under Checks so it is run whenever the adapter changes.
+- Native review assessment of the T4 slice against base fcff93e: `medium`, `review_due: false`,
+  reason `under_budget` (10 paths, 717 lines). The slice stays open.
+- T5 started. One read-only explorer mapped the mix domain inside Android's whole-app reducer
+  (about 2 500 lines with its tests, beyond an inline read) and returned the state shape, events,
+  rules, the tests by area and two corrections to the brief: there is no "mix ownership" in the
+  reducer (in-flight edits are reconciled by `MixSyncState(latest, answered)`), and Android sends
+  all five lists on every `mix`. Its reconciliation claim was spot-checked against
+  `MonitorReducer.kt:123-125,428-437` and `MonitorUiState.kt:262-278` and held exactly.
+  - Module decision: `BandEarMix` depends on `BandEarProtocol` and takes the desk's values at its
+    edge (`DeskConfiguration`, `MixReport`, `MixCommand`); the protocol types are the vocabulary
+    the desk publishes, and a parallel set would be mapping for its own sake. The dependency only
+    runs one way.
+  - T5a `Sources/BandEarMix/ChannelLayout.swift` and `MixState.swift`: strips, stereo pairs, the
+    balance rule, labels, group faders and their members, the musician's channel choices, locked
+    sides and following, all derived from plain index-aligned lists. `ChannelLayoutParityTests`
+    ports `ChannelLayoutTest.kt` (9); `MixReducerParityTests` ports the four layout tests of
+    `MonitorReducerTest.kt`. Commit `878b35b`.
+    - Kotlin's `roundToInt` and Swift's `rounded()` disagree on negative halves; both are then held
+      to 0-100, which makes them agree everywhere, and the round trip over 0...100 pins it.
+    - The first RED crashed the test process (`Index out of range` on an empty stub result) rather
+      than failing. Indexing is now behind `try #require(count == …)`, so a short result fails one
+      test instead of hiding every other result.
+    - Two implicit dependencies made explicit: the test target imported `BandEarProtocol` only
+      through `BandEarMix`, and `ChannelLayout.swift` used `trimmingCharacters` without importing
+      Foundation. Both compiled; both would break the day a transitive import changed.
+  - T2c (above): the `config` decoder now reads as `ControlChannel.kt` does. `sample_rate` is
+    optional (Android never reads it, and its own tests send configs without one); groups skip an
+    entry that is not an object or has no name, take `id` as optional and drop member channels that
+    are not whole numbers or are negative; `channels` absent or not a list is nil, otherwise exactly
+    `source_channels` entries with defaults for anything unreadable. Where Android's `optString`
+    and `optInt` coerce garbage (a name of `7`, a channel of `2.5`) this drops it instead, documented
+    at the decoder; the desk never sends either. `ConfigParityTests` ports
+    `aConfigHandsOnTheChannelDetailsInChannelOrder`, `aConfigFromAnOlderServerHandsOnNoDetails`,
+    `channelDetailsAreReadLeniently` and `everyKindIsReadByItsWireName` with Android's own JSON.
+    RED in two steps: first a compile error from the API change, then, with only the types made
+    optional, exactly the ten new leniency tests failing and every earlier test passing. Scope
+    checked on the diff: no line of the routing or of the other four decoders changed.
+  - T5b `Sources/BandEarMix/MixSession.swift`: the reducer for `config` and the musician's edits.
+    A `config` outside 1...32 channels is ignored (Android drops it in its parser); lists resize
+    keeping existing channels, new ones neutral with the default pans, group levels kept by
+    position. Strip edits go through pairs, refuse locked strips and anything while following;
+    master, mute and cap never are. Android writes by index unguarded and would throw on a list
+    shorter than the levels; this writes only what a list has room for. The T5a ports now reach
+    their states through the reducer, and `firstConfigBridge` proves the reducer builds exactly
+    the hand-built states the layout tests started from. 13 more ports from `MonitorReducerTest.kt`;
+    `aGroupLevelFillsTheOtherGroupsAsTheyRead` sets the short group list directly where Android
+    reaches it through a recall (T9). Commit `ce9ef1f`.
+  - Test-first: RED before each unit. T5a: 24 tests, 156 issues (after the crash fix). T5b: 44
+    tests, 54 issues, the T5a ports included because they now go through the stub reducer.
+- A correction to every assessment recorded so far. The rule takes `--base-ref <last reviewed
+  boundary>`, and `under_budget` does not advance the boundary, so with nothing reviewed it is
+  still the branch point. T1 was assessed against it, but T2, T3 and T4 were each assessed against
+  the previous docs commit, which reset the slice every time. Re-assessed correctly after T5b:
+  base 07a8711, 33 paths, 5 427 lines, `medium`, `review_due: false`, `under_budget`. The
+  outcome did not change, but the bases were wrong. Assessments from here on use 07a8711 until
+  something is reviewed.
+- Checks: `swift test --package-path apps/ios/BandEarKit`: 210 passed, 0 failed (137 protocol,
+  29 discovery, 44 mix). `swift build --build-tests`: no warnings. No SwiftUI, UIKit or
+  AVFoundation import in `Sources`.
+- Risk: none for T5a and T5b (additive module, nothing depends on it yet). T2c changes public
+  types of `BandEarProtocol` (`DeskConfiguration.sampleRate` and `.channels`, `ChannelGroup.id`
+  became optional); their only consumers are this package's tests and `BandEarMix`, so no
+  contract anyone already consumes changed.
+- T5c done (route: delegated writer; trigger: the long-session backstop, the parent context at
+  about 130k tokens). The parent fixed the API shape in the handoff (the `unreadableMixAck` case,
+  `MixSync`, the four new events, `reducedSending`, the `ServerMessage` to `MixEvent` mapping) and
+  the writer implemented it within eleven named edit surfaces. What landed:
+  - `ServerMessage.swift`: `mix_ack` and `mix_state` read as `parseMixReport` and
+    `parseEngineerControls` read them. The masters, the mute and all five lists are required now,
+    so a report missing a list is unreadable (T2b had read it as empty); the limit is any number cut
+    to its whole part and held to 0-100, else 100; `locked` counts only `true` entries; `following`
+    is only a string; `seq` is only a non-negative whole number. A numbered ack whose mix cannot be
+    read becomes `unreadableMixAck(sequence:)` and still answers its number. No other message type
+    changed, and no existing test did.
+  - `MixSync.swift`, `MixSession.swift`: `MixSync(latest, answered)` with `isSettled`, `changed()`,
+    `answeredUpTo(_:)`; `sync` and `isSessionRunning` on the session; `.sessionStarted`,
+    `.sessionEnded`, `.mixPushed`, `.mixAnswered`. A push applies its mix only when settled, an ack
+    only when it answers the newest change; engineer controls in a readable report apply at once; a
+    refusal only answers; reports outside a session change nothing (the answered number still moves,
+    as Android's does); session start resets the engineer controls, never the numbers. The echo
+    check compares against `mixAsPlayed`, the stored mix until T5d lifts it.
+  - `DeskReports.swift`: `MixReport.engineerControls` and `MixEvent(reportedBy:)`.
+    `EngineerControls.isLimited` added because two parity tests assert Android's `limited`.
+  - Ports: 26 from `MonitorReducerTest.kt` (795, 807 and 1166 partly, their More of me parts left
+    to T5d; 914's snapshot check to T5e; 776 sets directly the levels Android reaches by a recall)
+    and 12 from `ControlChannelTest.kt`. Skipped for later units: four recall tests (T9), four More
+    of me tests (T5d), two outgoing-mix tests (T5e). 20 Swift-only tests.
+  - RED against the writer's stub: 46 of 239 tests failed with 89 issues, no crash. GREEN: 268.
+    The writer also ran four mutations in a scratch copy (a push ignoring settled, any answer shown,
+    engineer controls changing outside a session, a mix applied outside one); each was caught.
+  - About 1 250 authored lines, over the ~400 heuristic: some 320 are source, the rest the parity
+    suites, every port reaching its state through events.
+- Parent checks of the delegated unit: every changed file inside the eleven surfaces; `swift test`
+  rerun by the parent: 148, 91 and 29 passed; scratch paths the writer reported removed after
+  inspection.
+- The warning check had been vacuous. The writer noticed that an incremental `swift build
+  --build-tests` after `swift test` recompiles nothing and so prints nothing, which is the order
+  every check since T1 ran in (with `swift test`'s own output filtered down to its result lines).
+  That explains why T3's `unused result` warning only surfaced in a fresh scratch copy. A full
+  build of a clean copy after T5c: 0 warnings in sources and tests, so the tree is clean as of
+  `9982f3b`. The documented check now builds a clean copy.
+- Risk: none. The writer named item 3 because `ServerMessage` gains a public case; as with T2c,
+  its only consumers are this package's own targets, which compile and pass, so no contract anyone
+  already consumes changed, and no independent verifier ran.
+- Work-unit commit: `9982f3b feat(ios): reconcile the desk's mix reports with the edits in flight`.
+- Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
+  (37 paths, 6 706 lines).
+- T5d done (route: delegated writer; trigger: the long-session backstop). The parent fixed the
+  shape in the handoff (`MoreOfMeNotice` with Android's seven cases, `MoreOfMeState`,
+  `MoreOfMe.liftedLevels`, `moreOfMe` and `ownLevelsToRestore` on the session, two events,
+  `mixAsPlayed` lifting, `reducedSending` clearing the restore) within eight named surfaces.
+  - `MoreOfMe.swift`: the lift ports `MixSnapshot.moreOfMe` and `moreOfMeFor`: the musician's
+    sides to 100, every other channel halved, locked sides as stored. Kotlin's `roundToInt` rounds
+    a half toward positive infinity, so a halved level is `(Double(level) / 2).rounded(.up)`, exact
+    for every `Int`; Swift's default `rounded()` agrees on 0...100 but not on negative halves, and a
+    test pins Kotlin's rule there. The rules that turn More of me off are internal methods on
+    `MoreOfMeState`.
+  - `MixSession.swift`: `applyConfig` fits the musician's channel to the new strips and keeps the
+    musician's own levels when a link turns More of me off; the engineer's lock or following turns
+    it off, and following stopping clears its notice; a report that is not an echo of the mix as
+    played turns it off with `mixChangedElsewhere`; after a link the musician's own levels go back
+    (Android's `dropLinkedLift`) and the result is numbered when it differs from what the desk
+    plays. The stored levels never carry the lift.
+  - Ports: 19 from `MonitorReducerTest.kt`, the five `moreOfMe` tests of `MixSnapshotTest.kt` and
+    `GroupSnapshotTest.moreOfMeKeepsTheGroupLevelsUntouched`; the deferred halves of four earlier
+    ports completed in place. 14 Swift-only tests. Skipped: the `MonitorViewModelTest.kt` tests
+    about what is sent (T5e or T6), storing the channel (T6), the amber strip (T8), recall (T9).
+  - Divergences: `liftedLevels` returns the levels unchanged where Android returns null, and every
+    Android caller then falls back to the stored mix, so behaviour is the same; the lift takes and
+    returns levels only, so the Android checks that pans, masters and groups come through untouched
+    are made on the session instead; Android's `sourceChannels <= 0` guard in `fittedTo` is left
+    out because `applyConfig` already rejects such a `config`.
+  - RED against the writer's stub: 130 mix tests, 38 failed with 64 expectations, no crash; five
+    passed on the stub because they assert that nothing changes, and four `#require` checks were
+    added so that tests built on a helper cannot pass against a reducer that does nothing. GREEN:
+    130. Ten mutations in a scratch copy (Swift's own rounding, restoring without numbering,
+    keeping the restore after a send, the engineer's locks in place of `lockedSides`, and more):
+    all caught.
+  - About 290 source and 620 test lines, over the ~400 heuristic, most of it the parity ports.
+- Parent checks of the delegated unit: all seven changed files inside the surfaces; `swift test`
+  rerun by the parent: 148, 130 and 29 passed; the writer's clean-copy build reported 0 warnings;
+  its scratch inspected (the mutation copy's sources matched the repository's) and removed.
+- Risk: none. Two public `MixEvent` cases added; the only consumers are this package's targets.
+- Work-unit commit: `28d2b3f feat(ios): lift the musician's own channel with More of me`.
+- Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
+  (40 paths, 7 601 lines).
+- T5e done (route: delegated writer; trigger: the long-session backstop), closing T5. Within
+  seven named surfaces, `ClientMessage.swift` limited to `MixCommand`'s doc comment.
+  - `OutgoingMix.swift`: `outgoingMix()` numbers the mix `sync.latest` (never nil, the opening
+    mix too), takes the master volume, the phone's own `levelCap` (not `effectiveCap`) and the mute,
+    and the five lists from the mix as played, so More of me is lifted here and only here with the
+    locked sides as stored. Every list goes out on every mix, as empty arrays before the first
+    `config`. `sends(_:before:after:)` ports Android's four rules: an edit sends when the mix
+    changed; a `config` when More of me went off for any reason but a link; a toggle when it
+    changed; a channel choice when More of me was on and the choice was taken. Desk reports and
+    session events never send through it. `reducedNumberingSends(by:)` is `reducedSending` with
+    that rule.
+  - `MixCommand`'s doc comment now keeps only the true part (an absent list leaves the desk's list
+    unchanged) and says this client sends every list, as Android does; the matching claim in this
+    document's T2 note is corrected in place, marked as corrected. The follow-up that tracked it is
+    closed.
+  - Ports: `aMixNeverCarriesTheEngineersControls` and `aMixCarriesTheNumberOfTheNewestChange…` from
+    `ControlChannelTest.kt`; 23 send-rule tests from `MonitorViewModelTest.kt`, run through a
+    socket-less harness (`Phone` in `Fixtures.swift`) that routes every event through
+    `reducedNumberingSends` and records `outgoingMix()` whenever the number grew;
+    `theMixBecomesTheSnapshotTheControlChannelSends` (649), never ported before; 914's snapshot
+    check completed in place. 8 Swift-only tests. Skipped: the recall and saved-mix tests (T9), and
+    those needing a socket, a queue, a reconnect, storage or the pill (T6, listed in Follow-ups).
+  - Divergences: the session's number is never nil, so the "none without one" half of
+    `aMixCarriesTheNumber…` is checked on a `MixCommand` built with no sequence;
+    `aLimitOnlyReport…` checks `effectiveCap` where Android checks the receive thread's ceiling,
+    which is copied from it.
+  - RED: a first stub with no lists and no number made 13 tests fail by a thrown decode error
+    rather than an expectation, so the stub became a constant mix with empty lists and seq 0; then
+    164 mix tests, 31 failed with 64 expectations, no crash. Five passed on the stub because a stub
+    that never sends satisfies them; `#require` checks were added to the ones that could pass
+    vacuously, and one test's extra checks were added after RED without RED being rerun. GREEN: 164.
+    Eleven mutations in a scratch copy, all caught. One of them ("a `config` never sends") was
+    caught only by a Swift-only test: Android's suite never reaches a `config` that turns More of
+    me off for a reason other than a link, which is the case for writing tests beyond the port.
+  - About 100 source and 830 test lines, over the ~400 heuristic because of the 25 parity ports.
+- Parent checks of the delegated unit: all seven changed files inside the surfaces, and only
+  doc-comment lines changed in `ClientMessage.swift`; `swift test` rerun by the parent: 148, 164
+  and 29 passed; the writer's clean-copy build reported 0 warnings; its scratch inspected (the
+  mutation copy's sources matched the repository's) and removed.
+- Risk: none. Public functions added to a module only this package uses, one property made
+  internal, one doc comment edited.
+- Work-unit commit: `b80bc49 feat(ios): build the outgoing mix and decide when the musician's
+  action sends one`.
+- Native review assessment against base 07a8711: `medium`, `review_due: false`, `under_budget`
+  (43 paths, 8 550 lines).
+- T5 complete: the mix module holds the channel layout, edits and `config`, reconciliation with
+  the desk, More of me, and the outgoing mix. 341 tests: 148 protocol, 164 mix, 29 discovery.
+- Pending: T6 (app shell and project file, with the `.xcodeproj` decision still open), T7, T8, T9.

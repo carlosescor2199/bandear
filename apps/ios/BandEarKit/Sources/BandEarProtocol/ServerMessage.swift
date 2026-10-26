@@ -30,11 +30,13 @@ public struct SourceChannel: Equatable, Sendable {
 
 /// One group in the desk's `config`: a stable id, a name, and 0-based source channel indices.
 public struct ChannelGroup: Equatable, Sendable {
-    public let id: String
+    /// The desk's stable id for the group, or nil from a desk that predates group ids. Groups are
+    /// matched by position everywhere, as on Android.
+    public let id: String?
     public let name: String
     public let channels: [Int]
 
-    public init(id: String, name: String, channels: [Int]) {
+    public init(id: String?, name: String, channels: [Int]) {
         self.id = id
         self.name = name
         self.channels = channels
@@ -50,13 +52,17 @@ public struct DeskConfiguration: Equatable, Sendable {
     public static let maximumGroups = 16
 
     public let sourceChannels: UInt8
-    public let sampleRate: UInt32
+    /// The rate the desk named, or nil when the `config` carried none; every audio datagram
+    /// carries the rate that matters.
+    public let sampleRate: UInt32?
     public let groups: [ChannelGroup]
-    public let channels: [SourceChannel]
+    /// Exactly one per source channel, or nil when the desk sent no details (an older desk), which
+    /// a screen shows differently from details that name nothing.
+    public let channels: [SourceChannel]?
 
     public init(
-        sourceChannels: UInt8, sampleRate: UInt32, groups: [ChannelGroup],
-        channels: [SourceChannel]
+        sourceChannels: UInt8, sampleRate: UInt32?, groups: [ChannelGroup],
+        channels: [SourceChannel]?
     ) {
         self.sourceChannels = sourceChannels
         self.sampleRate = sampleRate
@@ -152,6 +158,10 @@ public struct DeskError: Equatable, Sendable {
 public enum ServerMessage: Equatable, Sendable {
     case configuration(DeskConfiguration)
     case mixAck(MixReport)
+    /// A `mix_ack` numbered `sequence` whose mix could not be read. It still answers that number,
+    /// as Android's does (`ControlChannel.kt:172-176`), so the phone's mix it answers is not left
+    /// waiting for an answer that already came; there is just nothing to show.
+    case unreadableMixAck(sequence: UInt64)
     case mixState(MixReport)
     case playbackBuffer(PlaybackBufferSetting)
     case redundancyHold(blocks: UInt8)
@@ -170,9 +180,10 @@ public enum ServerMessage: Equatable, Sendable {
             case "config":
                 .configuration(try decoder.decode(WireConfiguration.self, from: data).value)
             case "mix_ack":
-                .mixAck(try decoder.decode(WireMixReport.self, from: data).value(sequenced: true))
+                try Self.mixAck(decoding: data, using: decoder)
             case "mix_state":
-                .mixState(try decoder.decode(WireMixReport.self, from: data).value(sequenced: false))
+                // The desk never numbers a push; a number on one answers nothing this phone sent.
+                .mixState(try decoder.decode(WireMixReport.self, from: data).value(sequence: nil))
             case "playback":
                 .playbackBuffer(try decoder.decode(WirePlayback.self, from: data).value)
             case "redundancy":
@@ -207,6 +218,26 @@ extension ServerMessage {
         }
     }
 
+    /// A `mix_ack`, read as Android reads one (`ControlChannel.kt:169-177`). A numbered ack whose mix
+    /// cannot be read still answers its number, as ``unreadableMixAck(sequence:)``.
+    ///
+    /// An ack with no number whose mix cannot be read is refused like any unreadable report. Android
+    /// never reads the mix of an unnumbered ack and only counts it as acknowledged; this client has
+    /// no message for "acknowledged, nothing to read", and the desk numbers the answer to every
+    /// numbered `mix` (`apps/server/src/control.rs:2530-2570`), so that difference is named here
+    /// rather than modelled.
+    fileprivate static func mixAck(decoding data: Data, using decoder: JSONDecoder) throws
+        -> ServerMessage
+    {
+        let sequence = try decoder.decode(WireSequence.self, from: data).value
+        do {
+            return .mixAck(try decoder.decode(WireMixReport.self, from: data).value(sequence: sequence))
+        } catch {
+            guard let sequence else { throw error }
+            return .unreadableMixAck(sequence: sequence)
+        }
+    }
+
     /// Runs `build` and turns a missing required key into
     /// ``ServerMessageError/missingField(_:inMessageType:)``, so one translation covers every
     /// message instead of each one catching for itself.
@@ -226,6 +257,32 @@ extension ServerMessage {
     }
 }
 
+/// Decodes an element when it can and yields nil when it cannot, so one unreadable entry never
+/// costs the whole list it sits in.
+private struct Lenient<Value: Decodable>: Decodable {
+    let value: Value?
+
+    init(from decoder: any Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
+
+/// A `config`, read as leniently as the Android client reads it (`ControlChannel.kt:158-167`,
+/// `parseGroups` at `:642-658`, `parseChannelDetails` at `:669-680`). The desk added fields over
+/// time (the channel details after the groups, a group's `id` after its name and channels), so a
+/// phone that insisted on every field would lose the whole configuration to an older desk.
+///
+/// - `source_channels` is the one field it cannot do without.
+/// - `sample_rate` is read when present; Android never reads it, and every audio datagram carries
+///   the rate that matters.
+/// - `groups`: anything but a list is none; an entry that is not an object or has no name is
+///   skipped; `id` is optional; a member channel that does not decode as a whole number, or is
+///   negative, is dropped. Android's `optString` and `optInt` coerce where this drops (a name of
+///   `7` becomes "7", a channel of `2.5` or "3" becomes 2 or 3); the desk only ever sends names
+///   and whole numbers, so this is the one place the two read garbage differently.
+/// - `channels`: anything but a list is no details at all (an older desk), which is not the same as
+///   empty details; a list becomes exactly `source_channels` entries, an entry that is not an
+///   object or a field of the wrong type reading as the default, an unknown kind as `other`.
 private struct WireConfiguration: Decodable {
     let value: DeskConfiguration
 
@@ -236,40 +293,103 @@ private struct WireConfiguration: Decodable {
         case channels
     }
 
+    /// A channel the engineer never touched: no name, kind `other`, shown, not linked.
+    private static let untouched = SourceChannel(
+        name: "", kind: .other, isHidden: false, isLinkedToNext: false)
+
     private struct WireGroup: Decodable {
-        let id: String
-        let name: String
-        let channels: [Int]
+        let group: ChannelGroup
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case channels
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            guard let name = try? container.decodeIfPresent(String.self, forKey: .name), !name.isEmpty
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "a group with no name"))
+            }
+            let members = try? container.decodeIfPresent([Lenient<Int>].self, forKey: .channels)
+            group = ChannelGroup(
+                id: try? container.decodeIfPresent(String.self, forKey: .id),
+                name: name,
+                channels: (members ?? []).compactMap(\.value).filter { $0 >= 0 })
+        }
     }
 
     private struct WireChannel: Decodable {
-        let name: String
-        let kind: String
-        let hidden: Bool
-        let link: Bool
+        let channel: SourceChannel
+
+        private enum CodingKeys: String, CodingKey {
+            case name
+            case kind
+            case hidden
+            case link
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let kind = try? container.decodeIfPresent(String.self, forKey: .kind)
+            channel = SourceChannel(
+                name: (try? container.decodeIfPresent(String.self, forKey: .name)) ?? "",
+                // An unknown kind is shown as `other`, which is the desk's own contract.
+                kind: kind.flatMap(ChannelKind.init(rawValue:)) ?? .other,
+                isHidden: (try? container.decodeIfPresent(Bool.self, forKey: .hidden)) == true,
+                isLinkedToNext: (try? container.decodeIfPresent(Bool.self, forKey: .link)) == true)
+        }
     }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let count = Int(try container.decode(UInt8.self, forKey: .sourceChannels))
+        let groups = try? container.decodeIfPresent([Lenient<WireGroup>].self, forKey: .groups)
+        let details = try? container.decodeIfPresent([Lenient<WireChannel>].self, forKey: .channels)
         value = DeskConfiguration(
-            sourceChannels: try container.decode(UInt8.self, forKey: .sourceChannels),
-            sampleRate: try container.decode(UInt32.self, forKey: .sampleRate),
-            groups: try container.decodeIfPresent([WireGroup].self, forKey: .groups)?
-                .map { ChannelGroup(id: $0.id, name: $0.name, channels: $0.channels) } ?? [],
-            channels: try container.decodeIfPresent([WireChannel].self, forKey: .channels)?
-                .map {
-                    SourceChannel(
-                        name: $0.name,
-                        // An unknown kind is shown as `other`, which is the desk's own contract.
-                        kind: ChannelKind(rawValue: $0.kind) ?? .other,
-                        isHidden: $0.hidden,
-                        isLinkedToNext: $0.link)
-                } ?? [])
+            sourceChannels: UInt8(count),
+            sampleRate: try? container.decodeIfPresent(UInt32.self, forKey: .sampleRate),
+            groups: (groups ?? []).compactMap { $0.value?.group },
+            channels: details.map { entries in
+                (0..<count).map { index in
+                    entries.indices.contains(index)
+                        ? entries[index].value?.channel ?? Self.untouched : Self.untouched
+                }
+            })
     }
 }
 
+/// The number of the phone's mix an answer names (`seq`), read as Android's `answeredSequence`
+/// reads it (`ControlChannel.kt:631`): a number that is not negative names one, and anything else
+/// names none without costing the message. Android cuts a fraction off (`1.5` names 1) where this
+/// names none; the desk only ever echoes the whole number the phone sent.
+private struct WireSequence: Decodable {
+    let value: UInt64?
+
+    private enum CodingKeys: String, CodingKey { case seq }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = try? container.decodeIfPresent(UInt64.self, forKey: .seq)
+    }
+}
+
+/// A whole mix report (`mix_ack`, `mix_state`), read as Android's `parseMixReport` and
+/// `parseEngineerControls` read one (`ControlChannel.kt:601-628`).
+///
+/// - The mix is required whole: the master volume, the level cap, the mute and all five lists. The
+///   desk always sends every field, so a report missing one, or with an entry of the wrong type, is
+///   unreadable: a push is refused and never applied, and a numbered ack answers its number with
+///   nothing to show. Android's `getInt` and `getBoolean` coerce where this refuses (a level of
+///   `2.5` or `"3"`, a mute of `"true"`); the desk never sends either.
+/// - The engineer's controls came later and are read leniently, so a desk that predates them still
+///   drives this client. `engineer_limit_percent` is any number, held to 0-100 and cut to its whole
+///   part, and anything else is no limit; `locked` locks the entries that are `true` and no other,
+///   and anything but a list locks nothing; `following` is a string, an empty one still a leader,
+///   and anything else is nobody.
 private struct WireMixReport: Decodable {
-    private let sequence: UInt64?
     private let volumePercent: Int
     private let maxLevelPercent: Int
     private let muted: Bool
@@ -278,12 +398,11 @@ private struct WireMixReport: Decodable {
     private let channelMutes: [Bool]
     private let channelSolos: [Bool]
     private let groupLevels: [Int]
-    private let engineerLimitPercent: Int?
+    private let engineerLimitPercent: Int
     private let locked: [Bool]?
     private let following: String?
 
     private enum CodingKeys: String, CodingKey {
-        case seq
         case volumePercent = "volume_percent"
         case maxLevelPercent = "max_level_percent"
         case muted
@@ -299,26 +418,30 @@ private struct WireMixReport: Decodable {
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        sequence = try container.decodeIfPresent(UInt64.self, forKey: .seq)
         volumePercent = try container.decode(Int.self, forKey: .volumePercent)
         maxLevelPercent = try container.decode(Int.self, forKey: .maxLevelPercent)
         muted = try container.decode(Bool.self, forKey: .muted)
-        channelGains = try container.decodeIfPresent([Int].self, forKey: .channels) ?? []
-        pans = try container.decodeIfPresent([Int].self, forKey: .pans) ?? []
-        channelMutes = try container.decodeIfPresent([Bool].self, forKey: .mutes) ?? []
-        channelSolos = try container.decodeIfPresent([Bool].self, forKey: .solos) ?? []
-        groupLevels = try container.decodeIfPresent([Int].self, forKey: .groupLevels) ?? []
-        engineerLimitPercent = try container.decodeIfPresent(
-            Int.self, forKey: .engineerLimitPercent)
-        locked = try container.decodeIfPresent([Bool].self, forKey: .locked)
-        following = try container.decodeIfPresent(String.self, forKey: .following)
+        channelGains = try container.decode([Int].self, forKey: .channels)
+        pans = try container.decode([Int].self, forKey: .pans)
+        channelMutes = try container.decode([Bool].self, forKey: .mutes)
+        channelSolos = try container.decode([Bool].self, forKey: .solos)
+        groupLevels = try container.decode([Int].self, forKey: .groupLevels)
+
+        // Read as a `Double` because Kotlin's `Number.toInt()` takes any number, a fraction too.
+        // Held to the range before it becomes an `Int`, so a huge number cannot trap the
+        // conversion (JSON has no NaN).
+        let limit = try? container.decodeIfPresent(Double.self, forKey: .engineerLimitPercent)
+        engineerLimitPercent =
+            limit.map { Int($0.clamped(to: 0...100)) } ?? MixReport.noEngineerLimitPercent
+        let locked = try? container.decodeIfPresent([Lenient<Bool>].self, forKey: .locked)
+        self.locked = locked.map { entries in entries.map { $0.value == true } }
+        following = try? container.decodeIfPresent(String.self, forKey: .following)
     }
 
-    /// `sequenced` is false for `mix_state`, which the desk never numbers; a number on one is
-    /// ignored rather than reported as the answer to a mix this phone sent.
-    func value(sequenced: Bool) -> MixReport {
+    /// The report numbered `sequence`: the number of the phone's mix a `mix_ack` answers, or nil.
+    func value(sequence: UInt64?) -> MixReport {
         MixReport(
-            sequence: sequenced ? sequence : nil,
+            sequence: sequence,
             volumePercent: volumePercent,
             maxLevelPercent: maxLevelPercent,
             muted: muted,
@@ -327,8 +450,8 @@ private struct WireMixReport: Decodable {
             channelMutes: channelMutes,
             channelSolos: channelSolos,
             groupLevels: groupLevels,
-            // A desk that predates the engineer's controls sends neither: no limit, nothing locked.
-            engineerLimitPercent: engineerLimitPercent ?? MixReport.noEngineerLimitPercent,
+            engineerLimitPercent: engineerLimitPercent,
+            // A desk that predates the locks sends none: nothing locked.
             locked: locked ?? [Bool](repeating: false, count: channelGains.count),
             following: following)
     }

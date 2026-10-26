@@ -212,6 +212,38 @@ internal class PmonPlayer(
             }
         }
 
+        // The link report rides on the loop's wake-ups: every packet and every receive timeout passes
+        // here, so a report is at most one timeout late, and the track's underrun count is read only
+        // when one is due.
+        fun reportIfDue() {
+            val nowMs = System.nanoTime() / NANOS_PER_MILLISECOND
+            if (!linkStats.isDue(nowMs)) {
+                return
+            }
+            // The cushion aimed for and the audio queued right now end the interval, on the track and
+            // before it; the report holds them as primitives.
+            val track = audioTrack
+            val extras = PlaybackLatency.reportExtras(
+                packetFrames = packetFrames,
+                cushionPackets = cushion.cushionPackets,
+                playbackRate = playbackRate,
+                timestampRead = track != null && track.getTimestamp(audioTimestamp),
+                framesWritten = framesWritten,
+                presentedFrame = audioTimestamp.framePosition,
+                appliedBufferFrames = appliedBufferFrames,
+                holdPackets = playout.holdPackets,
+                queuedFrames = queue.queuedFrames,
+            )
+            playout.poll(
+                nowMs,
+                track?.underrunCount ?: 0,
+                cushionMs = extras.cushionMs,
+                backlogMs = extras.backlogMs,
+            )?.let { report ->
+                listener.onLinkStats(report)
+            }
+        }
+
         try {
             try {
                 InetAddress.getByName(host)
@@ -251,37 +283,12 @@ internal class PmonPlayer(
                         listener.onError(error.message ?: "invalid PMON packet")
                     }
 
-                    // The link report rides on the loop's own wake-ups: every packet and every
-                    // receive timeout passes here, so a report is at most one timeout late, and the
-                    // track's underrun count is read only when one is due.
-                    val nowMs = System.nanoTime() / NANOS_PER_MILLISECOND
-                    if (linkStats.isDue(nowMs)) {
-                        // The cushion aimed for and the audio queued right now end the interval, on the
-                        // track and before it; the report holds them as primitives.
-                        val track = audioTrack
-                        val extras = PlaybackLatency.reportExtras(
-                            packetFrames = packetFrames,
-                            cushionPackets = cushion.cushionPackets,
-                            playbackRate = playbackRate,
-                            timestampRead = track != null && track.getTimestamp(audioTimestamp),
-                            framesWritten = framesWritten,
-                            presentedFrame = audioTimestamp.framePosition,
-                            appliedBufferFrames = appliedBufferFrames,
-                            holdPackets = playout.holdPackets,
-                            queuedFrames = queue.queuedFrames,
-                        )
-                        playout.poll(
-                            nowMs,
-                            track?.underrunCount ?: 0,
-                            cushionMs = extras.cushionMs,
-                            backlogMs = extras.backlogMs,
-                        )?.let { report ->
-                            listener.onLinkStats(report)
-                        }
-                    }
+                    reportIfDue()
 
                     try {
-                        while (true) {
+                        // While a surplus lasts this loop may not return to the receive above for a
+                        // long time, so it checks for a stop on every packet too.
+                        while (running.get()) {
                             val packet = queue.poll() ?: break
                             val packetPlayedAtNanos = System.nanoTime()
                             packetsReceived++
@@ -358,9 +365,13 @@ internal class PmonPlayer(
                                 framesWritten += writtenSamples / PlaybackLatency.CHANNELS
                             }
                             // What arrived while the write was blocked joins the queue now, so the next
-                            // packet's measure and the stats below see it.
+                            // packet's measure and the stats below see it. A surplus keeps this loop
+                            // busy, so the wake-up work the receive loop does per packet happens here
+                            // too: the desk's hold is re-read and the link report is never held back.
+                            playout.wake(mixState.redundancyHoldPackets)
                             drainWaiting(channel, drained) { length -> ingest(length) }
                             queueDue()
+                            reportIfDue()
                             if (audioTrack.getTimestamp(audioTimestamp)) {
                                 // Everything not heard yet: on the track and waiting before it.
                                 val instantBacklog = PlaybackLatency.backlogMs(

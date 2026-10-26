@@ -116,7 +116,9 @@ struct VerticalFader: View {
                 shadowed.fill(
                     Path(roundedRect: capRect, cornerRadius: 3), with: .color(BandEarColors.faderThumb))
             }
-            let line = CGRect(x: capRect.minX, y: capRect.minY + 6, width: capRect.width, height: 2)
+            let lineHeight: CGFloat = 2
+            let line = CGRect(
+                x: capRect.minX, y: capRect.midY - lineHeight / 2, width: capRect.width, height: lineHeight)
             layer.fill(Path(line), with: .color(BandEarColors.ground))
         }
     }

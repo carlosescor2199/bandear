@@ -20,9 +20,14 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   codecs, the jitter policy and the mix domain as plain Swift with no SwiftUI, UIKit or AVFoundation
   import. It runs under `swift test` from the command line: no `.xcodeproj`, no simulator, no
   Homebrew tooling. The app shell composes it later (T6) and stays thin.
-- **No generated project file yet.** XcodeGen and Tuist are both absent from this machine and a
-  hand-written `.xcodeproj` is an unmergeable blob. The decision is deferred to T6, where the shell
-  is the first thing that actually needs one.
+- **A committed `.xcodeproj` with synchronized folders (T6, user's decision on 2026-10-21).** T1
+  deferred the choice because a hand-written project file used to list every source file and was
+  an unmergeable blob. Xcode 16 and later reference a folder instead
+  (`PBXFileSystemSynchronizedRootGroup`), and this Xcode's own prototype for a new app project
+  (`IDEFoundation.framework/…/UntitledAppProjectPrototype/Project.xcodeproj/project.pbxproj`) is
+  334 lines with no source file listed, so adding Swift files never touches the project. Chosen
+  over XcodeGen (an extra tool for every contributor and CI) and Tuist (more than one app target
+  and one local package need). The project is based on that prototype rather than invented.
 - **Bonjour only for discovery (T4).** The `MLNK` broadcast beacon the Android client uses
   (`apps/server/src/discovery.rs:9-26`) is unreachable from iOS without
   `com.apple.developer.networking.multicast`. `NWBrowser` over `_bandear._tcp` needs only the
@@ -111,8 +116,39 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
   (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
   storage, which the pure mix module does not have.
-- [ ] T6 — App shell and project file (route: to be decided). SwiftUI app, `Info.plist` with
-  `NSLocalNetworkUsageDescription` and `NSBonjourServices`, composition root over `BandEarKit`.
+- [x] T6 — App shell, project file and control session. Grown since first written: the follow-ups
+  of T4 and T5c-T5e handed it the control channel, which no task held. Sliced:
+  - [x] T6a — The project and a shell that builds (route: delegated writer; trigger: the
+    long-session backstop). `apps/ios/BandEar/BandEar.xcodeproj` from Xcode's app prototype with a
+    synchronized `BandEar/` folder; target and product `BandEar`, bundle id `com.bandear.ios`, iOS
+    16 deployment target; the local package `../BandEarKit` linked (`BandEarProtocol`,
+    `BandEarDiscovery`, `BandEarMix`); `NSBonjourServices` = `_bandear._tcp` and an
+    `NSLocalNetworkUsageDescription` in the built app's `Info.plist`; a SwiftUI shell (iOS 16, so
+    `ObservableObject`, not `@Observable`) that lists the desks `BonjourDeskBrowser` finds and
+    says when local network access is denied. Proof of life: built for the simulator, launched on
+    one, a desk announced with `dns-sd -R` appears.
+  - [x] T6b — The control session, in a `BandEarSession` module of `BandEarKit` (route: delegated
+    writer; trigger: the long-session backstop). A `ControlTransport` port with a fake for tests and
+    a `WebSocketTransport` adapter (`NWConnection` with `NWProtocolWebSocket`, which connects to a
+    Bonjour service endpoint itself and answers the desk's pings); a `ControlSession` core that
+    registers on open (no capabilities until T7 implements them, so the desk sends nothing this
+    build cannot use), then sends the opening mix, routes every desk message (`config` to the
+    reducer directly, reports through `MixEvent(reportedBy:)`), runs every event through
+    `reducedNumberingSends` and sends `outgoingMix()` whenever `sync.latest` grew, keeps the desk's
+    playback and redundancy settings for T7, and sends `stats` only while open. No app changes, no
+    reconnect.
+  - [x] T6c — Session robustness, in `BandEarSession` (route: delegated writer; trigger: the
+    long-session backstop). `ReconnectPolicy.kt` (0.5, 1, 2, 4 s, then 5 s; reset on the first
+    message, not on open) and its tests; a connect timeout (a listed Bonjour desk that is gone, or
+    a host dropping SYNs, otherwise leaves the session `connecting` for good); the phone's own pings
+    so a dead link is noticed (Android pings every 5 s, `ControlTransport.kt:19,77`); `connection`
+    set before `.sessionStarted` and `.sessionEnded` are reduced; tests for the transport's failure
+    paths and for its release. See Follow-ups, "T6c inputs from T6b".
+  - [x] T6d — Identity, persistence and the app (route: delegated writer; trigger: the long-session
+    backstop). A stable client id
+    (`ClientIdentity.kt`); the musician's name and channel kept across launches; the Android tests
+    T5c-T5e left to T6 that need storage; connecting from the desk list to a session the screens
+    observe. Ends with the end-to-end check against the user's own desk machine.
 - [ ] T7 — UDP receive path and AVAudioEngine output (route: to be decided).
 - [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
 
@@ -143,6 +179,87 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   `aReconnectSendsTheMixAgainUnderItsNewestNumberAndItsAnswerSettlesIt`,
   `ControlChannelReconnectTest.everyOpenRegistersFirstAndThenSendsTheMix`,
   `anAckWithoutANumberOnlySaysTheServerHoldsTheMix`, and the storage tests listed under T5d.
+- **T8 inputs from T6a's review** (lineage `review-94c7ed93bf2370fa`, approved; all four
+  findings non-blocking and, in the review's own words, separate later work):
+  `R4-no-recovery-after-terminal-status` (after `localNetworkDenied` or `unavailable`, coming back
+  from Settings fires no `onAppear`, so the list stays stuck: restart on `scenePhase` and offer a
+  retry); `R4-unbounded-searching-state` ("Searching for desks…" can last forever with no hint);
+  `R3-repeated-start` and `R3-untested-run-guard` (`DeskDiscoveryModel.swift`: the run guard has
+  no test in the repository; moving it into `BandEarKit`, where `swift test` reaches it, would close
+  that).
+- **T8 inputs from T6a.** Discovery is never restarted when the app comes back from the
+  background or after the browser fails for good, because the root view's appear and disappear
+  rarely fire: restart it on `scenePhase` (the verifier's smallest fix; not reproducible without a
+  device). A sample rate shows as "48.000 Hz" under a Spanish locale, correct grouping but easy to
+  misread as 48: say "48 kHz". The status lines are provisional. "Designed for iPad/iPhone" on Mac
+  and visionOS is still on by default; whether to offer it there is a distribution choice for M4.
+- **T6c inputs from T6b** (its verifier and its review, lineage `review-2d1cf4a399f54d0d`,
+  approved, every finding non-blocking):
+  - `R3-restart-sends-on-old-connection` and `R3-stop-reduces-after-close-while-connected`
+    (`ControlSession.swift:88-89,105-108`): `start` reduces `.sessionStarted` while `connection` is
+    still `.connected` to the previous desk, and `stop` reduces `.sessionEnded` after closing but
+    while still `.connected`. Nothing is sent today, because neither event numbers a send, but the
+    guard rests on that and on the transport's own ordering. Set `connection` to `.connecting` or
+    `.idle` before reducing, and pin with tests that nothing reaches the old connection on a replace
+    and nothing is sent on a stop from connected.
+  - `R4-no-connect-timeout` (`WebSocketTransport.swift:99-105`), also the verifier's: an
+    `NWConnection` to an unannounced Bonjour service stays preparing with no timeout (it completes
+    on its own once the desk is announced again), and a typed host dropping SYNs waits for the
+    system's TCP timeout or longer.
+  - No dead-link detection: the phone only answers the desk's pings, so a Wi-Fi drop with no FIN
+    leaves the session `connected`. Android pings every 5 s.
+  - `R3-transport-failure-paths-unproved` (`WebSocketTransport.swift:115-125`): `.waiting` to
+    `.failed`, a receive error, a stream ending with no opcode and the `hostPort` fallback have no
+    test in any run. The verifier saw a refused port and an unknown host report `.failed` at once.
+  - The verifier's mutant M7 (the connection handler holding the transport strongly) was caught
+    only by its own probe; no test in this repository catches that retain cycle.
+  - A Close frame right behind another message is reported as `.failed` ("Socket is not
+    connected") rather than `.closed`. The desk never sends a Close frame (`control.rs:952` reads
+    one, then drops the stream); mapping that receive error to `.closed` is the smallest fix if it
+    matters for reconnecting.
+  - `close()` cancels without waiting for the desk's close reply, so the desk saw a reset in 4 of
+    10 rounds. Harmless; noted.
+- **T8 input from T6b's verifier.** A typed `[::1]` becomes `[[::1]]` and fails; Android accepts the
+  brackets. Strip them in the connection form.
+- **From T6c's verifier and review** (lineage `review-4e409e696a4429d2`, approved, both findings
+  non-blocking):
+  - `R3-001`: the transport's connect deadline and ping clock (`WebSocketTransport.swift:197-256`)
+    are exercised only by the opt-in round trip, so a default `swift test` would pass a regression
+    in cancelling the deadline on ready or in the pong bookkeeping. Three independent looks (writer,
+    verifier, review) named it. The fix is an injected clock on the transport, so the clocks run
+    under a manual clock in the default suite; worth a small unit of its own after T6d.
+  - `R3-002` (`ControlSession.swift:211-219`): a session that ends on its own through
+    `.sessionEnded` (the path T7's audio receiver will take) goes idle but keeps the outage's
+    `connectionError`. Clear it when the session ends. Done in T6d.
+  - For T8: `connectionError` stays set while `connected` until the desk's first message (the "one
+    outage" rule); do not show it as a current error.
+- **Desk-side findings from the first end-to-end run (server; out of this feature's scope, the
+  user's call).** The desk's control channel listens on IPv4 only (`0.0.0.0`,
+  `apps/server/src/control.rs:357`) while its Bonjour announcement carries IPv6 link-local
+  addresses too, including the loopback's `fe80::1`, published on `en1` as well as `lo0`. A client
+  that resolves the service where only IPv6 addresses exist reaches nothing; the iOS client now
+  forces IPv4 (`4694c2e`), and listening dual-stack or announcing IPv4 only would fix it on the desk.
+  Separately, with the desk running on macOS the Android discovery beacon fails on every send with
+  `No route to host` (os error 65): a broadcast to `255.255.255.255` needs an interface on macOS,
+  so an Android phone cannot find a macOS desk by beacon.
+- **T8 inputs from T6d's verifier.** A refused `start` still saves a client id (the id is resolved
+  as an argument before `Registration` throws; build the registration first). An empty name field
+  stores the device's name, so the next launch shows it, where Android keeps what was typed. A
+  session that ends on its own leaves `SessionView` on screen with the desk set (T7 or T8). A stored
+  `Bool` or a whole `Double` reads as a channel through `NSNumber` bridging; the app never writes
+  either.
+- **T7 inputs from T6b: align the `playback` and `redundancy` decoders with Android.** The T2b
+  decoder reads an unusable message (an unknown mode, `fixed` with no `ms`, `ms` outside 5-500, a
+  delay outside 0-4) as Auto or clamps it; Android ignores such a message and keeps the setting it
+  has. That reading was a guess made in T2b, the same kind T2c corrected for `config`. Parent's
+  decision: ignore them as Android does, done in T7 before it announces `playback.buffer` and
+  `redundancy.hold`, since only then can the desk send them. Six parity cases in
+  `ControlSessionParityTests` are marked `withKnownIssue`, which fails the suite the day the
+  decoder agrees, so the markers come off with the fix. Also for T7: `LinkStats` does not round the
+  extras to a hundredth (Android does; one more known issue), and leaves `recovered` out when nil,
+  where Android always sends it.
+- **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
+  response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **`BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
   playback timing. When T7 adds the player that depends on them, move them to a
   `BandEarPlayback` module so every module names its feature.
@@ -579,4 +696,197 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   (43 paths, 8 550 lines).
 - T5 complete: the mix module holds the channel layout, edits and `config`, reconciliation with
   the desk, More of me, and the outgoing mix. 341 tests: 148 protocol, 164 mix, 29 discovery.
-- Pending: T6 (app shell and project file, with the `.xcodeproj` decision still open), T7, T8, T9.
+- 2026-10-21, user's decision on how the Xcode project is defined: "`.xcodeproj` versionado
+  (Recommended)", the committed project with synchronized folders, over XcodeGen and Tuist.
+  Verified before it was offered: this Xcode's `Xcode3Core` knows
+  `PBXFileSystemSynchronizedRootGroup`, and its own new-app prototype (334 lines) lists only the
+  `.app` product, no source file. T6 sliced into T6a-T6c (see Tasks).
+- T6a done (route: delegated writer; trigger: the long-session backstop), within seven named
+  surfaces. What landed: `apps/ios/BandEar/BandEar.xcodeproj` built on Xcode's own app prototype
+  (new object IDs, `MyApp` renamed, its placeholder `PROJECT_UNIQUE_VALUE` dropped, `SWIFT_VERSION`
+  6.0), the synchronized `BandEar/` folder, `com.bandear.ios`, iOS 16, the local package
+  `../BandEarKit` with its three products, and a shared `BandEar` scheme in Xcode's own template
+  format. `NSBonjourServices` cannot be set from a build setting (`NSLocalNetworkUsageDescription`
+  can), so `BandEar/Info.plist` holds both and is merged through `INFOPLIST_FILE`, kept out of the
+  copied resources by a synchronized-group membership exception. The shell:
+  `DeskDiscoveryModel` (`@MainActor ObservableObject`, callbacks hopped to the main queue, a run
+  counter dropping reports from a stopped or replaced run, `stop()` clearing to idle, `deinit`
+  stopping the browser) and `DeskListView`.
+  - Parent change before commit: the prototype is multi-platform; the target is now iOS only
+    (`SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"`, `TARGETED_DEVICE_FAMILY = "1,2"`,
+    `SDKROOT = iphoneos`, the macOS-only sandbox settings removed), as the PRD asks. Rebuilt by the
+    parent: BUILD SUCCEEDED, no warning under `apps/ios/`, the built `Info.plist` showing
+    `com.bandear.ios`, `MinimumOSVersion` 16.0, `iPhoneSimulator` only, both network keys.
+  - Test-first exception: the shell holds no logic of its own (discovery is tested in
+    `BandEarKit`), so there is no meaningful unit RED; its proof is the build, the built
+    `Info.plist`, a fresh-copy build, the independent verifier and the simulator run below.
+  - Risk: items 4 and 6, named by the writer and agreed by the parent (async ordering in
+    `DeskDiscoveryModel`; no automated test covers the shell). An independent verifier ran: all
+    seven claims held, no blocker. It drove the unchanged model against a live `NWListener`
+    announcement from a scratch package, blocking the main thread so the browser's real reports
+    queued up before `stop()` or a second `start()`, and ran three mutants (no run check, no stop
+    in `deinit`, callbacks holding the model strongly), each caught. It left the workspace
+    untouched (`find -newer`). Its advisories are under Follow-ups.
+  - Proof of life on an iPhone 17 Pro simulator (iOS 27): the app showed "Searching for desks…";
+    a desk announced from the Mac with `dns-sd -R "BandEar on SIM-TEST" _bandear._tcp local 50001
+    v=1 sr=48000` appeared with its rate; stopping the announcement removed it on its own and the
+    app went back to searching. T4's no-timer decision holds on iOS too. The announcement was
+    visible on the local network for a few seconds.
+  - Work-unit commit: `b577761 feat(ios): add the Xcode project and a shell that lists Bonjour
+    desks`.
+  - Native review. Assessed with `--escalate-item 4`: against 07a8711 the whole branch came back
+    `high` and due (50 paths, 9 224 lines); the high-risk unit is reviewed alone, so it was
+    assessed against its parent 098577a: `high`, `review_due: true` (7 paths, 600 lines). The
+    preflight first asked for the untracked `.atl/` files to be declared (excluded, schema
+    `gentle-ai.review-intended-untracked-selection/v1` with `untracked_scope`,
+    `intended_untracked`, `expected_untracked_inventory`). The STATUS answering that submission,
+    run with only its own tokens, offered a START against 07a8711 (tree 95e8de7, the whole
+    branch); it was not run. Rerun with the original binding (`--base-ref=098577a
+    --committed-only=true`), the START targeted 825320c..46ba67f, T6a alone, lenses
+    `review-resilience` and `review-reliability`. Consent relayed: the user chose "Revisar este
+    cambio" (`granted`). Lineage `review-94c7ed93bf2370fa` created. Both in-process reviewer
+    captures then failed before starting (`invalid_request`, `mutation_outcome: not_started`,
+    `retry_safe: true`): the reviewer runs through the `claude` CLI, whose OAuth session had
+    expired and could not be refreshed. The bound STATUS still offers both slots; they are
+    relaunched once the user signs in again (`claude auth login`).
+  - The user signed in again (`claude auth login`). The bound STATUS still offered both slots;
+    relaunched concurrently in provider order, both captures completed in 33 s and the review
+    closed `approved` with four non-blocking findings (under Follow-ups, T8). Acknowledged with
+    the provider's exact `review.acknowledge-approved` invocation: `gentle-ai.review-acknowledged/v1`,
+    `action: acknowledged`, `authority: burned`. The reviewed boundary is now `b577761`;
+    assessments from here on use it as `--base-ref`. The slice before T6a (07a8711..098577a, T1 to
+    T5) was assessed `medium` and `under_budget` throughout and was never reviewed.
+- 2026-10-21, user's decision on how T6 is checked against a real desk: "Tu máquina del desk
+  (Recommended)": the user starts the desk on their own machine on this network and the simulator
+  connects over the LAN; nothing is downloaded or built on this Mac. The alternatives were building
+  the desk here (no crates cached, so a full dependency download, and the macOS microphone prompt,
+  since the desk has no demo mode and captures a real device) or the fake server alone. The check
+  needs the app wiring, so it moved to the end of T6c, and T6b stays inside `BandEarKit`.
+- T6b done (route: delegated writer; trigger: the long-session backstop), within the three named
+  surfaces. What landed in a new `BandEarSession` module (388 source lines):
+  - `ControlTransport` and `TransportEvent`, as specified; a fake in the tests.
+  - `ControlSession` (`@MainActor`): `mixSession`, `connection` (idle, connecting, connected,
+    disconnected, failed), `mixHeldByDesk` (Android's "acknowledged"), the desk's `playbackBuffer`
+    and `redundancyHoldBlocks` kept for T7, `lastError`, `stateDidChange`; `start` (throws on a
+    blank name; resets the buffer, the hold, the held flag and the last error, as Android's session
+    start does; a second `start` replaces the session), `stop`, `apply`, `send(stats:)`. Transport
+    events reach the main actor through `DispatchQueue.main.async`, which keeps them in order;
+    every connection is numbered and events from one stopped, replaced, closed or failed are
+    ignored, as Android ignores old sockets. `register` (no capabilities) then the opening mix on
+    open; `mix` and `stats` dropped while not connected; a socket closing does not end the session.
+  - `WebSocketTransport`: `NWConnection` with `autoReplyPing`, its state on its own queue, a
+    normal-closure frame on `close()`. One decision of the parent's did not hold: a typed desk was
+    to become `NWEndpoint.hostPort`, but Network's WebSocket client aborts with `ECONNABORTED`
+    before any handshake when given an IP address that way (IPv4 or IPv6; a `Host` header does not
+    help). A typed desk becomes `.url(ws://host:port)` instead, as Android connects
+    (`ControlChannel.kt:246`); IPv6 in brackets; a host no URL can hold falls back to `.hostPort`.
+    A Bonjour desk is `.service`, which Network resolves itself.
+  - Ports: 21 Android tests (9 new from `ControlChannelTest.kt`; the transport halves T5c left
+    for T6; two of `ControlChannelReconnectTest.kt` that need no reconnect; three of
+    `MonitorViewModelTest.kt`), 19 Swift-only tests, 2 endpoint-mapping tests. Skipped for T6c:
+    every reconnect and storage test, listed by the writer.
+  - The opt-in round trip (`BANDEAR_WS_IT=1`, `WebSocketTransportIntegrationTests`): by address in
+    0.7 s and over Bonjour in 1.6 s, the phone received the desk's `config`, the desk heard the
+    phone, three pings brought three pongs with the connection open, and closes from either side
+    were reported once. It announced `BandEar WS IT <8 hex>` for about 1.6 s.
+  - RED against the writer's stub: 39 of 40 failed with 66 issues, no crash; the one that passed
+    gained a `#require` and then failed on the stub. GREEN: all, with 7 known issues (the
+    divergences under Follow-ups). 14 mutations in a scratch copy, all caught; one only after
+    `aDeskReportThatNumbersAChangeSendsIt` was added for it.
+  - About 390 source and 1 300 test lines, over the ~400 heuristic, mostly the parity ports and a
+    WebSocket desk built inside the test process.
+- Parent checks: all eight changed paths inside the surfaces, `Package.swift` adding only the
+  product and two targets; `swift test` rerun by the parent: 43 session (7 known issues), 148,
+  164, 29; the writer's clean-copy build reported 0 warnings and the app still built; scratch
+  inspected and removed.
+- Work-unit commit: `fab5daf feat(ios): add the control session that speaks to the desk over a
+  WebSocket`.
+- Risk: items 4 and 6, named by the writer and agreed (the hop to the main queue and the guard
+  against old connections; `WebSocketTransport` covered only by the opt-in round trip). An
+  independent verifier was launched.
+  - Independent verifier: no blocker. Claims 1-5 and 7 held; 6 held for everything the desk sends
+    (the Close-frame case above is the one exception). It reproduced the `ECONNABORTED` finding on
+    its own (with `.hostPort` and an IP literal the desk accepts TCP and receives zero handshake
+    bytes), confirmed 491 events kept their order through the hop, the mix numbers 1, 2, 4, 5 with
+    3-4 dropped while down and the next open sending the newest, pongs echoing the desk's payload
+    and the phone surviving 12.5 s of a desk that drops silent clients after 10, and the session
+    and transport released after `stop()`. Ten mutants, all caught; M7 only by its probe. Workspace
+    untouched (`find -newer`).
+  - Native review: assessed with `--escalate-item 4` against the reviewed boundary `b577761`:
+    `high`, due (9 paths, 1 855 lines). START checked before it ran (base tree `46ba67f` =
+    `b577761`, candidate `8418926` = `HEAD`). Consent relayed; the user chose "Revisar este
+    cambio" (`granted`). Both reviewers completed in 55 s; `approved` with four non-blocking
+    findings (under Follow-ups, T6c). Acknowledged: `authority: burned`, lineage
+    `review-2d1cf4a399f54d0d`. The reviewed boundary is now `a0b94d8`.
+- T6 resliced: the robustness work the verifier and the review handed over is T6c, inside the
+  package and checked by `swift test`; identity, persistence, the app and the real-desk check are
+  T6d.
+- T6c done (route: delegated writer). `ReconnectPolicy` (0.5, 1, 2, 4 s, then 5 s; reset on the
+  desk's first message), an injected `ControlScheduler` (`MainQueueScheduler`; `ManualScheduler`
+  in tests), `ConnectionState` now idle, connecting, connected, reconnecting (`.disconnected` and
+  `.failed` removed: a running session always reconnects), `connectionError` once per outage,
+  `WebSocketTransport(connectTimeout: 10 s, pingInterval: 5 s)` failing a connection not open by
+  the deadline or whose ping's pong has not come back by the next one, and `connection` set before
+  `.sessionStarted`/`.sessionEnded` are reduced. Ports: all 12 of `ControlChannelReconnectTest.kt`,
+  5 of `ReconnectPolicyTest`, both `MonitorViewModelTest` reconnect tests; `ConnectionGenerationsTest`
+  covered through the session. RED 32 of 86 failing; GREEN 86 (7 known issues), 148, 164, 29;
+  opt-in round trip 17/17, six repeated runs. 21 mutations, 20 caught including the verifier's M7
+  retain cycle; the ordering fix's mutant is not catchable while neither session event can send.
+  Parent checks: all eleven paths inside the surfaces, `swift test` rerun, scratch removed.
+  Work-unit commit recorded in git log after `777d23e`.
+  - Risk: items 4 and 6, named by the writer (retry scheduling, stale-connection guards, the
+    transport's queue clocks; the clocks covered only by the opt-in round trip). PENDING: the
+    independent verifier and the native review (assess with `--escalate-item 4` against `a0b94d8`)
+    were not run, because the session hit its usage limit.
+- T6c checks, completed in a later session after the usage limit:
+  - Independent verifier: all nine claims held, no blocker. A real in-process desk restarted on the
+    same port (`allowLocalEndpointReuse`) was noticed in 0.006 s and the phone was back 0.30 s after
+    the restart, re-registered with the newest mix number; the backoff timeline matched Android's
+    across failures, an open with no message and a first message; a fuzz of 40 seeds by 400 steps
+    found no ordering violation; nine mutants caught. It confirmed the writer's claim from the code:
+    the mix number only grows on a sent change (`MixSession.swift:76`) and on restoring the
+    musician's own levels (`:229`, reached only from a desk report), so `.sessionStarted` and
+    `.sessionEnded` can never send, and the decision-4 reordering is defence in depth no test can
+    observe today.
+  - Native review: `--escalate-item 4` against `a0b94d8`, `high`, due (12 paths, 1 595 lines);
+    START checked (base `8418926` = `a0b94d8`, candidate `b10869b` = `HEAD`); the user chose
+    "Revisar este cambio" (`granted`); approved in 49 s with two non-blocking findings (above);
+    acknowledged, `authority: burned`, lineage `review-4e409e696a4429d2`. The reviewed boundary is
+    now `3540b25`.
+- T6d done (route: delegated writer). `MusicianStore` and `UserDefaultsMusicianStore`
+  (`bandear.client_id`, `bandear.musician_name`, `bandear.musician_channel`), `ClientIdentity`
+  (Android's `resolveClientId`, reusing `Registration`'s id rule), `ControlSession` taking the store
+  (name and remembered channel restored at construction, the channel stored only when the desk
+  announced it and forgotten when a `config` drops it, `R3-002` fixed), and the app's
+  `SessionModel`, name field, desk-to-session navigation and provisional `SessionView`. 115 session
+  tests; 14 of 14 mutations caught. The writer's early test runs left 64 empty
+  `com.bandear.tests.<UUID>.plist` files in `~/Library/Preferences` (`removePersistentDomain` leaves
+  the file); it switched to suites named by a path in a temp directory, and the parent removed the
+  64 after checking each was 42 bytes and matched the pattern. Work-unit commit `8597da5`.
+  - Independent verifier (item 6 named by the writer): all six claims held, no blocker; it drove the
+    real `inSession` binding of `DeskListView` and the model against fakes, and ran ten mutants, all
+    caught. It noticed the parent's uncommitted IPv4 change mid-run and verified `8597da5` without it.
+- End-to-end against the real desk (the user's choice of their own desk machine; asked to start it,
+  the parent built it on this Mac, which is that Mac mini: `cargo build -p personal-monitoring`, 24 s,
+  run with no arguments). The desk captured "Microsoft Teams Audio" (one channel, 48 kHz) and
+  announced "BandEar on Carloss-Mac-mini". On an iPhone 17 Pro simulator the app listed it with its
+  rate; the first connect showed "Reconnecting… not open after 10.0 seconds". Diagnosis: a manual
+  handshake to `192.168.1.54:50001` returned `101 Switching Protocols` and the desk's real `config`,
+  while both IPv6 link-local addresses were refused; the service had resolved over `lo0`, where the
+  announcement holds IPv6 only. Correction to what the parent first concluded: the old build was not
+  stuck for good, since the desk's log shows its retry registered over IPv4 at 18:23:07; the first
+  attempt simply lost 10 s. Fix (`4694c2e`, inline): `WebSocketTransport` requires IPv4; RED/GREEN on
+  a structural test of its parameters (`ip.version` `.any`, then `.v4`); the 18 opt-in round trips
+  still pass. Rebuilt and relaunched: the desk logged `control registration from
+  192.168.1.54:49934: 192.168.1.54:50000 as "iPhone 17 Pro"` about a second after the tap, the app
+  showed Connected with 1 strip (the desk's one channel), and the name stored by the previous run
+  was restored on relaunch. Disconnect ended the connection with no error on the desk, where the
+  connections killed by relaunching logged a reset without a closing handshake.
+- Native review of T6d and the IPv4 fix: `--escalate-item 6` against `3540b25`, `high`, due (19
+  paths, 958 lines); START checked (base `b10869b` = `3540b25`, candidate `d3ce3de` = `HEAD`); the
+  user chose "Revisar este cambio" (`granted`); approved in 45 s. Its four non-blocking findings are
+  the verifier's advisories found again independently (a refused start saving an id, the device
+  name stored for an empty field, `NSNumber` bridging), already under Follow-ups for T8.
+  Acknowledged; the reviewed boundary is now `2e151e7`.
+- T6 complete. Pending: T7, T8, T9, and the small unit for `R3-001` (an injected clock on the
+  transport, so its deadline and pings run in the default suite).

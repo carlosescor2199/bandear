@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "BandEarProtocol", targets: ["BandEarProtocol"]),
         .library(name: "BandEarDiscovery", targets: ["BandEarDiscovery"]),
         .library(name: "BandEarMix", targets: ["BandEarMix"]),
+        .library(name: "BandEarSession", targets: ["BandEarSession"]),
     ],
     targets: [
         .target(name: "BandEarProtocol"),
@@ -23,5 +24,13 @@ let package = Package(
         // depends on the protocol module; nothing in the protocol depends on the mix.
         .target(name: "BandEarMix", dependencies: ["BandEarProtocol"]),
         .testTarget(name: "BandEarMixTests", dependencies: ["BandEarMix", "BandEarProtocol"]),
+        // The control session joins the other three: it connects to a desk found by discovery,
+        // speaks the protocol over the connection, and runs the mix through it.
+        .target(
+            name: "BandEarSession",
+            dependencies: ["BandEarProtocol", "BandEarMix", "BandEarDiscovery"]),
+        .testTarget(
+            name: "BandEarSessionTests",
+            dependencies: ["BandEarSession", "BandEarProtocol", "BandEarMix", "BandEarDiscovery"]),
     ]
 )

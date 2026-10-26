@@ -131,7 +131,7 @@ export const DICTIONARY = Object.freeze({
     "dl.android.note": "Allow installs from your browser, then open the APK.",
     "dl.android.btn": "Download .apk",
     "dl.ios.file": "Coming soon",
-    "dl.ios.note": "An iOS app for musicians is on the roadmap.",
+    "dl.ios.note": "The iPhone app is built. It reaches the App Store once the project has an Apple Developer account.",
     "dl.ios.btn": "See the roadmap",
 
     "faq.eyebrow": "FAQ",
@@ -147,7 +147,7 @@ export const DICTIONARY = Object.freeze({
     "faq.a4":
       "Processing adds 0 ms: filters and dynamics have no look-ahead and effects are wet returns. The engine builds every mix once per 5.3 ms block, and with 32 inputs and 16 musicians it uses about 18% of each block. The total delay you hear depends on your Wi-Fi and each phone's buffer, which you can set from the desk.",
     "faq.q5": "Is there an iOS app?",
-    "faq.a5": "Not yet — an iOS app for musicians is on the roadmap.",
+    "faq.a5": "Yes, it is built and in the repository (iOS 16+). It reaches the App Store and TestFlight once the project has an Apple Developer account, which costs 99 USD a year; sponsoring helps make that happen. Developers with a Mac can already build it from source.",
     "faq.q6": "Why does my computer show a security warning?",
     "faq.a6":
       "The Windows installer is not signed yet: choose <em>More info → Run anyway</em>. The Mac app is not notarized by Apple: open it once, then go to <em>System Settings → Privacy &amp; Security</em> and choose <em>Open Anyway</em>. Fully signed installers are on the roadmap.",
@@ -277,7 +277,7 @@ export const DICTIONARY = Object.freeze({
     "dl.android.note": "Permite las instalaciones desde tu navegador y luego abre el APK.",
     "dl.android.btn": "Descargar .apk",
     "dl.ios.file": "Muy pronto",
-    "dl.ios.note": "Una app de iOS para músicos está en la hoja de ruta.",
+    "dl.ios.note": "La app de iPhone ya está hecha. Llega al App Store cuando el proyecto tenga una cuenta de Apple Developer.",
     "dl.ios.btn": "Ver la hoja de ruta",
 
     "faq.eyebrow": "Preguntas frecuentes",
@@ -293,7 +293,7 @@ export const DICTIONARY = Object.freeze({
     "faq.a4":
       "El procesamiento añade 0 ms: los filtros y la dinámica no usan look-ahead y los efectos son retornos en paralelo. El motor arma cada mezcla una vez por bloque de 5.3 ms y, con 32 entradas y 16 músicos, usa cerca del 18% de cada bloque. El retardo total que escuchas depende de tu Wi-Fi y del búfer de cada teléfono, que puedes ajustar desde la mesa.",
     "faq.q5": "¿Hay una app para iOS?",
-    "faq.a5": "Todavía no; una app de iOS para músicos está en la hoja de ruta.",
+    "faq.a5": "Sí, ya está hecha y en el repositorio (iOS 16+). Llega al App Store y a TestFlight cuando el proyecto tenga una cuenta de Apple Developer, que cuesta 99 USD al año; patrocinar ayuda a lograrlo. Quien tenga una Mac ya puede compilarla desde el código.",
     "faq.q6": "¿Por qué mi computadora muestra una advertencia de seguridad?",
     "faq.a6":
       "El instalador de Windows aún no está firmado: elige <em>Más información → Ejecutar de todas formas</em>. La app de Mac no está notarizada por Apple: ábrela una vez y luego ve a <em>Ajustes del Sistema → Privacidad y seguridad</em> y elige <em>Abrir igualmente</em>. Los instaladores firmados por completo están en la hoja de ruta.",

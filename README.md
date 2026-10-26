@@ -19,7 +19,7 @@ Low-latency personal monitoring over the Wi-Fi you already have — no extra har
 ![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)
 ![Tauri](https://img.shields.io/badge/Tauri-24C8DB?style=flat-square&logo=tauri&logoColor=white)
 
-[**🌐 Website**](https://bandear.com/) · [**Download**](#-download) · [**Quick start**](#-quick-start) · [**Features**](#-features) · [**How it works**](#-how-it-works) · [**Build from source**](#-build-from-source) · [**Support**](#-support-the-project)
+[**🌐 Website**](https://bandear.com/) · [**Download**](#-download) · [**Quick start**](#-quick-start) · [**Features**](#-features) · [**How it works**](#-how-it-works) · [**Build from source**](#%EF%B8%8F-build-from-source) · [**Support**](#-support-the-project)
 
 <br />
 
@@ -50,7 +50,7 @@ Grab the file for your system from the [**latest release**](https://github.com/c
 | 🤖 **Android** 10+ (the musicians' app) | `BandEar_<version>_android.apk` | Allow installs from your browser, then open the APK. |
 
 > [!NOTE]
-> An iOS app for musicians is on the roadmap.
+> **The iPhone app is built** (iOS 16+) and lives in [`apps/ios`](apps/ios). It reaches the App Store and TestFlight once the project has an Apple Developer account (99 USD a year) — [sponsoring](https://github.com/sponsors/carlosescor2199) is what makes that happen. Developers with a Mac can already [build it from source](#%EF%B8%8F-build-from-source).
 
 > [!TIP]
 > BandEar used to be called MixLink. The desktop app brings a MixLink desk's sessions, backups and recordings folder over on its first start. On Android, BandEar installs as a new app beside MixLink, so the phone's saved mixes start fresh. Phones and desks of either name still find each other.
@@ -146,7 +146,7 @@ flowchart LR
 
 - **Engine** — written in Rust. Capture runs in a lock-free, allocation-free audio path; every mix is built once per block (5.3 ms at 256 frames) and sent as 16-bit PCM over UDP.
 - **Desktop app** — [Tauri](https://tauri.app) with a plain web-components UI (no bundler, no npm dependencies).
-- **Phone app** — native Android (Kotlin + Jetpack Compose), with an adaptive jitter buffer and packet reordering.
+- **Phone apps** — native Android (Kotlin + Jetpack Compose) and iOS (Swift + SwiftUI, playing through AVAudioEngine), with one shared console design, an adaptive jitter buffer and packet reordering.
 - **Control** — a WebSocket channel carries mixes, link statistics and settings; phones find the desk through a discovery beacon, and iPhones through its Bonjour announcement (`_bandear._tcp`).
 
 **Performance** — with 32 processed inputs and 16 musicians, the engine uses about **18 % of each block** on average (release build). Processing adds **no latency**: filters and dynamics have no look-ahead, and effects are wet returns.
@@ -199,6 +199,19 @@ gradle -p apps/android :app:assembleDebug
 </details>
 
 <details>
+<summary><b>iPhone app</b></summary>
+
+Requirements: a Mac with Xcode 16 or newer, and an iPhone on iOS 16+.
+
+```bash
+open apps/ios/BandEar/BandEar.xcodeproj
+```
+
+In Xcode, pick your team under *Signing & Capabilities* and run the **BandEar** scheme on your iPhone. A free Apple ID works for your own device; Apple expires those installs after 7 days, so run it again from Xcode to renew.
+
+</details>
+
+<details>
 <summary><b>Tests</b></summary>
 
 ```bash
@@ -206,6 +219,7 @@ cargo test -p personal-monitoring        # audio engine
 cargo test -p bandear-desktop            # desktop commands
 node --test apps/desktop/ui/tests        # desktop UI logic
 gradle -p apps/android :app:testDebugUnitTest
+swift test --package-path apps/ios/BandEarKit   # iPhone app core (macOS)
 ```
 
 </details>
@@ -218,7 +232,8 @@ Every push of a `v*` tag builds the installers for all platforms with [GitHub Ac
 |---|---|
 | [`apps/server`](apps/server) | The audio engine: capture, processing, mixes, recording and the network |
 | [`apps/desktop`](apps/desktop) | The desktop app (Tauri) and its console UI — [more docs](apps/desktop/README.md) |
-| [`apps/android`](apps/android) | The musicians' phone app |
+| [`apps/android`](apps/android) | The musicians' Android app |
+| [`apps/ios`](apps/ios) | The musicians' iPhone app (`BandEar`) and its tested Swift core (`BandEarKit`) |
 | [`vendor/cpal`](vendor/cpal) | A patched copy of [cpal](https://github.com/RustAudio/cpal) that opens one ASIO driver by name |
 
 ---
@@ -229,8 +244,10 @@ Every push of a `v*` tag builds the installers for all platforms with [GitHub Ac
 - [x] Local mix, multitrack recording and virtual soundcheck
 - [x] Link health, phone buffer, redundancy and demo source
 - [x] Channel processing, limiter, reverb and delay
-- [ ] iOS app for musicians
-- [ ] Signed installers for Windows and macOS
+- [x] iPhone app for musicians, found over Bonjour (build it from source for now)
+- [x] One console-style design shared by the Android and iPhone apps
+- [ ] iPhone app on the App Store and TestFlight — needs an Apple Developer account ([sponsor goal](https://github.com/sponsors/carlosescor2199))
+- [ ] Signed Windows installer and notarized macOS app (builds after v0.2.0 are already ad-hoc signed, so macOS no longer calls the app damaged)
 
 Ideas and bug reports are welcome in [Issues](https://github.com/carlosescor2199/bandear/issues).
 

@@ -22,7 +22,7 @@ private let server = DiscoveredDesk(
 /// ui/screens/MixScreenTextTest.kt`), case for case.
 ///
 /// Its five `connectionBanner` cases (`noBannerWhileConnectedOrConnecting` through
-/// `aControlChannelThatGaveUpAsksForANewConnect`, lines 136-181) are the connection words' and are
+/// `aControlChannelThatGaveUpAsksForANewConnect`, lines 141-186) are the connection words' and are
 /// ported with them.
 @Suite("Mix words: Android parity")
 struct MixWordsParityTests {
@@ -146,7 +146,7 @@ struct MixWordsParityTests {
         #expect(MixWords.swipeForMore == "Swipe for more")
     }
 
-    /// `MixScreenTextTest.kt:108-114`
+    /// `MixScreenTextTest.kt:113-119`
     @Test func theMasterSaysMutedInWords() {
         #expect(MasterWords.valueText(volume: 85, muted: false) == "85%")
         #expect(MasterWords.valueText(volume: 85, muted: true) == "muted")
@@ -154,7 +154,7 @@ struct MixWordsParityTests {
         #expect(MasterWords.muteText(muted: true) == "Muted")
     }
 
-    /// `MixScreenTextTest.kt:116-122`
+    /// `MixScreenTextTest.kt:121-127`
     @Test func theChannelPickerNamesTheChosenChannelOrNone() {
         #expect(ChannelPickerWords.text("CH 3") == "CH 3")
         #expect(ChannelPickerWords.text(nil) == "None")
@@ -162,13 +162,13 @@ struct MixWordsParityTests {
         #expect(ChannelPickerWords.description(nil) == "My channel: none chosen. Tap to choose")
     }
 
-    /// `MixScreenTextTest.kt:124-128`
+    /// `MixScreenTextTest.kt:129-133`
     @Test func theHeaderFallsBackWhenNoNameIsSet() {
         #expect(MixWords.headerName("  Carlos D ") == "Carlos D")
         #expect(MixWords.headerName("   ") == "BandEar")
     }
 
-    /// `MixScreenTextTest.kt:130-134`
+    /// `MixScreenTextTest.kt:135-139`
     @Test func theHeaderNamesTheServerOfTheSession() {
         #expect(MixWords.headerServerText(server) == "192.168.1.34:50001")
         #expect(MixWords.headerServerText(nil) == "No server")

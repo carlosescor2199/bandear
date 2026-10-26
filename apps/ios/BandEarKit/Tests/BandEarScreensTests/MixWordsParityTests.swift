@@ -141,6 +141,11 @@ struct MixWordsParityTests {
         #expect(MixWords.sectionTitle(.groups, count: 4) == "GROUPS · 4")
     }
 
+    /// `MixScreenTextTest.kt:108-111`
+    @Test func anOverflowingRowSaysToSwipeForMore() {
+        #expect(MixWords.swipeForMore == "Swipe for more")
+    }
+
     /// `MixScreenTextTest.kt:108-114`
     @Test func theMasterSaysMutedInWords() {
         #expect(MasterWords.valueText(volume: 85, muted: false) == "85%")

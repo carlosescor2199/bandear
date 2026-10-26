@@ -31,7 +31,7 @@ aa12e08. Delivery: single PR. Tests: JVM unit tests (`gradle -p apps/android :ap
 ## Tasks
 
 - T1 — S1-S6: drift compensation in the Android playback path, pure policy with unit tests, honest
-  backlog. Route: delegated writer (reason: long-session context backstop in the parent). Commit: see L3
+  backlog. Route: delegated writer (reason: long-session context backstop in the parent). Commit: 1111baf
 
 ## Log
 

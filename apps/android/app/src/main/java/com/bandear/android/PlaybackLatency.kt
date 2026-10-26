@@ -87,6 +87,10 @@ object PlaybackLatency {
             pendingFrames(framesWritten, framePosition) * 1000.0 / sampleRate
         }
 
+    /** [frames] in milliseconds at [sampleRate], or 0 when the rate cannot be used. */
+    fun framesMs(frames: Long, sampleRate: Int): Double =
+        if (sampleRate <= 0) 0.0 else frames.coerceAtLeast(0L) * 1000.0 / sampleRate
+
     /**
      * The playback buffer to request, in frames, for a packet of [packetFrames] frames.
      *
@@ -125,7 +129,8 @@ object PlaybackLatency {
      *   The [holdPackets] held back for delayed redundant copies ([ReorderHold]) count in it too: they
      *   are audio held back before playing, as the track's buffer is.
      * - The backlog is the audio queued now ([backlogMs]): the [framesWritten] past the
-     *   [presentedFrame] the track's timestamp read; not measured (`NaN`) when there is no track or
+     *   [presentedFrame] the track's timestamp read, plus the [queuedFrames] still waiting in the
+     *   app before the track (see [PlayoutQueue]), so it is everything not yet heard; not measured (`NaN`) when there is no track or
      *   its timestamp could not be read ([timestampRead] false). A track always has its rate, so a
      *   read timestamp with no rate only happens in a test and reads as 0, as [backlogMs] reads it.
      */
@@ -138,6 +143,7 @@ object PlaybackLatency {
         presentedFrame: Long,
         appliedBufferFrames: Int = 0,
         holdPackets: Int = 0,
+        queuedFrames: Long = 0L,
     ): ReportExtras {
         val rate = playbackRate ?: 0
         val track = if (appliedBufferFrames > 0 && packetFrames > 0 && rate > 0) {
@@ -149,7 +155,11 @@ object PlaybackLatency {
         val held = if (holdPackets > 0) cushionMs(packetFrames, holdPackets, rate) else 0.0
         return ReportExtras(
             cushionMs = track + held,
-            backlogMs = if (timestampRead) backlogMs(framesWritten, presentedFrame, rate) else Double.NaN,
+            backlogMs = if (timestampRead) {
+                backlogMs(framesWritten, presentedFrame, rate) + framesMs(queuedFrames, rate)
+            } else {
+                Double.NaN
+            },
         )
     }
 

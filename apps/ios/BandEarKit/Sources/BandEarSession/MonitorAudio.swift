@@ -8,7 +8,10 @@ import Foundation
 /// Android's `AudioReceiver` seam over `PmonPlayer` (`MonitorCollaborators.kt:25-34`). A launch
 /// takes only the port: the receiver takes datagrams from any sender, so it needs no host.
 public protocol AudioReceiving: AnyObject {
-    /// True from ``start(port:)`` until the latest launch's loop has ended and reported its stop.
+    /// True from ``start(port:)`` until the latest launch's loop has ended and its
+    /// ``ReceiverListener/onStopped()`` has returned. The coordinator tags each report with its
+    /// launch while the report is handed over, which is right only because no new launch can start
+    /// before then (the T8c review).
     var isAlive: Bool { get }
 
     /// Launches a receiver on `port`. Called only while ``isAlive`` is false, since an older loop
@@ -54,15 +57,25 @@ public enum MonitorAudioError: Error, Equatable, Sendable, CustomStringConvertib
 ///   musician is not left connected to a desk they cannot hear. A lost control connection does not
 ///   stop the receiver: the session reconnects while the audio goes on.
 /// - Each link report goes to the desk through ``ControlSession/send(stats:)``, which sends only
-///   while the connection is open, as ``LinkStats/init(_:)`` builds it (`:149-152`).
+///   while the connection is open, as ``LinkStats/init(_:)`` builds it (`:149-152`), and its
+///   underruns add up in ``underrunTotal`` (`MonitorReducer.kt:177-182`).
 ///
 /// A receiver stays alive until its loop has reported its stop, and the receive loop holds the
 /// audio port until then, so a session cannot start while the previous receiver is alive: the
 /// start is refused with ``MonitorAudioError/previousReceiverStopping``, as Android refuses it, and
-/// the musician connects again a moment later. The receiver reports one stop per launch, in launch
-/// order, so the n-th report belongs to the n-th session, as Android counts them
-/// (`MonitorViewModel.kt:96-109,287-297`): a report only ends the latest session, and only when
-/// nothing ended it already, so a late report can never end a session twice or end the next one.
+/// the musician connects again a moment later.
+///
+/// Every report carries the launch whose loop made it, read as the receive thread hands it over.
+/// The receiver launches again only once the last loop has reported its stop, so each loop's
+/// reports all carry its own launch, even those still on their way when the next session starts.
+/// - A stop report ends only the latest session, and only when nothing ended it already, so a late
+///   one can never end a session twice or end the next one. Android pairs its stop reports with
+///   its sessions by counting them (`MonitorViewModel.kt:96-109,287-297`), which pairs them the
+///   same way.
+/// - Any other report reaches the diagnostics only from the latest launch, so a new session never
+///   shows the last one's figures (the T7f verifier's AD1). Android applies those as they come.
+/// - A link report handled after its session ended is dropped: the link it describes is no longer
+///   known (AD2). Android still shows a link health from it (`MonitorReducer.kt:177`).
 ///
 /// Everything happens on the main actor. The receiver reports from its receive thread, and every
 /// report is handed to the main queue in the order it came, without waiting for it, so the receive
@@ -75,8 +88,18 @@ public final class MonitorAudio {
         (any PlaybackSinkFactory, PlayerControls, any ReceiverListener) -> any AudioReceiving
 
     /// The control session the audio follows. The mix is edited through it
-    /// (``ControlSession/apply(_:)``); start and stop the session here, not on it.
+    /// (``ControlSession/apply(_:)``), and so is the name (``ControlSession/setMusicianName(_:)``);
+    /// start and stop the session here, not on it.
     public let session: ControlSession
+    /// Whether a session with its receiver runs: from ``start(_:musicianName:)`` until ``stop()``,
+    /// the session stopping, or the receiver ending on its own (Android's `running`). The screens
+    /// choose Connect or the tabs by it (Android's `appScreenFor`).
+    ///
+    /// The session's own `mixSession.isSessionRunning` gives the same answer whenever this
+    /// coordinator reports a change, a start included. Read this one: it belongs to the coordinator
+    /// the screens observe, and it never says a session runs that was started on the
+    /// ``ControlSession`` directly, with no receiver.
+    public private(set) var isRunning = false
     /// The receiver's latest metrics, or nil before the session's first packet played; a new
     /// session starts without any, as Android's diagnostics start again (`MonitorReducer.kt:70-72`).
     public private(set) var receiverStats: ReceiverStats?
@@ -84,6 +107,11 @@ public final class MonitorAudio {
     /// and once the session ended, when its link is no longer known (Android's `linkHealth` goes
     /// back to unknown then, `MonitorReducer.kt:78-81`).
     public private(set) var linkReport: LinkStatsReport?
+    /// The underruns of every link report of the session, added up, for the diagnostics (Android's
+    /// `diagnostics.underruns`, `MonitorReducer.kt:177-182`). A new session starts it again at 0;
+    /// an ended one keeps its total on show until then, as Android keeps its counters
+    /// (`MonitorReducer.kt:70-81`).
+    public private(set) var underrunTotal: Int64 = 0
     /// Why the receiver last refused a packet, failed to open the output, or lost its socket, or nil
     /// since the session started.
     public private(set) var receiverError: (any Error)?
@@ -94,13 +122,11 @@ public final class MonitorAudio {
 
     private let controls: PlayerControls
     private let receiver: any AudioReceiving
-    /// Whether a session with its receiver runs: from a start until a stop, the session stopping,
-    /// or the receiver ending on its own (Android's `running`).
-    private var running = false
-    /// Receivers launched so far; the current (or last) session is number `launched`.
+    /// The receiver's listener, which tags each report with its launch.
+    private let events: ReceiverEvents
+    /// Receivers launched so far; the current (or last) session is number `launched`, and so are
+    /// the reports of its receiver.
     private var launched = 0
-    /// Stop reports received so far.
-    private var stopsReported = 0
     /// The last session ended, by a stop or by its receiver; it is never ended again.
     private var lastEnded = 0
 
@@ -121,6 +147,7 @@ public final class MonitorAudio {
         let controls = PlayerControls()
         let events = ReceiverEvents()
         self.controls = controls
+        self.events = events
         receiver = makeReceiver(sinkFactory, controls, events)
         events.owner = self
         session.stateDidChange = { [weak self] in self?.sessionDidChange() }
@@ -132,19 +159,37 @@ public final class MonitorAudio {
     ///
     /// Does nothing while a session runs, as Android ignores a second Connect: stop it first.
     /// Throws, and starts nothing, while the previous session's receiver is still stopping
-    /// (``MonitorAudioError/previousReceiverStopping``), or for a name the desk would store as no
-    /// name (``ClientMessageError/nameIsBlank``).
+    /// (``MonitorAudioError/previousReceiverStopping``), or for a registration the desk would refuse
+    /// (``ClientMessageError/udpPortMustNotBeZero``). A start the session refuses reports one change
+    /// before it throws, with the last session's figures back.
     public func start(_ request: ConnectionRequest, musicianName: String) throws {
-        guard !running else { return }
+        guard !isRunning else { return }
         guard !receiver.isAlive else { throw MonitorAudioError.previousReceiverStopping }
-        // The session resets the desk's settings as it starts, and the controls follow it at once,
-        // so the receiver launched below never plays by the last desk's buffer or hold.
-        try session.start(request, musicianName: musicianName)
-        running = true
-        launched += 1
+        // Raised before the session starts, so the change the session reports as it starts already
+        // says a session runs, as the session itself then does. The last session's figures go before
+        // it too, so no observer reads them as the new session's; a start the session refuses puts
+        // them back, since Android keeps them on show until a session does start.
+        isRunning = true
+        let lastFigures = (receiverStats, linkReport, underrunTotal, receiverError)
         receiverStats = nil
         linkReport = nil
+        underrunTotal = 0
         receiverError = nil
+        do {
+            // The session resets the desk's settings as it starts, and the controls follow it at
+            // once, so the receiver launched below never plays by the last desk's buffer or hold.
+            try session.start(request, musicianName: musicianName)
+        } catch {
+            isRunning = false
+            (receiverStats, linkReport, underrunTotal, receiverError) = lastFigures
+            // Whatever the session reported before it refused, the last change says what holds now:
+            // no session, and the last figures back.
+            stateDidChange?()
+            throw error
+        }
+        launched += 1
+        // The reports the new receiver makes carry this launch from now on.
+        events.launch = launched
         receiver.start(port: request.audioPort)
         stateDidChange?()
     }
@@ -152,7 +197,7 @@ public final class MonitorAudio {
     /// Ends the session, if one runs: the receiver is asked to stop, then the session stops. The
     /// receiver's stop report, when it comes, ends nothing more.
     public func stop() {
-        guard running else { return }
+        guard isRunning else { return }
         endSession(stoppingTheReceiver: true)
         session.stop()
     }
@@ -161,7 +206,7 @@ public final class MonitorAudio {
     /// takes its receiver with it.
     private func sessionDidChange() {
         followSession()
-        if running, session.connection == .idle || !session.mixSession.isSessionRunning {
+        if isRunning, session.connection == .idle || !session.mixSession.isSessionRunning {
             endSession(stoppingTheReceiver: true)
         }
         stateDidChange?()
@@ -187,37 +232,49 @@ public final class MonitorAudio {
 
     /// The running session is over: no report can end it again, and its link is no longer known.
     private func endSession(stoppingTheReceiver: Bool) {
-        running = false
+        isRunning = false
         lastEnded = launched
         linkReport = nil
         if stoppingTheReceiver { receiver.stop() }
     }
 
-    /// One report from the receiver, on the main actor, in the order the receiver made them.
-    fileprivate func handle(_ event: ReceiverEvent) {
+    /// One report from the receiver, on the main actor, in the order the receiver made them, with
+    /// the launch whose loop made it.
+    fileprivate func handle(_ event: ReceiverEvent, from launch: Int) {
         switch event {
+        case .report(let report):
+            // A report of an earlier launch, still on its way when this session started, says
+            // nothing about this session.
+            guard launch == launched else { return }
+            show(report)
+        case .stopped:
+            receiverStopped(launch)
+        }
+    }
+
+    /// One report of the latest launch.
+    private func show(_ report: ReceiverReport) {
+        switch report {
         case .stats(let stats):
             receiverStats = stats
         case .linkStats(let report):
+            // Made before the session ended and handled after it: the desk no longer listens, and
+            // the link it describes is no longer known.
+            guard isRunning else { return }
             session.send(stats: LinkStats(report))
             linkReport = report
+            underrunTotal += report.underruns
         case .failed(let failure):
             receiverError = failure.error
-        case .stopped:
-            receiverStopped()
-            return
         }
         stateDidChange?()
     }
 
-    /// A receiver ended, on request or on its own, and reported it. Only the latest session's report
-    /// ends a session, and only once: a report for a session already ended (by a stop, or one
-    /// replaced by a newer session) does nothing (`MonitorViewModel.kt:287-297`).
-    private func receiverStopped() {
-        // The real receiver never reports more stops than launches; a stray report counts as the
-        // latest session's, so the counts cannot drift apart.
-        stopsReported = min(stopsReported + 1, launched)
-        guard stopsReported == launched, stopsReported != lastEnded else { return }
+    /// The loop of `launch` ended, on request or on its own, and reported it. Only the latest
+    /// session's report ends a session, and only once: a report for a session already ended (by a
+    /// stop, or one replaced by a newer session) does nothing (`MonitorViewModel.kt:287-297`).
+    private func receiverStopped(_ launch: Int) {
+        guard launch == launched, launch != lastEnded else { return }
         // The latest session's receiver ended on its own: the session ends with it.
         endSession(stoppingTheReceiver: false)
         session.stop()
@@ -226,10 +283,17 @@ public final class MonitorAudio {
 
 /// What the receiver reports, as it crosses from the receive thread to the main actor.
 private enum ReceiverEvent: Sendable {
+    /// What the diagnostics show and the desk hears.
+    case report(ReceiverReport)
+    /// The launch's loop ended; always its last report.
+    case stopped
+}
+
+/// A report the diagnostics show, or the desk hears.
+private enum ReceiverReport: Sendable {
     case stats(ReceiverStats)
     case linkStats(LinkStatsReport)
     case failed(ReceiverFailure)
-    case stopped
 }
 
 /// An error the receive thread hands the main actor. The receive thread lets go of it once it is
@@ -238,26 +302,39 @@ private struct ReceiverFailure: @unchecked Sendable {
     let error: any Error
 }
 
-/// The receiver's listener: hands each report to the main queue in the order it came and returns at
-/// once, so the receive thread, which also feeds the output, never waits for the main thread.
+/// The receiver's listener: hands each report to the main queue in the order it came, tagged with
+/// the launch that made it, and returns at once, so the receive thread, which also feeds the
+/// output, never waits for the main thread.
 ///
 /// The main queue runs blocks in the order they were queued, so the reports keep their order, the
 /// stop report last of its launch.
 private final class ReceiverEvents: ReceiverListener, @unchecked Sendable {
-    /// Set once on the main actor, while the coordinator is made and before any receiver starts;
-    /// only read after that.
+    /// Set once on the main actor, while the coordinator is made, and read only on the main actor,
+    /// inside the blocks the main queue runs. A receive thread therefore never holds the
+    /// coordinator, and can never be the one that lets it go off the main actor (the T7f
+    /// verifier's AD3).
     weak var owner: MonitorAudio?
 
+    private let lock = NSLock()
+    private var currentLaunch = 0
+
+    /// The launch whose loop reports from now on: set on the main actor before that loop starts,
+    /// read on the receive thread as each report is handed over.
+    var launch: Int {
+        get { lock.withLock { currentLaunch } }
+        set { lock.withLock { currentLaunch = newValue } }
+    }
+
     func onStats(_ stats: ReceiverStats) {
-        deliver(.stats(stats))
+        deliver(.report(.stats(stats)))
     }
 
     func onLinkStats(_ report: LinkStatsReport) {
-        deliver(.linkStats(report))
+        deliver(.report(.linkStats(report)))
     }
 
     func onError(_ error: any Error) {
-        deliver(.failed(ReceiverFailure(error: error)))
+        deliver(.report(.failed(ReceiverFailure(error: error))))
     }
 
     func onStopped() {
@@ -265,8 +342,9 @@ private final class ReceiverEvents: ReceiverListener, @unchecked Sendable {
     }
 
     private func deliver(_ event: ReceiverEvent) {
-        DispatchQueue.main.async { [weak owner = self.owner] in
-            MainActor.assumeIsolated { owner?.handle(event) }
+        let launch = self.launch
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { self.owner?.handle(event, from: launch) }
         }
     }
 }

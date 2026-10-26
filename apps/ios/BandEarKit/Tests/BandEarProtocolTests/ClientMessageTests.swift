@@ -59,11 +59,18 @@ struct ClientMessageTests {
         #expect(try Registration(name: "  Ana  ", udpPort: 50_000).name == "Ana")
     }
 
-    @Test("refuses a name with nothing in it", arguments: ["", "   ", "\t\n"])
-    func refusesBlankName(name: String) {
-        #expect(throws: ClientMessageError.nameIsBlank) {
-            try Registration(name: name, udpPort: 50_000)
-        }
+    /// Android's `RegistrationMessageTest.trimsTheNameButKeepsAnEmptyOne`: a name with nothing in it
+    /// still registers, with an empty name, which the desk stores as no name
+    /// (`registered_name`, `apps/server/src/protocol.rs:330-336`) and still sends audio to.
+    @Test("keeps a name with nothing in it, sent empty", arguments: ["", "   ", "\t\n"])
+    func keepsAnEmptyName(name: String) throws {
+        let registration = try Registration(name: name, udpPort: 50_001)
+
+        #expect(registration.name == "")
+        #expect(
+            try wireObject(.register(registration)) == [
+                "type": "register", "name": "", "udp_port": 50_001,
+            ] as NSDictionary)
     }
 
     @Test("caps the name at the sixty-four the desk keeps")

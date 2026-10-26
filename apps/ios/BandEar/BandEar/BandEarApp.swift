@@ -4,7 +4,7 @@ import SwiftUI
 struct BandEarApp: App {
     var body: some Scene {
         WindowGroup {
-            DeskListView()
+            RootView()
         }
     }
 }

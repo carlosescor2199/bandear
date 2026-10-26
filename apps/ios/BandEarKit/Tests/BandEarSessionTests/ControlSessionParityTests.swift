@@ -361,6 +361,40 @@ struct ControlSessionParityTests {
         #expect(session.connection == .idle)
         #expect(transport.opened.count == 1)
     }
+
+    // MARK: The registration (`RegistrationMessageTest.kt`)
+
+    /// Android's `CLIENT_ID` (`RegistrationMessageTest.kt:191`).
+    private static let clientID = "0b6f1c9e-2d4a-4f7b-9c3e-5a8d7e6f1a2b"
+
+    /// Android renames through `ControlChannel.updateRegistrationName` and runs its debounce with
+    /// `runDelayed`; here the musician's rename goes through the session, and its pause is the one
+    /// piece of work scheduled once the second connection opened.
+    @Test func theChannelAnnouncesTheSameClientIdOnEveryOpenAndOnARename() async throws {
+        let transport = FakeTransport()
+        let scheduler = ManualScheduler()
+        let session = ControlSession(
+            transport: transport, scheduler: scheduler,
+            store: FakeMusicianStore(clientID: Self.clientID))
+        let desk = FakeDesk(transport)
+
+        try session.start(toStage, musicianName: "Ana")
+        await desk.open()
+        await desk.fails("wifi gone")
+        try scheduler.runNextDue()
+        await desk.open()
+        session.setMusicianName("Bea")
+        try scheduler.runNextDue()
+
+        let registrations = try transport.sent(ofType: "register")
+        #expect(registrations.map { $0["name"] as? String } == ["Ana", "Ana", "Bea"])
+        #expect(
+            registrations.map { $0["client_id"] as? String }
+                == [Self.clientID, Self.clientID, Self.clientID])
+        #expect(
+            registrations.allSatisfy { ($0["capabilities"] as? [String])?.first == "stats.v2" },
+            "every registration announces the capabilities")
+    }
 }
 
 /// The Android client's tests of what its ViewModel sends and shows that need a socket, from

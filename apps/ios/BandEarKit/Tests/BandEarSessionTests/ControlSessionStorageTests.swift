@@ -20,26 +20,34 @@ struct ControlSessionStorageTests {
         return (session, transport)
     }
 
-    @Test("remembers the name a session starts with, as the desk stores it")
+    @Test("a session started with a name keeps it as typed and remembers it trimmed")
     func remembersTheName() throws {
         let (session, _) = launch()
 
         try session.start(toStage, musicianName: " Bea ")
 
-        #expect(session.musicianName == "Bea")
+        #expect(session.musicianName == " Bea ")
         #expect(store.musicianName == "Bea")
     }
 
-    @Test("a start refused for a blank name remembers nothing new")
-    func aRefusedStartKeepsTheName() {
+    @Test("a session started with a blank name keeps it as typed and remembers it empty")
+    func aBlankNameIsRememberedEmpty() throws {
         let (session, _) = launch()
 
-        #expect(throws: ClientMessageError.nameIsBlank) {
-            try session.start(toStage, musicianName: "  ")
-        }
+        try session.start(toStage, musicianName: "  ")
 
-        #expect(session.musicianName == "Ana")
-        #expect(store.musicianName == "Ana")
+        #expect(session.musicianName == "  ")
+        #expect(store.musicianName == "")
+    }
+
+    @Test("the next launch shows the name the last one remembered")
+    func theNameSurvivesTheLaunch() {
+        let (first, _) = launch()
+        first.setMusicianName(" Bea ")
+
+        let (next, _) = launch()
+
+        #expect(next.musicianName == "Bea")
     }
 
     @Test("the first launch makes an id and registers with it, and the next launch sends the same")

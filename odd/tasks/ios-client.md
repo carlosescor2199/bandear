@@ -113,6 +113,20 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - [x] T5d — More of me: derived at send time and never stored, its notices and turn-off paths,
     the musician's own levels put back after a link.
   - [x] T5e — The outgoing mix and when one is sent.
+- [x] T8e — The T8d review's four warnings, which the user asked for on 2026-10-23: "dale, arreglá
+  primero los warnings de T8". Route: one delegated writer, because the parent context is past the
+  long-session backstop. The review's suggestions stay under Follow-ups.
+  - R4-mirror-republish-per-change: a receiver report must not rebuild the Mix screen.
+    - The per-packet figures (receiver stats, link report, underrun total, receiver error,
+      `outputPlaying`) move to a model of their own that only Settings and Diagnostics observe.
+    - `mirror()` assigns a published value only when it changed.
+  - R2-duplicate-tone-mapping: one tone, colour, symbol, pill and banner style for every screen. The
+    Mix header uses the shared `ConnectionToneStyle`, `ConnectionToneDot` and `ConnectionBannerRow`;
+    its copies (`MixTone`, `MixBannerRow`, `MixConnectionPill`) go.
+  - R3-refused-start-restore-unpublished: `MonitorAudio.start` reports a change after it puts the
+    last figures back on a refused start, with a test.
+  - R3-discovery-double-start: discovery starts once per return to the foreground, never twice at
+    launch.
 - [ ] T9 — Mix banks and recall (route: to be decided). Device-local saved mixes
   (`MixBankStore.kt`) and recalling one into the mix. Split from T5 because it needs device
   storage, which the pure mix module does not have.
@@ -247,7 +261,84 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
   - `isPlaying` reads only that published value. The lock order is the output's lock, then the
     published one.
   - Commit recorded in Progress.
-- [ ] T8 — Screens: Connect, Mix, Mixes, Settings (route: to be decided).
+- [x] T8 — Screens: Connect, Mix, Mixes, Settings. The user asked "dale, seguí con T8" (2026-10-23).
+  Asked about the look, the user chose "Nativo iOS, mismos textos y reglas (Recommended)": standard
+  SwiftUI (`TabView`, `List`, `Slider`, sheets), with Android's content, its words verbatim and its
+  rules. Android's own faders, theme, fonts and gesture maths are not ported.
+  - Sources:
+    - A read-only map of Android's UI (`ui/screens`, `ui/components`, `ui/state`). Every string is
+      hard-coded in Kotlin.
+    - The T8 inputs under Follow-ups.
+  - Screens, as Android has them (`AppScreen.kt`, `MonitorApp.kt`):
+    - Connect, while no session runs, with the manual address reached from it.
+    - Then tabs: Mix, Mixes and Settings. Back goes to Mix, and a session start shows Mix.
+    - The channel sheet opens from a strip.
+    - Diagnostics live inside Settings.
+  - The split with T9: T8 builds the Mixes tab's layout and empty state ("No saved mixes yet" /
+    "Save the current mix above, then bring it back here with one tap.") and the pure text helpers
+    of `SavedMixesText.kt`. Storage, the snapshot, recall and the notices driven by the store are
+    T9's.
+  - [x] T8a — Connection and diagnostics words, in a new pure module `BandEarScreens` (route:
+    delegated writer, launched together with T8b and T8c). It covers:
+    - the screen choice (`appScreenFor`);
+    - the connection pill words;
+    - the control status detail;
+    - the reconnecting, lost and following banners;
+    - the connection form's errors, and `previousReceiverStopping`;
+    - Settings text;
+    - link health (`phoneLinkHealth`, the words and their meanings);
+    - loss, the diagnostics formats, and Connect's copy.
+
+    It ports `AppScreenTest`, `ConnectionPillTest`, `SettingsTextTest`, `LinkHealthTest` and
+    `PhoneLinkHealthTest`, plus the reducer's pill, banner and diagnostics cases.
+  - [x] T8b — Mix words, in the same module (route: delegated writer, launched together with T8a
+    and T8c). It covers:
+    - strip and group text, and pan text with its 5% detent;
+    - master, cap and the engineer's limit;
+    - More of me's caption and its seven notices;
+    - the channel sheet's text;
+    - the amber strip rule;
+    - the labels per channel kind;
+    - the empty rows;
+    - the `SavedMixesText.kt` helpers.
+
+    It ports `MixScreenTextTest`, `ChannelSheetTextTest`, `PanScaleTest` (text and detent),
+    `AtomLabelsTest` and `SavedMixesTextTest`.
+  - [x] T8c — The session's gaps for the screens, in `BandEarSession` (route: delegated writer,
+    launched together with T8a and T8b):
+    - the name is stored as typed and re-announced to the desk after a typing pause, as Android
+      does (`aNameChangeIsStoredAndAnnouncedAfterThePause`);
+    - whether a session runs, made public;
+    - the running underrun total per session, reset when a session starts, as Android does (its
+      writer found `SessionEnded` only resets link health, `MonitorReducer.kt:70-81`);
+    - the T7f verifier's AD1 (reports from a previous launch), AD2 (a late link report after a
+      stop) and AD3 (the weak owner read on the receive thread).
+  - [x] T8d — The SwiftUI screens on top, replacing `DeskListView` and `SessionView`:
+    - [x] T8d1 — The seam (route: inline, by the parent). `SessionModel` publishes the session,
+      the mix, the diagnostics, the tab, the manual form and the refusal. Its actions:
+      `connect(to:)`, `connectManually()`, `disconnect()`, `setName(_:)`, `apply(_:)`. The app
+      links `BandEarScreens`.
+    - [x] T8d2 — Connect, Settings (with Diagnostics), the app shell and the Mixes tab (route:
+      delegated writer, launched together with T8d3):
+      - the shell: Connect while no session runs, tabs Mix, Mixes and Settings while one runs, and
+        the manual address opened from Connect, all chosen by `AppScreen`;
+      - Connect: the name, the desks found, the manual entry, and the refusal banner;
+      - Settings: the server card, Disconnect, the name, the manual connection, and Diagnostics
+        with its expander;
+      - Mixes: its layout and empty state only (T9 adds the rest).
+    - [x] T8d3 — Mix and the channel sheet (route: delegated writer, launched together with
+      T8d2). It covers:
+      - the header, the pill and the banners;
+      - More of me and the channel picker;
+      - channels and groups, each strip with a native `Slider`, mute and solo;
+      - the master card with volume, mute, the level cap and the engineer's limit;
+      - the channel sheet with pan (`PanScale` and its detent), level, mute, solo, and the locked
+        and stereo notes.
+    Both writers use only `SessionModel` and `BandEarScreens`, edit no package code, and never edit
+    `SessionModel.swift`. A gap in the model goes back to the parent.
+  - Route: T8a, T8b and T8c are independent units with disjoint surfaces, each over 100 lines.
+    They run as three writers, each in its own worktree. The parent first adds the empty
+    `BandEarScreens` module, so no writer edits `Package.swift`.
 
 ## Follow-ups
 
@@ -424,6 +515,67 @@ multicast entitlement (`odd/tasks/desktop-bonjour.md`). Nothing on the iOS side 
     R3-002 of the same review: the publish order (a stop is published before a restart, the result
     after) has only the verifier's simulator probe as proof. Moving that sequence into
     `BandEarPlayback` would let `swift test` pin it.
+- **T8d inputs from the T8c verifier.**
+  - A2: `ControlSession.start` reports a change before `MonitorAudio` resets its diagnostics, so
+    the first change of a start still carries the previous session's underruns and error. A model
+    that reads them inside `stateDidChange` shows them for one change. Reset the figures before
+    `session.start` to close it. The T8c review found it again (`R3-start-observer-stale-diagnostics`),
+    so T8d's integration fixes it.
+  - T8c review, `R4-launch-tag-read-at-delivery`: the launch tag is right only while a receiver
+    stays alive until its `onStopped` has returned. `AudioReceiver` honours that (verified), and
+    `AudioReceiving`'s documentation should state it as the port's contract.
+  - A3: Android's name field cuts only the text an edit inserts (`keptEdit`, `BandEarTextField.kt`).
+    The session cuts the end of the whole name, which agrees for typing at the end but not for a
+    paste inside a name. The field would need `keptEdit` to match exactly.
+- **From the T8d verifier (advisories).**
+  - The refusal order differs from Android: `SessionModel.start` checks the form before the
+    previous receiver. The words differ only when both apply, during a stop that lasts
+    milliseconds.
+  - `mirror()` republishes every field on every change, the receiver's per-packet stats included,
+    so the Mix list re-renders with each packet. This is performance only.
+  - The `held` check (locked or following) is written in both the strip and the sheet, as on
+    Android, with no helper in `BandEarScreens`.
+  - A simulator app installed under a new bundle id can have its incoming UDP blocked by the macOS
+    firewall ("Link silent"), while its control connection works.
+- **From the T8d review. The four warnings are fixed in T8e; the suggestions are not.**
+  - R4-mirror-republish-per-change (also the verifier's): `mirror()` assigns every published field
+    on every change, so each receiver report rebuilds the whole Mix list. Assign only what changed,
+    or move the per-packet figures out of the mix screen's observation.
+  - R2-duplicate-tone-mapping: `MixTone`, `MixBannerRow` and `MixConnectionPill` copy
+    `ConnectionToneStyle`, `ConnectionBannerRow` and `ConnectionToneDot` with different symbols, so
+    one state looks different on Mix and on Connect or Settings. Keep one.
+  - R3-refused-start-restore-unpublished: a refused start restores the last figures without calling
+    `stateDidChange`. `ControlSession.start` throws before any change (the verifier's claim 5), so
+    no observer sees the cleared values today. Calling it after the restore would make that
+    structural.
+  - R3-discovery-double-start: `RootView` starts discovery on appear and again when active unless it
+    is browsing, so it can start twice at launch. `DeskDiscoveryModel.start` bumps its run and
+    starts the browser again; whether that is harmless depends on `BonjourDeskBrowser.start`.
+  - Suggestions:
+    - `ChannelSheet` says it opens fully expanded but sets no detent;
+    - `ChannelSheetKey` and `StripKey` are near copies;
+    - the stale-figures tests do not check `linkReport`;
+    - `SessionModel`'s start path has no automated test.
+- **From T8e (its writer named these).**
+  - A failed discovery browser is now retried only after a return from the background, and no
+    longer after a brief interruption such as Control Center. The local network wait clears by
+    itself once access is granted.
+  - Once, coming back from the background, the app showed Mix instead of Settings, and a second try
+    kept Settings. Nothing in T8e writes the tab. Watch whether the shell resets it.
+  - The `linkReport` checks added to the stale-figures tests are weak guards: an ended session
+    already clears `linkReport`.
+- **From the T8e review (not fixed).**
+  - Warnings, both already known:
+    - R3-discovery-retry-narrowed: the verifier's A1. A failed browser now retries only after a
+      background trip.
+    - R3-app-models-untested: the app's change-only mirrors and the idempotent discovery have no
+      automated test, because the app has no test target.
+  - Suggestions:
+    - `DiagnosticsSection`'s `diagnostics` property (a `DiagnosticsModel`) reads close to the
+      `Diagnostics` type. A name such as `figures` would be clearer.
+    - The assign-if-changed rule is written by hand per field in both mirrors. A helper would keep
+      it in one place, but not an `inout` one: passing a `@Published` property `inout` always
+      writes it back and publishes (the T8e writer measured it). A key-path assignment would work.
 - **T8 input from T6b.** An unreadable desk message is ignored; Android shows "Invalid control
   response" (an `error` with no message, an unnumbered ack that cannot be read).
 - **(Done in T7b.) `BandEarProtocol` holds more than the protocol.** `ReorderHold` and `CushionController` are
@@ -1404,4 +1556,185 @@ chain rather than one pull request. Provisional slices: T1-T3 (wire and timing c
   - Findings: two suggestions (seed the flag from the recovery) and one warning (R3-002, the
     publish order has no test). They are under "Gaps left by T7g" and not fixed.
 - T7h complete.
+- T8a, T8b and T8c: three writers launched together, each in its own worktree, all on `4801871`
+  (the empty `BandEarScreens` module).
+- T8a (connection and diagnostics words): 76 tests (RED 70 of 77), 10 of 10 mutants caught.
+  - Numbers round half up, as Java's `String.format` does, so one packet lost in 800 reads
+    "0.13 %".
+  - Android's `UNAVAILABLE` and `CLOSED` control states have no iOS counterpart, and their words
+    are not ported.
+  - A desk typed by hand is named "host:port".
+  - After the parent's message it maps no `nameIsBlank`, since T8c removed that error.
+- T8b (Mix words): 71 tests (51 ported, RED 70 of 71), 10 of 10 mutants caught.
+  - `PanScale` binds a native `Slider` over 0...1, with Android's 5% detent each side of centre.
+  - The kind labels come from `ChannelKind.label` (`ClientMixState.kt`), which no Android test
+    pins.
+  - Android's gesture tests are skipped, since its own faders are not ported.
+- T8c (the session's gaps): 27 tests, TSan clean, 15 of 15 mutants caught.
+  - The name is kept as typed (cut at 64 UTF-16 units without splitting a character) and stored
+    trimmed. A rename is announced 400 ms after typing stops (`NAME_RESEND_DEBOUNCE_MS`).
+  - A blank name registers as `""`, as Android does, so `ClientMessageError.nameIsBlank` is gone.
+  - `MonitorAudio.isRunning` and `underrunTotal`.
+  - AD1: reports are tagged with their launch. AD2: late link reports are dropped. AD3: the owner
+    is read on main.
+  - Changed expectations, on purpose: four blank-name cases, plus `remembersTheName` (the session
+    now keeps `" Bea "` as typed while the store keeps `"Bea"`). The verifier's A1 corrected
+    this count.
+- Parent's integration:
+  - Every path was inside its writer's surfaces, on the same base, and the copies were identical.
+  - The following banner's words existed twice (T8a's `ConnectionBanner`, T8b's `MixWords`).
+    `ConnectionBanner.following` now uses `MixWords`, since Android keeps those words in
+    `MixScreenText.kt`.
+  - Combined suite: 834 tests (660 + 76 + 71 + 27), 0 warnings on a never-built copy, and the app
+    builds.
+  - Commits: `bb5562a` (T8b), `3e590c3` (T8a), `1e315f0` (T8c, alone, since it touches
+    concurrency, item 4).
+- Open for T8d: `SessionModel` connects under the device name when the field is empty. Android
+  sends a blank name, and the user chose Android's rules, so T8d drops that substitution.
+- T8c independent verifier (high-risk item 4): no blocker; claims 1-5 PASS.
+  - Real-time pauses: five renames 100 ms apart send exactly one `register`, about 400 ms after the
+    last.
+  - `isRunning` agreed with `isSessionRunning` at every change over 650 starts.
+  - Hammer probe under TSan (25 s, 9 956 steps, 1 627 renames): 0 violations.
+  - Mutants removing the AD1 or AD2 guard, or reading the tag on main, were caught.
+  - 834 tests, 0 warnings, and the app builds.
+  - The differential against the base matches the changed expectations once A1's correction is
+    counted.
+  - A2 and A3 are T8d inputs (Follow-ups). A4: Android adds a late report's underruns to an ended
+    session; iOS drops them, as AD2 asks.
+- Native reviews for T8a-T8c:
+  - The pending slice `9641033..3e590c3` (the T8 plan, the module, T8b, T8a) was reviewed from a
+    detached worktree at `3e590c3`: `medium`, `under_budget` (44 paths). The user chose "Revisar
+    este cambio" (`granted`). Lenses: reliability and readability.
+    - Approved. Lineage `review-ce445ad2b433a1b5`.
+    - R2-001: the header names a desk by `DiscoveredDesk.name`, the banners by
+      `ConnectionWords.deskLabel`. The model names a typed desk by `deskLabel`, so they agree.
+    - R2-002 and R2-003: two test names overstate their bodies.
+    - R3-001: `PanScale.value` does not guard non-finite input. That is defensive only, since a
+      `Slider` does not produce it.
+  - T8c (`3e590c3..1e315f0`), from a detached worktree at `1e315f0`, with item 4 escalated: `high`
+    (11 paths, 857 lines). The user chose `granted`. Lenses: resilience and reliability.
+    - Approved. Lineage `review-3eab327013d37338`, acknowledged. The
+      reviewed boundary is now `1e315f0`.
+    - Two warnings, under Follow-ups: the launch tag's contract, and stale diagnostics at a start.
+- T8d:
+  - The seam: `SessionModel` (`ad8d2e1`) and a placeholder `MixView` with the shell's signature
+    (`19e804c`). Then two writers launched together, each in its own worktree.
+- T8d2 (shell, Connect, the manual address, Settings with Diagnostics, Mixes), `6badef1`:
+  - `RootView` picks the screen with `AppScreen`: Connect in a `NavigationStack`, with the manual
+    form pushed; a `TabView` while a session runs.
+  - Discovery stops in the background and starts again on return.
+  - The manual address screen is the Settings screen with a "Servers" back button, as on Android.
+  - It builds, the suite passes, and every visible word matched `BandEarScreens`.
+- T8d3 (Mix and the channel sheet), `c4a3bd1`:
+  - `MixView` is the container; `MixContent` is presentational and has debug-only previews.
+  - The pan `Slider` uses `PanScale` with the 5% detent. Once a drag leaves it, the thumb can
+    trail the finger; that is worth a feel test on a device.
+  - The sheet opens fully expanded (Android's `skipPartiallyExpanded`).
+  - Simulator screenshots with a sample mix covered channels, groups, the master with the limit,
+    the sheet, the notice, and following while reconnecting.
+- Parent's integration:
+  - The two units' helpers did not clash, and the copies were identical to the writers'.
+  - My first copy missed the two modified files (a relative `cd` in a subshell); copying them by
+    hand fixed the build.
+  - The model's leftovers from the provisional screen were dropped (`6f009f3`).
+  - The T8c verifier's A2 and the T8c review's warning were fixed test-first in `4f77237`:
+    - the last session's figures are cleared before `session.start`, and put back if the session
+      refuses the start;
+    - RED: the new test caught the stale figures;
+    - GREEN: 836 tests, 0 warnings, TSan clean, and the app builds;
+    - `AudioReceiving.isAlive` now states its contract.
+- End to end on the simulator against the desk on this Mac (`--device "Microsoft Teams Audio"
+  --target 127.0.0.1:59999`):
+  - Connect listed "BandEar server / BandEar on Carloss-M…" with Connect.
+  - After typing "Carlos" and connecting, the desk logged `registration ... as "Carlos"`, and the
+    app showed the Mix tab:
+    - "Carlos / BandEar on Carloss-Mac-mini" with the green Connected pill;
+    - More of me off, "MY CHANNEL None", and `CHANNELS · 1`;
+    - CH 1 at 100% with "L100". That is the desk's default (`default_pan`, even sources hard left,
+      `mix.rs:508-516`), not a fault.
+    - the master at 100% with "Level cap 100% · protects your ears".
+  - Mixes showed its intro and empty state.
+  - Settings showed:
+    - the server card ("… · connected") and Disconnect;
+    - the manual connection, disabled with "Disconnect first to connect to another server.";
+    - Diagnostics: Link good, 185 packets/s (the desk sends 187.5), loss 0.00 %, 0 underruns.
+  - Typing " E" after the name made the desk log `registration ... as "Carlos E"` on the same
+    connection: one announcement after the pause.
+- Risk for T8d: item 6. The views have no automated test; the app has no test target. Their rules
+  and words are tested in the package. Item 4 applies too: `4f77237` changes the order of the
+  coordinator's state at a start.
+- T8d independent verifier (items 6 and 4): no blocker. Claims 1-5 and 7 PASS, and claim 6 PASS for
+  every listed exercise.
+  - No copy in the views apart from the recorded stopped-output line.
+  - Navigation matches `AppScreen.kt`.
+  - Every edit goes through the model.
+  - The stale-figures fix: its test fails against the base `MonitorAudio` and passes at HEAD.
+  - End to end against the desk, through a passive observer WebSocket that receives the desk's
+    `mix_state` pushes:
+    - a slider to 62, mute on and off, pan dragged to centre (50);
+    - More of me lifting to 100, then back;
+    - a rename to "Verifier" on the same connection;
+    - a manual connect named `192.168.1.54:50001`;
+    - an empty name, registered "(unnamed)";
+    - a Bonjour connect, and Disconnect.
+  - Audio was not re-proven in its run: the macOS firewall blocked incoming UDP for its scratch
+    bundle id. The parent's run on the same commit had 185 packets/s.
+  - 836 tests, 0 warnings, and the app builds. Its trivial advisory (an unused `import UIKit`) is
+    fixed in the next commit; the rest are under Follow-ups.
+- T8d native review:
+  - Assessed against `1e315f0` with item 4 escalated: `high`, due (22 paths, 2098 lines).
+  - START checked: base `2c8bad3` = `1e315f0`, candidate `0cdb31e` = `de5d54f`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: resilience, readability and
+    reliability.
+  - Approved. Lineage `review-37d22f13a853d20b`, acknowledged. The reviewed boundary is now
+    `de5d54f`.
+  - 4 warnings and 4 suggestions are under Follow-ups. They are not fixed: findings alone authorize
+    no change.
+- T8 complete. Saving, recalling, renaming and deleting mixes are T9's.
+- T8e (one writer in a worktree), commits `980f814` (package) and `bebd734` (app):
+  - R4: the per-packet figures moved to `DiagnosticsModel` (`session.diagnostics`), which only
+    `DiagnosticsSection` and the stopped-output row observe. `mirror()` assigns only changed
+    values; errors are compared by type and `String(reflecting:)`, since a cast to `any Equatable`
+    warns on Darwin.
+    - Measured with scratch body counters at 185-187 packets/s: on Mix, `MixView.body` went up 375
+      times every 2 s at the base. At the head it stays flat while `DiagnosticsSection` follows the
+      reports.
+  - R2: `MixTone`, `MixBannerRow` and `MixConnectionPill` are deleted. Mix uses
+    `ConnectionBannerRow` and a new shared `ConnectionPillBadge`.
+  - R3 (refused start): `MonitorAudio` reports one change after it restores the figures.
+    - RED: the new test heard nothing. GREEN: 837 tests.
+    - A mutant without the call is caught.
+    - The `linkReport` suggestion was folded in.
+  - R3 (discovery): `DeskDiscoveryModel.start()` does nothing until `stop()`. iOS 16 has no
+    `onChange(initial:)`, so both triggers stay and the model is idempotent. Launch started the
+    browser once, and each return from the background starts it once.
+  - Checks: 0 warnings on a never-built copy, and the app builds.
+  - Simulator tip: the desk's `--target 127.0.0.1:59999` reaches a manual connection to
+    `127.0.0.1` with audio port 59999 over loopback, which the firewall does not block.
+  - Risk: item 6. The app side has no automated test, only the probe and screenshots.
+- T8e independent verifier (item 6): no blocker. Claims 1-6 PASS on `072e170` against the base
+  `2d9c707`.
+  - Its own body counters at 186-187 packets/s, rebuilds every 2 s:
+    - base on Mix: about 380-401 rebuilds of `RootView`, `MixView` and `MixContent`;
+    - head on Mix: 0 over five readings;
+    - head on Settings: only `DiagnosticsSection` and the stopped-output row follow the reports.
+  - A refused start reports one change at the head and none at the base. A successful start is
+    unchanged.
+  - Discovery started once at launch, and once per return across six trips to the background.
+  - The tab after the background: not reproduced. Only a connect and the user write it. Nothing in
+    T8e touches it.
+  - 837 tests, 0 warnings, the app builds, and the end-to-end check against the desk passed
+    (connect, slider, rename, disconnect, Bonjour).
+  - Advisories: A1 (a failed browser retries only after a background trip) is already under
+    Follow-ups. A2: the restored `linkReport` is always nil. A3: Mix's banners now look like
+    Connect's. A4: the tab note remains unexplained.
+- T8e native review:
+  - Assessed against `de5d54f` with item 6 escalated: `high`, due (12 paths, 438 lines).
+  - START checked: base `0cdb31e` = `de5d54f`, candidate `8674c13` = `9907f62`.
+  - The user chose "Revisar este cambio" (`granted`). Lenses: reliability and readability.
+  - Approved. Lineage `review-f598fe3b1e0b5532`, acknowledged. The reviewed boundary is now
+    `9907f62`.
+  - Two warnings (both already known) and two suggestions are under Follow-ups.
+- T8e complete. Next: T9 (mix banks and recall), or the remaining follow-ups, as the user decides.
 

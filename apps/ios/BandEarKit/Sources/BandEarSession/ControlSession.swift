@@ -23,7 +23,11 @@ import Foundation
 /// - What the phone remembers lives in a ``MusicianStore``, as Android's ViewModel keeps it in its
 ///   `MonitorStore` (`MonitorViewModel.kt:322-324,424,490,519-525`): the name and the channel are
 ///   read back when the session is made, the client id when a session starts, the name is written
-///   when a session starts with it, and the musician's channel whenever it changes.
+///   whenever the musician types it (``setMusicianName(_:)``) or starts a session with it, and the
+///   musician's channel whenever it changes.
+/// - A name typed while the session runs is announced to the desk once typing pauses
+///   (`ControlChannel.kt:333-348`): the registration again, under the new name, which the desk
+///   reads as a rename of the musician it has.
 ///
 /// Everything happens on the main actor. The transport reports from its own thread, and every
 /// event is handed to the main queue in the order it came, so the session's state is only touched
@@ -67,8 +71,10 @@ public final class ControlSession {
     /// A desk closing the connection is no failure, so an outage that began with a close reports its
     /// first failure instead.
     public private(set) var connectionError: String?
-    /// The name the musician last started a session with, as the desk stores it; remembered across
-    /// launches, and empty before the first.
+    /// The musician's name exactly as typed, as Android's state keeps it (`MonitorUiState.kt:34`),
+    /// but cut at ``Registration/maximumNameLength`` as Android's name fields cut it
+    /// (``setMusicianName(_:)``). Remembered across launches trimmed, so a launch starts from the
+    /// name the desk stores; empty before the first.
     public private(set) var musicianName: String
     /// Called on the main actor after anything above may have changed. A ``MonitorAudio`` made with
     /// this session takes it over, and calls its own after following the change.
@@ -91,6 +97,8 @@ public final class ControlSession {
     private var stopped = true
     private var reconnectPolicy = ReconnectPolicy()
     private var pendingRetry: (any ScheduledTask)?
+    /// The announcement of a renamed musician, waiting for typing to pause.
+    private var pendingNameAnnouncement: (any ScheduledTask)?
     /// Whether the current connection has heard from the desk yet.
     private var connectionProved = false
 
@@ -109,29 +117,36 @@ public final class ControlSession {
         mixSession.moreOfMe.musicianChannel = store.musicianChannel
     }
 
+    /// How long typing must pause before a renamed musician is announced to the desk, so a word
+    /// typed is one registration rather than one per key (`NAME_RESEND_DEBOUNCE_MS`,
+    /// `ControlChannel.kt:15`).
+    private static let nameAnnouncementPause: Duration = .milliseconds(400)
+
     /// Starts a session with the desk `request` names, registering as `musicianName` with this
     /// phone's audio port and this installation's ``ClientIdentity``, and opens the connection. The
-    /// name is remembered as the desk stores it. A session already running is replaced: its
-    /// connection is no longer heard, and a retry it was waiting for is called off.
+    /// name is taken as ``setMusicianName(_:)`` takes it, and registered trimmed; one with nothing in
+    /// it registers as no name, as Android's does. A session already running is replaced: its
+    /// connection is no longer heard, and a retry or a name announcement it was waiting for is
+    /// called off.
     ///
-    /// Throws, and starts nothing, for a name the desk would store as no name
-    /// (``ClientMessageError/nameIsBlank``).
+    /// Throws, and starts nothing, for a registration the desk would refuse
+    /// (``ClientMessageError/udpPortMustNotBeZero``).
     public func start(_ request: ConnectionRequest, musicianName: String) throws {
         // Every capability this build implements, as Android announces all of its own on every
         // registration (`ControlChannel.kt:531-558`): the desk then sends the `playback` and
         // `redundancy` settings the player follows, and reads the extras and `recovered` of `stats`.
         let registration = try Registration(
-            name: musicianName, udpPort: request.audioPort,
+            name: Self.typedName(musicianName), udpPort: request.audioPort,
             clientID: ClientIdentity.clientID(in: store), capabilities: ClientCapability.allCases)
         self.registration = registration
-        self.musicianName = registration.name
-        store.musicianName = registration.name
+        takeName(musicianName)
         endpoint = request.endpoint
         // The previous connection is set aside before anything below could send: what this session
         // sends goes out once its own connection opens.
         current = nil
         connection = .connecting
         cancelPendingRetry()
+        cancelPendingNameAnnouncement()
         stopped = false
         reconnectPolicy.reset()
         connectionError = nil
@@ -144,16 +159,48 @@ public final class ControlSession {
         stateDidChange?()
     }
 
-    /// Ends the session: the connection closes, a retry it was waiting for is called off, and nothing
-    /// the connection reports afterwards is heard.
+    /// Ends the session: the connection closes, a retry or a name announcement it was waiting for is
+    /// called off, and nothing the connection reports afterwards is heard.
     public func stop() {
         current = nil
         connection = .idle
         stopped = true
         cancelPendingRetry()
+        cancelPendingNameAnnouncement()
         connectionError = nil
         transport.close()
         reduce(.sessionEnded)
+        stateDidChange?()
+    }
+
+    /// The musician typed `name`. It is kept as typed and remembered, and while a session runs it is
+    /// announced to the desk once typing has paused for 400 ms, as Android's
+    /// `setName` does (`MonitorViewModel.kt:488-492`, `ControlChannel.kt:333-348`).
+    ///
+    /// - The name is cut at ``Registration/maximumNameLength`` UTF-16 units, the length Android's
+    ///   name fields stop at (`MAX_NAME_LENGTH`, `BandEarTextField.kt:67-85`), one unit shorter
+    ///   rather than split a character made of two. The desk keeps 64 Unicode scalars, so all of it
+    ///   reaches the desk.
+    /// - The store remembers it trimmed, as Android's does (`MixBankStore.kt:61-63`).
+    /// - The announcement is the session's registration again under the new name: the desk renames
+    ///   the musician it has and keeps their mix, so nothing reconnects. Each change waits the whole
+    ///   pause again. It goes out only if the connection is open when the pause ends; a connection
+    ///   that opens later registers under the new name anyway.
+    public func setMusicianName(_ name: String) {
+        takeName(name)
+        // The same port, id and capabilities the session registered with, so this cannot throw.
+        if mixSession.isSessionRunning, let registration,
+            let renamed = try? Registration(
+                name: musicianName, udpPort: registration.udpPort, clientID: registration.clientID,
+                capabilities: registration.capabilities)
+        {
+            self.registration = renamed
+            cancelPendingNameAnnouncement()
+            pendingNameAnnouncement = scheduler.schedule(after: Self.nameAnnouncementPause) {
+                [weak self] in
+                self?.announceName()
+            }
+        }
         stateDidChange?()
     }
 
@@ -284,6 +331,39 @@ public final class ControlSession {
     private func cancelPendingRetry() {
         pendingRetry?.cancel()
         pendingRetry = nil
+    }
+
+    /// Keeps `name` as typed and cut, and has the store remember it trimmed.
+    private func takeName(_ name: String) {
+        musicianName = Self.typedName(name)
+        store.musicianName = musicianName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// `name` cut at ``Registration/maximumNameLength`` UTF-16 units, Kotlin's `String.length`,
+    /// without splitting a character made of two units (`BandEarTextField.kt:67-85`).
+    private static func typedName(_ name: String) -> String {
+        guard name.utf16.count > Registration.maximumNameLength else { return name }
+        var kept = String.UnicodeScalarView()
+        var units = 0
+        for scalar in name.unicodeScalars {
+            units += UTF16.width(scalar)
+            guard units <= Registration.maximumNameLength else { break }
+            kept.append(scalar)
+        }
+        return String(kept)
+    }
+
+    /// Typing paused: the renamed musician is announced, if the connection is open.
+    private func announceName() {
+        pendingNameAnnouncement = nil
+        if let registration {
+            send(.register(registration))
+        }
+    }
+
+    private func cancelPendingNameAnnouncement() {
+        pendingNameAnnouncement?.cancel()
+        pendingNameAnnouncement = nil
     }
 
     /// One message from the desk. A message this build cannot read is ignored like one it does not

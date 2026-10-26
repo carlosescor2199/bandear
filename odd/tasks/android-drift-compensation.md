@@ -49,3 +49,13 @@ aa12e08. Delivery: single PR. Tests: JVM unit tests (`gradle -p apps/android :ap
   bounded at 24 000 frames), `DriftTrimmer` (pure; 2 s persistence window on the minimum surplus, 8 frames
   per splice, 500 ppm budget, never below target) decides, `PcmSplice` removes the frames with a 64-frame
   crossfade. `backlog_ms` now adds the queued frames (`reportExtras(queuedFrames)`). Not verified on a device.
+- L4 (verification): Risk item 4 (concurrency: reworked receive/write loop). Independent verifier:
+  S2-S6 met on reading, S1 needs a device, no blockers; advisories: drained packets skew jitter,
+  trimmed frames are not counted as discarded, queue overflow drops are not counted as lost.
+- L5 (native review review-0e848b63f58b4f8e, lenses resilience + reliability, user granted): one
+  CRITICAL finding, the write loop refilled itself while a surplus lasted and starved the receive
+  loop's link report, hold re-read and stop check. Bounded correction `faf72e7` (plan 60 lines):
+  `reportIfDue()` shared by both loops, the write loop re-reads the hold and reports per packet and
+  loops only `while (running.get())`. Full `:app:testDebugUnitTest`: 570 tests, 0 failures. Targeted
+  validation approved; acknowledged.
+- Pending: device test on the S23 with the X32 for about 20 minutes, watching that latency stays flat.

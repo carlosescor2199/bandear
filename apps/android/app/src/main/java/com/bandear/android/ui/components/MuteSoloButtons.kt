@@ -35,6 +35,12 @@ private val KeySize = 44.dp
 /** A disabled key fades but keeps its colours, so it still shows whether it is on. */
 private const val DisabledKeyAlpha = 0.4f
 
+/** What a screen reader calls a channel's Mute key: "Mute CH 3". */
+fun muteKeyDescription(channelLabel: String): String = "Mute $channelLabel"
+
+/** What a screen reader calls a channel's Solo key: "Solo CH 3". */
+fun soloKeyDescription(channelLabel: String): String = "Solo $channelLabel"
+
 /**
  * The Mute and Solo keys of one channel strip. Each is a switch for a screen reader, named with
  * [channelLabel] ("Mute CH 3") so it is clear which channel it acts on; a key that is on is filled
@@ -54,7 +60,7 @@ fun MuteSoloButtons(
     Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         ToggleKey(
             letter = "M",
-            description = "Mute $channelLabel",
+            description = muteKeyDescription(channelLabel),
             on = muted,
             onColor = colors.red,
             onToggle = onMute,
@@ -62,7 +68,7 @@ fun MuteSoloButtons(
         )
         ToggleKey(
             letter = "S",
-            description = "Solo $channelLabel",
+            description = soloKeyDescription(channelLabel),
             on = soloed,
             onColor = colors.accent,
             onToggle = onSolo,

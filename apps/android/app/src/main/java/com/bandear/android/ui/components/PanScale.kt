@@ -54,6 +54,15 @@ fun panPositionOf(pan: Int, travelPx: Float, detentShare: Float = PAN_DETENT_SHA
     }
 }
 
+/**
+ * Where the centre of a thumb [thumbPx] wide sits for [pan] on a control [lengthPx] wide, in
+ * pixels from its left end: [panPositionOf] over the travel the gesture uses (the width minus the
+ * thumb), plus half a thumb. The centre is drawn in the middle of the control; a control no wider
+ * than its thumb keeps the thumb at the start.
+ */
+fun panCentreOf(pan: Int, lengthPx: Float, thumbPx: Float): Float =
+    panPositionOf(pan, (lengthPx - thumbPx).coerceAtLeast(0f)) + thumbPx / 2f
+
 /** How much of the travel each side outside the detent spans. */
 private fun sideTravel(travelPx: Float, detentShare: Float): Float =
     travelPx * (0.5f - detentShare.coerceIn(0f, 0.5f))
@@ -111,3 +120,4 @@ internal object PanScale : FaderScale {
 
     override fun offsetOf(value: Int, travelPx: Float): Float = travelPx - panPositionOf(value, travelPx)
 }
+

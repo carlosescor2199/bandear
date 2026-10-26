@@ -142,8 +142,7 @@ private fun PanMark(text: String, modifier: Modifier) {
 private fun DrawScope.drawPan(pan: Int, colors: BandEarColors) {
     val trackHeight = PanTrackHeight.toPx()
     val thumb = PanThumbSize.toPx()
-    val travel = (size.width - thumb).coerceAtLeast(0f)
-    val thumbCentreX = panPositionOf(pan, travel) + thumb / 2f
+    val thumbCentreX = panCentreOf(pan, size.width, thumb)
     val middleX = size.width / 2f
     val trackTop = (size.height - trackHeight) / 2f
     val corner = CornerRadius(trackHeight / 2f)

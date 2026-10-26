@@ -68,7 +68,7 @@
     }
 
     /// The Mix screen over a sample mix that takes its own edits through the mix's reducer, so the
-    /// controls move in a preview as they do in the app.
+    /// controls move in a preview as they do in the app. The panel host stands in for the root's.
     struct MixPreviewHost: View {
         @State var mixSession: MixSession
         var status = MixSamples.connected
@@ -76,15 +76,74 @@
         var body: some View {
             MixContent(
                 musicianName: "Carlos", desk: MixSamples.desk, status: status,
-                mixSession: mixSession, apply: { mixSession = mixSession.reduced(by: $0) })
+                mixSession: mixSession, apply: { mixSession = mixSession.reduced(by: $0) }
+            )
+            .modalPanelHost()
         }
     }
 
-    #Preview("Mix · More of me on, drums locked") {
+    /// One of the Mix screen's panels already open over the console, as a scribble strip or the
+    /// master's level cap opens it, with edits going through the mix's reducer.
+    struct MixPanelPreviewHost: View {
+        enum Panel {
+            /// The panel of the strip known by this channel.
+            case channel(Int)
+            case master
+        }
+
+        @State var mixSession: MixSession
+        let panel: Panel
+
+        var body: some View {
+            let mix = mixSession.mix
+            let apply: MixApply = { mixSession = mixSession.reduced(by: $0) }
+            MixContent(
+                musicianName: "Carlos", desk: MixSamples.desk, status: MixSamples.connected,
+                mixSession: mixSession, apply: apply
+            )
+            .modalPanel(isPresented: .constant(true), doneTitle: ChannelSheetWords.done) {
+                switch panel {
+                case .channel(let channel):
+                    if let strip = ChannelSheetWords.sheetStrip(in: mix.strips, open: channel) {
+                        ChannelSheetTitle(strip: strip)
+                    }
+                case .master:
+                    MasterPanelTitle()
+                }
+            } content: {
+                switch panel {
+                case .channel(let channel):
+                    if let strip = ChannelSheetWords.sheetStrip(in: mix.strips, open: channel) {
+                        ChannelSheet(strip: strip, mix: mix, moreOfMe: mixSession.moreOfMe, apply: apply)
+                    }
+                case .master:
+                    MasterPanel(mix: mix, apply: apply)
+                }
+            }
+        }
+    }
+
+    // The console in both orientations: the drums locked, the unnamed guitar (CH 4) muted, the
+    // bass soloed, the keys a stereo pair, the lead vox the musician's own and lifted, and the
+    // engineer's limit of 85% marked on the master.
+
+    @available(iOS 17.0, *)
+    #Preview("Mix · portrait", traits: .fixedLayout(width: 390, height: 844)) {
         MixPreviewHost(mixSession: MixSamples.moreOfMeOn)
     }
 
-    #Preview("Mix · following Ana's mix") {
+    @available(iOS 17.0, *)
+    #Preview("Mix · landscape", traits: .fixedLayout(width: 844, height: 390)) {
+        MixPreviewHost(mixSession: MixSamples.moreOfMeOn)
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Mix · following Ana's mix · portrait", traits: .fixedLayout(width: 390, height: 844)) {
+        MixPreviewHost(mixSession: MixSamples.following)
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Mix · following Ana's mix · landscape", traits: .fixedLayout(width: 844, height: 390)) {
         MixPreviewHost(mixSession: MixSamples.following)
     }
 
@@ -94,5 +153,30 @@
 
     #Preview("Mix · waiting for channels") {
         MixPreviewHost(mixSession: MixSamples.waiting)
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Channel panel · portrait", traits: .fixedLayout(width: 390, height: 844)) {
+        MixPanelPreviewHost(mixSession: MixSamples.moreOfMeOn, panel: .channel(1))
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Channel panel · landscape", traits: .fixedLayout(width: 844, height: 390)) {
+        MixPanelPreviewHost(mixSession: MixSamples.moreOfMeOn, panel: .channel(1))
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Channel panel · locked", traits: .fixedLayout(width: 390, height: 844)) {
+        MixPanelPreviewHost(mixSession: MixSamples.moreOfMeOn, panel: .channel(5))
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Master panel · portrait", traits: .fixedLayout(width: 390, height: 844)) {
+        MixPanelPreviewHost(mixSession: MixSamples.moreOfMeOn, panel: .master)
+    }
+
+    @available(iOS 17.0, *)
+    #Preview("Master panel · landscape", traits: .fixedLayout(width: 844, height: 390)) {
+        MixPanelPreviewHost(mixSession: MixSamples.moreOfMeOn, panel: .master)
     }
 #endif

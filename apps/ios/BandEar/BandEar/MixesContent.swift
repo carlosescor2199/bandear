@@ -6,6 +6,8 @@ import UIKit
 /// The Mixes tab as Android's `SavedMixesScreen` lays it out, rendered natively: the title and its
 /// introduction, the save card with what the last action did under it, then the saved mixes, each
 /// with Recall and a ⋮ menu holding Rename and Delete, or the empty state while none is saved.
+/// In the look of the "Mixes" boards: one column in portrait; in landscape the title and the save
+/// field on the left, the saved mixes on the right.
 ///
 /// The presentational half: it shows the values it is given and reports actions through its
 /// closures, with every word from ``SavedMixesWords``. What is typed and which dialog is open are
@@ -33,14 +35,36 @@ struct MixesContent: View {
     /// The mix whose delete dialog is open.
     @State private var deleting: String?
 
+    @Environment(\.screenOrientation) private var orientation
+
     var body: some View {
-        List {
-            introSection
-            saveSection
-            listSection
+        let landscape = orientation.isLandscape
+        // One layout or the other around the same two columns, so what is typed in the save field
+        // and its focus stay through a rotation.
+        let layout =
+            landscape
+            ? AnyLayout(HStackLayout(alignment: .top, spacing: 32))
+            : AnyLayout(VStackLayout(alignment: .leading, spacing: 28))
+        ScrollView {
+            layout {
+                VStack(alignment: .leading, spacing: landscape ? 24 : 28) {
+                    introSection
+                    saveSection
+                }
+                .frame(width: landscape ? 280 : nil)
+                .frame(maxWidth: landscape ? nil : .infinity, alignment: .leading)
+                listSection
+                    .padding(.top, landscape ? 8 : 0)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, landscape ? 16 : 12)
+            .padding(.bottom, 24)
         }
         .scrollDismissesKeyboard(.interactively)
+        .background(BandEarColors.ground.ignoresSafeArea())
         .navigationTitle(SavedMixesWords.screenTitle)
+        .toolbar(.hidden, for: .navigationBar)
         .alert(
             SavedMixesWords.renameTitle(renaming ?? ""), isPresented: shown($renaming),
             presenting: renaming
@@ -73,89 +97,102 @@ struct MixesContent: View {
         let text: String?
     }
 
+    /// The screen's title and what it is for.
     private var introSection: some View {
-        Section {
+        VStack(alignment: .leading, spacing: 8) {
+            ScreenTitle(text: SavedMixesWords.screenTitle)
             Text(SavedMixesWords.screenIntro)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+                .bandEarFont(BandEarType.bodyMedium)
+                .foregroundStyle(BandEarColors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     /// The name field and Save, with what the last action did under them.
     private var saveSection: some View {
-        Section {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionCaption(text: SavedMixesWords.saveCaption)
+            HStack(spacing: 10) {
                 TextField(
                     SavedMixesWords.saveFieldLabel, text: $typedName,
-                    prompt: Text(SavedMixesWords.saveFieldPlaceholder)
+                    prompt: fieldPrompt(SavedMixesWords.saveFieldPlaceholder)
                 )
                 .textInputAutocapitalization(.sentences)
                 .submitLabel(.done)
                 .focused($saveFieldFocused)
                 .onSubmit(saveTypedName)
-                Button(SavedMixesWords.save, action: saveTypedName)
-                    .buttonStyle(.borderedProminent)
+                .boxedField { saveFieldFocused = true }
+                // As tall as the field beside it.
+                Button(action: saveTypedName) {
+                    Text(SavedMixesWords.save)
+                        .padding(.horizontal, 6)
+                        .frame(maxHeight: .infinity)
+                }
+                .buttonStyle(BandEarButtonStyle(kind: .primary))
             }
-        } header: {
-            Text(SavedMixesWords.saveCaption)
-                .textCase(nil)
-        } footer: {
+            .fixedSize(horizontal: false, vertical: true)
             if let noticeText {
                 Text(noticeText)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.primary)
+                    .bandEarFont(BandEarType.bodySmall.with(weight: .medium))
+                    .foregroundStyle(BandEarColors.text)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
     /// The saved mixes, or the empty state while none is saved.
     private var listSection: some View {
-        Section {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionCaption(text: SavedMixesWords.listTitle(count: names.count))
             if names.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(SavedMixesWords.emptyTitle)
-                        .font(.headline)
+                        .bandEarFont(BandEarType.bodyLarge.with(size: 16, weight: .semibold))
+                        .foregroundStyle(BandEarColors.text)
                     Text(SavedMixesWords.emptyDetail)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .bandEarFont(BandEarType.bodySmall)
+                        .foregroundStyle(BandEarColors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.vertical, 4)
+                .padding(.vertical, 14)
+                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .screenCard()
                 .accessibilityElement(children: .combine)
             } else {
-                // A name is saved once, so it tells the rows apart.
-                ForEach(names, id: \.self) { name in
-                    row(name)
+                VStack(spacing: 0) {
+                    // A name is saved once, so it tells the rows apart.
+                    ForEach(names, id: \.self) { name in
+                        if name != names.first {
+                            CardDivider()
+                        }
+                        row(name)
+                    }
                 }
-            }
-        } header: {
-            Text(SavedMixesWords.listTitle(count: names.count))
-                .textCase(nil)
-        } footer: {
-            if !names.isEmpty {
-                Text(SavedMixesWords.menuHint)
+                .screenCard()
+                SectionHint(text: SavedMixesWords.menuHint)
             }
         }
     }
 
     /// One saved mix: its name, "Active now" while it is the active one, Recall, and the ⋮ menu.
     private func row(_ name: String) -> some View {
-        HStack(spacing: 12) {
+        let active = name == activeName
+        return HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
-                    .font(.body.weight(.semibold))
+                    .bandEarFont(BandEarType.bodyLarge.with(size: 16, weight: active ? .semibold : .medium))
+                    .foregroundStyle(BandEarColors.text)
                     .lineLimit(1)
-                if let detail = SavedMixesWords.detail(active: name == activeName) {
+                if let detail = SavedMixesWords.detail(active: active) {
                     Text(detail)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.tint)
+                        .bandEarFont(BandEarType.bodySmall)
+                        .foregroundStyle(BandEarColors.accent)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .combine)
-            Spacer(minLength: 8)
-            Button(SavedMixesWords.recall) { recall(name) }
-                .buttonStyle(.bordered)
+            SecondaryButton(title: SavedMixesWords.recall) { recall(name) }
                 .accessibilityLabel(SavedMixesWords.recallLabel(name))
             Menu {
                 Button(SavedMixesWords.rename) { startRenaming(name) }
@@ -164,8 +201,8 @@ struct MixesContent: View {
                 // The ⋮ the hint under the list names.
                 Image(systemName: "ellipsis")
                     .rotationEffect(.degrees(90))
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(BandEarColors.textSecondary)
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
@@ -188,6 +225,9 @@ struct MixesContent: View {
                 Text(SavedMixesWords.deleteMessage)
             }
         }
+        .padding(.vertical, 8)
+        .padding(.leading, 16)
+        .padding(.trailing, 8)
     }
 
     // MARK: Actions
@@ -237,6 +277,8 @@ struct MixesContent: View {
                 notice: .recalled(name: "Ballads"), noticeNumber: 1, save: { _ in true },
                 recall: { _ in }, rename: { _, _ in }, delete: { _ in })
         }
+        .screenOrientationHost()
+        .preferredColorScheme(.dark)
     }
 
     #Preview("Mixes · empty") {
@@ -245,5 +287,7 @@ struct MixesContent: View {
                 names: [], activeName: nil, notice: nil, noticeNumber: 0, save: { _ in false },
                 recall: { _ in }, rename: { _, _ in }, delete: { _ in })
         }
+        .screenOrientationHost()
+        .preferredColorScheme(.dark)
     }
 #endif

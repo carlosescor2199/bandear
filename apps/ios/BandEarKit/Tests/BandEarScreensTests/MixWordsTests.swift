@@ -30,6 +30,12 @@ struct MixWordsTests {
         #expect(MixWords.noGroups == "The server has no groups.")
     }
 
+    /// The redesign's portrait console: the hint beside "CHANNELS · N" while the strips overflow the
+    /// screen. Android adds the same words in its copy helper, with its own test.
+    @Test func anOverflowingRowSaysToSwipeForMore() {
+        #expect(MixWords.swipeForMore == "Swipe for more")
+    }
+
     /// `leaderName` (`MonitorUiState.kt:426`): the leader trimmed, or "another musician".
     @Test func theLeaderIsNamedTrimmedOrAsAnotherMusician() {
         #expect(MixWords.leaderName("  Ana ") == "Ana")

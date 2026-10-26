@@ -6,8 +6,10 @@ import SwiftUI
 /// VoiceOver hears it exactly as the native segmented `Picker` it replaces, with no label of its
 /// own: each choice by its title, the selected one as selected, and its place among them.
 ///
-/// 36 pt tall, as the design's header controls are (taller only for large Dynamic Type), and as
-/// wide as its choices need: it never shortens a title, so leave it the room.
+/// Drawn 36 pt tall, as the design's header controls are (taller only for large Dynamic Type), in
+/// the middle of a 44 pt frame: each choice's touch target runs past its drawn segment to the
+/// frame's top and bottom. As wide as its choices need: it never shortens a title, so leave it the
+/// room.
 struct SegmentedChoice<Value: Hashable>: View {
     let options: [Value]
     @Binding var selection: Value
@@ -30,15 +32,20 @@ struct SegmentedChoice<Value: Hashable>: View {
                         .background(
                             selected ? BandEarColors.surfaceRaised : .clear,
                             in: BandEarShapes.rounded(BandEarShapes.key))
+                        // The control's 3 pt inset and the frame's 4 pt margin, above and below.
+                        .padding(.vertical, 7)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(3)
-        .background(BandEarColors.surface, in: BandEarShapes.rounded(BandEarShapes.control))
-        .overlay(
-            BandEarShapes.rounded(BandEarShapes.control).strokeBorder(BandEarColors.border, lineWidth: 1))
+        .padding(.horizontal, 3)
+        .background {
+            let shape = BandEarShapes.rounded(BandEarShapes.control)
+            shape.fill(BandEarColors.surface)
+                .overlay(shape.strokeBorder(BandEarColors.border, lineWidth: 1))
+                .padding(.vertical, 4)
+        }
         .accessibilityRepresentation {
             Picker(selection: $selection) {
                 ForEach(options, id: \.self) { option in

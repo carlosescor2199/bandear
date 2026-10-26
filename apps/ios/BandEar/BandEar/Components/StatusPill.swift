@@ -6,7 +6,8 @@ import SwiftUI
 /// it is never told by colour alone; VoiceOver hears `voiceOverLabel` instead, such as
 /// ``ConnectionPill/spokenDescription``.
 ///
-/// 36 pt tall, as the design's header controls are; it is not a control.
+/// Drawn 36 pt tall, as the design's header controls are, in the middle of a 44 pt frame: it is not
+/// a control, but VoiceOver's touch exploration finds it as easily as the controls beside it.
 struct StatusPill: View {
     let tone: ConnectionTone
     let text: String
@@ -26,6 +27,8 @@ struct StatusPill: View {
         .frame(minHeight: 36)
         .background(BandEarColors.tint(tone), in: Capsule())
         .overlay(Capsule().strokeBorder(BandEarColors.tintBorder(tone), lineWidth: 1))
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(voiceOverLabel)
     }

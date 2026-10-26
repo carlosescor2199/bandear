@@ -5,8 +5,9 @@ import SwiftUI
 /// The diagnostics of Settings: the phone's own link health, the six readings that tell whether
 /// the audio is healthy, and an expander with every counter and the recent errors.
 ///
-/// Follows the Android client's `DiagnosticsCard` (`SettingsScreen.kt`); every word and number
-/// comes from ``Diagnostics`` and ``DiagnosticsWords``.
+/// Follows the Android client's `DiagnosticsCard` (`SettingsScreen.kt`) in the look of the
+/// "Settings" boards: the six readings as a grid of tiles, their numbers in the number face. Every
+/// word and number comes from ``Diagnostics`` and ``DiagnosticsWords``.
 struct DiagnosticsSection: View {
     /// The desk's reply and the connection's outage, which a receiver report leaves alone.
     @ObservedObject var session: SessionModel
@@ -21,52 +22,40 @@ struct DiagnosticsSection: View {
 
     var body: some View {
         let readings = self.readings
-        Section {
-            ForEach(readings.summary, id: \.label) { reading in
-                ReadingRow(reading: reading)
-            }
-            Button {
-                expanded.toggle()
-            } label: {
-                HStack {
-                    Text(DiagnosticsWords.expanderText(expanded: expanded))
-                    Spacer(minLength: 8)
-                    Image(systemName: "chevron.down")
-                        .font(.footnote.weight(.semibold))
-                        .rotationEffect(expanded ? .degrees(180) : .zero)
-                        .accessibilityHidden(true)
-                }
-            }
-            .accessibilityValue(DiagnosticsWords.expanderState(expanded: expanded))
-            if expanded {
-                // Every counter and the recent errors can be selected and copied, for a bug report.
-                ForEach(readings.allReadings(controlStatus: controlStatus), id: \.label) { reading in
-                    ReadingRow(reading: reading)
-                        .textSelection(.enabled)
-                }
-                Text(DiagnosticsWords.recentErrorsTitle)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .accessibilityAddTraits(.isHeader)
-                let errors = readings.recentErrors
-                if errors.isEmpty {
-                    Text(DiagnosticsWords.noRecentErrors)
-                        .font(.subheadline)
-                } else {
-                    ForEach(errors, id: \.self) { error in
-                        Text(error)
-                            .font(.subheadline)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-        } header: {
-            HStack {
-                Text(DiagnosticsWords.title)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                SectionCaption(text: DiagnosticsWords.title)
                 Spacer(minLength: 8)
                 LinkHealthLight(health: readings.linkHealth)
             }
-            .textCase(nil)
+            .frame(minHeight: 20)
+            ReadingGrid(readings: readings.summary)
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Text(DiagnosticsWords.expanderText(expanded: expanded))
+                        .bandEarFont(BandEarType.bodyLarge.with(weight: .medium))
+                        .foregroundStyle(BandEarColors.text)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(BandEarColors.textSecondary)
+                        .rotationEffect(expanded ? .degrees(180) : .zero)
+                        .accessibilityHidden(true)
+                }
+                .padding(.horizontal, 4)
+                .frame(minHeight: 48)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PressedDimStyle())
+            .accessibilityValue(DiagnosticsWords.expanderState(expanded: expanded))
+            if expanded {
+                AllCounters(
+                    readings: readings.allReadings(controlStatus: controlStatus),
+                    errors: readings.recentErrors)
+            }
         }
     }
 
@@ -83,15 +72,99 @@ struct DiagnosticsSection: View {
     }
 }
 
-/// One labelled number, its digits aligned.
-private struct ReadingRow: View {
-    let reading: Diagnostics.Reading
+/// The compact readings two by two, as tiles of one card with a rule between them.
+private struct ReadingGrid: View {
+    let readings: [Diagnostics.Reading]
 
     var body: some View {
-        LabeledContent(reading.label) {
-            Text(reading.value)
-                .monospacedDigit()
+        let shape = BandEarShapes.rounded(BandEarShapes.panel)
+        let rows = stride(from: 0, to: readings.count, by: 2).map {
+            Array(readings[$0..<min($0 + 2, readings.count)])
         }
+        VStack(spacing: 1) {
+            ForEach(rows, id: \.first?.label) { row in
+                HStack(spacing: 1) {
+                    ForEach(row, id: \.label) { reading in
+                        ReadingTile(reading: reading)
+                    }
+                    if row.count < 2 {
+                        BandEarColors.surface
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .background(BandEarColors.border)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(BandEarColors.border, lineWidth: 1))
+    }
+}
+
+/// One labelled number, its digits in the number face.
+private struct ReadingTile: View {
+    let reading: Diagnostics.Reading
+    @Environment(\.screenOrientation) private var orientation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(reading.label)
+                .bandEarFont(BandEarType.labelMedium)
+                .foregroundStyle(BandEarColors.textSecondary)
+            Text(reading.value)
+                .bandEarFont(BandEarType.number.with(size: orientation.isLandscape ? 17 : 18))
+                .foregroundStyle(BandEarColors.text)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .padding(.vertical, orientation.isLandscape ? 12 : 14)
+        .padding(.horizontal, orientation.isLandscape ? 14 : 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(BandEarColors.surface)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Every counter and the recent errors, on a card. Each can be selected and copied, for a bug
+/// report.
+private struct AllCounters: View {
+    let readings: [Diagnostics.Reading]
+    let errors: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(readings, id: \.label) { reading in
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text(reading.label)
+                        .bandEarFont(BandEarType.bodySmall)
+                        .foregroundStyle(BandEarColors.textSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(reading.value)
+                        .bandEarFont(BandEarType.numberSmall)
+                        .foregroundStyle(BandEarColors.text)
+                        .multilineTextAlignment(.trailing)
+                }
+                .textSelection(.enabled)
+                .accessibilityElement(children: .combine)
+            }
+            SectionCaption(text: DiagnosticsWords.recentErrorsTitle)
+                .padding(.top, 8)
+            if errors.isEmpty {
+                Text(DiagnosticsWords.noRecentErrors)
+                    .bandEarFont(BandEarType.bodySmall)
+                    .foregroundStyle(BandEarColors.text)
+            } else {
+                ForEach(errors, id: \.self) { error in
+                    Text(error)
+                        .bandEarFont(BandEarType.bodySmall)
+                        .foregroundStyle(BandEarColors.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .screenCard()
     }
 }
 
@@ -104,6 +177,8 @@ private struct LinkHealthLight: View {
         HStack(spacing: 6) {
             ConnectionToneDot(tone: health.tone)
             Text(health.summaryText)
+                .bandEarFont(BandEarType.bodySmall.with(weight: .semibold))
+                .foregroundStyle(BandEarColors.text)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(health.spokenDescription)

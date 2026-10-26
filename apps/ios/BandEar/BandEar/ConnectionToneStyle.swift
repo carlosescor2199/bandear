@@ -1,17 +1,11 @@
 import BandEarScreens
 import SwiftUI
 
-/// How a ``ConnectionTone`` is drawn: a system colour and an SF Symbol. Every sign also says its
-/// state in words, so the colour never carries it alone.
+/// How a ``ConnectionTone`` is drawn: a brand colour (``BandEarColors/solid(_:)``) and an SF Symbol.
+/// Every sign also says its state in words, so the colour never carries it alone.
 enum ConnectionToneStyle {
     static func color(_ tone: ConnectionTone) -> Color {
-        switch tone {
-        case .green: .green
-        case .amber: .orange
-        case .red: .red
-        case .blue: .blue
-        case .neutral: .gray
-        }
+        BandEarColors.solid(tone)
     }
 
     /// The symbol beside a banner of this tone.
@@ -38,24 +32,13 @@ struct ConnectionToneDot: View {
     }
 }
 
-/// A ``ConnectionPill``: its words beside the dot of its tone, in a capsule tinted by that tone. A
-/// screen reader hears the state and its meaning instead.
+/// A ``ConnectionPill``: its words beside the dot of its tone, in a capsule on that tone's tint
+/// (``StatusPill``). A screen reader hears the state and its meaning instead.
 struct ConnectionPillBadge: View {
     let pill: ConnectionPill
 
     var body: some View {
-        let color = ConnectionToneStyle.color(pill.tone)
-        HStack(spacing: 6) {
-            ConnectionToneDot(tone: pill.tone)
-            Text(pill.words)
-                .font(.caption.weight(.semibold))
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(color.opacity(0.15), in: Capsule())
-        .overlay(Capsule().strokeBorder(color.opacity(0.4)))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(pill.spokenDescription)
+        StatusPill(tone: pill.tone, text: pill.words, voiceOverLabel: pill.spokenDescription)
     }
 }
 
@@ -71,14 +54,16 @@ struct ConnectionBannerRow: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(banner.title)
-                    .font(.subheadline.weight(.semibold))
+                    .bandEarFont(BandEarType.bodyLarge.with(weight: .semibold))
+                    .foregroundStyle(BandEarColors.text)
                 Text(banner.detail)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .bandEarFont(BandEarType.bodySmall)
+                    .foregroundStyle(BandEarColors.textSecondary)
             }
             if banner.busy {
                 Spacer(minLength: 8)
                 ProgressView()
+                    .tint(ConnectionToneStyle.color(banner.tone))
                     .accessibilityHidden(true)
             }
         }

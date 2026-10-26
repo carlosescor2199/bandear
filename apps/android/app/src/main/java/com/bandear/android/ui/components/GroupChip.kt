@@ -26,6 +26,12 @@ fun groupToneFor(index: Int): GroupTone {
     return tones[Math.floorMod(index, tones.size)]
 }
 
+/**
+ * What a screen reader hears for the group named [name], wherever the group is named beside a
+ * channel or on a group strip: "Group: Drums", so the name is not taken for a channel's.
+ */
+fun groupChipDescription(name: String): String = "Group: $name"
+
 /** The small tag on a channel strip naming the group the channel belongs to. */
 @Composable
 fun GroupChip(name: String, tone: GroupTone, modifier: Modifier = Modifier) {
@@ -35,7 +41,7 @@ fun GroupChip(name: String, tone: GroupTone, modifier: Modifier = Modifier) {
         modifier = modifier
             .background(colors.groupBackground(tone), BandEarShapes.Tag)
             .padding(horizontal = 8.dp, vertical = 2.dp)
-            .clearAndSetSemantics { contentDescription = "Group: $name" },
+            .clearAndSetSemantics { contentDescription = groupChipDescription(name) },
         style = MaterialTheme.typography.labelSmall,
         color = colors.groupText(tone),
         maxLines = 1,

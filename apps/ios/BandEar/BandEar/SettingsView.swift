@@ -81,10 +81,9 @@ struct SettingsView: View {
                     Text(SettingsWords.serverCardTitle(status))
                         .bandEarFont(BandEarType.bodyLarge.with(size: 16, weight: .semibold))
                         .foregroundStyle(BandEarColors.text)
-                    Text(SettingsWords.serverCardDetail(status))
+                    ServerCardDetail(text: SettingsWords.serverCardDetail(status))
                         .bandEarFont(BandEarType.bodySmall)
                         .foregroundStyle(BandEarColors.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityElement(children: .combine)
@@ -202,6 +201,32 @@ extension VerticalAlignment {
     }
 
     fileprivate static let settingsColumns = VerticalAlignment(SettingsColumns.self)
+}
+
+/// The server card's line under its title (``SettingsWords/serverCardDetail(_:)``). While a session
+/// runs it is where, then the connection's state after a " · ": where that does not fit on one line,
+/// the place is cut short in its middle and the state stays whole, so it never wraps onto a line of
+/// its own (the landscape card is narrow). VoiceOver reads the line in full. Otherwise it is advice,
+/// which wraps.
+private struct ServerCardDetail: View {
+    let text: String
+
+    var body: some View {
+        if let state = text.range(of: " · ", options: .backwards) {
+            HStack(spacing: 0) {
+                Text(text[..<state.lowerBound])
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(text[state.lowerBound...])
+                    .fixedSize()
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(text)
+        } else {
+            Text(text)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 }
 
 /// The way back from the manual address form to Connect's servers, above the title (Android's

@@ -1,5 +1,6 @@
 /// The rules the app's views lay themselves out and take touches by, on plain numbers: which way a
-/// space is laid out, whose a drag is, how tall a modal panel's content is drawn. The views read
+/// space is laid out, whose a drag is, how tall a modal panel's content and the Mix screen's console
+/// are drawn, and when a drag closes a bottom sheet. The views read
 /// their sizes and gestures from SwiftUI and UIKit and ask here, so `swift test` proves the rules
 /// without a simulator.
 ///
@@ -42,5 +43,26 @@ public enum LayoutRules {
     /// panel hugs its content and a tall one scrolls.
     public static func panelContentHeight(ideal: Double, maxHeight: Double, proposed: Double?) -> Double {
         min(ideal, maxHeight, proposed ?? .infinity)
+    }
+
+    /// How far a drag must carry a portrait bottom sheet down for letting go to close it
+    /// (``sheetDragCloses(predictedPull:)``).
+    public static let sheetCloseDistance = 100.0
+
+    /// Whether letting go of a drag down a portrait bottom sheet's grabber or header closes the
+    /// sheet: when the drag would carry it down more than ``sheetCloseDistance``, counting how far
+    /// its speed would have taken it (`predictedPull`, the drag's predicted end), so a long pull and
+    /// a quick flick both close it. Short of that, or pushed back up, the sheet springs back.
+    public static func sheetDragCloses(predictedPull: Double) -> Bool {
+        predictedPull > sheetCloseDistance
+    }
+
+    /// How tall the Mix screen's console of strips is drawn under the parts above it (`topHeight`,
+    /// with the gaps between them): the height they leave of the space `spaceHeight` tall, but never
+    /// less than `least`, so the faders keep a travel long enough to set by hand. When the space
+    /// leaves less, as when banners stack in landscape, the console keeps `least` and the screen
+    /// scrolls instead, as Android's `ConsoleLayout` does (`ui/screens/MixScreen.kt`).
+    public static func consoleHeight(spaceHeight: Double, topHeight: Double, least: Double) -> Double {
+        max(spaceHeight - topHeight, least)
     }
 }

@@ -111,18 +111,18 @@ struct ConnectionBannerParityTests {
             connection: connection, sessionRunning: true, desk: server, mixHeldByDesk: held)
     }
 
-    // MixScreenTextTest.kt:136
+    // MixScreenTextTest.kt:141
     @Test func noBannerWhileConnectedOrConnecting() {
         #expect(running(.connected, held: true).banner == nil)
         #expect(running(.connecting, held: false).banner == nil)
     }
 
-    // MixScreenTextTest.kt:142
+    // MixScreenTextTest.kt:147
     @Test func noBannerWithoutASession() {
         #expect(ConnectionStatus().banner == nil)
     }
 
-    // MixScreenTextTest.kt:147
+    // MixScreenTextTest.kt:152
     @Test func reconnectingSaysTheServerHoldsTheMixWhenItDoes() {
         #expect(
             running(.reconnecting, held: true).banner
@@ -133,7 +133,7 @@ struct ConnectionBannerParityTests {
                     busy: true))
     }
 
-    // MixScreenTextTest.kt:161
+    // MixScreenTextTest.kt:166
     @Test func reconnectingSaysThePhoneMixesWhenTheServerNeverTookOver() {
         #expect(
             running(.reconnecting, held: false).banner?.detail

@@ -35,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
@@ -50,6 +51,7 @@ import com.bandear.android.ui.components.StripKeySlotHeight
 import com.bandear.android.ui.components.StripKeys
 import com.bandear.android.ui.components.StripPan
 import com.bandear.android.ui.components.VerticalFader
+import com.bandear.android.ui.components.groupChipDescription
 import com.bandear.android.ui.components.groupToneFor
 import com.bandear.android.ui.components.scribbleColors
 import com.bandear.android.ui.components.scribbleToneFor
@@ -263,14 +265,18 @@ private fun ChannelStrip(
             held = !open,
         )
         val group = channel.group
+        val subtitle = group?.name ?: "No group"
         ScribbleStrip(
             title = channel.label,
-            subtitle = group?.name ?: "No group",
+            subtitle = subtitle,
             tone = scribbleToneFor(mine, group?.index),
             contentDescription = channelSettingsLabel(channel),
             onClick = onOpen,
             onClickLabel = "Open the channel's settings",
             stateDescription = channelPanState(channel.pan, channel.stereo),
+            // The group is read after the button as its chip was beside the label button. A held
+            // strip shows its group here too, so it reads it as well, as iOS does.
+            subtitleDescription = if (group != null) groupChipDescription(group.name) else subtitle,
             stereo = channel.stereo,
         )
     }
@@ -319,7 +325,8 @@ private fun StripValue(text: String, color: Color, held: Boolean) {
 
 /**
  * The foot of a group strip, drawn as a scribble strip on the group's [tone]: its [name] over its
- * [members]. It is not a button: a group has no panel to open.
+ * [members]. It is not a button: a group has no panel to open. A screen reader reads the name as
+ * the group chip on the strip was read ("Group: Drums"), then the members.
  */
 @Composable
 private fun GroupLabel(name: String, members: String, tone: ScribbleTone) {
@@ -342,6 +349,7 @@ private fun GroupLabel(name: String, members: String, tone: ScribbleTone) {
         ) {
             Text(
                 text = name,
+                modifier = Modifier.clearAndSetSemantics { contentDescription = groupChipDescription(name) },
                 style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, lineHeight = 16.sp),
                 color = colors.content,
                 maxLines = 1,

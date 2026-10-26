@@ -9,10 +9,11 @@ extension View {
     /// panel is drawn here rather than presented.
     ///
     /// The panel's top row holds `header` (the panel's title, such as the channel's name) and a
-    /// `doneTitle` button (``ChannelSheetWords/done``). Tapping the scrim, the Done button or
-    /// VoiceOver's escape gesture (a two-finger Z) sets `isPresented` to false. The content scrolls
-    /// when it is taller than the panel; in portrait the sheet is as tall as its content, which may
-    /// take up to three quarters of the space.
+    /// `doneTitle` button (``ChannelSheetWords/done``). Tapping the scrim, the Done button, dragging
+    /// the portrait sheet down by its grabber or header, or VoiceOver's escape gesture (a two-finger
+    /// Z) sets `isPresented` to false. The content scrolls when it is taller than the panel; in
+    /// portrait the sheet is as tall as its content, which may take up to three quarters of the
+    /// space.
     ///
     /// For VoiceOver the panel is modal: the views beneath are hidden while it is up, and focus
     /// moves into it when it opens and back when it closes.
@@ -158,6 +159,10 @@ private struct ModalPanelLayer<Header: View, Panel: View>: View {
 }
 
 /// The panel itself: the grabber in portrait, the header row with Done, and the content.
+///
+/// In portrait the sheet follows a finger dragging its grabber or header down, and letting go
+/// closes it or springs it back (``LayoutRules/sheetDragCloses(predictedPull:)``), as a system
+/// sheet does; the content below keeps its own drags for its sliders and its scrolling.
 private struct ModalPanelSurface<Header: View, Panel: View>: View {
     let orientation: LayoutOrientation
     let available: CGSize
@@ -166,33 +171,46 @@ private struct ModalPanelSurface<Header: View, Panel: View>: View {
     let header: () -> Header
     let panel: () -> Panel
 
+    /// How far a finger has dragged the portrait sheet down; back to 0, springing, when it lets go
+    /// or the drag is cancelled.
+    @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.3, dampingFraction: 0.8)))
+    private var pull: CGFloat = 0
+    /// Where a drag that closes the sheet let go of it, so it leaves from there.
+    @State private var closingPull: CGFloat = 0
+
     /// The landscape panel's width inside the safe area; its background runs on past the edge.
     private static var sideWidth: CGFloat { 360 }
 
     var body: some View {
         let landscape = orientation.isLandscape
         VStack(alignment: .leading, spacing: landscape ? 12 : 18) {
-            if !landscape {
-                Capsule()
-                    .fill(BandEarColors.border)
-                    .frame(width: 36, height: 5)
-                    .frame(maxWidth: .infinity)
-                    .accessibilityHidden(true)
-            }
-            HStack(spacing: 8) {
-                header()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button {
-                    dismiss()
-                } label: {
-                    Text(doneTitle)
-                        .bandEarFont(BandEarType.bodyLarge.with(weight: .semibold))
-                        .foregroundStyle(BandEarColors.accent)
-                        .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
-                        .contentShape(Rectangle())
+            VStack(alignment: .leading, spacing: landscape ? 12 : 18) {
+                if !landscape {
+                    Capsule()
+                        .fill(BandEarColors.border)
+                        .frame(width: 36, height: 5)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityHidden(true)
                 }
-                .buttonStyle(PressedDimStyle())
+                HStack(spacing: 8) {
+                    header()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        dismiss()
+                    } label: {
+                        Text(doneTitle)
+                            .bandEarFont(BandEarType.bodyLarge.with(weight: .semibold))
+                            .foregroundStyle(BandEarColors.accent)
+                            .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressedDimStyle())
+                }
             }
+            // The sheet's top padding is part of what a finger can grab.
+            .padding(.top, landscape ? 0 : Self.portraitTopPadding)
+            .contentShape(Rectangle())
+            .gesture(dragToClose, including: landscape ? .subviews : .all)
             let maxHeight = LayoutRules.panelContentMaxHeight(
                 spaceHeight: Double(available.height), isLandscape: landscape)
             ContentHeightLayout(maxHeight: CGFloat(maxHeight)) {
@@ -202,7 +220,7 @@ private struct ModalPanelSurface<Header: View, Panel: View>: View {
                 }
             }
         }
-        .padding(.top, landscape ? 16 : 10)
+        .padding(.top, landscape ? 16 : 0)
         .padding(.leading, landscape ? 24 : 20)
         .padding(.trailing, landscape ? 16 : 20)
         .padding(.bottom, landscape ? 20 : 16)
@@ -217,11 +235,33 @@ private struct ModalPanelSurface<Header: View, Panel: View>: View {
                 .flipsForRightToLeftLayoutDirection(true)
                 .ignoresSafeArea()
         }
+        .offset(y: max(pull, closingPull))
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { dismiss() }
         .onAppear { UIAccessibility.post(notification: .screenChanged, argument: nil) }
         .onDisappear { UIAccessibility.post(notification: .screenChanged, argument: nil) }
+    }
+}
+
+extension ModalPanelSurface {
+    /// The space over the grabber in portrait.
+    private static var portraitTopPadding: CGFloat { 10 }
+
+    /// A drag down the portrait sheet's top: the sheet follows the finger down, not up, and closes
+    /// when it lets go far or fast enough.
+    private var dragToClose: some Gesture {
+        // Measured on the screen, since the sheet moves under the finger.
+        DragGesture(minimumDistance: 4, coordinateSpace: .global)
+            .updating($pull) { value, pull, _ in
+                pull = max(value.translation.height, 0)
+            }
+            .onEnded { value in
+                guard LayoutRules.sheetDragCloses(predictedPull: Double(value.predictedEndTranslation.height))
+                else { return }
+                closingPull = max(value.translation.height, 0)
+                dismiss()
+            }
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "bandear-desktop"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Desktop mixing console for the BandEar server engine: every musician's mix, the phones and the audio input."
 publish = false

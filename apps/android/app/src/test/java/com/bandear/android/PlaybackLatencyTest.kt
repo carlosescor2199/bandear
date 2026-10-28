@@ -75,6 +75,28 @@ class PlaybackLatencyTest {
     }
 
     @Test
+    fun theBacklogReportedCountsTheAudioQueuedBeforeTheTrackToo() {
+        // 480 frames on the track plus 960 waiting before it are 1 440 frames: 30 ms at 48 kHz.
+        val extras = PlaybackLatency.reportExtras(
+            packetFrames = 240,
+            cushionPackets = 3,
+            playbackRate = 48_000,
+            timestampRead = true,
+            framesWritten = 1_000L,
+            presentedFrame = 520L,
+            queuedFrames = 960L,
+        )
+        assertEquals(30.0, extras.backlogMs, 1e-9)
+        // The cushion is the aim, not what is queued: it does not move.
+        assertEquals(15.0, extras.cushionMs, 1e-9)
+        // Not measured while the track's own position is unknown, queue or not.
+        assertTrue(
+            PlaybackLatency.reportExtras(240, 3, 48_000, false, 0L, 0L, queuedFrames = 960L)
+                .backlogMs.isNaN(),
+        )
+    }
+
+    @Test
     fun theCushionReportedCountsThePacketsHeldBackForDelayedCopies() {
         // 240-frame packets at 48 kHz are 5 ms each: a 3-packet cushion and a 2-packet hold are 25 ms;
         // swapped they would read the same, so the track's applied size is used too: 600 frames and 2

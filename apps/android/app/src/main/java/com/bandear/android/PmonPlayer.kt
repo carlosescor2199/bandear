@@ -7,13 +7,25 @@ import android.media.AudioTrack
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.SocketException
+import java.nio.ByteBuffer
+import java.nio.channels.DatagramChannel
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val NANOS_PER_MILLISECOND = 1_000_000L
 
 /** A frame of the track: 16-bit stereo. */
 private const val BYTES_PER_FRAME = 2 * PlaybackLatency.CHANNELS
+
+/**
+ * The most audio kept waiting before the track, in frames (half a second at 48 kHz). Only a track
+ * that stalls for that long reaches it, and the oldest audio is then given up on.
+ */
+private const val MAX_QUEUED_FRAMES = 24_000L
+
+/** The most datagrams read from the socket in one drain, so a drain always ends. */
+private const val MAX_DRAIN_DATAGRAMS = 512
 
 /**
  * Which receive loop owns the shared session flag: the one launched last.
@@ -133,6 +145,12 @@ internal class PmonPlayer(
         val linkStats = LinkStatsAccumulator(metricsStartedAtNanos / NANOS_PER_MILLISECOND)
         // The hold and the link report together, wake-up by wake-up (see [HoldPlayout]).
         val playout = HoldPlayout(hold, linkStats)
+        // The packets that are due, waiting to be written to the track. Everything the socket holds is
+        // moved here first, so the audio a blocked write leaves waiting is counted, not hidden in the
+        // kernel's socket buffer.
+        val queue = PlayoutQueue<PmonPacket>(MAX_QUEUED_FRAMES)
+        // Removes the surplus a faster desk clock piles up in the queue, a few frames at a time.
+        var trimmer: DriftTrimmer? = null
         var previousPacketAtNanos: Long? = null
         var interArrivalMs = 0.0
         var jitterMs = 0.0
@@ -149,6 +167,82 @@ internal class PmonPlayer(
         var appliedBufferFrames = 0
         val audioTimestamp = AudioTimestamp()
         val buffer = ByteArray(65_507)
+        val drained = ByteBuffer.wrap(buffer)
+
+        // Parses and offers the datagram in [buffer], and measures the arrival's spacing.
+        fun ingest(length: Int) {
+            val packet = PmonPacketParser.parse(buffer, length)
+            if (packet.channels > MAX_CHANNELS) {
+                throw PmonPacketParseException(
+                    "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
+                )
+            }
+            if (!playout.offer(packet.sequence, packet)) {
+                // A duplicate, or a packet that arrived after a newer one was played or given up on:
+                // playing it now would be out of order, and its gap is already counted.
+                return
+            }
+            // The arrival's spacing, as it arrived, whatever the hold does with it.
+            val packetReceivedAtNanos = System.nanoTime()
+            previousPacketAtNanos?.let { previousAtNanos ->
+                val intervalMs = (packetReceivedAtNanos - previousAtNanos) / 1_000_000.0
+                if (interArrivalMs == 0.0) {
+                    interArrivalMs = intervalMs
+                } else {
+                    interArrivalMs += 0.1 * (intervalMs - interArrivalMs)
+                }
+                jitterMs += 0.1 * (kotlin.math.abs(intervalMs - interArrivalMs) - jitterMs)
+                linkStats.onArrivalDeviation(intervalMs - interArrivalMs)
+            }
+            previousPacketAtNanos = packetReceivedAtNanos
+        }
+
+        // Every packet now due, in sequence order (at once with no hold, else once the hold has passed
+        // or a late copy filled its gap), moved to the queue.
+        fun queueDue() {
+            while (true) {
+                val packet = playout.nextToPlay(System.nanoTime() / NANOS_PER_MILLISECOND) ?: break
+                val dropped = queue.add(packet, packet.samples.size / PlaybackLatency.CHANNELS)
+                if (dropped > 0) {
+                    // The track stalled for so long that the queue hit its bound: the oldest audio is
+                    // given up on, and counted as discarded.
+                    discardedSamples += dropped * PlaybackLatency.CHANNELS
+                    packetsWithDiscardedSamples++
+                }
+            }
+        }
+
+        // The link report rides on the loop's wake-ups: every packet and every receive timeout passes
+        // here, so a report is at most one timeout late, and the track's underrun count is read only
+        // when one is due.
+        fun reportIfDue() {
+            val nowMs = System.nanoTime() / NANOS_PER_MILLISECOND
+            if (!linkStats.isDue(nowMs)) {
+                return
+            }
+            // The cushion aimed for and the audio queued right now end the interval, on the track and
+            // before it; the report holds them as primitives.
+            val track = audioTrack
+            val extras = PlaybackLatency.reportExtras(
+                packetFrames = packetFrames,
+                cushionPackets = cushion.cushionPackets,
+                playbackRate = playbackRate,
+                timestampRead = track != null && track.getTimestamp(audioTimestamp),
+                framesWritten = framesWritten,
+                presentedFrame = audioTimestamp.framePosition,
+                appliedBufferFrames = appliedBufferFrames,
+                holdPackets = playout.holdPackets,
+                queuedFrames = queue.queuedFrames,
+            )
+            playout.poll(
+                nowMs,
+                track?.underrunCount ?: 0,
+                cushionMs = extras.cushionMs,
+                backlogMs = extras.backlogMs,
+            )?.let { report ->
+                listener.onLinkStats(report)
+            }
+        }
 
         try {
             try {
@@ -157,39 +251,13 @@ internal class PmonPlayer(
                 listener.onError("Could not resolve server host: ${error.message ?: "unknown error"}")
                 return
             }
-            DatagramSocket(port).also { openedSocket ->
+            // A channel's socket, so what is already waiting can be read without blocking.
+            DatagramChannel.open().use { channel ->
+                val openedSocket = channel.socket()
                 socket = openedSocket
+                openedSocket.bind(InetSocketAddress(port))
                 openedSocket.soTimeout = 250
-            }.use { openedSocket ->
                 while (running.get()) {
-                    // The link report rides on the loop's own wake-ups: every packet and every
-                    // receive timeout passes here, so a report is at most one timeout late, and the
-                    // track's underrun count is read only when one is due.
-                    val nowMs = System.nanoTime() / NANOS_PER_MILLISECOND
-                    if (linkStats.isDue(nowMs)) {
-                        // The cushion aimed for and the audio queued right now end the interval; the
-                        // report holds them as primitives and is handed over as it always was.
-                        val track = audioTrack
-                        val extras = PlaybackLatency.reportExtras(
-                            packetFrames = packetFrames,
-                            cushionPackets = cushion.cushionPackets,
-                            playbackRate = playbackRate,
-                            timestampRead = track != null && track.getTimestamp(audioTimestamp),
-                            framesWritten = framesWritten,
-                            presentedFrame = audioTimestamp.framePosition,
-                            appliedBufferFrames = appliedBufferFrames,
-                            holdPackets = playout.holdPackets,
-                        )
-                        playout.poll(
-                            nowMs,
-                            track?.underrunCount ?: 0,
-                            cushionMs = extras.cushionMs,
-                            backlogMs = extras.backlogMs,
-                        )?.let { report ->
-                            listener.onLinkStats(report)
-                        }
-                    }
-
                     val datagram = DatagramPacket(buffer, buffer.size)
                     datagram.setLength(buffer.size)
                     val arrived = try {
@@ -206,38 +274,23 @@ internal class PmonPlayer(
                         // applies from the next packet.
                         playout.wake(mixState.redundancyHoldPackets)
                         if (arrived) {
-                            val packet = PmonPacketParser.parse(datagram.data, datagram.length)
-                            if (packet.channels > MAX_CHANNELS) {
-                                throw PmonPacketParseException(
-                                    "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
-                                )
-                            }
-                            if (!playout.offer(packet.sequence, packet)) {
-                                // A duplicate, or a packet that arrived after a newer one was played
-                                // or given up on: playing it now would be out of order, and its gap is
-                                // already counted.
-                                continue
-                            }
-                            // The arrival's spacing, as it arrived, whatever the hold does with it.
-                            val packetReceivedAtNanos = System.nanoTime()
-                            previousPacketAtNanos?.let { previousAtNanos ->
-                                val intervalMs = (packetReceivedAtNanos - previousAtNanos) / 1_000_000.0
-                                if (interArrivalMs == 0.0) {
-                                    interArrivalMs = intervalMs
-                                } else {
-                                    interArrivalMs += 0.1 * (intervalMs - interArrivalMs)
-                                }
-                                jitterMs += 0.1 * (kotlin.math.abs(intervalMs - interArrivalMs) - jitterMs)
-                                linkStats.onArrivalDeviation(intervalMs - interArrivalMs)
-                            }
-                            previousPacketAtNanos = packetReceivedAtNanos
+                            ingest(datagram.length)
+                            // Then whatever else the socket already holds.
+                            drainWaiting(channel, drained) { length -> ingest(length) }
                         }
+                        queueDue()
+                    } catch (error: Exception) {
+                        listener.onError(error.message ?: "invalid PMON packet")
+                    }
 
-                        // Every packet now due, in sequence order: at once with no hold, else once
-                        // the hold has passed or a late copy filled its gap.
-                        while (true) {
+                    reportIfDue()
+
+                    try {
+                        // While a surplus lasts this loop may not return to the receive above for a
+                        // long time, so it checks for a stop on every packet too.
+                        while (running.get()) {
+                            val packet = queue.poll() ?: break
                             val packetPlayedAtNanos = System.nanoTime()
-                            val packet = playout.nextToPlay(packetPlayedAtNanos / NANOS_PER_MILLISECOND) ?: break
                             packetsReceived++
                             lastSampleRate = packet.sampleRate
                             val elapsedSeconds = (packetPlayedAtNanos - metricsStartedAtNanos) / 1_000_000_000.0
@@ -253,6 +306,7 @@ internal class PmonPlayer(
                                 cushion.follow(mixState.deskBufferMs, packetFrames, playbackRate, capacityFrames)
                                 appliedBufferFrames =
                                     applyPlaybackBufferTarget(track, packetFrames, cushion.cushionPackets)
+                                trimmer = DriftTrimmer(playbackRate)
                                 audioTrack = track
                             } else if (packet.sampleRate != sourceSampleRate) {
                                 throw PmonPacketParseException(
@@ -260,13 +314,33 @@ internal class PmonPlayer(
                                 )
                             }
 
-                            val processedSamples = Pcm16Processor.applyLocalProtection(
+                            var processedSamples = Pcm16Processor.applyLocalProtection(
                                 samples = packet.samples,
                                 volumePercent = mixState.volumePercent,
                                 maxLevelPercent = mixState.maxLevelPercent,
                                 muted = mixState.muted,
                                 serverOwnsMix = listener.serverOwnsMix(),
                             )
+                            // The audio still to play ahead of this packet, on the track and waiting
+                            // before it, against the buffer the track is sized to. A track holds no more
+                            // than its buffer, so what it reports beyond it is a stale position, not audio.
+                            val activeTrimmer = trimmer
+                            if (activeTrimmer != null && audioTrack.getTimestamp(audioTimestamp)) {
+                                val targetFrames = if (appliedBufferFrames > 0) {
+                                    appliedBufferFrames
+                                } else {
+                                    PlaybackLatency.targetBufferFrames(packetFrames, cushion.cushionPackets)
+                                }.toLong()
+                                val onTrack = minOf(
+                                    PlaybackLatency.pendingFrames(framesWritten, audioTimestamp.framePosition),
+                                    targetFrames,
+                                )
+                                val cut = activeTrimmer.onPacket(packetFrames, onTrack + queue.queuedFrames, targetFrames)
+                                if (cut > 0) {
+                                    processedSamples =
+                                        PcmSplice.removeFrames(processedSamples, PlaybackLatency.CHANNELS, cut)
+                                }
+                            }
                             val writtenSamples = audioTrack.write(
                                 processedSamples,
                                 0,
@@ -290,12 +364,21 @@ internal class PmonPlayer(
                             if (writtenSamples > 0) {
                                 framesWritten += writtenSamples / PlaybackLatency.CHANNELS
                             }
+                            // What arrived while the write was blocked joins the queue now, so the next
+                            // packet's measure and the stats below see it. A surplus keeps this loop
+                            // busy, so the wake-up work the receive loop does per packet happens here
+                            // too: the desk's hold is re-read and the link report is never held back.
+                            playout.wake(mixState.redundancyHoldPackets)
+                            drainWaiting(channel, drained) { length -> ingest(length) }
+                            queueDue()
+                            reportIfDue()
                             if (audioTrack.getTimestamp(audioTimestamp)) {
+                                // Everything not heard yet: on the track and waiting before it.
                                 val instantBacklog = PlaybackLatency.backlogMs(
                                     framesWritten,
                                     audioTimestamp.framePosition,
                                     playbackRate ?: packet.sampleRate,
-                                )
+                                ) + PlaybackLatency.framesMs(queue.queuedFrames, playbackRate ?: packet.sampleRate)
                                 playbackBacklogMs = if (playbackBacklogMs == 0.0) {
                                     instantBacklog
                                 } else {
@@ -354,6 +437,26 @@ internal class PmonPlayer(
             // The flag goes down (only if this is still the latest launch) before the receiver is
             // free again, so no new session can start in between and be ended by this loop.
             launches.finished(Thread.currentThread()) { listener.onStopped() }
+        }
+    }
+
+    /**
+     * Reads every datagram the socket already holds, without waiting for more, into [bytes] one at a
+     * time, calling [onDatagram] with each one's length. The channel is blocking again afterwards, as
+     * the loop's timed receive needs it.
+     */
+    private inline fun drainWaiting(channel: DatagramChannel, bytes: ByteBuffer, onDatagram: (Int) -> Unit) {
+        channel.configureBlocking(false)
+        try {
+            var count = 0
+            while (count < MAX_DRAIN_DATAGRAMS) {
+                bytes.clear()
+                if (channel.receive(bytes) == null) break
+                count++
+                onDatagram(bytes.position())
+            }
+        } finally {
+            channel.configureBlocking(true)
         }
     }
 
